@@ -25,10 +25,10 @@ pub struct SentryConfig {
     #[serde(default)]
     pub rules: RulesConfig,
     /// Event sources.
-    #[serde(default)]
+    #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
     /// Response actions.
-    #[serde(default)]
+    #[serde(default, rename = "action")]
     pub actions: Vec<ActionConfig>,
 }
 
@@ -123,7 +123,7 @@ fn default_llm_cache_ttl() -> u64 {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RulesConfig {
     /// Default rule packs and their mode.
-    #[serde(default)]
+    #[serde(default, rename = "pack")]
     pub packs: Vec<RulePackConfig>,
     /// Static inline rules.
     #[serde(default)]
