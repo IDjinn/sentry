@@ -1,0 +1,99 @@
+# sentry.toml — aaPanel production config (SHADOW mode, log-only).
+#
+# Copy this to config/sentry.toml on the server and edit.
+# All rule packs start in "shadow" mode: Sentry detects and logs but never
+# blocks. Promote to "enforce" only after confirming no false positives.
+#
+# Secrets via env (never here): SENTRY_CF_TOKEN, SENTRY_CF_ZONE, SENTRY_LLM_KEY,
+# SENTRY_STORAGE__POSTGRES__URL.
+
+[core]
+data_dir = "/var/lib/sentry"
+channel_buffer = 8192
+
+# ── Storage ──────────────────────────────────────────────────────────────
+[storage.postgres]
+url = "postgres://sentry:changeme@localhost:5432/sentry"
+max_connections = 10
+
+# ── LLM (optional, disabled by default) ──────────────────────────────────
+[llm]
+provider = "none"
+only_above = 30
+concurrency = 4
+cache_ttl_secs = 300
+
+# ── Rules engine — everything in SHADOW for initial testing ──────────────
+[rules]
+
+[[rules.pack]]
+name = "vpn_proxy"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "tor"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "crawlers_bad"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "crawlers_good"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "sensitive_paths"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "empty_ua"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "http_anomaly"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "rate_scan"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "country_blocklist"
+mode  = "off"
+# countries = ["RU", "CN"]
+
+# Allow internal monitoring / health checks.
+[[rules.custom]]
+name = "allow localhost"
+priority = 1
+match = 'ip=127.0.0.0/8'
+action = "allow"
+
+[[rules.custom]]
+name = "allow private networks"
+priority = 2
+match = 'ip=10.0.0.0/8 OR ip=172.16.0.0/12 OR ip=192.168.0.0/16'
+action = "allow"
+
+# ── Sources — aaPanel nginx logs (combined format is the nginx default) ──
+[[source]]
+type = "nginx"
+[source.options]
+path = "/var/log/nginx/elexapk.com.log"
+format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"'
+
+[[source]]
+type = "nginx"
+[source.options]
+path = "/var/log/nginx/cok-chat.elexapk.com.log"
+format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"'
+
+# ── Actions — start with log only, add blocklist/cloudflare later ─────────
+[[action]]
+type = "blocklist"
+[action.options]
+ttl_secs = 86400
+
+[[action]]
+type = "log"

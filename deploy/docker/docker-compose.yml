@@ -40,8 +40,8 @@ services:
       RUST_LOG: info,sentry=debug
     volumes:
       - ../../config/sentry.example.toml:/etc/sentry/sentry.toml:ro
-      # aaPanel nginx logs (read-only):
-      - /www/wwwlogs:/var/log/nginx:ro
+      # Mount nginx log if monitoring host nginx:
+      # - /var/log/nginx:/var/log/nginx:ro
       - sentrydata:/var/lib/sentry
     restart: unless-stopped
 
