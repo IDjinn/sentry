@@ -131,7 +131,7 @@ impl EventRepo {
             r#"INSERT INTO events
                (id, timestamp, source, client_ip, client_port, server_port,
                 asn, country, protocol, risk_score, risk_level, verdict, signals, raw)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+               VALUES ($1, $2, $3, $4::inet, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                ON CONFLICT (id) DO NOTHING"#,
         )
         .bind(evt.id)
@@ -295,7 +295,7 @@ impl IpStateRepo {
     ) -> Result<()> {
         sqlx::query(
             r#"INSERT INTO ip_state (ip, status, reason, expires_at)
-               VALUES ($1, 'blocked', $2, $3)
+               VALUES ($1::inet, 'blocked', $2, $3)
                ON CONFLICT (ip) DO UPDATE SET
                    status = 'blocked',
                    reason = $2,
@@ -316,7 +316,7 @@ impl IpStateRepo {
         let row: (bool,) = sqlx::query_as(
             r#"SELECT EXISTS(
                    SELECT 1 FROM ip_state
-                   WHERE ip = $1 AND status = 'blocked'
+                   WHERE ip = $1::inet AND status = 'blocked'
                      AND (expires_at IS NULL OR expires_at > now())
                )"#,
         )
@@ -345,7 +345,7 @@ impl IpStateRepo {
 
     /// Remove an IP from the state table.
     pub async fn unblock(&self, ip: IpAddr) -> Result<()> {
-        sqlx::query("DELETE FROM ip_state WHERE ip = $1")
+        sqlx::query("DELETE FROM ip_state WHERE ip = $1::inet")
             .bind(ip.to_string())
             .execute(self.pool.inner())
             .await
