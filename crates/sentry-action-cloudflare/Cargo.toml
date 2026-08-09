@@ -1,6 +1,6 @@
 [package]
 name = "sentry-action-cloudflare"
-description = "Cloudflare firewall/challenge action plugin for Sentry"
+description = "Cloudflare ChallengeProvider (edge block/challenge) for Sentry"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

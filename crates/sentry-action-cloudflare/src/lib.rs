@@ -1,8 +1,13 @@
-//! Cloudflare action plugin.
+//! Cloudflare edge-action provider.
 //!
-//! Executes block / challenge / rate-limit via the Cloudflare API when the
-//! decider emits a matching verdict. Keeps a local in-memory cache of IPs
-//! already acted on (with TTL) to avoid hammering the API.
+//! Implements [`sentry_core::ChallengeProvider`]: applies block / challenge /
+//! rate-limit rules to a client IP via the Cloudflare firewall-rules API.
+//! Keeps a local in-memory cache of IPs already acted on (with TTL) to avoid
+//! hammering the API.
+//!
+//! Wired into the daemon either as `type = "cloudflare"` (backward-compatible
+//! alias) or as `type = "challenge"`, `provider = "cloudflare"` (canonical
+//! provider-agnostic form). See `sentry-core::challenge`.
 
 #![forbid(unsafe_code)]
 
@@ -12,55 +17,38 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use sentry_core::action::Action;
 use sentry_core::analysis::Verdict;
+use sentry_core::challenge::{ChallengeProvider, EdgeMode, EdgeOptions};
 use sentry_core::error::Result;
-use sentry_core::event::Event;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-/// Cloudflare action configuration.
+/// Cloudflare provider configuration.
 #[derive(Debug, Clone)]
-pub struct CloudflareActionConfig {
+pub struct CloudflareProviderConfig {
     /// API token (env: `SENTRY_CF_TOKEN`).
     pub token: String,
     /// Zone id (env: `SENTRY_CF_ZONE`).
     pub zone: String,
-    /// Challenge mode: `block` | `js_challenge` | `managed_challenge`.
-    pub mode: ChallengeMode,
-    /// How long to keep an IP blocked/challenged.
+    /// Default challenge mode when the pipeline verdict is `Challenge` and
+    /// no explicit mode is supplied via [`EdgeOptions`].
+    pub default_mode: EdgeMode,
+    /// How long to keep an IP blocked/challenged, when not overridden by
+    /// [`EdgeOptions::ttl`].
     pub ttl: Duration,
 }
 
-/// Challenge mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChallengeMode {
-    Block,
-    JsChallenge,
-    ManagedChallenge,
-}
-
-impl ChallengeMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Block => "block",
-            Self::JsChallenge => "js_challenge",
-            Self::ManagedChallenge => "managed_challenge",
-        }
-    }
-}
-
-/// Cloudflare action.
-pub struct CloudflareAction {
-    cfg: CloudflareActionConfig,
+/// Cloudflare [`ChallengeProvider`] implementation.
+pub struct CloudflareProvider {
+    cfg: CloudflareProviderConfig,
     http: reqwest::Client,
     /// Cache of IP → expiry instant. Prevents duplicate API calls.
     cache: Arc<RwLock<HashMap<IpAddr, Instant>>>,
 }
 
-impl CloudflareAction {
-    /// Create a new Cloudflare action.
-    pub fn new(cfg: CloudflareActionConfig) -> Self {
+impl CloudflareProvider {
+    /// Create a new Cloudflare provider.
+    pub fn new(cfg: CloudflareProviderConfig) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -79,9 +67,9 @@ impl CloudflareAction {
     }
 
     /// Record that we acted on `ip`.
-    async fn record(&self, ip: IpAddr) {
+    async fn record(&self, ip: IpAddr, ttl: Duration) {
         let mut cache = self.cache.write().await;
-        cache.insert(ip, Instant::now() + self.cfg.ttl);
+        cache.insert(ip, Instant::now() + ttl);
     }
 
     /// Prune expired entries (called opportunistically).
@@ -90,42 +78,55 @@ impl CloudflareAction {
         let now = Instant::now();
         cache.retain(|_, exp| *exp > now);
     }
+
+    /// Resolve the Cloudflare firewall-rule `mode` for a given verdict.
+    ///
+    /// - `Block` → `block` (hard block, regardless of configured mode).
+    /// - `Challenge` → the configured [`EdgeOptions::mode`], falling back to
+    ///   the provider's `default_mode`.
+    /// - `RateLimit` → `rate_limit`.
+    /// - `Allow` / `Quarantine` never reach here (filtered by
+    ///   [`sentry_core::ChallengeAction`]).
+    fn resolve_mode(&self, verdict: Verdict, opts: &EdgeOptions) -> EdgeMode {
+        match verdict {
+            Verdict::Block => EdgeMode::Block,
+            Verdict::Challenge => opts.mode_or(self.cfg.default_mode),
+            Verdict::RateLimit => EdgeMode::RateLimit,
+            // Defensive: should never be called for these.
+            Verdict::Allow | Verdict::Quarantine => opts.mode_or(self.cfg.default_mode),
+        }
+    }
 }
 
 #[async_trait]
-impl Action for CloudflareAction {
+impl ChallengeProvider for CloudflareProvider {
     fn name(&self) -> &'static str {
         "cloudflare"
     }
 
-    fn applies_to(&self, decision: &sentry_core::analysis::Decision) -> bool {
-        matches!(
-            decision.action,
-            Verdict::Block | Verdict::Challenge | Verdict::RateLimit
-        )
-    }
-
-    async fn execute(
-        &self,
-        evt: &Event,
-        _decision: &sentry_core::analysis::Decision,
-    ) -> Result<()> {
-        let ip = evt.client_ip;
+    async fn apply(&self, ip: IpAddr, verdict: Verdict, opts: &EdgeOptions) -> Result<()> {
         if self.is_cached(ip).await {
             return Ok(());
         }
+
+        let ttl = if opts.ttl.is_zero() {
+            self.cfg.ttl
+        } else {
+            opts.ttl
+        };
+        let mode = self.resolve_mode(verdict, opts);
 
         let url = format!(
             "https://api.cloudflare.com/client/v4/zones/{}/firewall/rules",
             self.cfg.zone
         );
         let body = serde_json::json!({
-            "mode": self.cfg.mode.as_str(),
+            "mode": mode.as_str(),
             "configuration": {
                 "target": "ip",
                 "value": ip.to_string(),
             },
-            "ttl": self.cfg.ttl.as_secs(),
+            "ttl": ttl.as_secs(),
         });
 
         match self
@@ -138,8 +139,8 @@ impl Action for CloudflareAction {
         {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    info!(ip = %ip, mode = self.cfg.mode.as_str(), "cloudflare rule created");
-                    self.record(ip).await;
+                    info!(ip = %ip, mode = mode.as_str(), "cloudflare rule created");
+                    self.record(ip, ttl).await;
                     self.prune().await;
                 } else {
                     let status = resp.status();

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use sentry_core::challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
 use sentry_core::config::{ActionKind, SentryConfig};
 use sentry_core::event::Event;
 use sentry_core::packs::build_default_ruleset;
@@ -242,31 +243,19 @@ fn build_registry(cfg: &SentryConfig) -> color_eyre::Result<sentry_core::registr
                 ));
             }
             ActionKind::Cloudflare => {
-                let token = std::env::var("SENTRY_CF_TOKEN").unwrap_or_default();
-                let zone = std::env::var("SENTRY_CF_ZONE").unwrap_or_default();
-                if token.is_empty() || zone.is_empty() {
-                    warn!("cloudflare action configured but SENTRY_CF_TOKEN/SENTRY_CF_ZONE env unset — skipping");
-                    continue;
+                if let Some(action) = build_challenge_action("cloudflare", &act.options)? {
+                    builder.register_action(action);
                 }
-                let mode = act
-                    .options
-                    .get("mode")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("managed_challenge");
-                let mode = match mode {
-                    "block" => sentry_action_cloudflare::ChallengeMode::Block,
-                    "js_challenge" => sentry_action_cloudflare::ChallengeMode::JsChallenge,
-                    _ => sentry_action_cloudflare::ChallengeMode::ManagedChallenge,
-                };
-                let ttl = parse_ttl_secs(&act.options, 86400);
-                builder.register_action(sentry_action_cloudflare::CloudflareAction::new(
-                    sentry_action_cloudflare::CloudflareActionConfig {
-                        token,
-                        zone,
-                        mode,
-                        ttl: Duration::from_secs(ttl),
-                    },
-                ));
+            }
+            ActionKind::Challenge => {
+                let provider = act.provider.as_deref().ok_or_else(|| {
+                    color_eyre::eyre::eyre!(
+                        "challenge action requires `provider` (e.g. provider = \"cloudflare\")"
+                    )
+                })?;
+                if let Some(action) = build_challenge_action(provider, &act.options)? {
+                    builder.register_action(action);
+                }
             }
         }
     }
@@ -287,6 +276,72 @@ fn parse_ttl_secs(opts: &HashMap<String, toml::Value>, default_secs: u64) -> u64
         .and_then(|v| v.as_integer())
         .map(|i| i.max(0) as u64)
         .unwrap_or(default_secs)
+}
+
+/// Parse the `mode` option from a config options map into an [`EdgeMode`].
+///
+/// Returns `None` when absent (caller applies a provider default) or when the
+/// value is invalid — in the latter case a warning is emitted so misconfigured
+/// modes don't silently fall back.
+fn parse_edge_mode(opts: &HashMap<String, toml::Value>) -> Option<EdgeMode> {
+    let raw = opts.get("mode")?.as_str()?;
+    match EdgeMode::parse(raw) {
+        Some(m) => Some(m),
+        None => {
+            warn!(
+                mode = raw,
+                "invalid challenge `mode` (expected block | js_challenge | managed_challenge | rate_limit), falling back to default"
+            );
+            None
+        }
+    }
+}
+
+/// Build a provider-agnostic [`ChallengeAction`] for the named edge provider.
+///
+/// Returns `Ok(None)` when the provider should be skipped (e.g. Cloudflare
+/// token/zone env vars unset), preserving the previous skip-with-warning
+/// behavior. Errors are reserved for unknown provider names.
+///
+/// Adding a new edge provider = implement
+/// [`ChallengeProvider`](sentry_core::ChallengeProvider) in its own crate,
+/// add a `match` arm here, and add the crate to `sentry-cli/Cargo.toml`. No
+/// changes to `ActionKind`, verdict filtering, or the rules engine.
+fn build_challenge_action(
+    provider_name: &str,
+    options: &HashMap<String, toml::Value>,
+) -> color_eyre::Result<Option<ChallengeAction>> {
+    let ttl = Duration::from_secs(parse_ttl_secs(options, 86400));
+    let mode = parse_edge_mode(options);
+    let opts = EdgeOptions { ttl, mode };
+
+    let provider: Arc<dyn ChallengeProvider> = match provider_name {
+        "cloudflare" => {
+            let token = std::env::var("SENTRY_CF_TOKEN").unwrap_or_default();
+            let zone = std::env::var("SENTRY_CF_ZONE").unwrap_or_default();
+            if token.is_empty() || zone.is_empty() {
+                warn!(
+                    "cloudflare action configured but SENTRY_CF_TOKEN/SENTRY_CF_ZONE env unset — skipping"
+                );
+                return Ok(None);
+            }
+            Arc::new(sentry_action_cloudflare::CloudflareProvider::new(
+                sentry_action_cloudflare::CloudflareProviderConfig {
+                    token,
+                    zone,
+                    default_mode: EdgeMode::ManagedChallenge,
+                    ttl,
+                },
+            ))
+        }
+        other => {
+            return Err(color_eyre::eyre::eyre!(
+                "unknown challenge provider `{other}` — known: cloudflare"
+            ));
+        }
+    };
+
+    Ok(Some(ChallengeAction::new(provider, opts)))
 }
 
 /// Parse a risk level name from config (`"high"` → `RiskLevel::High`).

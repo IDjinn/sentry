@@ -123,10 +123,27 @@ http_anomaly, rate_scan. Ver `ARCHITECTURE.md` §10 para a lista completa.
 ### Actions — type-safe
 
 O tipo de action em config é o enum `sentry_core::config::ActionKind`
-(`Cloudflare` | `Webhook` | `Blocklist` | `Log`), **não** uma string. Erros
-de digitação em `type = "..."` no TOML falham em tempo de carga, não em
-runtime. Ao adicionar um novo plugin de action, adicione uma variante ao
-enum e um braço no `match` de `daemon::build_registry`.
+(`Cloudflare` | `Challenge` | `Webhook` | `Blocklist` | `Log`), **não** uma
+string. Erros de digitação em `type = "..."` no TOML falham em tempo de carga,
+não em runtime.
+
+- Para actions de **edge** (block/challenge/rate-limit em CDN/WAF), use a
+  forma canonical `type = "challenge"` + `provider = "cloudflare"`. O alias
+  `type = "cloudflare"` (sem `provider`) é equivalente e mantido por
+  compatibilidade.
+- Actions de edge são provider-agnostic via trait
+  `sentry_core::ChallengeProvider` (espelha o `LlmProvider`):
+  `ChallengeAction` (em core) faz o filtro de verdict (`Block`/`Challenge`/
+  `RateLimit`) e delega ao provider. O provider só implementa `apply(ip,
+  verdict, opts)`.
+- **Adicionar um novo provider de edge** (AWS WAF, Fastly, Bunny…):
+  1. Crie a crate `sentry-action-<nome>` implementando `ChallengeProvider`.
+  2. Adicione-a a `sentry-cli/Cargo.toml`.
+  3. Adicione um braço no `match` de `daemon::build_challenge_action`.
+  Sem mudar `ActionKind`, regras, ou filtro de verdict.
+- Para actions **não-edge** (webhook, blocklist, log), adicione uma variante
+  ao `ActionKind` e um braço no `match` de `daemon::build_registry` como
+  antes.
 
 ## 7. Fases do projeto
 
@@ -140,6 +157,10 @@ enum e um braço no `match` de `daemon::build_registry`.
   - ✅ Nginx source (parser + tail com rotação) — 3 testes
   - ✅ Daemon com wiring end-to-end (sources→pipeline→actions coloridas)
   - ✅ Actions type-safe via `ActionKind` (Blocklist/Webhook/Cloudflare/Log)
+  - ✅ Edge actions provider-agnostic via trait `ChallengeProvider`
+    (`ChallengeAction` filtra verdict, provider só implementa `apply`).
+    Cloudflare migrado para provider; canonical config `type = "challenge"`,
+    `provider = "cloudflare"` — 5 testes
   - ⬜ TUI `ratatui` (stub — F1.9)
   - ⬜ Storage repos (schema pronto, queries pendentes — F1.3)
   - ⬜ CLI subcommands (stubs — F1.8)
@@ -156,7 +177,7 @@ Backlog detalhado em `ARCHITECTURE.md` §15.
 C:\Users\lucas\.cargo\bin\cargo.exe fmt --all -- --check
 C:\Users\lucas\.cargo\bin\cargo.exe clippy --all-targets --all-features -- -D warnings
 C:\Users\lucas\.cargo\bin\cargo.exe test --all
-# Resultado esperado: 23 testes passando (20 core + 3 nginx)
+# Resultado esperado: 28 testes passando (25 core + 3 nginx)
 ```
 
 ## 8. Convenões de código

@@ -12,6 +12,7 @@
 
 pub mod action;
 pub mod analysis;
+pub mod challenge;
 pub mod config;
 pub mod error;
 pub mod event;
@@ -24,6 +25,7 @@ pub mod source;
 
 pub use action::Action;
 pub use analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};
+pub use challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
 pub use error::{CoreError, Result};
 pub use event::{
     Direction, Event, GeoInfo, HttpData, HttpMethod, ProtocolData, ProtocolKind, RawData, RawEvent,

@@ -199,9 +199,15 @@ pub struct SourceConfig {
 /// An action plugin entry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActionConfig {
-    /// Plugin kind: `cloudflare` | `webhook` | `blocklist` | `log`.
+    /// Plugin kind: `cloudflare` | `webhook` | `blocklist` | `log` | `challenge`.
     #[serde(rename = "type")]
     pub kind: ActionKind,
+    /// Edge provider name, used only when `kind = "challenge"`
+    /// (e.g. `"cloudflare"` | `"aws_waf"` | `"fastly"`). Ignored by other
+    /// kinds. Enables adding new edge providers without a new `ActionKind`
+    /// variant each time — see [`ChallengeProvider`](crate::challenge::ChallengeProvider).
+    #[serde(default)]
+    pub provider: Option<String>,
     /// Arbitrary plugin-specific fields.
     #[serde(default)]
     pub options: HashMap<String, toml::Value>,
@@ -216,7 +222,17 @@ pub struct ActionConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ActionKind {
     /// `sentry-action-cloudflare` — block/challenge via the Cloudflare API.
+    ///
+    /// Backward-compatible alias for [`Self::Challenge`] with
+    /// `provider = "cloudflare"`. New configs should prefer the canonical
+    /// `challenge` form.
     Cloudflare,
+    /// Provider-agnostic edge action. The actual provider is selected by
+    /// [`ActionConfig::provider`] (e.g. `"cloudflare"`). New edge providers
+    /// implement [`ChallengeProvider`](crate::challenge::ChallengeProvider)
+    /// and are wired in `daemon::build_registry` — no new `ActionKind`
+    /// variant needed.
+    Challenge,
     /// `sentry-action-webhook` — POST a JSON alert to a URL.
     Webhook,
     /// `sentry-action-blocklist` — in-memory IP blocklist with TTL.
@@ -231,6 +247,7 @@ impl ActionKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Cloudflare => "cloudflare",
+            Self::Challenge => "challenge",
             Self::Webhook => "webhook",
             Self::Blocklist => "blocklist",
             Self::Log => "log",

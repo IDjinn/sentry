@@ -107,12 +107,14 @@ type = "blocklist"
 ttl_secs = 86400
 
 [[action]]
-type = "cloudflare"
+type = "challenge"
+provider = "cloudflare"        # cloudflare | aws_waf | fastly | ... (extensible via ChallengeProvider)
 [action.options]
-mode = "managed_challenge"   # block | js_challenge | managed_challenge
+mode = "managed_challenge"     # block | js_challenge | managed_challenge | rate_limit
 ttl_secs = 86400
 # token: env SENTRY_CF_TOKEN
 # zone:   env SENTRY_CF_ZONE
+# Backward-compatible alias: `type = "cloudflare"` (no `provider`) is equivalent.
 
 [[action]]
 type = "webhook"
