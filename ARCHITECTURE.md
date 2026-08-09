@@ -879,8 +879,24 @@ Legenda: **F1** = Fase 1 (MVP nginx), **F2** = Cloudflare + IA local, **F3** = M
 - [~] **F3.5** LLM provider trait (`ollama`/`openai`): prompt enxuto, JSON schema strict, cache de verdicts — trait `LlmProvider` em `llm.rs`; **zero adapters**
 - [ ] **F3.6** Pipeline de retreinamento: exportar incidentes confirmados → dataset → novo modelo
 - [ ] **F3.7** Reputation feeds: importar blocklists públicas (Emerging Threats, Spamhaus) periodicamente — config schema + `ReputationTier` existem; sem fetcher
-- [ ] **F3.8** Detecção de comportamento: scan, brute-force, credential stuffing (janelas deslizantes) — signal kinds existem; sem detectores
-- [ ] **F3.9** Inline proxy opcional (`sentry-proxy`) — modo bloqueio antes da app (com timeout fallback)
+- [ ] **F3.8** Detecção de comportamento: scan, brute-force, credential stuffing (janelas deslizantes) — signal kinds existem; sem detectores. Sub-padrões a cobrir:
+  - **Random-filename scan (`.php`/`.asp`/`.jsp`/`.html` probing)**: mesmo IP hitando muitos paths curtos/aleatórios de extensão de script com 404 (`/lm13.php`, `/1aa.php`, `/aaa.php`, `/cccc.php`, `/666.php`...). Sinais: alta cardinalidade de paths distintos por IP em janela curta + baixa taxa de 200 + nomes não-parametrizáveis (sem segmento dinâmico conhecido, fora da árvore de rotas). Distinto de F2.9/F2.10 (rotas parametrizadas/aprendidas) pois aqui o path é literalmente arbitrário — nenhum template se aplica. Heurística candidata: `RandomScan` em `heuristics.rs` com janela deslizante por IP (e.g. ≥8 paths distintos de extensão web em ≤60s, todos 4xx, e entropia/normalização do basename acima de threshold) → sinal acumulativo + bônus de repetição; ajustar peso em `§16` (sugerido 25, acumula sim). Caso real de referência: `20.199.183.210` varrendo 25+ arquivos `.php` aleatórios, todos `404 [UnknownRoute]`, sem UA suspeito — hoje classificado apenas `LOW` por `Rota inexistente` (peso 8).
+  - **404-scan genérico** (qualquer extensão/path, sem payload malicioso): contador deslizante de 404 por IP, threshold separado do `rate_scan` pack (hoje `rate_scan` é só burst de reqs, não discrimina 4xx).
+  - **Brute-force de auth** (401/403 concentrados em poucas rotas): janela deslizante por IP+rota, taxa de 401/403 acima de N.
+  - **Credential stuffing** (rotas de login com variação alta de payloads + user-agents rotativos): janela por IP+rota + distinct-UAs.
+  - **Directory brute-force** (`/admin`, `/wp-admin`, `/backup`, `/db.sql`, wordlists comuns): integrar com reputation/wordlist `tools/wordlists` (F3.x) — distinguir de scanner legítimo por `crawlers_good` + taxa de 200.
+- [ ] **F3.9** Modos de posicionamento do Sentry na borda — duas topologias suportadas, configuráveis via `[deployment] mode = "..."`:
+  - **Inline / edge (ativo)**: Sentry na borda, **antes** das regras do nginx/upstream (reverse proxy/TCP listener). Bloqueia/contesta antes do app receber. Sub-variantes:
+    - `edge-http` (F3.9a): reverse proxy HTTP(S) na porta `:80`/`:443` (ou outra via `listen`), termina TLS ou repassa, aplica verdict antes de fazer `proxy_pass` para o backend. Concorrente com F3.1 (axum middleware) e F3.9 proxy — unificar num `sentry-edge` crate. Em modo ativo, `Action::Block` descarta a conn/retorna 403/444; `Challenge` retorna challenge JS; `RateLimit` aplica `429`.
+    - `edge-tcp` (F3.9b): listener TCP em portas comuns arbitrárias (`:22`, `:3306`, `:6379`, `:5432`...) para serviços expostos sem HTTP — heurísticas específicas por protocolo (banner-grab, auth brute-force). Reusa `sentry-source-tcp` (F3.2) em modo inline.
+    - `edge-sidecar` (F3.9c): sidecar/envoy filter/WASM — modo inline leve sem assumir porta pública; útil em k8s (daemonset por node) — ver F4 deploy.
+    - Posicionamento "antes do nginx" exigirá documentar ordem de chain: `client → sentry-edge → nginx → app` e que regras de rate-limit/WAF do nginx **não** substituem o Sentry (Sentry atua na camada de decisão de ameaça; nginx mantém suas regras de app).
+  - **Passive / out-of-band (read-only)**: modo atual (F1), sem inline. Ouve tráfego sem interceptar — três fontes passivas possíveis:
+    - `passive-log` (F3.9d): tail de access.log (já feito por `sentry-source-nginx`, F1.1) — zero risco, mas só detecta **depois** do app responder (404 já foi servido). Apenas alerta/blocklist futura.
+    - `passive-mirror` (F3.9e): porta espelho (switch SPAN / `iptables TEE` / `mirror` em Cilium/eBPF) → Sentry escuta cópia read-only do tráfego sem ser path ativo. Detecta em tempo real mas só age **ex-post** (webhook, Cloudflare API, blocklist downstream).
+    - `passive-tap` (F3.9f): sniffing promíscuo via `pnet`/`libpcap` (sem IP na interface) — útil em appliances de rede; variantes de `sentry-source-tcp` (F3.2) em modo tap.
+  - **Critério de escolha** (documentar em `docs/DEPLOY.md`): inline se o serviço não tolera ataque reaching o app (RCE/0-day risk); passive se a infra não permite mudar path/SSL ou se o objetivo é só observabilidade. **Default = passive** (mantém paridade com F1; inline exige opt-in explícito + health-check do backend).
+  - **Métrica chave de comparação**: tempo entre request chegar e verdict aplicado — inline alvo ≤50ms; passive é pós-resposta (apenas para o próximo request do mesmo IP).
 
 ### Fase 4 — Operação & Dashboard
 - [ ] **F4.1** Modo serviço: integração systemd unit / Windows Service / launchd plist
@@ -916,6 +932,7 @@ Legenda: **F1** = Fase 1 (MVP nginx), **F2** = Cloudflare + IA local, **F3** = M
 | Rota inexistente              | 8    | sim      |
 | >10 404/IP em 60s             | 35   | —        |
 | User-agent vazio/suspeito     | 10   | sim      |
+| Random-filename scan (`.php` probing, janela 60s) | 25 | sim |  *(F3.8 — pendente)*
 | Tor exit node                 | 15   | —        |
 | IP em reputation feed         | 50   | —        |
 | Anomalia ONNX > 0.8           | 50   | não      |
