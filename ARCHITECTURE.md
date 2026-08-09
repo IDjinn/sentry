@@ -322,7 +322,7 @@ flowchart LR
     CF2 --> CF3{Já bloqueado recentemente?}
     CF3 -->|não| CF4[Criar/Atualizar firewall rule]
     CF3 -->|sim| CF5[Estender TTL]
-    CF4 --> CF6[Challenge mode: js_challenge|managed_challenge|block]
+    CF4 --> CF6["Challenge mode: js_challenge / managed_challenge / block"]
     CF6 --> CF7[Webhook confirmação]
     CF1 -->|não| BL[Blocklist local only]
 ```
