@@ -867,6 +867,9 @@ Legenda: **F1** = Fase 1 (MVP nginx), **F2** = Cloudflare + IA local, **F3** = M
 - [ ] **F2.6** Rate-limiting por IP/ASN (token bucket em memória + Redis opt) — `RuleMatch::Rate` retorna `false`
 - [x] **F2.7** Alertas: `sentry-action-webhook` (Discord/Slack/Telegram genérico) — `sentry-action-webhook/src/lib.rs` (POST JSON com contexto)
 - [ ] **F2.8** Métricas: counters/histogramas exportáveis (`sentry report --export`) — só 2 counters in-process
+- [ ] **F2.9** Roteador: rotas parametrizadas (`/users/{id}/posts/{post_id}`) — hoje só exato/glob `*` em `glob_simple` (`pipeline.rs:60-112`); adicionar template matcher com placeholders nomeados e normalização de path (colapsar segmentos dinâmicos)
+- [ ] **F2.10** Roteador: auto-aprendizado (modo `learn`) — observar tráfego e inferir rotas conhecidas em runtime (frequência + estabilidade de shape), persistir em `routes` no Postgres; referenciado em `cmd.rs:161-163` ("not yet implemented (F2)"); revisar `RouteValidator` para suportar hot-reload das rotas aprendidas
+- [ ] **F2.11** Roteador: import de specs OpenAPI/Swagger 2.0/3.x — parser de `paths` + `parameters` para gerar rotas parametrizadas automaticamente (sub-comando `sentry routes import --openapi spec.json|yaml`); suportar também Postman Collection e HAR como fontes secundárias; mapear `path templates` (`/users/{id}`) para o matcher de F2.9
 
 ### Fase 3 — Multi-source + LLM
 - [ ] **F3.1** `sentry-source-http`: middleware axum que recebe cópia da req (modo sidecar/inline leve) — sem crate
