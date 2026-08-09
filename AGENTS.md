@@ -148,12 +148,14 @@ não em runtime.
 ## 7. Fases do projeto
 
 - **F0** (concluída): fundação — workspace, core, traits, config, CLI skeleton
-- **F1** (em andamento): MVP nginx — source, heurísticas, scorer, pipeline, TUI
-  - ✅ Heurísticas com URL-decode (SQLi/XSS/PathTraversal/Log4Shell/CmdInjection/
-    SensitivePath/BadCrawler/EmptyUserAgent) — 9 testes
-  - ✅ Rules engine (Rule/RuleMatch/RuleAction/RuleSet) — 7 testes
-  - ✅ Default packs (sensitive_paths/crawlers_bad/empty_ua/http_anomaly)
-  - ✅ Pipeline (rules→heuristics→route→scorer→decider) — 3 testes
+- **F1** (concluída): MVP nginx — source, heurísticas, scorer, pipeline, TUI
+  - ✅ Heurísticas com URL-decode (SQLi/XSS/PathTraversal/LFI/Log4Shell/
+    CmdInjection/SensitivePath/BadCrawler/EmptyUserAgent) — 9 testes + 6 proptests
+  - ✅ Rules engine (Rule/RuleMatch/RuleAction/RuleSet, SharedRuleSet) — 7 testes
+  - ✅ DSL parser (recursive-descent, AND/OR/NOT/parens) — 14 testes
+  - ✅ Default packs (sensitive_paths/crawlers_bad/crawlers_good/empty_ua/
+    http_anomaly/vpn_proxy/tor/rate_scan/country_blocklist) — 9 packs
+  - ✅ Pipeline (rules→heuristics→route→scorer→decider, hot-reload) — 5 testes
   - ✅ Nginx source (parser + tail com rotação) — 3 testes
   - ✅ Daemon com wiring end-to-end (sources→pipeline→actions coloridas)
   - ✅ Actions type-safe via `ActionKind` (Blocklist/Webhook/Cloudflare/Log)
@@ -161,9 +163,18 @@ não em runtime.
     (`ChallengeAction` filtra verdict, provider só implementa `apply`).
     Cloudflare migrado para provider; canonical config `type = "challenge"`,
     `provider = "cloudflare"` — 5 testes
-  - ⬜ TUI `ratatui` (stub — F1.9)
-  - ⬜ Storage repos (schema pronto, queries pendentes — F1.3)
-  - ⬜ CLI subcommands (stubs — F1.8)
+  - ✅ Storage repos (5 repos: Event/Incident/IpState/Rule/Route) com migrations
+    Postgres, `sqlx::query()` runtime, migrations init + routes
+  - ✅ Geo enrichment (sentry-geo com maxminddb, graceful no-op se MMDB ausente)
+  - ✅ Daemon com geo enrichment + dedupe LRU (TTL 10s) + storage persistence
+    (async spawn) + LISTEN/NOTIFY hot-reload (`sentry_rules_changed` channel)
+  - ✅ CLI subcommands completos (incidents, ip, routes, rules, report, config,
+    model, cloudflare, test, auto) — handlers em `cmd.rs`
+  - ✅ TUI `ratatui` standalone (lê eventos recentes do Postgres, scrollável,
+    atalhos j/k/Space/g/G/q/Esc)
+  - ✅ Fixtures + snapshot tests (11 fixtures nginx, 11 snapshots insta)
+  - ✅ CI GitHub Actions (fmt, clippy, test matrix 3 OS, storage com Postgres)
+  - ✅ Config example completo (`[geo]`, `[[routes.known]]`, `[scorer]`)
 - **F2**: Cloudflare + IA local (ONNX)
 - **F3**: Multi-source (TCP, syslog) + LLM (OpenRouter)
 - **F4**: Dashboard web
@@ -177,7 +188,7 @@ Backlog detalhado em `ARCHITECTURE.md` §15.
 C:\Users\lucas\.cargo\bin\cargo.exe fmt --all -- --check
 C:\Users\lucas\.cargo\bin\cargo.exe clippy --all-targets --all-features -- -D warnings
 C:\Users\lucas\.cargo\bin\cargo.exe test --all
-# Resultado esperado: 28 testes passando (25 core + 3 nginx)
+# Resultado esperado: 57 testes passando (53 core + 3 nginx + 1 snapshot)
 ```
 
 ## 8. Convenões de código

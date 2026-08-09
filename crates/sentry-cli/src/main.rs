@@ -7,16 +7,21 @@ async fn main() -> color_eyre::Result<()> {
 
     let cli = sentry_cli::Cli::parse();
 
-    let needs_config = matches!(
-        cli.command,
-        sentry_cli::cli::Command::Run | sentry_cli::cli::Command::Config { .. }
-    );
-
-    let cfg = if needs_config {
+    let cfg = {
         let path = cli.config.as_ref().map(|s| PathBuf::from(s.as_str()));
-        Some(sentry_cli::config::load(path.as_deref())?)
-    } else {
-        None
+        match sentry_cli::config::load(path.as_deref()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                let needs_config = matches!(
+                    cli.command,
+                    sentry_cli::cli::Command::Run | sentry_cli::cli::Command::Config { .. }
+                );
+                if needs_config {
+                    return Err(e);
+                }
+                None
+            }
+        }
     };
 
     sentry_cli::logging::init(cli.verbose);

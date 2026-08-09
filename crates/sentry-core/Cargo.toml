@@ -32,3 +32,4 @@ regex = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"
+proptest = { workspace = true }

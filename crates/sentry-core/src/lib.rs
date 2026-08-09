@@ -26,6 +26,11 @@ pub mod source;
 pub use action::Action;
 pub use analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};
 pub use challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
+pub use config::{
+    ActionConfig, ActionKind, CoreConfig, FeedConfig, GeoConfig, LlmConfig, PostgresConfig,
+    RouteDefConfig, RoutesConfig, RuleDefConfig, RulePackConfig, RulesConfig, ScorerConfig,
+    SentryConfig, SourceConfig, StorageConfig,
+};
 pub use error::{CoreError, Result};
 pub use event::{
     Direction, Event, GeoInfo, HttpData, HttpMethod, ProtocolData, ProtocolKind, RawData, RawEvent,
@@ -35,5 +40,7 @@ pub use heuristics::{Heuristic, HeuristicEngine};
 pub use packs::{build_default_ruleset, PackMode};
 pub use pipeline::{Pipeline, ProcessedEvent, RouteDef, RouteValidator};
 pub use registry::{Registry, RegistryBuilder};
-pub use rules::{Rule, RuleAction, RuleId, RuleMatch, RuleSet, RuleSource};
+pub use rules::{
+    dsl, shared, Rule, RuleAction, RuleId, RuleMatch, RuleSet, RuleSource, SharedRuleSet,
+};
 pub use source::Source;

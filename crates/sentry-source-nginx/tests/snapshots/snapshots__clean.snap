@@ -1,0 +1,16 @@
+---
+source: crates/sentry-source-nginx/tests/snapshots.rs
+expression: summary
+---
+fixture: clean
+line:    203.0.113.10 - - [10/Jan/2026:13:55:36 +0000] "GET /api/users?id=42 HTTP/1.1" 200 1234 "-" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+method:  Some(Get)
+path:    /api/users
+query:   id=42
+status:  200
+ua:      Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+score:   8
+level:   INFO
+verdict: Allow
+rule:    -
+signals: [unknown_route]

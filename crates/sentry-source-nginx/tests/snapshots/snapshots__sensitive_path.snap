@@ -1,0 +1,16 @@
+---
+source: crates/sentry-source-nginx/tests/snapshots.rs
+expression: summary
+---
+fixture: sensitive_path
+line:    198.51.100.31 - - [10/Jan/2026:13:55:45 +0000] "GET /.env HTTP/1.1" 404 8 "-" "Mozilla/5.0"
+method:  Some(Get)
+path:    /.env
+query:   -
+status:  404
+ua:      Mozilla/5.0
+score:   100
+level:   CRIT
+verdict: Block
+rule:    sensitive_path_0
+signals: [rule_hit]

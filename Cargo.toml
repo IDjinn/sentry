@@ -77,6 +77,10 @@ notify = "6"
 # Regex
 regex = "1"
 
+# Testing
+proptest = "1"
+insta = "1"
+
 # Internal crates (path deps)
 sentry-core = { path = "crates/sentry-core" }
 sentry-storage = { path = "crates/sentry-storage" }

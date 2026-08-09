@@ -2,24 +2,67 @@
 //!
 //! The daemon:
 //! 1. Loads config and builds the plugin registry + ruleset
-//! 2. Starts all sources (concurrent event streams)
-//! 3. Merges streams into one channel (fan-in)
-//! 4. For each event: enrich (geo) → pipeline (rules → heuristics → score) → actions
-//! 5. Prints colored events to stdout and logs decisions
+//! 2. Opens geo databases (graceful no-op if absent)
+//! 3. Optionally connects to Postgres (storage + hot-reload)
+//! 4. Starts all sources (concurrent event streams)
+//! 5. Merges streams into one channel (fan-in)
+//! 6. For each event: enrich (geo) → dedupe → pipeline → persist → actions
+//! 7. Prints colored events to stdout and logs decisions
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sentry_core::challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
 use sentry_core::config::{ActionKind, SentryConfig};
 use sentry_core::event::Event;
 use sentry_core::packs::build_default_ruleset;
-use sentry_core::pipeline::{Pipeline, RouteDef, RouteValidator};
+use sentry_core::pipeline::{Pipeline, RouteValidator};
 use sentry_core::registry::RegistryBuilder;
+use sentry_core::rules::{shared, RuleSet, SharedRuleSet};
 use sentry_core::RiskLevel;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+/// Deduplication cache: prevents processing the same event (by key) within a TTL window.
+struct DedupeCache {
+    entries: HashMap<String, Instant>,
+    ttl: Duration,
+}
+
+impl DedupeCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl,
+        }
+    }
+
+    /// Returns `true` if the key was already seen recently (i.e. should be skipped).
+    fn check_and_mark(&mut self, key: &str) -> bool {
+        let now = Instant::now();
+        self.entries
+            .retain(|_, ts| now.duration_since(*ts) < self.ttl);
+        if self.entries.contains_key(key) {
+            true
+        } else {
+            self.entries.insert(key.to_string(), now);
+            false
+        }
+    }
+}
+
+/// Build the dedup key for an event (IP + path + method).
+fn dedup_key(evt: &Event) -> String {
+    let path = evt.http().map(|h| h.path.as_str()).unwrap_or("");
+    let method = evt
+        .http()
+        .and_then(|h| h.method)
+        .map(|m| format!("{m:?}"))
+        .unwrap_or_default();
+    format!("{}:{}:{}", evt.client_ip, method, path)
+}
 
 /// Run the daemon.
 pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
@@ -28,7 +71,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         "starting sentry daemon"
     );
 
-    // Build the ruleset from configured packs.
+    // Build the ruleset from configured packs + custom rules.
     let pack_modes: HashMap<String, String> = cfg
         .rules
         .packs
@@ -36,26 +79,82 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         .map(|p| (p.name.clone(), p.mode.clone()))
         .collect();
     let rules = build_default_ruleset(&pack_modes);
-    info!(rule_count = rules.len(), "ruleset built");
+    info!(rule_count = rules.len(), "ruleset built from default packs");
 
-    // Build route validator (empty for now — routes come from config later).
-    let route_validator = RouteValidator::new(vec![
-        RouteDef {
-            path: "/".into(),
-            methods: vec!["GET".into()],
-        },
-        RouteDef {
-            path: "/api/*".into(),
-            methods: vec!["GET".into(), "POST".into()],
-        },
-        RouteDef {
-            path: "/static/*".into(),
-            methods: vec!["GET".into()],
-        },
-    ]);
+    let shared_rules: SharedRuleSet = shared(rules);
 
-    // Build the pipeline.
-    let pipeline = Arc::new(Pipeline::new(rules, route_validator));
+    // Build route validator from config (fall back to empty = all unknown).
+    let route_validator = RouteValidator::from_config(&cfg.routes.known);
+    if cfg.routes.known.is_empty() {
+        warn!("no routes configured — all paths will generate UnknownRoute signals");
+    } else {
+        info!(
+            route_count = cfg.routes.known.len(),
+            "routes loaded from config"
+        );
+    }
+
+    // Build the pipeline with config-driven scorer.
+    let pipeline = Arc::new(Pipeline::with_config(
+        Arc::clone(&shared_rules),
+        route_validator,
+        cfg.scorer.clone(),
+    ));
+    info!(
+        weights = cfg.scorer.weights.len(),
+        repetition_bonus = cfg.scorer.repetition_bonus,
+        "pipeline built"
+    );
+
+    // Open geo databases (graceful no-op if files absent).
+    let geo = match sentry_geo::GeoLookup::open(&cfg.geo.city_db, &cfg.geo.asn_db) {
+        Ok(g) => {
+            if cfg.geo.city_db.exists() || cfg.geo.asn_db.exists() {
+                info!("geo enrichment enabled");
+            } else {
+                info!(
+                    "geo databases not found — enrichment disabled (download GeoLite2 to enable)"
+                );
+            }
+            Some(Arc::new(g))
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to open geo databases — enrichment disabled");
+            None
+        }
+    };
+
+    // Optionally connect to Postgres for persistence + hot-reload.
+    let repo = if !cfg.storage.postgres.url.is_empty() {
+        match sentry_storage::PgPool::connect(&cfg.storage.postgres).await {
+            Ok(pool) => {
+                if let Err(e) = sentry_storage::migrations::run(&pool).await {
+                    warn!(error = %e, "migration run failed — continuing without migrations");
+                }
+                let repo = sentry_storage::Repo::new(pool);
+                info!("postgres storage connected");
+
+                // Start the LISTEN/NOTIFY hot-reload task.
+                let reload_rules = Arc::clone(&shared_rules);
+                let reload_pool = repo.pool().clone();
+                tokio::spawn(async move {
+                    rules_hot_reload(reload_pool, reload_rules).await;
+                });
+
+                Some(Arc::new(repo))
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "postgres connection failed — running without persistence"
+                );
+                None
+            }
+        }
+    } else {
+        info!("no storage.postgres.url configured — running without persistence");
+        None
+    };
 
     // Build the plugin registry from config.
     let registry = build_registry(&cfg)?;
@@ -65,12 +164,14 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     }
 
     // Fan-in: merge all source streams into one channel.
-    let (event_tx, mut event_rx) = mpsc::channel::<Event>(8192);
+    let buffer = cfg.core.channel_buffer.max(256);
+    let (event_tx, mut event_rx) = mpsc::channel::<Event>(buffer);
 
     // Start each source.
     for source in registry.sources() {
         let source = Arc::clone(source);
         let tx = event_tx.clone();
+        let geo_clone = geo.as_ref().map(Arc::clone);
         tokio::spawn(async move {
             info!(source = source.name(), "starting source");
             match source.stream().await {
@@ -78,9 +179,11 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                     while let Some(raw) = rx.recv().await {
                         let ip = raw
                             .client_ip
-                            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                        let evt = raw.into_event(ip);
-                        // Enrichment (geo/asn) would go here.
+                            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                        let mut evt = raw.into_event(ip);
+                        if let Some(ref g) = geo_clone {
+                            g.enrich(&mut evt);
+                        }
                         if tx.try_send(evt).is_err() {
                             warn!(source = source.name(), "event channel full, dropping event");
                         }
@@ -97,13 +200,20 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
 
     // Main processing loop.
     info!("pipeline ready, processing events");
+    let mut dedupe = DedupeCache::new(Duration::from_secs(10));
     let mut processed_count: u64 = 0;
     let mut blocked_count: u64 = 0;
+    let mut dropped_dupes: u64 = 0;
 
     while let Some(evt) = event_rx.recv().await {
+        let key = dedup_key(&evt);
+        if dedupe.check_and_mark(&key) {
+            dropped_dupes += 1;
+            continue;
+        }
+
         let result = pipeline.process(&evt);
 
-        // Print colored event line.
         print_event(
             &result.event,
             &result.analysis.risk_level,
@@ -115,7 +225,27 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 .collect::<Vec<_>>(),
         );
 
-        // Execute applicable actions.
+        if let Some(ref repo) = repo {
+            let signals_json = serde_json::to_value(&result.analysis.signals).unwrap_or_default();
+            let repo = Arc::clone(repo);
+            let result_clone = result.clone();
+            tokio::spawn(async move {
+                let events = repo.events();
+                if let Err(e) = events
+                    .insert(
+                        &result_clone.event,
+                        result_clone.analysis.risk_score,
+                        result_clone.analysis.risk_level,
+                        result_clone.decision.action,
+                        &signals_json,
+                    )
+                    .await
+                {
+                    warn!(error = %e, "failed to persist event");
+                }
+            });
+        }
+
         for action in registry.actions() {
             if action.applies_to(&result.decision) {
                 if let Err(e) = action.execute(&result.event, &result.decision).await {
@@ -129,11 +259,11 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             blocked_count += 1;
         }
 
-        // Log stats periodically.
         if processed_count % 100 == 0 {
             info!(
                 processed = processed_count,
                 acted_upon = blocked_count,
+                dropped_dupes = dropped_dupes,
                 "stats"
             );
         }
@@ -144,6 +274,43 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         "daemon shutting down — source streams exhausted"
     );
     Ok(())
+}
+
+/// Background task: LISTEN for `sentry_rules_changed` notifications and hot-reload the ruleset.
+///
+/// On each notification, loads the fresh ruleset from Postgres and swaps it
+/// into the shared `Arc<RwLock<RuleSet>>`. If the connection drops, it retries
+/// with backoff.
+async fn rules_hot_reload(pool: sentry_storage::PgPool, rules: SharedRuleSet) {
+    const CHANNEL: &str = "sentry_rules_changed";
+    loop {
+        match pool.listen(CHANNEL).await {
+            Ok(mut listener) => {
+                info!(channel = CHANNEL, "listening for rule change notifications");
+                while let Ok(_notif) = listener.recv().await {
+                    let repo = sentry_storage::Repo::new(pool.clone());
+                    match repo.rules().load_ruleset().await {
+                        Ok(new_ruleset) => {
+                            let count = new_ruleset.len();
+                            {
+                                let mut guard = rules.write().unwrap();
+                                *guard = new_ruleset;
+                            }
+                            info!(rule_count = count, "ruleset hot-reloaded");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to reload ruleset from db");
+                        }
+                    }
+                }
+                warn!("LISTEN connection closed, reconnecting in 5s…");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to start LISTEN, retrying in 5s…");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }
 
 /// Print a colored event line to stdout.
@@ -187,7 +354,14 @@ fn build_registry(cfg: &SentryConfig) -> color_eyre::Result<sentry_core::registr
                     .and_then(|v| v.as_str())
                     .unwrap_or("/var/log/nginx/access.log")
                     .to_string();
-                let format = src.options.get("format").and_then(|v| v.as_str()).unwrap_or(r#"$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent""#).to_string();
+                let format = src
+                    .options
+                    .get("format")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(
+                        r#"$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent""#,
+                    )
+                    .to_string();
                 let ns = sentry_source_nginx::NginxSource::new(
                     sentry_source_nginx::NginxSourceConfig {
                         path: path.into(),
@@ -197,14 +371,15 @@ fn build_registry(cfg: &SentryConfig) -> color_eyre::Result<sentry_core::registr
                 )?;
                 builder.register_source(ns);
             }
-            other => info!(
-                source = other,
-                "source plugin not yet implemented, skipping"
-            ),
+            other => {
+                info!(
+                    source = other,
+                    "source plugin not yet implemented, skipping"
+                );
+            }
         }
     }
 
-    // Build actions from config, dispatching on the type-safe ActionKind.
     let mut log_requested = false;
     for act in &cfg.actions {
         match act.kind {
@@ -260,7 +435,6 @@ fn build_registry(cfg: &SentryConfig) -> color_eyre::Result<sentry_core::registr
         }
     }
 
-    // The log action is always present — it's the sink of last resort.
     if log_requested || cfg.actions.is_empty() {
         builder.register_action(LogAction);
     }
@@ -268,8 +442,6 @@ fn build_registry(cfg: &SentryConfig) -> color_eyre::Result<sentry_core::registr
     Ok(builder.build())
 }
 
-/// Read `ttl_secs` (or `timeout_secs`) from a config options map, falling
-/// back to `default_secs`. Returns the value in seconds.
 fn parse_ttl_secs(opts: &HashMap<String, toml::Value>, default_secs: u64) -> u64 {
     opts.get("ttl_secs")
         .or_else(|| opts.get("timeout_secs"))
@@ -278,11 +450,6 @@ fn parse_ttl_secs(opts: &HashMap<String, toml::Value>, default_secs: u64) -> u64
         .unwrap_or(default_secs)
 }
 
-/// Parse the `mode` option from a config options map into an [`EdgeMode`].
-///
-/// Returns `None` when absent (caller applies a provider default) or when the
-/// value is invalid — in the latter case a warning is emitted so misconfigured
-/// modes don't silently fall back.
 fn parse_edge_mode(opts: &HashMap<String, toml::Value>) -> Option<EdgeMode> {
     let raw = opts.get("mode")?.as_str()?;
     match EdgeMode::parse(raw) {
@@ -297,16 +464,6 @@ fn parse_edge_mode(opts: &HashMap<String, toml::Value>) -> Option<EdgeMode> {
     }
 }
 
-/// Build a provider-agnostic [`ChallengeAction`] for the named edge provider.
-///
-/// Returns `Ok(None)` when the provider should be skipped (e.g. Cloudflare
-/// token/zone env vars unset), preserving the previous skip-with-warning
-/// behavior. Errors are reserved for unknown provider names.
-///
-/// Adding a new edge provider = implement
-/// [`ChallengeProvider`](sentry_core::ChallengeProvider) in its own crate,
-/// add a `match` arm here, and add the crate to `sentry-cli/Cargo.toml`. No
-/// changes to `ActionKind`, verdict filtering, or the rules engine.
 fn build_challenge_action(
     provider_name: &str,
     options: &HashMap<String, toml::Value>,
@@ -344,7 +501,6 @@ fn build_challenge_action(
     Ok(Some(ChallengeAction::new(provider, opts)))
 }
 
-/// Parse a risk level name from config (`"high"` → `RiskLevel::High`).
 fn parse_risk_level(s: &str) -> Option<RiskLevel> {
     match s.to_ascii_lowercase().as_str() {
         "info" => Some(RiskLevel::Info),
@@ -356,7 +512,6 @@ fn parse_risk_level(s: &str) -> Option<RiskLevel> {
     }
 }
 
-/// Simple log action — prints decisions to stdout (always present).
 struct LogAction;
 
 #[async_trait::async_trait]
@@ -375,8 +530,18 @@ impl sentry_core::Action for LogAction {
         decision: &sentry_core::Decision,
     ) -> sentry_core::Result<()> {
         if decision.action != sentry_core::Verdict::Allow {
-            info!(ip = %evt.client_ip, action = ?decision.action, score = decision.analysis.risk_score, "decision executed");
+            info!(
+                ip = %evt.client_ip,
+                action = ?decision.action,
+                score = decision.analysis.risk_score,
+                "decision executed"
+            );
         }
         Ok(())
     }
+}
+
+#[allow(dead_code)]
+fn _ensure_ruleset_import() -> RuleSet {
+    RuleSet::default()
 }

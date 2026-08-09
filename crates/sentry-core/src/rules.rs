@@ -10,6 +10,7 @@
 //! in Postgres (hot-reloaded via LISTEN/NOTIFY), and reputation feeds.
 
 use std::net::IpAddr;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -19,6 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::Verdict;
 use crate::event::{Event, HttpMethod, ProtocolKind};
+
+pub mod dsl;
 
 /// Stable identifier for a rule.
 pub type RuleId = String;
@@ -105,6 +108,18 @@ pub struct Rule {
 pub struct RuleSet {
     /// Rules sorted by priority ascending.
     rules: Vec<Rule>,
+}
+
+/// A hot-reloadable handle to a [`RuleSet`].
+///
+/// The daemon holds this as `Arc<RwLock<RuleSet>>` and the hot-reload
+/// task swaps the inner set via `write()`. Evaluation acquires a `read()`
+/// lock — cheap because evaluation is fast (microseconds).
+pub type SharedRuleSet = Arc<RwLock<RuleSet>>;
+
+/// Create a [`SharedRuleSet`] from a [`RuleSet`].
+pub fn shared(ruleset: RuleSet) -> SharedRuleSet {
+    Arc::new(RwLock::new(ruleset))
 }
 
 impl RuleSet {
@@ -463,15 +478,59 @@ fn ip_in_range(ip: IpAddr, lo: IpAddr, hi: IpAddr) -> bool {
     }
 }
 
-/// Apply a path match operator.
+/// Percent-decode a URL component (same logic as heuristics).
+///
+/// Rule path matching runs on the decoded form so encoded payloads
+/// (`%2e%2e%2f` = `../`) can't bypass rule matchers.
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = hex_val(bytes[i + 1]);
+                let lo = hex_val(bytes[i + 2]);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push((h << 4) | l);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Apply a path match operator on the URL-decoded path.
 fn match_path(op: &PathOp, pattern: &str, path: &str) -> bool {
+    let decoded = url_decode(path);
     match op {
-        PathOp::Equals => path == pattern,
-        PathOp::Glob => glob_match(pattern, path),
+        PathOp::Equals => decoded == pattern,
+        PathOp::Glob => glob_match(pattern, &decoded),
         PathOp::Regex => Regex::new(pattern)
-            .map(|re| re.is_match(path))
+            .map(|re| re.is_match(&decoded))
             .unwrap_or(false),
-        PathOp::StartsWith => path.starts_with(pattern),
+        PathOp::StartsWith => decoded.starts_with(pattern),
     }
 }
 

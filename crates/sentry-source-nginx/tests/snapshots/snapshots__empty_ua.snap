@@ -1,0 +1,16 @@
+---
+source: crates/sentry-source-nginx/tests/snapshots.rs
+expression: summary
+---
+fixture: empty_ua
+line:    198.51.100.30 - - [10/Jan/2026:13:55:44 +0000] "GET / HTTP/1.1" 200 256 "-" ""
+method:  Some(Get)
+path:    /
+query:   -
+status:  200
+ua:      
+score:   18
+level:   LOW
+verdict: Allow
+rule:    -
+signals: [suspicious_ua, unknown_route]

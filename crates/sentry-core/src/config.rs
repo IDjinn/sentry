@@ -18,12 +18,21 @@ pub struct SentryConfig {
     /// Storage backend.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// Geo/ASN enrichment.
+    #[serde(default)]
+    pub geo: GeoConfig,
     /// LLM provider.
     #[serde(default)]
     pub llm: LlmConfig,
     /// Rules engine.
     #[serde(default)]
     pub rules: RulesConfig,
+    /// Known routes for the route validator.
+    #[serde(default)]
+    pub routes: RoutesConfig,
+    /// Scorer weights and repetition bonus.
+    #[serde(default)]
+    pub scorer: ScorerConfig,
     /// Event sources.
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
@@ -81,6 +90,84 @@ pub struct PostgresConfig {
 
 fn default_pg_max_conn() -> u32 {
     10
+}
+
+/// Geo/ASN enrichment config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoConfig {
+    /// Path to the GeoLite2-City database file.
+    #[serde(default = "default_geo_city_db")]
+    pub city_db: PathBuf,
+    /// Path to the GeoLite2-ASN database file.
+    #[serde(default = "default_geo_asn_db")]
+    pub asn_db: PathBuf,
+}
+
+impl Default for GeoConfig {
+    fn default() -> Self {
+        Self {
+            city_db: default_geo_city_db(),
+            asn_db: default_geo_asn_db(),
+        }
+    }
+}
+
+fn default_geo_city_db() -> PathBuf {
+    PathBuf::from("/var/lib/sentry/GeoLite2-City.mmdb")
+}
+
+fn default_geo_asn_db() -> PathBuf {
+    PathBuf::from("/var/lib/sentry/GeoLite2-ASN.mmdb")
+}
+
+/// Known routes for the route validator.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoutesConfig {
+    /// Known routes (exact path or glob like `/api/*`).
+    #[serde(default)]
+    pub known: Vec<RouteDefConfig>,
+}
+
+/// A single known route definition.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RouteDefConfig {
+    /// Path pattern (exact or glob like `/api/*`).
+    pub path: String,
+    /// Allowed methods (empty = any).
+    #[serde(default)]
+    pub methods: Vec<String>,
+}
+
+/// Scorer config: signal weights and repetition bonus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScorerConfig {
+    /// Override weights for specific signal kinds (key = signal name, e.g. `"sql_injection"`).
+    #[serde(default)]
+    pub weights: HashMap<String, u8>,
+    /// Whether to apply a repetition bonus for repeated signals in a time window.
+    #[serde(default = "default_repetition_bonus")]
+    pub repetition_bonus: bool,
+    /// Sliding window duration in seconds for repetition tracking.
+    #[serde(default = "default_repetition_window")]
+    pub repetition_window_secs: u64,
+}
+
+impl Default for ScorerConfig {
+    fn default() -> Self {
+        Self {
+            weights: HashMap::new(),
+            repetition_bonus: default_repetition_bonus(),
+            repetition_window_secs: default_repetition_window(),
+        }
+    }
+}
+
+fn default_repetition_bonus() -> bool {
+    true
+}
+
+fn default_repetition_window() -> u64 {
+    60
 }
 
 /// LLM provider config.

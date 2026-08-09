@@ -1,0 +1,16 @@
+---
+source: crates/sentry-source-nginx/tests/snapshots.rs
+expression: summary
+---
+fixture: bad_crawler
+line:    198.51.100.29 - - [10/Jan/2026:13:55:43 +0000] "GET /admin HTTP/1.1" 200 256 "-" "sqlmap/1.7.2#stable (https://sqlmap.org)"
+method:  Some(Get)
+path:    /admin
+query:   -
+status:  200
+ua:      sqlmap/1.7.2#stable (https://sqlmap.org)
+score:   48
+level:   MED
+verdict: RateLimit
+rule:    -
+signals: [bad_crawler, unknown_route]

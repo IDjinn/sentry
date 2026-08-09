@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --all --locked
+      - name: Build release
+        run: cargo build --release --locked
+
+  storage:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sentry
+          POSTGRES_PASSWORD: sentry
+          POSTGRES_DB: sentry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sentry"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SENTRY_STORAGE__POSTGRES__URL: postgres://sentry:sentry@localhost:5432/sentry
+      DATABASE_URL: postgres://sentry:sentry@localhost:5432/sentry
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Storage crate build + test
+        run: cargo test -p sentry-storage --all-features
+      - name: Validate example config
+        run: cargo build --locked && ./target/debug/sentry --config config/sentry.example.toml config validate

@@ -13,6 +13,44 @@ channel_buffer = 4096
 url = "postgres://sentry:changeme@localhost:5432/sentry"
 max_connections = 10
 
+# ── Geo / ASN enrichment ─────────────────────────────────────────────────
+# Download GeoLite2 (free) from MaxMind and place the .mmdb files here.
+# If the files are absent, geo enrichment is a graceful no-op.
+[geo]
+city_db = "/var/lib/sentry/GeoLite2-City.mmdb"
+asn_db  = "/var/lib/sentry/GeoLite2-ASN.mmdb"
+
+# ── Known routes (route validator) ────────────────────────────────────────
+# Routes your app actually serves. Requests outside this set (or with
+# disallowed methods) raise an `UnknownRoute` signal. Empty = all unknown.
+# `path` accepts exact strings or globs like `/api/*`. Empty `methods` = any.
+[[routes.known]]
+path = "/"
+methods = ["GET"]
+
+[[routes.known]]
+path = "/api/health"
+methods = ["GET"]
+
+[[routes.known]]
+path = "/api/users/*"
+methods = ["GET", "POST", "PATCH", "DELETE"]
+
+[[routes.known]]
+path = "/static/*"
+methods = ["GET"]
+
+# ── Scorer ─────────────────────────────────────────────────────────────────
+# Override default weights for specific signal kinds (key = signal name).
+# repetition_bonus adds score for repeated signals within the sliding window.
+[scorer]
+repetition_bonus = true
+repetition_window_secs = 60
+# [scorer.weights]
+# sql_injection = 35
+# xss = 30
+# path_traversal = 25
+
 # ── LLM (optional) ───────────────────────────────────────────────────────
 # provider = "none" disables LLM entirely (default).
 # OpenRouter routes to any model (Claude, GPT, Gemini, Qwen, Llama, …).

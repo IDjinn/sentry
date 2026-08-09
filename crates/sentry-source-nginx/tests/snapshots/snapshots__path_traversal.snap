@@ -1,0 +1,16 @@
+---
+source: crates/sentry-source-nginx/tests/snapshots.rs
+expression: summary
+---
+fixture: path_traversal
+line:    198.51.100.25 - - [10/Jan/2026:13:55:39 +0000] "GET /../../etc/passwd HTTP/1.1" 404 12 "-" "Mozilla/5.0"
+method:  Some(Get)
+path:    /../../etc/passwd
+query:   -
+status:  404
+ua:      Mozilla/5.0
+score:   98
+level:   CRIT
+verdict: Block
+rule:    -
+signals: [lfi, path_traversal, unknown_route]

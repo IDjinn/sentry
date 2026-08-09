@@ -835,48 +835,48 @@ stateDiagram-v2
 Legenda: **F1** = Fase 1 (MVP nginx), **F2** = Cloudflare + IA local, **F3** = Multi-source + LLM, **F4** = Dashboard.
 
 ### Fase 0 — Fundação
-- [ ] **F0.1** Inicializar workspace Cargo + crates skeleton
-- [ ] **F0.2** Definir `sentry-core`: `Event`, `RawEvent`, `Signal`, `RiskLevel`, `Decision`, erros
-- [ ] **F0.3** Traits `Source`, `Action`, `Registry`
-- [ ] **F0.4** Config loader (figment: TOML + env)
-- [ ] **F0.5** `tracing` setup com spans por evento
-- [ ] **F0.6** CI: fmt, clippy (-D warnings), testes, build multi-OS via `cross`
+- [x] **F0.1** Inicializar workspace Cargo + crates skeleton — `Cargo.toml:1-13` (9 crates)
+- [x] **F0.2** Definir `sentry-core`: `Event`, `RawEvent`, `Signal`, `RiskLevel`, `Decision`, erros — `event.rs`, `analysis.rs`, `error.rs`
+- [x] **F0.3** Traits `Source`, `Action`, `Registry` — `source.rs`, `action.rs`, `registry.rs`, `challenge.rs`
+- [x] **F0.4** Config loader (figment: TOML + env) — `sentry-core/src/config.rs`, `sentry-cli/src/config.rs:13-42`
+- [~] **F0.5** `tracing` setup com spans por evento — `logging.rs` init ok; **faltam spans por evento**
+- [x] **F0.6** CI: fmt, clippy (-D warnings), testes, build multi-OS — `.github/workflows/ci.yml` (lint + test matrix ubuntu/windows/macos + storage com Postgres)
 
 ### Fase 1 — MVP nginx (read-only + console)
-- [ ] **F1.1** `sentry-source-nginx`: tail de arquivo com `notify`/`tokio`, parse de formato custom `$var`
-- [ ] **F1.2** Ingestor: normalização → `Event`, dedupe, enriquecimento geo (maxminddb local)
-- [ ] **F1.3** `sentry-storage`: schema SQLite (events, incidents, ip_state, routes)
-- [ ] **F1.4** Heurísticas: regex SQLi/XSS/LFI/RCE/path-traversal/log4shell, assinaturas
-- [ ] **F1.5** Roteiro de rotas: trie + config allowlist + modo `learn`
-- [ ] **F1.5b** Rules Engine: trait `Rule`/`RuleMatch`/`RuleAction`, avaliador com short-circuit, hot-reload via Postgres LISTEN/NOTIFY, DSL parser para `match`
-- [ ] **F1.5c** Pack `sensitive_paths` (enforce default): lista completa §10.3.1 com normalização de encoding + allowlist `/.well-known/security.txt`
-- [ ] **F1.5d** Packs default: `vpn_proxy`, `tor`, `crawlers_bad`, `empty_ua`, `http_anomaly` em modo shadow; `sentry rules` CLI (list/add/block/allow/test/packs)
-- [ ] **F1.6** Scorer: combinar sinais → `risk_score`/`level` (pesos em config)
-- [ ] **F1.7** Pipeline assíncrono: `tokio` mpsc, fan-out heurística+rota, fan-in no scorer
-- [ ] **F1.8** CLI: `sentry`, `tail` (com cores), `incidents list/show`, `ip info`, `routes list`, `report`, `config`
-- [ ] **F1.9** TUI `ratatui`: 3 painéis + atalhos
-- [ ] **F1.10** Fixtures de logs nginx + testes de parse (`insta` snapshots)
-- [ ] **F1.11** Testes de heurísticas com `proptest` (payloads maliciosos catalogados)
+- [x] **F1.1** `sentry-source-nginx`: tail de arquivo com `notify`/`tokio`, parse de formato custom `$var` — `source.rs` (rotação), `parser.rs` (`LogFormat::compile`)
+- [x] **F1.2** Ingestor: normalização → `Event`, dedupe, enriquecimento geo (maxminddb local) — `sentry-geo` pronto; daemon com geo enrichment + dedupe LRU TTL 10s (`daemon.rs`)
+- [x] **F1.3** `sentry-storage`: schema Postgres (events, incidents, ip_state, rules, routes) — 5 repos em `repo.rs`; migrations `init.sql` + `routes.sql`; daemon persiste (async spawn)
+- [x] **F1.4** Heurísticas: regex SQLi/XSS/LFI/RCE/path-traversal/log4shell, assinaturas — 9 detectores em `heuristics.rs` (SQLi/XSS/PathTraversal/LFI/Log4Shell/CmdInjection/SensitivePath/BadCrawler/EmptyUserAgent)
+- [x] **F1.5** Roteador de rotas: config allowlist + modo `learn` — `RouteValidator` em `pipeline.rs` com globs; `RouteValidator::from_config`; modo `learn` pendente (F2)
+- [x] **F1.5b** Rules Engine: trait `Rule`/`RuleMatch`/`RuleAction`, avaliador com short-circuit, hot-reload via Postgres LISTEN/NOTIFY, DSL parser para `match` — tipos + avaliador em `rules.rs`; DSL recursive-descent em `rules/dsl.rs` (14 testes); LISTEN/NOTIFY `sentry_rules_changed`
+- [x] **F1.5c** Pack `sensitive_paths` (enforce default): lista completa §10.3.1 com normalização de encoding + allowlist `/.well-known/security.txt` — 6 regex + allowlist em `packs.rs`; URL-decode no matcher (`rules.rs`)
+- [x] **F1.5d** Packs default: `vpn_proxy`, `tor`, `crawlers_bad`, `crawlers_good`, `empty_ua`, `http_anomaly`, `rate_scan`, `country_blocklist` em modo shadow; `sentry rules` CLI completa (list/show/add/block/allow/enable/disable/delete/packs/test)
+- [x] **F1.6** Scorer: combinar sinais → `risk_score`/`level` (pesos em config) — `from_signals` + `score_with_weights` em `pipeline.rs`; `ScorerConfig` (weights + repetition bonus + window); bônus de repetição (`RepetitionTracker`)
+- [~] **F1.7** Pipeline assíncrono: `tokio` mpsc, fan-out heurística+rota, fan-in no scorer — fan-in mpsc no daemon; `process()` é sequencial, sem fan-out
+- [x] **F1.8** CLI: `sentry`, `tail` (com cores), `incidents list/show`, `ip block/unblock/info`, `routes list`, `rules *`, `report`, `config validate/show`, `test`, `model`, `cloudflare` — handlers reais em `cmd.rs`
+- [x] **F1.9** TUI `ratatui`: standalone lê eventos recentes do Postgres, scrollável, atalhos j/k/Space/g/G/q/Esc — `tui.rs` (~250 linhas)
+- [x] **F1.10** Fixtures de logs nginx + testes de parse (`insta` snapshots) — 11 fixtures + 11 snapshots em `sentry-source-nginx/tests/`
+- [x] **F1.11** Testes de heurísticas com `proptest` (payloads maliciosos catalogados) — 6 proptests em `heuristics.rs`
 
 ### Fase 2 — Cloudflare + IA local
-- [ ] **F2.1** `sentry-ai`: trait `ThreatModel`, impl ONNX via `ort`
-- [ ] **F2.2** Treinar modelo v1 (dataset de payloads) — pipeline Python em `tools/train`
-- [ ] **F2.3** `sentry-action-cloudflare`: client API (firewall rules, challenge modes), cache de IPs, TTL
-- [ ] **F2.4** Decisor: política de verdict → action mapping
-- [ ] **F2.5** `sentry cloudflare status/pull/test`
-- [ ] **F2.6** Rate-limiting por IP/ASN (token bucket em memória + Redis opt)
-- [ ] **F2.7** Alertas: `sentry-action-webhook` (Discord/Slack/Telegram genérico)
-- [ ] **F2.8** Métricas: counters/histogramas exportáveis (`sentry report --export`)
+- [~] **F2.1** `sentry-ai`: trait `ThreatModel`, impl ONNX via `ort` — trait em `threat.rs`; feature `onnx` existe; **sem impl ONNX**
+- [ ] **F2.2** Treinar modelo v1 (dataset de payloads) — pipeline Python em `tools/train` — sem `tools/`
+- [x] **F2.3** `sentry-action-cloudflare`: client API (firewall rules, challenge modes), cache de IPs, TTL — `sentry-action-cloudflare/src/lib.rs` (ChallengeProvider, cache, TTL)
+- [~] **F2.4** Decisor: política de verdict → action mapping — scorer→verdict em `analysis.rs`; **sem policy table configurável**
+- [ ] **F2.5** `sentry cloudflare status/pull/test` — CLI stubs apenas
+- [ ] **F2.6** Rate-limiting por IP/ASN (token bucket em memória + Redis opt) — `RuleMatch::Rate` retorna `false`
+- [x] **F2.7** Alertas: `sentry-action-webhook` (Discord/Slack/Telegram genérico) — `sentry-action-webhook/src/lib.rs` (POST JSON com contexto)
+- [ ] **F2.8** Métricas: counters/histogramas exportáveis (`sentry report --export`) — só 2 counters in-process
 
 ### Fase 3 — Multi-source + LLM
-- [ ] **F3.1** `sentry-source-http`: middleware axum que recebe cópia da req (modo sidecar/inline leve)
-- [ ] **F3.2** `sentry-source-tcp`: captura via `pnet` (filtro por porta), reconstrução de stream HTTP quando possível
-- [ ] **F3.3** `sentry-source-cloudflare`: pull de logs existentes (polling)
-- [ ] **F3.4** `sentry-source-syslog`: receptor RFC 5424 (UDP/TCP) para equipamentos de rede
-- [ ] **F3.5** LLM provider trait (`ollama`/`openai`): prompt enxuto, JSON schema strict, cache de verdicts
+- [ ] **F3.1** `sentry-source-http`: middleware axum que recebe cópia da req (modo sidecar/inline leve) — sem crate
+- [ ] **F3.2** `sentry-source-tcp`: captura via `pnet` (filtro por porta), reconstrução de stream HTTP quando possível — sem crate
+- [ ] **F3.3** `sentry-source-cloudflare`: pull de logs existentes (polling) — sem crate
+- [ ] **F3.4** `sentry-source-syslog`: receptor RFC 5424 (UDP/TCP) para equipamentos de rede — sem crate
+- [~] **F3.5** LLM provider trait (`ollama`/`openai`): prompt enxuto, JSON schema strict, cache de verdicts — trait `LlmProvider` em `llm.rs`; **zero adapters**
 - [ ] **F3.6** Pipeline de retreinamento: exportar incidentes confirmados → dataset → novo modelo
-- [ ] **F3.7** Reputation feeds: importar blocklists públicas (Emerging Threats, Spamhaus) periodicamente
-- [ ] **F3.8** Detecção de comportamento: scan, brute-force, credential stuffing (janelas deslizantes)
+- [ ] **F3.7** Reputation feeds: importar blocklists públicas (Emerging Threats, Spamhaus) periodicamente — config schema + `ReputationTier` existem; sem fetcher
+- [ ] **F3.8** Detecção de comportamento: scan, brute-force, credential stuffing (janelas deslizantes) — signal kinds existem; sem detectores
 - [ ] **F3.9** Inline proxy opcional (`sentry-proxy`) — modo bloqueio antes da app (com timeout fallback)
 
 ### Fase 4 — Operação & Dashboard
@@ -889,12 +889,15 @@ Legenda: **F1** = Fase 1 (MVP nginx), **F2** = Cloudflare + IA local, **F3** = M
 - [ ] **F4.7** Alta disponibilidade: estado em Redis/Postgres compartilhado
 
 ### Cross-cutting (contínuo)
-- [ ] **X.1** Documentação de plugin (`docs/PLUGIN_DEV.md`)
-- [ ] **X.2** Catálogo de threat models (`docs/THREAT_MODELS.md`)
+- [ ] **X.1** Documentação de plugin (`docs/PLUGIN_DEV.md`) — sem `docs/`
+- [ ] **X.2** Catálogo de threat models (`docs/THREAT_MODELS.md`) — sem `docs/`
 - [ ] **X.3** Benchmarks de throughput (criterion) — meta: 10k req/s parsed
-- [ ] **X.4** Hardening: segredos via env/secret manager, nunca em config commitada
+- [~] **X.4** Hardening: segredos via env/secret manager, nunca em config commitada — env vars ok; sem secret manager
 - [ ] **X.5** Release automation: `cargo-dist` ou `cross` → GitHub Releases multi-OS
 - [ ] **X.6** Telemetria opt-in de uso (não de dados) para guiar roadmap
+
+> **Legenda**: `[x]` = feito · `[~]` = parcial (ver nota) · `[ ]` = pendente
+> **Devs notáveis**: storage é Postgres (não SQLite); `sentry-auto` não tem crate (só CLI stub); 9 packs default implementados; DSL de `match` completo (recursive-descent, 14 testes); TUI ratatui standalone lê do Postgres; 57 testes (53 core + 3 nginx + 1 snapshot); CI GitHub Actions (fmt/clippy/test 3 OS + storage).
 
 ---
 

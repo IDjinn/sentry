@@ -1,0 +1,16 @@
+---
+source: crates/sentry-source-nginx/tests/snapshots.rs
+expression: summary
+---
+fixture: lfi
+line:    198.51.100.26 - - [10/Jan/2026:13:55:40 +0000] "GET /?page=../../etc/passwd HTTP/1.1" 200 64 "-" "Mozilla/5.0"
+method:  Some(Get)
+path:    /
+query:   page=../../etc/passwd
+status:  200
+ua:      Mozilla/5.0
+score:   98
+level:   CRIT
+verdict: Block
+rule:    -
+signals: [lfi, path_traversal, unknown_route]

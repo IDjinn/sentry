@@ -1,0 +1,16 @@
+---
+source: crates/sentry-source-nginx/tests/snapshots.rs
+expression: summary
+---
+fixture: http_anomaly
+line:    198.51.100.32 - - [10/Jan/2026:13:55:46 +0000] "TRACE / HTTP/1.1" 405 4 "-" "Mozilla/5.0"
+method:  Some(Trace)
+path:    /
+query:   -
+status:  405
+ua:      Mozilla/5.0
+score:   8
+level:   INFO
+verdict: Allow
+rule:    -
+signals: [unknown_route]

