@@ -20,6 +20,10 @@ services:
     restart: always
     environment:
       RUST_LOG: info,sentry=info
+      SENTRY_CF_TOKEN: "${SENTRY_CF_TOKEN:-}"
+      SENTRY_CF_ZONE: "${SENTRY_CF_ZONE:-}"
+      SENTRY_LLM_KEY: "${SENTRY_LLM_KEY:-}"
+      SENTRY_STORAGE__POSTGRES__URL: "${SENTRY_STORAGE__POSTGRES__URL:-}"
     volumes:
       - ../../config/sentry.toml:/etc/sentry/sentry.toml:ro
       - /www/wwwlogs:/var/log/nginx:ro
