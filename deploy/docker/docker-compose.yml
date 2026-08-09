@@ -11,7 +11,7 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: sentry
-      POSTGRES_PASSWORD: changeme
+      POSTGRES_PASSWORD: ${SENTRY_PG_PASSWORD:-changeme}
       POSTGRES_DB: sentry
     ports:
       - "5432:5432"
@@ -32,7 +32,7 @@ services:
         condition: service_healthy
     environment:
       SENTRY_CONFIG: /etc/sentry/sentry.toml
-      SENTRY_STORAGE__POSTGRES__URL: postgres://sentry:changeme@postgres:5432/sentry
+      SENTRY_STORAGE__POSTGRES__URL: postgres://sentry:${SENTRY_PG_PASSWORD:-changeme}@postgres:5432/sentry
       # Secrets via env, never in config:
       SENTRY_CF_TOKEN: ${SENTRY_CF_TOKEN:-}
       SENTRY_CF_ZONE: ${SENTRY_CF_ZONE:-}
