@@ -1,9 +1,15 @@
 //! Cloudflare edge-action provider.
 //!
 //! Implements [`sentry_core::ChallengeProvider`]: applies block / challenge /
-//! rate-limit rules to a client IP via the Cloudflare firewall-rules API.
+//! rate-limit rules to a client IP via the Cloudflare **IP Access Rules** API
+//! (`POST /zones/{zone}/firewall/access_rules/rules`). The legacy
+//! `/firewall/rules` endpoint was deprecated on 2025-06-15 (API error 10020,
+//! "firewallrules.api.maintenance_mode") and no longer accepts modifications.
+//!
 //! Keeps a local in-memory cache of IPs already acted on (with TTL) to avoid
-//! hammering the API.
+//! hammering the API. Note that the access-rules API itself has no `ttl`
+//! parameter — rules are permanent at the edge until manually removed; the
+//! local cache only guards Sentry's own de-duplication window.
 //!
 //! Wired into the daemon either as `type = "cloudflare"` (backward-compatible
 //! alias) or as `type = "challenge"`, `provider = "cloudflare"` (canonical
@@ -96,6 +102,36 @@ impl CloudflareProvider {
             Verdict::Allow | Verdict::Quarantine => opts.mode_or(self.cfg.default_mode),
         }
     }
+
+    /// Map an [`EdgeMode`] to the Cloudflare IP Access Rules `mode` string.
+    ///
+    /// `Block` / `JsChallenge` / `ManagedChallenge` map directly. `RateLimit`
+    /// is not supported by the access-rules API (rate limiting requires the
+    /// Rulesets API); we fall back to `block` and emit a warning so the action
+    /// still protects the zone.
+    fn access_rule_mode(&self, mode: EdgeMode) -> &'static str {
+        match mode {
+            EdgeMode::Block => "block",
+            EdgeMode::JsChallenge => "js_challenge",
+            EdgeMode::ManagedChallenge => "managed_challenge",
+            EdgeMode::RateLimit => {
+                warn!(
+                    "cloudflare IP Access rules do not support rate limiting; \
+                     falling back to block"
+                );
+                "block"
+            }
+        }
+    }
+
+    /// Cloudflare access rules require distinct `target` values for IPv4 (`ip`)
+    /// vs IPv6 (`ip6`).
+    fn access_rule_target(ip: IpAddr) -> &'static str {
+        match ip {
+            IpAddr::V4(_) => "ip",
+            IpAddr::V6(_) => "ip6",
+        }
+    }
 }
 
 #[async_trait]
@@ -115,18 +151,20 @@ impl ChallengeProvider for CloudflareProvider {
             opts.ttl
         };
         let mode = self.resolve_mode(verdict, opts);
+        let cf_mode = self.access_rule_mode(mode);
+        let target = Self::access_rule_target(ip);
 
         let url = format!(
-            "https://api.cloudflare.com/client/v4/zones/{}/firewall/rules",
+            "https://api.cloudflare.com/client/v4/zones/{}/firewall/access_rules/rules",
             self.cfg.zone
         );
         let body = serde_json::json!({
-            "mode": mode.as_str(),
+            "mode": cf_mode,
             "configuration": {
-                "target": "ip",
+                "target": target,
                 "value": ip.to_string(),
             },
-            "ttl": ttl.as_secs(),
+            "notes": "sentry",
         });
 
         match self
@@ -139,7 +177,7 @@ impl ChallengeProvider for CloudflareProvider {
         {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    info!(ip = %ip, mode = mode.as_str(), "cloudflare rule created");
+                    info!(ip = %ip, mode = cf_mode, "cloudflare access rule created");
                     self.record(ip, ttl).await;
                     self.prune().await;
                 } else {
