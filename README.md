@@ -121,9 +121,6 @@ cargo build --release
 ./target/debug/sentry run
 ```
 
-> **Windows**: use the rustup cargo
-> (`C:\Users\<user>\.cargo\bin\cargo.exe`), not the chocolatey one.
-
 ### Configuration
 
 Copy `config/sentry.example.toml` → `sentry.toml` and edit. The env overlay

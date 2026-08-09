@@ -30,22 +30,22 @@ Leia-o antes de tocar na arquitetura ou adicionar fases.
 ## 3. Comandos essenciais
 
 ```bash
-# Build (usar o cargo do rustup, NÃO o do chocolatey que está no PATH)
-C:\Users\lucas\.cargo\bin\cargo.exe build
-C:\Users\lucas\.cargo\bin\cargo.exe build --release
+# Build
+cargo build
+cargo build --release
 
 # Lint (SEMPRE rodar antes de commit)
-C:\Users\lucas\.cargo\bin\cargo.exe fmt --all -- --check
-C:\Users\lucas\.cargo\bin\cargo.exe clippy --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
 
 # Testes
-C:\Users\lucas\.cargo\bin\cargo.exe test --all
-C:\Users\lucas\.cargo\bin\cargo.exe test -p sentry-core   # crate específica
+cargo test --all
+cargo test -p sentry-core   # crate específica
 
 # Rodar a CLI (após build)
-.\target\debug\sentry.exe --help
-.\target\debug\sentry.exe config validate
-.\target\debug\sentry.exe run
+./target/debug/sentry --help
+./target/debug/sentry config validate
+./target/debug/sentry run
 
 # Docker
 docker build -t sentry .
@@ -54,11 +54,6 @@ docker compose -f deploy/docker/docker-compose.yml up
 # Kubernetes
 kubectl apply -f deploy/k8s/
 ```
-
-> ⚠️ **Importante (Windows)**: o `cargo` em `C:\ProgramData\chocolatey\bin\`
-> é um wrapper que usa toolchain GNU e causa erro `dlltool not found`. Use
-> sempre `C:\Users\lucas\.cargo\bin\cargo.exe` (toolchain MSVC). Se um
-> subcomando falhar com `dlltool`, é sintoma de estar usando o cargo errado.
 
 ## 4. Estrutura do workspace
 
@@ -185,9 +180,9 @@ Backlog detalhado em `ARCHITECTURE.md` §15.
 
 ```bash
 # Antes de commitar, rodar:
-C:\Users\lucas\.cargo\bin\cargo.exe fmt --all -- --check
-C:\Users\lucas\.cargo\bin\cargo.exe clippy --all-targets --all-features -- -D warnings
-C:\Users\lucas\.cargo\bin\cargo.exe test --all
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
 # Resultado esperado: 57 testes passando (53 core + 3 nginx + 1 snapshot)
 ```
 
@@ -221,8 +216,6 @@ C:\Users\lucas\.cargo\bin\cargo.exe test --all
 ## 11. Notas do ambiente (Windows)
 
 - Toolchain ativo: `stable-x86_64-pc-windows-msvc` (rustup default)
-- O `cargo` do chocolatey (`C:\ProgramData\chocolatey\bin\cargo.exe`) é GNU e
-  **não serve** — causa `dlltool not found`. Use o do rustup.
 - MSVC Build Tools 2022 instalados em
   `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`
 - `link.exe` do MSVC está disponível; o `link.exe` do Git em
