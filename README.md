@@ -169,4 +169,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## License
 
-Private. See [`LICENSE`](./LICENSE) if applicable.
+Licensed under the [PolyForm Noncommercial License 1.0.0](./LICENSE).
+
+You may use, copy, modify, and distribute this software for **noncommercial**
+purposes only, with attribution. Commercial use requires a separate commercial
+license from the copyright holder. See `LICENSE` for the full terms.
