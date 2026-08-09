@@ -1,0 +1,25 @@
+[package]
+name = "sentry-ai"
+description = "Threat models and LLM provider abstraction for Sentry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+onnx = ["dep:ort"]
+
+[dependencies]
+sentry-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["download-binaries"], optional = true }

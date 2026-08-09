@@ -1,0 +1,15 @@
+[package]
+name = "sentry-geo"
+description = "MaxMindDB-based geo/ASN enrichment for Sentry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+sentry-core = { workspace = true }
+maxminddb = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

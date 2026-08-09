@@ -1,0 +1,93 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sentry-core",
+    "crates/sentry-storage",
+    "crates/sentry-ai",
+    "crates/sentry-geo",
+    "crates/sentry-source-nginx",
+    "crates/sentry-action-cloudflare",
+    "crates/sentry-action-webhook",
+    "crates/sentry-action-blocklist",
+    "crates/sentry-cli",
+]
+default-members = ["crates/sentry-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/lucas/sentry"
+authors = ["lucas"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# TUI
+ratatui = "0.28"
+crossterm = "0.28"
+
+# Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Errors
+thiserror = "1"
+anyhow = "1"
+color-eyre = "0.6"
+
+# IDs / time
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Network parsing
+http = "1"
+ipnet = "2"
+
+# Storage
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json"] }
+
+# ML (only pulled when a crate opts in via the `onnx` feature; not a workspace dep)
+
+# Geo
+maxminddb = "0.24"
+
+# Config
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# File watching (nginx log tail)
+notify = "6"
+
+# Regex
+regex = "1"
+
+# Internal crates (path deps)
+sentry-core = { path = "crates/sentry-core" }
+sentry-storage = { path = "crates/sentry-storage" }
+sentry-ai = { path = "crates/sentry-ai" }
+sentry-geo = { path = "crates/sentry-geo" }
+sentry-source-nginx = { path = "crates/sentry-source-nginx" }
+sentry-action-cloudflare = { path = "crates/sentry-action-cloudflare" }
+sentry-action-webhook = { path = "crates/sentry-action-webhook" }
+sentry-action-blocklist = { path = "crates/sentry-action-blocklist" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

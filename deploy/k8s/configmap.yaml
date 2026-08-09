@@ -1,0 +1,39 @@
+# ConfigMap — non-secret config for Sentry.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentry-config
+  namespace: sentry
+data:
+  sentry.toml: |
+    [core]
+    data_dir = "/var/lib/sentry"
+    channel_buffer = 4096
+
+    [storage.postgres]
+    url = "postgres://sentry@postgres.sentry.svc.cluster.local:5432/sentry"
+    max_connections = 10
+
+    [llm]
+    provider = "none"
+
+    [[rules.pack]]
+    name = "vpn_proxy"
+    mode  = "shadow"
+
+    [[rules.pack]]
+    name = "tor"
+    mode  = "shadow"
+
+    [[rules.pack]]
+    name = "crawlers_bad"
+    mode  = "enforce"
+
+    [[rules.pack]]
+    name = "sensitive_paths"
+    mode  = "enforce"
+
+    [[source]]
+    type = "nginx"
+    [source.options]
+    path = "/var/log/nginx/access.log"

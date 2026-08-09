@@ -1,0 +1,45 @@
+[package]
+name = "sentry-cli"
+description = "Sentry access monitor CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "sentry"
+path = "src/main.rs"
+
+[features]
+default = ["tui"]
+tui = ["dep:ratatui", "dep:crossterm"]
+
+[dependencies]
+sentry-core = { workspace = true }
+sentry-storage = { workspace = true }
+sentry-ai = { workspace = true }
+sentry-geo = { workspace = true }
+sentry-source-nginx = { workspace = true }
+sentry-action-cloudflare = { workspace = true }
+sentry-action-webhook = { workspace = true }
+sentry-action-blocklist = { workspace = true }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+figment = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+color-eyre = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+ratatui = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }

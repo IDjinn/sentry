@@ -1,0 +1,12 @@
+# kustomization.yaml — apply all manifests at once:
+#   kubectl apply -k deploy/k8s/
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: sentry
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml
+  - postgres.yaml
+  - sentry.yaml
+  - pdb.yaml

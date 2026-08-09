@@ -1,0 +1,34 @@
+[package]
+name = "sentry-core"
+description = "Core types, traits and pipeline for the Sentry access monitor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# Enables the ONNX threat model trait bounds (heavy dep) only when needed.
+onnx = []
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+http = { workspace = true }
+ipnet = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = "1"

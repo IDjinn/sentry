@@ -1,0 +1,8 @@
+/target
+/.idea
+/.cargo
+*.swp
+*.swo
+.env
+sentry.toml
+config/sentry.toml

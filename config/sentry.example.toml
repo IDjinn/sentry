@@ -1,0 +1,125 @@
+# sentry.example.toml — example configuration for Sentry.
+#
+# Copy to `sentry.toml` and edit. Secrets go in env vars, not here.
+# Env overlay (figment): SENTRY_<SECTION>__<KEY>=value
+#   e.g. SENTRY_STORAGE__POSTGRES__URL=postgres://sentry:secret@db/sentry
+
+[core]
+data_dir = "/var/lib/sentry"
+channel_buffer = 4096
+
+# ── Storage ──────────────────────────────────────────────────────────────
+[storage.postgres]
+url = "postgres://sentry:changeme@localhost:5432/sentry"
+max_connections = 10
+
+# ── LLM (optional) ───────────────────────────────────────────────────────
+# provider = "none" disables LLM entirely (default).
+# OpenRouter routes to any model (Claude, GPT, Gemini, Qwen, Llama, …).
+# Set SENTRY_LLM_KEY env var for the API key; never put it here.
+[llm]
+provider = "none"            # none | openrouter | ollama | openai | anthropic
+model = ""                   # e.g. "anthropic/claude-3.5-sonnet" (openrouter)
+base_url = ""                # override for self-hosted (e.g. http://localhost:11434 for ollama)
+only_above = 30              # only invoke LLM for events with risk score > 30
+concurrency = 4
+cache_ttl_secs = 300
+
+# ── Rules engine ─────────────────────────────────────────────────────────
+[rules]
+
+# Default rule packs. mode = "shadow" (log only) | "enforce" (act) | "off".
+# sensitive_paths ships in "enforce" by default — see ARCHITECTURE.md §10.3.1.
+[[rules.pack]]
+name = "vpn_proxy"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "tor"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "crawlers_bad"
+mode  = "enforce"
+
+[[rules.pack]]
+name = "crawlers_good"
+mode  = "enforce"
+
+[[rules.pack]]
+name = "sensitive_paths"
+mode  = "enforce"
+
+[[rules.pack]]
+name = "empty_ua"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "http_anomaly"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "rate_scan"
+mode  = "shadow"
+
+[[rules.pack]]
+name = "country_blocklist"
+mode  = "off"
+# countries = ["RU", "CN"]   # ISO 3166-1 alpha-2
+
+# Static inline rules (in addition to the DB-managed ones).
+[[rules.custom]]
+name = "allow internal monitoring"
+priority = 1
+match = 'ip=10.0.0.0/8'
+action = "allow"
+
+[[rules.custom]]
+name = "challenge datacenter ASN outside business hours"
+priority = 20
+match = 'asn=14061 AND time outside(09:00-18:00 America/Sao_Paulo)'
+action = "challenge"
+
+# Reputation feeds to sync periodically.
+# [[rules.feed]]
+# name = "spamhaus_drop"
+# url  = "https://www.spamhaus.org/drop/drop.txt"
+# refresh_hours = 24
+# action = "block"
+
+# ── Sources ──────────────────────────────────────────────────────────────
+[[source]]
+type = "nginx"
+[source.options]
+path = "/var/log/nginx/access.log"
+format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"'
+
+# [[source]]
+# type = "cloudflare"
+# [source.options]
+# zone = "example.com"
+# poll_secs = 30
+
+# ── Actions ──────────────────────────────────────────────────────────────
+[[action]]
+type = "blocklist"
+[action.options]
+ttl_secs = 86400
+
+[[action]]
+type = "cloudflare"
+[action.options]
+mode = "managed_challenge"   # block | js_challenge | managed_challenge
+ttl_secs = 86400
+# token: env SENTRY_CF_TOKEN
+# zone:   env SENTRY_CF_ZONE
+
+[[action]]
+type = "webhook"
+[action.options]
+url = "https://discord.com/api/webhooks/000000/xxxxx"
+on_levels = ["high", "critical"]
+timeout_secs = 10
+
+[[action]]
+type = "log"

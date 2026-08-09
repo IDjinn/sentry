@@ -1,0 +1,11 @@
+# PodDisruptionBudget — ensure at least 1 sentry pod stays during node drains.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentry
+  namespace: sentry
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: sentry

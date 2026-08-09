@@ -1,0 +1,50 @@
+# docker-compose.yml — Sentry + Postgres for local dev / prod single-node.
+#
+# Usage:
+#   docker compose -f deploy/docker/docker-compose.yml up
+#   SENTRY_CF_TOKEN=xxx SENTRY_CF_ZONE=yyy docker compose ... up
+
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sentry
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: sentry
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentry"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  sentry:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SENTRY_CONFIG: /etc/sentry/sentry.toml
+      SENTRY_STORAGE__POSTGRES__URL: postgres://sentry:changeme@postgres:5432/sentry
+      # Secrets via env, never in config:
+      SENTRY_CF_TOKEN: ${SENTRY_CF_TOKEN:-}
+      SENTRY_CF_ZONE: ${SENTRY_CF_ZONE:-}
+      SENTRY_LLM_KEY: ${SENTRY_LLM_KEY:-}
+      RUST_LOG: info,sentry=debug
+    volumes:
+      - ../../config/sentry.example.toml:/etc/sentry/sentry.toml:ro
+      # aaPanel nginx logs (read-only):
+      - /www/wwwlogs:/var/log/nginx:ro
+      - sentrydata:/var/lib/sentry
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  sentrydata:

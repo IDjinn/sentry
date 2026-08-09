@@ -1,0 +1,95 @@
+# Sentry — Deployment + Service.
+# Runs the sentry daemon. Mounts nginx logs from the host if using a DaemonSet
+# pattern, or runs standalone with the Cloudflare source.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentry
+  namespace: sentry
+  labels:
+    app: sentry
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sentry
+  template:
+    metadata:
+      labels:
+        app: sentry
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: sentry
+          image: sentry:latest
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          env:
+            - name: SENTRY_CONFIG
+              value: /etc/sentry/sentry.toml
+            - name: SENTRY_STORAGE__POSTGRES__URL
+              value: postgres://sentry@postgres.sentry.svc.cluster.local:5432/sentry
+            - name: SENTRY_CF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sentry-secrets
+                  key: cf-token
+            - name: SENTRY_CF_ZONE
+              valueFrom:
+                secretKeyRef:
+                  name: sentry-secrets
+                  key: cf-zone
+            - name: SENTRY_LLM_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sentry-secrets
+                  key: llm-key
+            - name: RUST_LOG
+              value: info,sentry=debug
+          volumeMounts:
+            - name: config
+              mountPath: /etc/sentry
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/sentry
+            # Mount host nginx logs (requires hostPath or node-level mounter):
+            # - name: nginx-logs
+            #   mountPath: /var/log/nginx
+            #   readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          livenessProbe:
+            exec:
+              command: ["sentry", "config", "validate"]
+            initialDelaySeconds: 5
+            periodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: sentry-config
+        - name: data
+          emptyDir: {}
+        # - name: nginx-logs
+        #   hostPath:
+        #     path: /var/log/nginx
+        #     type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentry
+  namespace: sentry
+spec:
+  selector:
+    app: sentry
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
