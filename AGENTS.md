@@ -229,3 +229,33 @@ C:\Users\lucas\.cargo\bin\cargo.exe test --all
   `C:\Program Files\Git\usr\bin\` pode conflitar — o rustup prioriza o MSVC.
 - Postgres para testes locais: rodar via `deploy/docker/docker-compose.yml`
   (serviço `postgres`) ou instalar localmente.
+
+## 12. Documentação (Fumadocs)
+
+A documentação do projeto vive em um repo separado (`IDjinn/sentry-docs`),
+montado como **git submodule** em `docs/`, deployado na Vercel em
+**https://sentry.lucas-romero.com**.
+
+- **Stack**: Fumadocs 16 + Next.js 16 + Tailwind v4 + Mermaid
+- **i18n**: `/pt` (PT-BR, source primária) e `/en` (tradução)
+- **Logo**: `sentry.png` na raiz do repo principal é a source of truth;
+  cópia em `sentry-docs/public/sentry.png` (atualização manual)
+
+### Editar docs
+
+```bash
+cd docs
+bun install
+bun run dev   # http://localhost:3000 -> /pt
+```
+
+Conteúdo está em `content/pt/` e `content/en/` (arquivos `.mdx`).
+
+### Bump do submodule
+
+Após mudanças mergeadas em `sentry-docs`:
+```bash
+git -C docs pull origin main
+git add docs
+git commit -m "docs: bump sentry-docs"
+```

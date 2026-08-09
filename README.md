@@ -38,7 +38,48 @@ Sources (plugins)  →  Pipeline  →  Actions (plugins)
 
 Every source and action is a plugin behind the `Source` and `Action` traits.
 The core (`sentry-core`) is pure: it defines contracts, no heavy I/O. See
-[`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design.
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design, or browse the
+live docs at **https://sentry.lucas-romero.com**.
+
+## Documentation
+
+Full docs live in a separate repo (`IDjinn/sentry-docs`), mounted as a
+submodule under [`docs/`](./docs) and deployed to Vercel at
+**https://sentry.lucas-romero.com**.
+
+- **Languages**: Portuguese (source) at `/pt`, English translation at `/en`.
+- **Built with**: [Fumadocs](https://fumadocs.vercel.app) + Next.js 16 + Tailwind v4.
+- **Diagram support**: Mermaid (native plugin).
+
+### Read locally
+
+```bash
+git clone --recurse-submodules <this-repo>
+cd docs
+bun install
+bun run dev   # http://localhost:3000 -> redirects to /pt
+```
+
+To update docs without cloning the main repo:
+```bash
+git clone git@github.com:IDjinn/sentry-docs.git
+cd sentry-docs && bun install && bun run dev
+```
+
+### Update the submodule pointer
+
+After changes are merged into `sentry-docs`:
+```bash
+git -C docs pull origin main
+git add docs
+git commit -m "docs: bump sentry-docs"
+```
+
+### Logo
+
+The project logo `sentry.png` at the repo root is the source of truth. A
+copy is committed in `sentry-docs/public/sentry.png` — update it there
+when the root PNG changes.
 
 ## Workspace
 
