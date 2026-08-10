@@ -51,6 +51,39 @@ repetition_window_secs = 60
 # xss = 30
 # path_traversal = 25
 
+# ── Verdict policy ─────────────────────────────────────────────────────────
+# Override the verdict applied at each risk level. Useful to soften the
+# default mapping (Medium → rate_limit, High → challenge, Critical → block)
+# or to add `[[policy.override]]` DSL rules that force a specific verdict
+# when a condition matches (evaluated before the level mapping).
+[policy]
+medium = "rate_limit"
+high = "challenge"
+critical = "block"
+
+# Override rules: force a verdict when `match` DSL hits.
+# match uses the same DSL as rules.custom (ip=, asn=, path=, method=, …).
+# [[policy.override]]
+# match = 'path ^/wp-admin$ AND NOT ip=10.0.0.0/8'
+# verdict = "block"
+# reason = "wp-admin only accessible from internal network"
+
+# ── Rate-limit backend ────────────────────────────────────────────────────
+# Backend for `RuleMatch::Rate` conditions. `memory` is single-node
+# (in-process sliding window); `redis` shares counters across nodes
+# (requires `--features rate-redis` on sentry-cli).
+[rate_limit]
+backend = "memory"
+# backend = "redis"
+# redis_url = "redis://127.0.0.1/"
+
+# ── Metrics (Prometheus) ──────────────────────────────────────────────────
+# Exposes /metrics on the configured bind address. Disable with enabled=false.
+[metrics]
+enabled = true
+host = "0.0.0.0"
+port = 9100
+
 # ── LLM (optional) ───────────────────────────────────────────────────────
 # provider = "none" disables LLM entirely (default).
 # OpenRouter routes to any model (Claude, GPT, Gemini, Qwen, Llama, …).

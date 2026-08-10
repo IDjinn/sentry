@@ -26,6 +26,10 @@ pub enum CoreError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// Challenge / edge provider error (e.g. Cloudflare API failure).
+    #[error("challenge provider error: {0}")]
+    Challenge(String),
+
     /// Catch-all for errors that don't fit a more specific variant.
     #[error(transparent)]
     Other(#[from] anyhow::Error),

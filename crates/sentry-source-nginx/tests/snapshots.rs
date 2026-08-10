@@ -102,6 +102,7 @@ fn signal_label(k: sentry_core::SignalKind) -> &'static str {
         Log4Shell => "log4shell",
         Rce => "rce",
         UnknownRoute => "unknown_route",
+        MethodNotAllowed => "method_not_allowed",
         ScanBehavior => "scan_behavior",
         AbnormalRate => "abnormal_rate",
         SuspiciousUA => "suspicious_ua",

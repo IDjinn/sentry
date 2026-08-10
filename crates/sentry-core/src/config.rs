@@ -33,6 +33,15 @@ pub struct SentryConfig {
     /// Scorer weights and repetition bonus.
     #[serde(default)]
     pub scorer: ScorerConfig,
+    /// Verdict policy (decider stage).
+    #[serde(default)]
+    pub policy: PolicyConfig,
+    /// Rate-limit backend for `RuleMatch::Rate` conditions.
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+    /// Prometheus metrics server.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     /// Event sources.
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
@@ -168,6 +177,126 @@ fn default_repetition_bonus() -> bool {
 
 fn default_repetition_window() -> u64 {
     60
+}
+
+/// Verdict policy: level → verdict mapping plus ordered overrides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyConfig {
+    /// Verdict for Info events (default `allow`).
+    #[serde(default = "default_policy_allow")]
+    pub info: String,
+    /// Verdict for Low events (default `allow`).
+    #[serde(default = "default_policy_allow")]
+    pub low: String,
+    /// Verdict for Medium events (default `rate_limit`).
+    #[serde(default = "default_policy_rate_limit")]
+    pub medium: String,
+    /// Verdict for High events (default `challenge`).
+    #[serde(default = "default_policy_challenge")]
+    pub high: String,
+    /// Verdict for Critical events (default `block`).
+    #[serde(default = "default_policy_block")]
+    pub critical: String,
+    /// Ordered overrides: first DSL expression matching the event wins.
+    #[serde(default, rename = "override")]
+    pub overrides: Vec<PolicyOverrideConfig>,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            info: default_policy_allow(),
+            low: default_policy_allow(),
+            medium: default_policy_rate_limit(),
+            high: default_policy_challenge(),
+            critical: default_policy_block(),
+            overrides: Vec::new(),
+        }
+    }
+}
+
+/// A single policy override: DSL match expression → forced verdict.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PolicyOverrideConfig {
+    /// DSL match expression (same syntax as `rules.custom`).
+    pub r#match: String,
+    /// Verdict to force: `allow` | `rate_limit` | `challenge` | `block` | `quarantine`.
+    pub verdict: String,
+}
+
+fn default_policy_allow() -> String {
+    "allow".to_string()
+}
+fn default_policy_rate_limit() -> String {
+    "rate_limit".to_string()
+}
+fn default_policy_challenge() -> String {
+    "challenge".to_string()
+}
+fn default_policy_block() -> String {
+    "block".to_string()
+}
+
+/// Rate-limit backend config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    /// Backend: `memory` (default, single-node) | `redis` (multi-node,
+    /// requires the `rate-redis` feature on the CLI build).
+    #[serde(default = "default_rate_backend")]
+    pub backend: String,
+    /// Redis URL (used only when `backend = "redis"`).
+    #[serde(default = "default_redis_url")]
+    pub redis_url: String,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_rate_backend(),
+            redis_url: default_redis_url(),
+        }
+    }
+}
+
+fn default_rate_backend() -> String {
+    "memory".to_string()
+}
+fn default_redis_url() -> String {
+    "redis://127.0.0.1/".to_string()
+}
+
+/// Prometheus metrics server config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// Enable the `/metrics` HTTP endpoint.
+    #[serde(default = "default_metrics_enabled")]
+    pub enabled: bool,
+    /// Bind address (e.g. `0.0.0.0`).
+    #[serde(default = "default_metrics_host")]
+    pub host: String,
+    /// Bind port (default 9100).
+    #[serde(default = "default_metrics_port")]
+    pub port: u16,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_metrics_enabled(),
+            host: default_metrics_host(),
+            port: default_metrics_port(),
+        }
+    }
+}
+
+fn default_metrics_enabled() -> bool {
+    true
+}
+fn default_metrics_host() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_metrics_port() -> u16 {
+    9100
 }
 
 /// LLM provider config.

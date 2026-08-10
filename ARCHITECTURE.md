@@ -859,17 +859,17 @@ Legenda: **F1** = Fase 1 (MVP nginx), **F2** = Cloudflare + IA local, **F3** = M
 - [x] **F1.11** Testes de heurísticas com `proptest` (payloads maliciosos catalogados) — 6 proptests em `heuristics.rs`
 
 ### Fase 2 — Cloudflare + IA local
-- [~] **F2.1** `sentry-ai`: trait `ThreatModel`, impl ONNX via `ort` — trait em `threat.rs`; feature `onnx` existe; **sem impl ONNX**
-- [ ] **F2.2** Treinar modelo v1 (dataset de payloads) — pipeline Python em `tools/train` — sem `tools/`
+- [~] **F2.1** `sentry-ai`: trait `ThreatModel`, impl ONNX via `ort` — trait em `threat.rs`; feature `onnx` existe; **adiado** (decisão ML vs LLM pendente)
+- [ ] **F2.2** Treinar modelo v1 (dataset de payloads) — **adiado** (depende de F2.1)
 - [x] **F2.3** `sentry-action-cloudflare`: client API (firewall rules, challenge modes), cache de IPs, TTL — `sentry-action-cloudflare/src/lib.rs` (ChallengeProvider, cache, TTL)
-- [~] **F2.4** Decisor: política de verdict → action mapping — scorer→verdict em `analysis.rs`; **sem policy table configurável**
-- [ ] **F2.5** `sentry cloudflare status/pull/test` — CLI stubs apenas
-- [ ] **F2.6** Rate-limiting por IP/ASN (token bucket em memória + Redis opt) — `RuleMatch::Rate` retorna `false`
+- [x] **F2.4** Decisor: política de verdict → action mapping — `policy.rs` com `VerdictPolicy`, `PolicyConfig` em `config.rs`, `[[policy.override]]` DSL; daemon wired; 6 testes
+- [x] **F2.5** `sentry cloudflare status/test/pull` — `cloudflare status` (verify token+zone, list access rules), `cloudflare test` (dry-run), `cloudflare pull` (list sentry rules); reaper task que deleta regras expiradas; idempotência de regras duplicadas; `verify()`/`list_access_rules()`/`delete_access_rule()`/`expired_keys()`/`forget()` no provider; registro local antes da req (dedup de concorrência)
+- [x] **F2.6** Rate-limiting por IP/ASN (sliding window em memória + Redis opt) — `ratelimit.rs` (`RateLimitBackend`, `InMemoryRateLimiter`), `rate_redis.rs` (`RedisRateLimiter`), `RuleMatch::Rate` wired com backend, daemon build + prune task, `[rate_limit]` em config; 7 testes
 - [x] **F2.7** Alertas: `sentry-action-webhook` (Discord/Slack/Telegram genérico) — `sentry-action-webhook/src/lib.rs` (POST JSON com contexto)
-- [ ] **F2.8** Métricas: counters/histogramas exportáveis (`sentry report --export`) — só 2 counters in-process
-- [ ] **F2.9** Roteador: rotas parametrizadas (`/users/{id}/posts/{post_id}`) — hoje só exato/glob `*` em `glob_simple` (`pipeline.rs:60-112`); adicionar template matcher com placeholders nomeados e normalização de path (colapsar segmentos dinâmicos)
-- [ ] **F2.10** Roteador: auto-aprendizado (modo `learn`) — observar tráfego e inferir rotas conhecidas em runtime (frequência + estabilidade de shape), persistir em `routes` no Postgres; referenciado em `cmd.rs:161-163` ("not yet implemented (F2)"); revisar `RouteValidator` para suportar hot-reload das rotas aprendidas
-- [ ] **F2.11** Roteador: import de specs OpenAPI/Swagger 2.0/3.x — parser de `paths` + `parameters` para gerar rotas parametrizadas automaticamente (sub-comando `sentry routes import --openapi spec.json|yaml`); suportar também Postman Collection e HAR como fontes secundárias; mapear `path templates` (`/users/{id}`) para o matcher de F2.9
+- [x] **F2.8** Métricas: counters/histogramas Prometheus + `/metrics` HTTP server — `metrics.rs` (`prometheus` + `hyper`), `report --from/--export json|csv`, aggregations em `repo.rs` (`count_by_level_since`, `count_by_verdict_since`, `top_ips`, `top_paths`, `queries_per_hour`); `[metrics]` em config
+- [x] **F2.9** Roteador: rotas parametrizadas (`/users/{id}/posts/{post_id}`) — `template_match` com placeholders nomeados, trailing `/*`, `allows_method` + `MethodNotAllowed` signal; 7 testes em `pipeline.rs`
+- [x] **F2.10** Roteador: auto-aprendizado (modo `learn`) — `routes_learn.rs` (`RouteLearner`: shape inference, min_hits/min_ips); `RouteValidator::merge(config ∪ db)`; startup carrega rotas do DB; `routes_hot_reload` via `LISTEN/NOTIFY sentry_routes_changed`; `sentry routes learn [--dry-run] [--min-hits N] [--min-ips N]`; 6 testes
+- [x] **F2.11** Roteador: import de specs OpenAPI/Swagger 2.0/3.x + Postman + HAR — `routes_import.rs` (parsers JSON/YAML, auto-detect, dedup contra DB, NOTIFY); `sentry routes import <path> [--format openapi|swagger|postman|har|auto] [--dry-run]`; 12 testes (8 unit + 4 fixtures)
 
 ### Fase 3 — Multi-source + LLM
 - [ ] **F3.1** `sentry-source-http`: middleware axum que recebe cópia da req (modo sidecar/inline leve) — sem crate

@@ -170,7 +170,26 @@ não em runtime.
   - ✅ Fixtures + snapshot tests (11 fixtures nginx, 11 snapshots insta)
   - ✅ CI GitHub Actions (fmt, clippy, test matrix 3 OS, storage com Postgres)
   - ✅ Config example completo (`[geo]`, `[[routes.known]]`, `[scorer]`)
-- **F2**: Cloudflare + IA local (ONNX)
+- **F2** (exceto IA): Cloudflare hardening + roteador parametrizado/learn/import + rate-limit + métricas
+  - ✅ F2.4 Verdict policy (`policy.rs`, `VerdictPolicy`, `PolicyConfig`,
+    `[[policy.override]]` DSL) — 6 testes
+  - ✅ F2.5+CF Cloudflare status/test/pull CLI + reaper (deleta regras expiradas)
+    + idempotência (duplicate-rule) + registro local antes da req —
+    `verify()`/`list_access_rules()`/`delete_access_rule()`/`expired_keys()`/`forget()`
+  - ✅ F2.6 Rate-limit (`ratelimit.rs`: `RateLimitBackend` + `InMemoryRateLimiter`
+    sliding-window; `rate_redis.rs`: `RedisRateLimiter` feature `rate-redis`) —
+    daemon wired + prune task; 7 testes
+  - ✅ F2.8 Métricas Prometheus + `/metrics` hyper server (`metrics.rs`),
+    `report --from/--export json|csv`, aggregations em `repo.rs`; `[metrics]` em config
+  - ✅ F2.9 Rotas parametrizadas (`template_match`: `{id}`, trailing `/*`,
+    `MethodNotAllowed` signal) — 7 testes
+  - ✅ F2.10 Route learner (`routes_learn.rs`: shape inference, min_hits/min_ips) +
+    DB route merge (`RouteValidator::merge(config ∪ db)`) + startup carrega DB +
+    `routes_hot_reload` via NOTIFY + `sentry routes learn [--dry-run]` — 6 testes
+  - ✅ F2.11 Import OpenAPI/Swagger 2/3 + Postman v2.1 + HAR (`routes_import.rs`:
+    parsers JSON/YAML, auto-detect, dedup contra DB, NOTIFY) +
+    `sentry routes import <path> [--format] [--dry-run]` — 12 testes
+  - ⏸️ F2.1/F2.2 IA local (ONNX/ML/LLM) — **adiada** (decisão ML vs LLM pendente)
 - **F3**: Multi-source (TCP, syslog) + LLM (OpenRouter)
 - **F4**: Dashboard web
 
@@ -183,7 +202,7 @@ Backlog detalhado em `ARCHITECTURE.md` §15.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 57 testes passando (53 core + 3 nginx + 1 snapshot)
+# Resultado esperado: 97 testes passando (75 core + 8 routes-import + 4 fixtures + 3 nginx + 11 snapshots — destes 8 + 4 + 3 são de integração)
 ```
 
 ## 8. Convenões de código

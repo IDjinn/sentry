@@ -141,7 +141,28 @@ pub enum RoutesCmd {
     /// List known routes.
     List,
     /// Start baseline learning mode.
-    Learn,
+    Learn {
+        /// Dry-run: only print inferred routes, don't persist them.
+        #[arg(long)]
+        dry_run: bool,
+        /// Minimum hits for a route shape to be considered stable.
+        #[arg(long, default_value = "10")]
+        min_hits: u32,
+        /// Minimum number of distinct IPs that hit the shape.
+        #[arg(long, default_value = "2")]
+        min_ips: u32,
+    },
+    /// Import routes from an OpenAPI/Swagger/Postman/HAR spec.
+    Import {
+        /// Path to the spec file (JSON or YAML).
+        path: String,
+        /// Force a format instead of auto-detecting.
+        #[arg(long, value_enum)]
+        format: Option<crate::routes_import::ImportFormat>,
+        /// Dry-run: parse and report what would be imported, don't persist.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -216,8 +237,10 @@ pub enum ModelCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum CloudflareCmd {
-    /// Show Cloudflare sync status.
+    /// Show Cloudflare sync status (token validity, zone, rule count).
     Status,
-    /// Pull existing logs.
+    /// Verify the token + zone without making changes (dry-run).
+    Test,
+    /// Pull existing logs (best-effort Logpull / GraphQL).
     Pull,
 }

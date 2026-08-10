@@ -105,6 +105,8 @@ pub enum SignalKind {
     Rce,
     /// Request hit a path that doesn't exist (directory brute-force).
     UnknownRoute,
+    /// Method not allowed on a known route (e.g. `POST` on a GET-only route).
+    MethodNotAllowed,
     /// Same IP produced many 404s in a short window.
     ScanBehavior,
     /// IP exceeded the configured rate limit.

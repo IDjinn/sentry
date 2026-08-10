@@ -1,0 +1,11 @@
+{
+  "log": {
+    "version": "1.2",
+    "entries": [
+      { "request": { "method": "GET", "url": "https://api.example.com/users/42" } },
+      { "request": { "method": "GET", "url": "https://api.example.com/users/550e8400-e29b-41d4-a716-446655440000" } },
+      { "request": { "method": "POST", "url": "https://api.example.com/login" } },
+      { "request": { "method": "GET", "url": "https://api.example.com/static/app.css" } }
+    ]
+  }
+}

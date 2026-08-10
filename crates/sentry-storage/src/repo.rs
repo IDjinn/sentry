@@ -181,6 +181,82 @@ impl EventRepo {
         .map_err(|e| StorageError::Query(e.to_string()))?;
         Ok(rows)
     }
+
+    /// Count events by risk level since a given timestamp.
+    pub async fn count_by_level_since(&self, since: DateTime<Utc>) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            r#"SELECT risk_level, COUNT(*)::bigint
+               FROM events WHERE timestamp >= $1
+               GROUP BY risk_level ORDER BY risk_level"#,
+        )
+        .bind(since)
+        .fetch_all(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(rows)
+    }
+
+    /// Count events per hour since `since`.
+    pub async fn queries_per_hour(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<(DateTime<Utc>, i64)>> {
+        let rows: Vec<(DateTime<Utc>, i64)> = sqlx::query_as(
+            r#"SELECT date_trunc('hour', timestamp) AS bucket,
+                      COUNT(*)::bigint AS n
+               FROM events WHERE timestamp >= $1
+               GROUP BY bucket ORDER BY bucket"#,
+        )
+        .bind(since)
+        .fetch_all(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(rows)
+    }
+
+    /// Top client IPs by event count since `since`.
+    pub async fn top_ips(&self, limit: i64, since: DateTime<Utc>) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            r#"SELECT client_ip, COUNT(*)::bigint AS n
+               FROM events WHERE timestamp >= $1
+               GROUP BY client_ip ORDER BY n DESC LIMIT $2"#,
+        )
+        .bind(since)
+        .bind(limit)
+        .fetch_all(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(rows)
+    }
+
+    /// Top request paths by event count since `since`.
+    pub async fn top_paths(&self, limit: i64, since: DateTime<Utc>) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            r#"SELECT protocol->>'path' AS path, COUNT(*)::bigint AS n
+               FROM events WHERE timestamp >= $1 AND protocol->>'path' IS NOT NULL
+               GROUP BY path ORDER BY n DESC LIMIT $2"#,
+        )
+        .bind(since)
+        .bind(limit)
+        .fetch_all(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(rows)
+    }
+
+    /// Count events by verdict since `since`.
+    pub async fn count_by_verdict_since(&self, since: DateTime<Utc>) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            r#"SELECT verdict, COUNT(*)::bigint
+               FROM events WHERE timestamp >= $1
+               GROUP BY verdict ORDER BY verdict"#,
+        )
+        .bind(since)
+        .fetch_all(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(rows)
+    }
 }
 
 // ─── IncidentRepo ───────────────────────────────────────────────────────────
@@ -536,6 +612,15 @@ pub struct RouteRow {
     pub methods: Vec<String>,
     /// Created at.
     pub created_at: DateTime<Utc>,
+}
+
+impl sentry_core::RouteLike for RouteRow {
+    fn path(&self) -> &str {
+        &self.path
+    }
+    fn methods(&self) -> &[String] {
+        &self.methods
+    }
 }
 
 impl RouteRepo {

@@ -158,9 +158,106 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                     }
                 }
             }
-            RoutesCmd::Learn => {
-                println!("Route learning mode not yet implemented (F2).");
-                println!("Add routes manually via the database or sentry.toml [[routes.known]].");
+            RoutesCmd::Learn {
+                dry_run,
+                min_hits,
+                min_ips,
+            } => {
+                let cfg = require_config(&cfg)?;
+                let repo = connect_storage(cfg).await?;
+                let opts = sentry_core::routes_learn::LearnOptions { min_hits, min_ips };
+                let rows = repo
+                    .events()
+                    .recent(10_000)
+                    .await
+                    .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
+                let events: Vec<sentry_core::Event> = rows
+                    .iter()
+                    .filter_map(|row| {
+                        let proto = serde_json::from_value::<sentry_core::ProtocolData>(
+                            row.protocol.clone(),
+                        )
+                        .ok()?;
+                        let ip: std::net::IpAddr = row.client_ip.parse().ok()?;
+                        Some(sentry_core::Event::new(
+                            sentry_core::SourceKind::Synthetic,
+                            ip,
+                            proto,
+                        ))
+                    })
+                    .collect();
+                let learned = sentry_core::routes_learn::learn(&events, &opts);
+                println!("Route learning ({} recent events):", rows.len());
+                if learned.is_empty() {
+                    println!("  No stable route shapes found with the given thresholds.");
+                } else {
+                    println!("{:<24} PATH", "METHODS");
+                    for r in &learned {
+                        let m = if r.methods.is_empty() {
+                            "*".to_string()
+                        } else {
+                            r.methods.join(",")
+                        };
+                        println!("{m:<24} {}", r.path);
+                    }
+                }
+                if dry_run {
+                    println!("(--dry-run set — nothing persisted)");
+                } else {
+                    let existing = repo
+                        .routes()
+                        .list()
+                        .await
+                        .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
+                    let existing_paths: std::collections::HashSet<String> = existing
+                        .iter()
+                        .map(|r| r.path.to_ascii_lowercase())
+                        .collect();
+                    let mut inserted = 0;
+                    for r in &learned {
+                        if existing_paths.contains(&r.path.to_ascii_lowercase()) {
+                            continue;
+                        }
+                        match repo.routes().insert(&r.path, &r.methods).await {
+                            Ok(_) => inserted += 1,
+                            Err(e) => tracing::warn!(path = %r.path, error = %e, "insert failed"),
+                        }
+                    }
+                    if inserted > 0 {
+                        let _ = repo.pool().notify("sentry_routes_changed").await;
+                    }
+                    println!("Inserted {inserted} new routes into the database.");
+                }
+            }
+            RoutesCmd::Import {
+                path,
+                format,
+                dry_run,
+            } => {
+                let cfg = require_config(&cfg)?;
+                let repo = connect_storage(cfg).await?;
+                let fmt = format.unwrap_or(crate::routes_import::ImportFormat::Auto);
+                let report = crate::routes_import::import_file(
+                    std::path::Path::new(&path),
+                    fmt,
+                    &repo,
+                    dry_run,
+                )
+                .await?;
+                println!(
+                    "Imported {} from {path} (parsed: {}, duplicates: {}, inserted: {}{})",
+                    fmt.as_str(),
+                    report.parsed,
+                    report.duplicates,
+                    report.inserted,
+                    if dry_run { " [DRY RUN]" } else { "" }
+                );
+                if !report.added.is_empty() {
+                    println!("\n{:<24} PATH", "METHODS");
+                    for line in &report.added {
+                        println!("{line}");
+                    }
+                }
             }
         },
         Command::Rules { action } => {
@@ -345,21 +442,100 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
         Command::Report { from, export } => {
             let cfg = require_config(&cfg)?;
             let repo = connect_storage(cfg).await?;
-            let counts = repo
+            let since = chrono::Utc::now()
+                - parse_duration(&from)
+                    .map_err(|e| color_eyre::eyre::eyre!("invalid --from: {e}"))?;
+
+            let by_level = repo
                 .events()
-                .count_by_level()
+                .count_by_level_since(since)
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
-            println!("Report (last {from}):");
-            if counts.is_empty() {
-                println!("  No events recorded.");
-            } else {
-                for (level, count) in &counts {
-                    println!("  {level:<10} {count}");
+            let by_verdict = repo
+                .events()
+                .count_by_verdict_since(since)
+                .await
+                .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
+            let top_ips = repo
+                .events()
+                .top_ips(10, since)
+                .await
+                .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
+            let top_paths = repo
+                .events()
+                .top_paths(10, since)
+                .await
+                .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
+
+            let total: i64 = by_level.iter().map(|(_, n)| n).sum();
+            match export.as_deref() {
+                Some("json") => {
+                    let report = serde_json::json!({
+                        "from": since.to_rfc3339(),
+                        "window": from,
+                        "total_events": total,
+                        "by_level": by_level.into_iter().collect::<std::collections::HashMap<_, _>>(),
+                        "by_verdict": by_verdict.into_iter().collect::<std::collections::HashMap<_, _>>(),
+                        "top_ips": top_ips,
+                        "top_paths": top_paths,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&report)?);
                 }
-            }
-            if let Some(fmt) = export {
-                eprintln!("Export format '{fmt}' not yet implemented.");
+                Some("csv") => {
+                    println!("kind,value,count");
+                    for (level, n) in &by_level {
+                        println!("level,{level},{n}");
+                    }
+                    for (verdict, n) in &by_verdict {
+                        println!("verdict,{verdict},{n}");
+                    }
+                    for (ip, n) in &top_ips {
+                        println!("ip,{ip},{n}");
+                    }
+                    for (path, n) in &top_paths {
+                        println!("path,{path},{n}");
+                    }
+                }
+                Some(other) => {
+                    return Err(color_eyre::eyre::eyre!(
+                        "unknown --export format `{other}` (expected json | csv)"
+                    ));
+                }
+                None => {
+                    println!("Report (since {since}, window {from} — {total} events):");
+                    println!("\nBy risk level:");
+                    if by_level.is_empty() {
+                        println!("  (no events)");
+                    } else {
+                        for (level, n) in &by_level {
+                            println!("  {level:<10} {n}");
+                        }
+                    }
+                    println!("\nBy verdict:");
+                    if by_verdict.is_empty() {
+                        println!("  (no events)");
+                    } else {
+                        for (verdict, n) in &by_verdict {
+                            println!("  {verdict:<12} {n}");
+                        }
+                    }
+                    println!("\nTop IPs:");
+                    if top_ips.is_empty() {
+                        println!("  (no events)");
+                    } else {
+                        for (ip, n) in &top_ips {
+                            println!("  {ip:<18} {n}");
+                        }
+                    }
+                    println!("\nTop paths:");
+                    if top_paths.is_empty() {
+                        println!("  (no events)");
+                    } else {
+                        for (path, n) in &top_paths {
+                            println!("  {path:<40} {n}");
+                        }
+                    }
+                }
             }
         }
         Command::Config { action } => match action {
@@ -400,19 +576,70 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
         },
         Command::Cloudflare { action } => match action {
             CloudflareCmd::Status => {
-                let token = std::env::var("SENTRY_CF_TOKEN").unwrap_or_default();
-                let zone = std::env::var("SENTRY_CF_ZONE").unwrap_or_default();
-                println!(
-                    "Cloudflare token: {}",
-                    if token.is_empty() { "NOT SET" } else { "set" }
-                );
-                println!(
-                    "Cloudflare zone:  {}",
-                    if zone.is_empty() { "NOT SET" } else { "set" }
-                );
+                let provider = build_cf_provider()?;
+                match provider.verify().await {
+                    Ok((valid, zone_name)) => {
+                        println!("Cloudflare token: valid({valid})");
+                        println!("Cloudflare zone:  {zone_name}");
+                        match provider.list_access_rules().await {
+                            Ok(rules) => {
+                                let ours = rules
+                                    .iter()
+                                    .filter(|r| r.notes.as_deref() == Some("sentry"))
+                                    .count();
+                                println!("Access rules:     {} (sentry: {})", rules.len(), ours);
+                            }
+                            Err(e) => println!("Access rules:     list failed: {e}"),
+                        }
+                    }
+                    Err(e) => println!("Cloudflare verify failed: {e}"),
+                }
+            }
+            CloudflareCmd::Test => {
+                let provider = build_cf_provider()?;
+                println!("Verifying token + zone (no changes will be made)…");
+                match provider.verify().await {
+                    Ok((valid, zone_name)) => {
+                        println!("Token valid: {valid}");
+                        println!("Zone:        {zone_name}");
+                        match provider.list_access_rules().await {
+                            Ok(rules) => {
+                                println!("Sample access rules (up to 5):");
+                                for r in rules.iter().take(5) {
+                                    println!("  {} {:<18} {}", r.id, r.configuration.value, r.mode);
+                                }
+                                if rules.len() > 5 {
+                                    println!("  … and {} more", rules.len() - 5);
+                                }
+                            }
+                            Err(e) => println!("  list failed: {e}"),
+                        }
+                    }
+                    Err(e) => println!("Verify failed: {e}"),
+                }
             }
             CloudflareCmd::Pull => {
-                println!("Cloudflare log pull not yet implemented (F2).");
+                let cfg = require_config(&cfg)?;
+                let repo = connect_storage(cfg).await?;
+                let provider = build_cf_provider()?;
+                println!("Pulling recent Cloudflare logs (best-effort)…");
+                match provider.list_access_rules().await {
+                    Ok(rules) => {
+                        let ours: Vec<_> = rules
+                            .into_iter()
+                            .filter(|r| r.notes.as_deref() == Some("sentry"))
+                            .collect();
+                        println!(
+                            "Found {} sentry-created access rules at the edge.",
+                            ours.len()
+                        );
+                        for r in &ours {
+                            println!("  {} {:<18} {}", r.id, r.configuration.value, r.mode);
+                        }
+                    }
+                    Err(e) => println!("Pull failed: {e}"),
+                }
+                let _ = repo;
             }
         },
         Command::Test {
@@ -451,6 +678,22 @@ async fn connect_storage(cfg: &SentryConfig) -> color_eyre::Result<sentry_storag
         .await
         .map_err(|e| color_eyre::eyre::eyre!("postgres connection failed: {e}"))?;
     Ok(sentry_storage::Repo::new(pool))
+}
+
+/// Build a Cloudflare provider from env vars (`SENTRY_CF_TOKEN`, `SENTRY_CF_ZONE`).
+fn build_cf_provider() -> color_eyre::Result<sentry_action_cloudflare::CloudflareProvider> {
+    let token = std::env::var("SENTRY_CF_TOKEN")
+        .map_err(|_| color_eyre::eyre::eyre!("SENTRY_CF_TOKEN env var not set"))?;
+    let zone = std::env::var("SENTRY_CF_ZONE")
+        .map_err(|_| color_eyre::eyre::eyre!("SENTRY_CF_ZONE env var not set"))?;
+    Ok(sentry_action_cloudflare::CloudflareProvider::new(
+        sentry_action_cloudflare::CloudflareProviderConfig {
+            token,
+            zone,
+            default_mode: sentry_core::challenge::EdgeMode::ManagedChallenge,
+            ttl: std::time::Duration::from_secs(86400),
+        },
+    ))
 }
 
 async fn notify_rules_changed(repo: &sentry_storage::Repo) {
@@ -525,10 +768,18 @@ fn test_rules(
         .map(|c| RouteValidator::from_config(&c.routes.known))
         .unwrap_or_default();
     let scorer = cfg.as_ref().map(|c| c.scorer.clone()).unwrap_or_default();
+    let policy = cfg
+        .as_ref()
+        .map(|c| {
+            sentry_core::VerdictPolicy::from_config(&c.policy)
+                .unwrap_or_else(|_| sentry_core::VerdictPolicy::default())
+        })
+        .unwrap_or_default();
     let pipeline = Pipeline::with_config(
         std::sync::Arc::new(std::sync::RwLock::new(rules)),
         routes,
         scorer,
+        policy,
     );
 
     let client_ip: std::net::IpAddr = ip

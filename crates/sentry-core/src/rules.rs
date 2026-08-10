@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::Verdict;
 use crate::event::{Event, HttpMethod, ProtocolKind};
+use crate::ratelimit::RateLimitBackend;
 
 pub mod dsl;
 
@@ -150,11 +151,23 @@ impl RuleSet {
     /// the rule id, or `None` if no rule matched. `Allow` rules also
     /// short-circuit (they bypass the rest of the pipeline).
     pub fn evaluate(&self, evt: &Event) -> Option<(&Rule, bool)> {
+        self.evaluate_with(evt, None)
+    }
+
+    /// Evaluate with a rate-limit backend for `RuleMatch::Rate` conditions.
+    ///
+    /// Without a backend, `Rate` conditions never match (same as
+    /// [`evaluate`](Self::evaluate)).
+    pub fn evaluate_with(
+        &self,
+        evt: &Event,
+        backend: Option<&dyn RateLimitBackend>,
+    ) -> Option<(&Rule, bool)> {
         for rule in &self.rules {
             if !rule.enabled {
                 continue;
             }
-            if rule.match_.matches(evt) {
+            if rule.match_.matches_with(evt, backend) {
                 // Allow and Block/Challenge/RateLimit short-circuit;
                 // Log/Tag continue to the next rule after annotating.
                 let short_circuit = matches!(
@@ -350,6 +363,14 @@ impl RuleMatch {
     /// lazily on first use and cached (future optimization: pre-compile in
     /// `RuleSet::new`).
     pub fn matches(&self, evt: &Event) -> bool {
+        self.matches_with(evt, None)
+    }
+
+    /// Evaluate with an optional rate-limit backend for `Rate` conditions.
+    ///
+    /// `Time` conditions still require wall-clock evaluation (future work)
+    /// and never match here.
+    pub fn matches_with(&self, evt: &Event, backend: Option<&dyn RateLimitBackend>) -> bool {
         match self {
             Self::Ip { cidr } => match_ip(cidr, evt.client_ip),
             Self::Asn(asn) => evt.asn == Some(*asn),
@@ -422,15 +443,46 @@ impl RuleMatch {
                 .and_then(|h| h.status)
                 .map(|s| s == *code)
                 .unwrap_or(false),
-            Self::Rate { .. } | Self::Time { .. } => {
-                // Rate and time checks need external state (sliding window)
-                // or wall-clock; handled by the evaluator, not the matcher.
+            Self::Rate {
+                count,
+                per_secs,
+                scope,
+            } => {
+                let Some(backend) = backend else {
+                    return false;
+                };
+                let Some(key) = rate_scope_key(*scope, evt) else {
+                    return false;
+                };
+                // Bucket identity includes the condition params so two rules
+                // with identical thresholds share a counter, and different
+                // thresholds stay independent.
+                let key = format!("{key}:{count}/{per_secs}s");
+                backend.record_and_check(&key, *count, *per_secs)
+            }
+            Self::Time { .. } => {
+                // Time windows need wall-clock + timezone handling; future work.
                 false
             }
-            Self::All(items) => items.iter().all(|m| m.matches(evt)),
-            Self::Any(items) => items.iter().any(|m| m.matches(evt)),
-            Self::Not(inner) => !inner.matches(evt),
+            Self::All(items) => items.iter().all(|m| m.matches_with(evt, backend)),
+            Self::Any(items) => items.iter().any(|m| m.matches_with(evt, backend)),
+            Self::Not(inner) => !inner.matches_with(evt, backend),
         }
+    }
+}
+
+/// Build the backend key for a rate condition scope.
+///
+/// `PerAsn` returns `None` when the event has no ASN (never matches);
+/// `PerPath` returns `None` for non-HTTP events.
+fn rate_scope_key(scope: RateScope, evt: &Event) -> Option<String> {
+    match scope {
+        RateScope::PerIp => Some(format!("ip:{}", evt.client_ip)),
+        RateScope::PerAsn => evt.asn.map(|a| format!("asn:{a}")),
+        RateScope::PerPath => evt
+            .http()
+            .map(|h| format!("path:{}", h.path.to_ascii_lowercase())),
+        RateScope::Global => Some("global".to_string()),
     }
 }
 
@@ -774,6 +826,84 @@ mod tests {
             })),
         ]);
         assert!(!m2.matches(&evt));
+    }
+
+    fn rate_rule(count: u32, per_secs: u64, scope: RateScope) -> Rule {
+        Rule {
+            id: "rate".into(),
+            name: "rate".into(),
+            priority: 1,
+            enabled: true,
+            match_: RuleMatch::Rate {
+                count,
+                per_secs,
+                scope,
+            },
+            action: RuleAction::RateLimit,
+            ttl: None,
+            source: RuleSource::Config,
+            tags: vec![],
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn rate_never_matches_without_backend() {
+        let rs = RuleSet::new(vec![rate_rule(1, 60, RateScope::PerIp)]);
+        let evt = http_event("/", "1.2.3.4");
+        for _ in 0..5 {
+            assert!(rs.evaluate(&evt).is_none());
+        }
+    }
+
+    #[test]
+    fn rate_matches_after_threshold_with_backend() {
+        let rs = RuleSet::new(vec![rate_rule(3, 60, RateScope::PerIp)]);
+        let backend = crate::ratelimit::InMemoryRateLimiter::new();
+        let evt = http_event("/", "1.2.3.4");
+
+        assert!(rs.evaluate_with(&evt, Some(&backend)).is_none());
+        assert!(rs.evaluate_with(&evt, Some(&backend)).is_none());
+        assert!(rs.evaluate_with(&evt, Some(&backend)).is_none());
+        let (rule, short) = rs
+            .evaluate_with(&evt, Some(&backend))
+            .expect("4th hit crosses count=3");
+        assert_eq!(rule.id, "rate");
+        assert!(short);
+    }
+
+    #[test]
+    fn rate_scopes_track_independently() {
+        let rs = RuleSet::new(vec![rate_rule(1, 60, RateScope::PerPath)]);
+        let backend = crate::ratelimit::InMemoryRateLimiter::new();
+
+        let a1 = http_event("/a", "1.1.1.1");
+        let a2 = http_event("/a", "2.2.2.2");
+        let b1 = http_event("/b", "3.3.3.3");
+
+        assert!(rs.evaluate_with(&a1, Some(&backend)).is_none());
+        assert!(rs.evaluate_with(&b1, Some(&backend)).is_none());
+        // Second hit on /a (different IP — scope is per path) fires.
+        assert!(rs.evaluate_with(&a2, Some(&backend)).is_some());
+        // /b still under threshold.
+        assert!(rs.evaluate_with(&b1, Some(&backend)).is_some());
+    }
+
+    #[test]
+    fn rate_per_asn_needs_asn() {
+        let m = RuleMatch::Rate {
+            count: 1,
+            per_secs: 60,
+            scope: RateScope::PerAsn,
+        };
+        let backend = crate::ratelimit::InMemoryRateLimiter::new();
+        let evt = http_event("/", "1.2.3.4");
+        assert!(!m.matches_with(&evt, Some(&backend)));
+
+        let mut evt2 = http_event("/", "1.2.3.4");
+        evt2.asn = Some(1234);
+        assert!(!m.matches_with(&evt2, Some(&backend)));
+        assert!(m.matches_with(&evt2, Some(&backend)));
     }
 }
 

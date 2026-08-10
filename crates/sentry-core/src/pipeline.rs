@@ -16,15 +16,41 @@ use crate::analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, V
 use crate::config::{RouteDefConfig, ScorerConfig};
 use crate::event::Event;
 use crate::heuristics::HeuristicEngine;
+use crate::policy::VerdictPolicy;
+use crate::ratelimit::RateLimitBackend;
 use crate::rules::{RuleSet, SharedRuleSet};
 
 /// Route definition for the route validator.
+///
+/// The `path` pattern supports three forms:
+/// - exact: `/api/users`
+/// - glob: `/api/*` (`*` matches any sequence, case-insensitive)
+/// - template: `/users/{id}/posts/{post_id}` (`{name}` matches exactly one
+///   non-empty segment; a trailing `/*` segment matches the rest)
 #[derive(Debug, Clone)]
 pub struct RouteDef {
-    /// Path pattern (exact or glob like `/api/*`).
+    /// Path pattern (exact, glob or template).
     pub path: String,
     /// Allowed methods (empty = any).
     pub methods: Vec<String>,
+}
+
+/// Read-only view of a stored route, used by [`RouteValidator::merge`] to
+/// avoid forcing callers to allocate `RouteDef`s from DB rows.
+pub trait RouteLike {
+    /// Path pattern.
+    fn path(&self) -> &str;
+    /// Allowed methods.
+    fn methods(&self) -> &[String];
+}
+
+impl RouteLike for RouteDef {
+    fn path(&self) -> &str {
+        &self.path
+    }
+    fn methods(&self) -> &[String] {
+        &self.methods
+    }
 }
 
 impl RouteDef {
@@ -34,6 +60,27 @@ impl RouteDef {
             path: cfg.path.clone(),
             methods: cfg.methods.clone(),
         }
+    }
+
+    /// Whether the (lowercased) path matches this route's pattern.
+    fn matches_path(&self, path_lower: &str) -> bool {
+        let pat = self.path.to_ascii_lowercase();
+        if pat.contains('{') {
+            template_match(&pat, path_lower)
+        } else if pat.contains('*') {
+            glob_simple(&pat, path_lower)
+        } else {
+            pat == path_lower
+        }
+    }
+
+    /// Whether `method` is allowed on this route (empty list = any).
+    fn allows_method(&self, method: crate::event::HttpMethod) -> bool {
+        self.methods.is_empty()
+            || self
+                .methods
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(method.as_str()))
     }
 }
 
@@ -56,34 +103,116 @@ impl RouteValidator {
         }
     }
 
+    /// Iterate over known routes (for listing / merging with DB routes).
+    pub fn routes(&self) -> impl Iterator<Item = &RouteDef> {
+        self.routes.iter()
+    }
+
+    /// Merge config routes with DB-loaded routes (deduped by lowercased path).
+    ///
+    /// Config routes always win (they have a higher precedence); DB rows
+    /// with the same path are skipped. Returns a fresh `RouteValidator`.
+    pub fn merge(config: &[RouteDefConfig], db_rows: &[impl RouteLike]) -> Self {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut routes: Vec<RouteDef> = Vec::new();
+
+        for cfg_route in config {
+            let key = cfg_route.path.to_ascii_lowercase();
+            if seen.insert(key) {
+                routes.push(RouteDef::from_config(cfg_route));
+            }
+        }
+        for row in db_rows {
+            let key = row.path().to_ascii_lowercase();
+            if seen.insert(key) {
+                routes.push(RouteDef {
+                    path: row.path().to_string(),
+                    methods: row.methods().to_vec(),
+                });
+            }
+        }
+        Self { routes }
+    }
+
     /// Check if a path matches any known route.
     pub fn is_known(&self, path: &str) -> bool {
         let path_lower = path.to_ascii_lowercase();
-        self.routes.iter().any(|r| {
-            if r.path.contains('*') {
-                glob_simple(&r.path.to_ascii_lowercase(), &path_lower)
-            } else {
-                r.path.to_ascii_lowercase() == path_lower
-            }
-        })
+        self.routes.iter().any(|r| r.matches_path(&path_lower))
     }
 
-    /// Validate an event, returning signals if the route is unknown.
+    /// Validate an event, returning signals for unknown routes or methods.
     pub fn validate(&self, evt: &Event) -> Vec<Signal> {
         let http = match evt.http() {
             Some(h) => h,
             None => return vec![],
         };
-        if !self.is_known(&http.path) {
-            vec![Signal {
+        let path_lower = http.path.to_ascii_lowercase();
+        match self.routes.iter().find(|r| r.matches_path(&path_lower)) {
+            None => vec![Signal {
                 kind: crate::analysis::SignalKind::UnknownRoute,
                 weight: 8,
                 detail: Some(http.path.clone()),
-            }]
-        } else {
-            vec![]
+            }],
+            Some(route) => {
+                let method_violation = http
+                    .method
+                    .map(|m| !route.allows_method(m))
+                    .unwrap_or(false);
+                if method_violation {
+                    vec![Signal {
+                        kind: crate::analysis::SignalKind::MethodNotAllowed,
+                        weight: 10,
+                        detail: Some(format!(
+                            "{} {}",
+                            http.method.map(|m| m.as_str()).unwrap_or("?"),
+                            http.path
+                        )),
+                    }]
+                } else {
+                    vec![]
+                }
+            }
         }
     }
+}
+
+/// Template matcher: `/users/{id}` matches `/users/42` but not `/users/42/posts`.
+///
+/// A `{name}` segment matches exactly one non-empty segment. A trailing `*`
+/// segment matches zero or more remaining segments. A `*` anywhere else
+/// falls back to plain glob semantics. Comparison is case-insensitive
+/// (callers pass lowercased strings).
+fn template_match(pattern: &str, path: &str) -> bool {
+    let pat_segs: Vec<&str> = pattern.split('/').collect();
+    let path_segs: Vec<&str> = path.split('/').collect();
+
+    let wildcard_last = pat_segs.last() == Some(&"*");
+    if pat_segs[..pat_segs.len() - 1].contains(&"*") {
+        return glob_simple(pattern, path);
+    }
+
+    let fixed = if wildcard_last {
+        &pat_segs[..pat_segs.len() - 1]
+    } else {
+        &pat_segs[..]
+    };
+    if !wildcard_last && path_segs.len() != fixed.len() {
+        return false;
+    }
+    if wildcard_last && path_segs.len() < fixed.len() {
+        return false;
+    }
+    for (pat, seg) in fixed.iter().zip(path_segs.iter()) {
+        let is_param = pat.starts_with('{') && pat.ends_with('}') && pat.len() > 2;
+        if is_param {
+            if seg.is_empty() {
+                return false;
+            }
+        } else if pat != seg {
+            return false;
+        }
+    }
+    true
 }
 
 /// Simple glob: `*` matches any sequence.
@@ -162,9 +291,11 @@ impl RepetitionTracker {
 pub struct Pipeline {
     rules: SharedRuleSet,
     heuristics: HeuristicEngine,
-    routes: RouteValidator,
+    routes: RwLock<RouteValidator>,
     scorer: ScorerConfig,
+    policy: VerdictPolicy,
     repetition: Option<RwLock<RepetitionTracker>>,
+    rate_limiter: Option<Arc<dyn RateLimitBackend>>,
 }
 
 /// Output of processing a single event.
@@ -187,11 +318,18 @@ impl Pipeline {
             Arc::new(RwLock::new(rules)),
             routes,
             ScorerConfig::default(),
+            VerdictPolicy::default(),
         )
     }
 
-    /// Create a pipeline with a shared ruleset (hot-reloadable), routes and scorer config.
-    pub fn with_config(rules: SharedRuleSet, routes: RouteValidator, scorer: ScorerConfig) -> Self {
+    /// Create a pipeline with a shared ruleset (hot-reloadable), routes,
+    /// scorer config and verdict policy.
+    pub fn with_config(
+        rules: SharedRuleSet,
+        routes: RouteValidator,
+        scorer: ScorerConfig,
+        policy: VerdictPolicy,
+    ) -> Self {
         let repetition = if scorer.repetition_bonus {
             Some(RwLock::new(RepetitionTracker::new(
                 scorer.repetition_window_secs,
@@ -202,10 +340,18 @@ impl Pipeline {
         Self {
             rules,
             heuristics: HeuristicEngine::with_defaults(),
-            routes,
+            routes: RwLock::new(routes),
             scorer,
+            policy,
             repetition,
+            rate_limiter: None,
         }
+    }
+
+    /// Attach a rate-limit backend (enables `RuleMatch::Rate` conditions).
+    pub fn with_rate_limiter(mut self, backend: Arc<dyn RateLimitBackend>) -> Self {
+        self.rate_limiter = Some(backend);
+        self
     }
 
     /// Process a single event through the full pipeline.
@@ -213,7 +359,9 @@ impl Pipeline {
     pub fn process(&self, evt: &Event) -> ProcessedEvent {
         let ruleset = self.rules.read().unwrap();
 
-        if let Some((rule, short_circuit)) = ruleset.evaluate(evt) {
+        if let Some((rule, short_circuit)) =
+            ruleset.evaluate_with(evt, self.rate_limiter.as_deref())
+        {
             let action = rule.action;
             if short_circuit {
                 let verdict: Verdict = action.into();
@@ -260,7 +408,7 @@ impl Pipeline {
         drop(ruleset);
 
         let mut signals = self.heuristics.analyze(evt);
-        signals.extend(self.routes.validate(evt));
+        signals.extend(self.routes.read().unwrap().validate(evt));
 
         let bonus = if let Some(ref rep) = self.repetition {
             let mut tracker = rep.write().unwrap();
@@ -275,10 +423,11 @@ impl Pipeline {
             self.score_with_weights(signals, bonus)
         };
 
+        let (action, override_reason) = self.policy.decide(analysis.risk_level, evt);
         let decision = Decision {
             analysis: analysis.clone(),
-            action: analysis.verdict,
-            override_reason: None,
+            action,
+            override_reason,
         };
 
         ProcessedEvent {
@@ -300,6 +449,7 @@ impl Pipeline {
                 SignalKind::Log4Shell => "log4shell",
                 SignalKind::Rce => "rce",
                 SignalKind::UnknownRoute => "unknown_route",
+                SignalKind::MethodNotAllowed => "method_not_allowed",
                 SignalKind::ScanBehavior => "scan_behavior",
                 SignalKind::AbnormalRate => "abnormal_rate",
                 SignalKind::SuspiciousUA => "suspicious_ua",
@@ -343,6 +493,50 @@ impl Pipeline {
     pub fn swap_rules(&self, new_rules: RuleSet) {
         let mut guard = self.rules.write().unwrap();
         *guard = new_rules;
+    }
+
+    /// Swap the route validator (hot-reload of learned/imported routes).
+    pub fn swap_routes(&self, new_routes: RouteValidator) {
+        let mut guard = self.routes.write().unwrap();
+        *guard = new_routes;
+    }
+
+    /// Rescore an event with extra signals merged in (e.g. from the ONNX
+    /// model), re-applying the scorer weights and the verdict policy.
+    ///
+    /// Used by the daemon after async stages that run outside the sync
+    /// [`process`](Self::process) path.
+    pub fn rescore(&self, evt: &Event, extra_signals: Vec<Signal>) -> ProcessedEvent {
+        let mut signals = self.heuristics.analyze(evt);
+        signals.extend(self.routes.read().unwrap().validate(evt));
+        signals.extend(extra_signals);
+
+        let bonus = if let Some(ref rep) = self.repetition {
+            let mut tracker = rep.write().unwrap();
+            tracker.record(evt.client_ip, &signals)
+        } else {
+            0
+        };
+
+        let analysis = if self.scorer.weights.is_empty() && bonus == 0 {
+            AnalysisResult::from_signals(signals)
+        } else {
+            self.score_with_weights(signals, bonus)
+        };
+
+        let (action, override_reason) = self.policy.decide(analysis.risk_level, evt);
+        let decision = Decision {
+            analysis: analysis.clone(),
+            action,
+            override_reason,
+        };
+
+        ProcessedEvent {
+            event: evt.clone(),
+            analysis,
+            decision,
+            rule_hit: None,
+        }
     }
 }
 
@@ -432,7 +626,7 @@ mod tests {
         };
         let rules: SharedRuleSet = Arc::new(RwLock::new(RuleSet::default()));
         let routes = RouteValidator::default();
-        let p = Pipeline::with_config(rules, routes, scorer);
+        let p = Pipeline::with_config(rules, routes, scorer, VerdictPolicy::default());
 
         let evt = http_evt("/nonexistent");
         let r1 = p.process(&evt);
@@ -449,5 +643,104 @@ mod tests {
         let routes = RouteValidator::from_config(&route_configs);
         assert!(routes.is_known("/api/users"));
         assert!(!routes.is_known("/admin"));
+    }
+
+    #[test]
+    fn template_route_matches_single_segment() {
+        let routes = RouteValidator::new(vec![RouteDef {
+            path: "/users/{id}".into(),
+            methods: vec![],
+        }]);
+        assert!(routes.is_known("/users/42"));
+        assert!(routes.is_known("/Users/ABC"));
+        assert!(!routes.is_known("/users"));
+        assert!(!routes.is_known("/users/42/posts"));
+    }
+
+    #[test]
+    fn template_route_multiple_params() {
+        let routes = RouteValidator::new(vec![RouteDef {
+            path: "/users/{id}/posts/{post_id}".into(),
+            methods: vec![],
+        }]);
+        assert!(routes.is_known("/users/42/posts/7"));
+        assert!(!routes.is_known("/users/42/posts"));
+        assert!(!routes.is_known("/users/42/posts/7/comments"));
+    }
+
+    #[test]
+    fn template_route_trailing_wildcard() {
+        let routes = RouteValidator::new(vec![RouteDef {
+            path: "/static/{version}/*".into(),
+            methods: vec![],
+        }]);
+        assert!(routes.is_known("/static/v1/css/app.css"));
+        assert!(routes.is_known("/static/v1"));
+        assert!(!routes.is_known("/static"));
+    }
+
+    #[test]
+    fn template_param_rejects_empty_segment() {
+        assert!(!template_match("/users/{id}", "/users/"));
+        assert!(template_match("/users/{id}", "/users/0"));
+    }
+
+    fn http_evt_method(path: &str, method: crate::event::HttpMethod) -> Event {
+        Event::new(
+            SourceKind::Synthetic,
+            std::net::IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            ProtocolData::Http(HttpData {
+                path: path.to_string(),
+                method: Some(method),
+                ..Default::default()
+            }),
+        )
+    }
+
+    #[test]
+    fn method_not_allowed_on_known_route() {
+        let routes = RouteValidator::new(vec![RouteDef {
+            path: "/api/users".into(),
+            methods: vec!["GET".into()],
+        }]);
+        let p = Pipeline::new(RuleSet::default(), routes);
+
+        let get = p.process(&http_evt_method(
+            "/api/users",
+            crate::event::HttpMethod::Get,
+        ));
+        assert!(get
+            .analysis
+            .signals
+            .iter()
+            .all(|s| s.kind != SignalKind::MethodNotAllowed && s.kind != SignalKind::UnknownRoute));
+
+        let post = p.process(&http_evt_method(
+            "/api/users",
+            crate::event::HttpMethod::Post,
+        ));
+        assert!(post
+            .analysis
+            .signals
+            .iter()
+            .any(|s| s.kind == SignalKind::MethodNotAllowed));
+    }
+
+    #[test]
+    fn empty_methods_allows_any() {
+        let routes = RouteValidator::new(vec![RouteDef {
+            path: "/api/users".into(),
+            methods: vec![],
+        }]);
+        let p = Pipeline::new(RuleSet::default(), routes);
+        let res = p.process(&http_evt_method(
+            "/api/users",
+            crate::event::HttpMethod::Delete,
+        ));
+        assert!(res
+            .analysis
+            .signals
+            .iter()
+            .all(|s| s.kind != SignalKind::MethodNotAllowed));
     }
 }

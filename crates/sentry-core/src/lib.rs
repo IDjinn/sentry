@@ -19,7 +19,10 @@ pub mod event;
 pub mod heuristics;
 pub mod packs;
 pub mod pipeline;
+pub mod policy;
+pub mod ratelimit;
 pub mod registry;
+pub mod routes_learn;
 pub mod rules;
 pub mod source;
 
@@ -27,9 +30,10 @@ pub use action::Action;
 pub use analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};
 pub use challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
 pub use config::{
-    ActionConfig, ActionKind, CoreConfig, FeedConfig, GeoConfig, LlmConfig, PostgresConfig,
-    RouteDefConfig, RoutesConfig, RuleDefConfig, RulePackConfig, RulesConfig, ScorerConfig,
-    SentryConfig, SourceConfig, StorageConfig,
+    ActionConfig, ActionKind, CoreConfig, FeedConfig, GeoConfig, LlmConfig, MetricsConfig,
+    PolicyConfig, PolicyOverrideConfig, PostgresConfig, RateLimitConfig, RouteDefConfig,
+    RoutesConfig, RuleDefConfig, RulePackConfig, RulesConfig, ScorerConfig, SentryConfig,
+    SourceConfig, StorageConfig,
 };
 pub use error::{CoreError, Result};
 pub use event::{
@@ -38,7 +42,9 @@ pub use event::{
 };
 pub use heuristics::{Heuristic, HeuristicEngine};
 pub use packs::{build_default_ruleset, PackMode};
-pub use pipeline::{Pipeline, ProcessedEvent, RouteDef, RouteValidator};
+pub use pipeline::{Pipeline, ProcessedEvent, RouteDef, RouteLike, RouteValidator};
+pub use policy::VerdictPolicy;
+pub use ratelimit::{InMemoryRateLimiter, RateLimitBackend};
 pub use registry::{Registry, RegistryBuilder};
 pub use rules::{
     dsl, shared, Rule, RuleAction, RuleId, RuleMatch, RuleSet, RuleSource, SharedRuleSet,

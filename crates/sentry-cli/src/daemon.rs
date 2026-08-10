@@ -19,11 +19,19 @@ use sentry_core::config::{ActionKind, SentryConfig};
 use sentry_core::event::Event;
 use sentry_core::packs::build_default_ruleset;
 use sentry_core::pipeline::{Pipeline, RouteValidator};
+use sentry_core::ratelimit::{InMemoryRateLimiter, RateLimitBackend};
 use sentry_core::registry::RegistryBuilder;
 use sentry_core::rules::{shared, RuleSet, SharedRuleSet};
 use sentry_core::RiskLevel;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+/// A challenge action paired with its concrete provider handle (when the
+/// provider is built locally — currently only Cloudflare).
+struct ChallengeActionWithProvider {
+    action: ChallengeAction,
+    provider: Option<Arc<sentry_action_cloudflare::CloudflareProvider>>,
+}
 
 /// Deduplication cache: prevents processing the same event (by key) within a TTL window.
 struct DedupeCache {
@@ -83,29 +91,6 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
 
     let shared_rules: SharedRuleSet = shared(rules);
 
-    // Build route validator from config (fall back to empty = all unknown).
-    let route_validator = RouteValidator::from_config(&cfg.routes.known);
-    if cfg.routes.known.is_empty() {
-        warn!("no routes configured — all paths will generate UnknownRoute signals");
-    } else {
-        info!(
-            route_count = cfg.routes.known.len(),
-            "routes loaded from config"
-        );
-    }
-
-    // Build the pipeline with config-driven scorer.
-    let pipeline = Arc::new(Pipeline::with_config(
-        Arc::clone(&shared_rules),
-        route_validator,
-        cfg.scorer.clone(),
-    ));
-    info!(
-        weights = cfg.scorer.weights.len(),
-        repetition_bonus = cfg.scorer.repetition_bonus,
-        "pipeline built"
-    );
-
     // Open geo databases (graceful no-op if files absent).
     let geo = match sentry_geo::GeoLookup::open(&cfg.geo.city_db, &cfg.geo.asn_db) {
         Ok(g) => {
@@ -156,11 +141,75 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         None
     };
 
+    // Build route validator: merge config routes with DB-loaded routes.
+    let db_routes = if let Some(ref repo) = repo {
+        match repo.routes().list().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "failed to load routes from db — using config only");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let route_validator = RouteValidator::merge(&cfg.routes.known, &db_routes);
+    let total_routes = route_validator.routes().count();
+    if total_routes == 0 {
+        warn!("no routes configured — all paths will generate UnknownRoute signals");
+    } else {
+        info!(
+            total_routes,
+            config_routes = cfg.routes.known.len(),
+            db_routes = db_routes.len(),
+            "routes loaded (config ∪ db)"
+        );
+    }
+
+    // Build the pipeline with config-driven scorer + verdict policy.
+    let policy = sentry_core::VerdictPolicy::from_config(&cfg.policy)
+        .map_err(|e| color_eyre::eyre::eyre!("invalid [policy] config: {e}"))?;
+    let pipeline = Arc::new(
+        Pipeline::with_config(
+            Arc::clone(&shared_rules),
+            route_validator,
+            cfg.scorer.clone(),
+            policy,
+        )
+        .with_rate_limiter(build_rate_limiter(&cfg)?),
+    );
+    info!(
+        weights = cfg.scorer.weights.len(),
+        repetition_bonus = cfg.scorer.repetition_bonus,
+        rate_backend = cfg.rate_limit.backend.as_str(),
+        "pipeline built"
+    );
+
+    // Start the routes LISTEN/NOTIFY hot-reload task (only with storage).
+    if let Some(ref repo) = repo {
+        let reload_pool = repo.pool().clone();
+        let reload_pipeline = Arc::clone(&pipeline);
+        let config_routes = cfg.routes.known.clone();
+        tokio::spawn(async move {
+            routes_hot_reload(reload_pool, reload_pipeline, config_routes).await;
+        });
+    }
+
     // Build the plugin registry from config.
-    let registry = build_registry(&cfg)?;
+    let (registry, cf_provider) = build_registry(&cfg)?;
 
     if registry.source_count() == 0 {
         warn!("no sources configured — daemon will idle. Add [[source]] entries in sentry.toml");
+    }
+
+    // Spawn the Cloudflare reaper: periodically lists access rules at the
+    // edge, finds the ones Sentry created (notes = "sentry"), and deletes
+    // those whose local TTL has expired.
+    if let Some(cf) = cf_provider.as_ref() {
+        let cf = Arc::clone(cf);
+        tokio::spawn(async move {
+            cloudflare_reaper(cf).await;
+        });
     }
 
     // Fan-in: merge all source streams into one channel.
@@ -205,14 +254,28 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     let mut blocked_count: u64 = 0;
     let mut dropped_dupes: u64 = 0;
 
+    let metrics = crate::metrics::Metrics::new();
+    if cfg.metrics.enabled {
+        let addr: std::net::SocketAddr = format!("{}:{}", cfg.metrics.host, cfg.metrics.port)
+            .parse()
+            .map_err(|e| color_eyre::eyre::eyre!("invalid metrics bind address: {e}"))?;
+        let m = metrics.clone();
+        tokio::spawn(async move {
+            serve_metrics(m, addr).await;
+        });
+    }
+
     while let Some(evt) = event_rx.recv().await {
         let key = dedup_key(&evt);
         if dedupe.check_and_mark(&key) {
             dropped_dupes += 1;
+            metrics.dedupe_drops.inc();
             continue;
         }
 
+        let start = Instant::now();
         let result = pipeline.process(&evt);
+        let duration = start.elapsed();
 
         print_event(
             &result.event,
@@ -248,11 +311,17 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
 
         for action in registry.actions() {
             if action.applies_to(&result.decision) {
+                metrics
+                    .actions
+                    .with_label_values(&[action.name(), verdict_str(result.decision.action)])
+                    .inc();
                 if let Err(e) = action.execute(&result.event, &result.decision).await {
                     warn!(action = action.name(), error = %e, "action failed");
                 }
             }
         }
+
+        metrics.record_event(result.decision.action, result.analysis.risk_level, duration);
 
         processed_count += 1;
         if result.decision.action != sentry_core::Verdict::Allow {
@@ -274,6 +343,23 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         "daemon shutting down — source streams exhausted"
     );
     Ok(())
+}
+
+/// String label for a verdict (used in Prometheus action labels).
+fn verdict_str(v: sentry_core::Verdict) -> &'static str {
+    match v {
+        sentry_core::Verdict::Allow => "allow",
+        sentry_core::Verdict::RateLimit => "rate_limit",
+        sentry_core::Verdict::Challenge => "challenge",
+        sentry_core::Verdict::Block => "block",
+        sentry_core::Verdict::Quarantine => "quarantine",
+    }
+}
+
+/// Thin wrapper so the daemon can call the metrics server without importing
+/// the crate-internal module path in every call site.
+async fn serve_metrics(m: crate::metrics::Metrics, addr: std::net::SocketAddr) {
+    crate::metrics::serve(m, addr).await;
 }
 
 /// Background task: LISTEN for `sentry_rules_changed` notifications and hot-reload the ruleset.
@@ -342,8 +428,18 @@ fn print_event(evt: &Event, level: &RiskLevel, signals: &[String]) {
 }
 
 /// Build the plugin registry from config.
-fn build_registry(cfg: &SentryConfig) -> color_eyre::Result<sentry_core::registry::Registry> {
+///
+/// Returns the registry plus, when a Cloudflare challenge action is
+/// configured, a handle to the concrete `CloudflareProvider` (used by the
+/// background reaper and the CLI status commands).
+fn build_registry(
+    cfg: &SentryConfig,
+) -> color_eyre::Result<(
+    sentry_core::registry::Registry,
+    Option<Arc<sentry_action_cloudflare::CloudflareProvider>>,
+)> {
     let mut builder = RegistryBuilder::new();
+    let mut cf_provider: Option<Arc<sentry_action_cloudflare::CloudflareProvider>> = None;
 
     for src in &cfg.sources {
         match src.kind.as_str() {
@@ -418,8 +514,11 @@ fn build_registry(cfg: &SentryConfig) -> color_eyre::Result<sentry_core::registr
                 ));
             }
             ActionKind::Cloudflare => {
-                if let Some(action) = build_challenge_action("cloudflare", &act.options)? {
-                    builder.register_action(action);
+                if let Some(built) = build_challenge_action("cloudflare", &act.options)? {
+                    if cf_provider.is_none() {
+                        cf_provider = built.provider;
+                    }
+                    builder.register_action(built.action);
                 }
             }
             ActionKind::Challenge => {
@@ -428,8 +527,11 @@ fn build_registry(cfg: &SentryConfig) -> color_eyre::Result<sentry_core::registr
                         "challenge action requires `provider` (e.g. provider = \"cloudflare\")"
                     )
                 })?;
-                if let Some(action) = build_challenge_action(provider, &act.options)? {
-                    builder.register_action(action);
+                if let Some(built) = build_challenge_action(provider, &act.options)? {
+                    if cf_provider.is_none() {
+                        cf_provider = built.provider;
+                    }
+                    builder.register_action(built.action);
                 }
             }
         }
@@ -439,7 +541,7 @@ fn build_registry(cfg: &SentryConfig) -> color_eyre::Result<sentry_core::registr
         builder.register_action(LogAction);
     }
 
-    Ok(builder.build())
+    Ok((builder.build(), cf_provider))
 }
 
 fn parse_ttl_secs(opts: &HashMap<String, toml::Value>, default_secs: u64) -> u64 {
@@ -467,12 +569,15 @@ fn parse_edge_mode(opts: &HashMap<String, toml::Value>) -> Option<EdgeMode> {
 fn build_challenge_action(
     provider_name: &str,
     options: &HashMap<String, toml::Value>,
-) -> color_eyre::Result<Option<ChallengeAction>> {
+) -> color_eyre::Result<Option<ChallengeActionWithProvider>> {
     let ttl = Duration::from_secs(parse_ttl_secs(options, 86400));
     let mode = parse_edge_mode(options);
     let opts = EdgeOptions { ttl, mode };
 
-    let provider: Arc<dyn ChallengeProvider> = match provider_name {
+    let (provider, cf_concrete): (
+        Arc<dyn ChallengeProvider>,
+        Option<Arc<sentry_action_cloudflare::CloudflareProvider>>,
+    ) = match provider_name {
         "cloudflare" => {
             let token = std::env::var("SENTRY_CF_TOKEN").unwrap_or_default();
             let zone = std::env::var("SENTRY_CF_ZONE").unwrap_or_default();
@@ -482,14 +587,15 @@ fn build_challenge_action(
                 );
                 return Ok(None);
             }
-            Arc::new(sentry_action_cloudflare::CloudflareProvider::new(
+            let cf = Arc::new(sentry_action_cloudflare::CloudflareProvider::new(
                 sentry_action_cloudflare::CloudflareProviderConfig {
                     token,
                     zone,
                     default_mode: EdgeMode::ManagedChallenge,
                     ttl,
                 },
-            ))
+            ));
+            (cf.clone(), Some(cf))
         }
         other => {
             return Err(color_eyre::eyre::eyre!(
@@ -498,7 +604,139 @@ fn build_challenge_action(
         }
     };
 
-    Ok(Some(ChallengeAction::new(provider, opts)))
+    Ok(Some(ChallengeActionWithProvider {
+        action: ChallengeAction::new(provider, opts),
+        provider: cf_concrete,
+    }))
+}
+
+/// Background task: Cloudflare access-rule reaper.
+///
+/// Periodically lists access rules at the edge that Sentry created
+/// (`notes = "sentry"`) and deletes those whose local TTL has expired.
+/// This keeps the edge clean — the access-rules API has no TTL of its own,
+/// so without reaping Sentry-created rules would accumulate forever.
+async fn cloudflare_reaper(cf: Arc<sentry_action_cloudflare::CloudflareProvider>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(300));
+    interval.tick().await; // skip the immediate tick
+    loop {
+        interval.tick().await;
+        let expired = cf.expired_keys().await;
+        if expired.is_empty() {
+            continue;
+        }
+        let rules = match cf.list_access_rules().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "cloudflare reaper: list failed");
+                continue;
+            }
+        };
+        let mut reaped = 0u32;
+        for rule in rules {
+            // Only touch rules Sentry created.
+            if rule.notes.as_deref() != Some("sentry") {
+                continue;
+            }
+            let Ok(ip) = rule.configuration.value.parse::<IpAddr>() else {
+                continue;
+            };
+            if expired.contains(&ip) {
+                match cf.delete_access_rule(&rule.id).await {
+                    Ok(_) => {
+                        cf.forget(ip).await;
+                        reaped += 1;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, rule_id = %rule.id, "cloudflare reaper: delete failed")
+                    }
+                }
+            }
+        }
+        if reaped > 0 {
+            info!(reaped, "cloudflare reaper: deleted expired access rules");
+        }
+    }
+}
+
+/// Background task: LISTEN for `sentry_routes_changed` notifications and
+/// hot-reload the route validator (merging config + DB routes).
+async fn routes_hot_reload(
+    pool: sentry_storage::PgPool,
+    pipeline: Arc<Pipeline>,
+    config_routes: Vec<sentry_core::config::RouteDefConfig>,
+) {
+    const CHANNEL: &str = "sentry_routes_changed";
+    loop {
+        match pool.listen(CHANNEL).await {
+            Ok(mut listener) => {
+                info!(
+                    channel = CHANNEL,
+                    "listening for route change notifications"
+                );
+                while let Ok(_notif) = listener.recv().await {
+                    let repo = sentry_storage::Repo::new(pool.clone());
+                    match repo.routes().list().await {
+                        Ok(rows) => {
+                            let merged = RouteValidator::merge(&config_routes, &rows);
+                            let count = merged.routes().count();
+                            pipeline.swap_routes(merged);
+                            info!(route_count = count, "routes hot-reloaded");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to reload routes from db");
+                        }
+                    }
+                }
+                warn!("routes LISTEN connection closed, reconnecting in 5s…");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to start routes LISTEN, retrying in 5s…");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// Build the rate-limit backend from config.
+///
+/// For `memory` (default) the returned backend is an `InMemoryRateLimiter`
+/// and a background prune task is spawned. For `redis` the CLI must be built
+/// with `--features rate-redis`.
+fn build_rate_limiter(cfg: &SentryConfig) -> color_eyre::Result<Arc<dyn RateLimitBackend>> {
+    match cfg.rate_limit.backend.as_str() {
+        "memory" | "" => {
+            let limiter = Arc::new(InMemoryRateLimiter::new());
+            let prune_handle = Arc::clone(&limiter);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    prune_handle.prune();
+                }
+            });
+            Ok(limiter)
+        }
+        "redis" => {
+            #[cfg(feature = "rate-redis")]
+            {
+                let limiter =
+                    crate::rate_redis::RedisRateLimiter::connect(&cfg.rate_limit.redis_url)?;
+                info!(url = %cfg.rate_limit.redis_url, "redis rate-limit backend connected");
+                Ok(Arc::new(limiter))
+            }
+            #[cfg(not(feature = "rate-redis"))]
+            {
+                Err(color_eyre::eyre::eyre!(
+                    "rate_limit.backend = \"redis\" requires building sentry-cli with --features rate-redis"
+                ))
+            }
+        }
+        other => Err(color_eyre::eyre::eyre!(
+            "unknown rate_limit.backend `{other}` — expected `memory` or `redis`"
+        )),
+    }
 }
 
 fn parse_risk_level(s: &str) -> Option<RiskLevel> {

@@ -1,0 +1,12 @@
+swagger: "2.0"
+info:
+  title: Swagger Demo
+  version: "1.0"
+paths:
+  /api/items:
+    get: {}
+    post: {}
+  /api/items/{itemId}:
+    get: {}
+    put: {}
+    delete: {}

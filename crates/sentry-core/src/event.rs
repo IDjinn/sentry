@@ -136,6 +136,22 @@ impl HttpMethod {
         }
     }
 
+    /// Uppercase stable name used in logs and route method checks.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+            Self::Connect => "CONNECT",
+            Self::Trace => "TRACE",
+            Self::Other => "OTHER",
+        }
+    }
+
     /// Whether this method is considered "rare/dangerous" by the default
     /// `http_anomaly` rule pack (`TRACE`, `CONNECT`).
     pub fn is_rare(self) -> bool {

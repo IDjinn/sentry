@@ -1,0 +1,44 @@
+{
+  "info": {
+    "_postman_variable_scope": "environment",
+    "name": "Demo Collection"
+  },
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "url": "{{base}}/api/login"
+          }
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "url": "{{base}}/api/logout"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get User",
+      "request": {
+        "method": "GET",
+        "url": "https://api.example.com/users/:userId"
+      }
+    },
+    {
+      "name": "Get User Posts",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "https://api.example.com/users/:userId/posts",
+          "path": ["users", ":userId", "posts"]
+        }
+      }
+    }
+  ]
+}
