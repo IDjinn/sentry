@@ -185,7 +185,9 @@ não em runtime.
     `MethodNotAllowed` signal) — 7 testes
   - ✅ F2.10 Route learner (`routes_learn.rs`: shape inference, min_hits/min_ips) +
     DB route merge (`RouteValidator::merge(config ∪ db)`) + startup carrega DB +
-    `routes_hot_reload` via NOTIFY + `sentry routes learn [--dry-run]` — 6 testes
+    `routes_hot_reload` via NOTIFY + `sentry routes learn [--dry-run]` +
+    learner contínuo em background (`[route_learner]`: enabled/interval_secs/
+    window_secs/min_hits/min_ips, auto-push via NOTIFY) — 7 testes
   - ✅ F2.11 Import OpenAPI/Swagger 2/3 + Postman v2.1 + HAR (`routes_import.rs`:
     parsers JSON/YAML, auto-detect, dedup contra DB, NOTIFY) +
     `sentry routes import <path> [--format] [--dry-run]` — 12 testes
@@ -202,7 +204,7 @@ Backlog detalhado em `ARCHITECTURE.md` §15.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 97 testes passando (75 core + 8 routes-import + 4 fixtures + 3 nginx + 11 snapshots — destes 8 + 4 + 3 são de integração)
+# Resultado esperado: 98 testes passando (75 core + 8 routes-import + 4 fixtures + 3 nginx + 11 snapshots — destes 8 + 4 + 3 são de integração)
 ```
 
 ## 8. Convenões de código

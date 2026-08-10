@@ -171,6 +171,25 @@ impl EventRepo {
         Ok(rows)
     }
 
+    /// Fetch all events since a given timestamp (oldest first).
+    ///
+    /// Used by the background route learner to scan a sliding window.
+    pub async fn recent_since(&self, since: DateTime<Utc>) -> Result<Vec<EventRow>> {
+        let rows = sqlx::query_as::<_, EventRow>(
+            r#"SELECT id, timestamp, source, client_ip::text AS client_ip,
+                      client_port, server_port, asn, country,
+                      protocol, risk_score, risk_level, verdict, signals, raw
+               FROM events
+               WHERE timestamp >= $1
+               ORDER BY timestamp ASC"#,
+        )
+        .bind(since)
+        .fetch_all(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(rows)
+    }
+
     /// Count events by risk level.
     pub async fn count_by_level(&self) -> Result<Vec<(String, i64)>> {
         let rows: Vec<(String, i64)> = sqlx::query_as(

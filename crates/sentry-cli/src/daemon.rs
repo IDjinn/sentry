@@ -193,6 +193,15 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         tokio::spawn(async move {
             routes_hot_reload(reload_pool, reload_pipeline, config_routes).await;
         });
+
+        // Continuous route learner (auto-push via NOTIFY sentry_routes_changed).
+        if cfg.route_learner.enabled {
+            let learner_repo = Arc::clone(repo);
+            let learner_cfg = cfg.route_learner.clone();
+            tokio::spawn(async move {
+                route_learner_task(learner_repo, learner_cfg).await;
+            });
+        }
     }
 
     // Build the plugin registry from config.
@@ -695,6 +704,91 @@ async fn routes_hot_reload(
             }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// Convert a stored `EventRow` back into a domain `Event`.
+///
+/// Shared by the `routes learn` CLI handler and the background learner task.
+pub(crate) fn event_row_to_event(row: &sentry_storage::EventRow) -> Option<Event> {
+    let proto = serde_json::from_value::<sentry_core::ProtocolData>(row.protocol.clone()).ok()?;
+    let ip: IpAddr = row.client_ip.parse().ok()?;
+    Some(Event::new(sentry_core::SourceKind::Synthetic, ip, proto))
+}
+
+/// Background task: continuous route learner.
+///
+/// Every `interval_secs`, scans events from the last `window_secs`, infers
+/// stable route shapes, dedups against the DB, inserts new routes, and
+/// notifies the daemon to hot-reload them.
+async fn route_learner_task(
+    repo: Arc<sentry_storage::Repo>,
+    cfg: sentry_core::config::RouteLearnerConfig,
+) {
+    let interval = Duration::from_secs(cfg.interval_secs.max(30));
+    let window = chrono::Duration::seconds(cfg.window_secs as i64);
+    let opts = sentry_core::routes_learn::LearnOptions {
+        min_hits: cfg.min_hits,
+        min_ips: cfg.min_ips,
+    };
+    info!(
+        interval_secs = cfg.interval_secs,
+        window_secs = cfg.window_secs,
+        min_hits = cfg.min_hits,
+        min_ips = cfg.min_ips,
+        "route learner task started"
+    );
+    let mut tick = tokio::time::interval(interval);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let since = chrono::Utc::now() - window;
+        let rows = match repo.events().recent_since(since).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "route learner: failed to fetch events");
+                continue;
+            }
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        let events: Vec<Event> = rows.iter().filter_map(event_row_to_event).collect();
+        if events.is_empty() {
+            continue;
+        }
+        let learned = sentry_core::routes_learn::learn(&events, &opts);
+        if learned.is_empty() {
+            continue;
+        }
+        let existing = match repo.routes().list().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "route learner: failed to list existing routes");
+                continue;
+            }
+        };
+        let existing_paths: std::collections::HashSet<String> = existing
+            .iter()
+            .map(|r| r.path.to_ascii_lowercase())
+            .collect();
+        let mut inserted = 0u32;
+        for r in &learned {
+            if existing_paths.contains(&r.path.to_ascii_lowercase()) {
+                continue;
+            }
+            match repo.routes().insert(&r.path, &r.methods).await {
+                Ok(_) => {
+                    inserted += 1;
+                    info!(path = %r.path, "route learner: discovered new route");
+                }
+                Err(e) => warn!(error = %e, path = %r.path, "route learner: insert failed"),
+            }
+        }
+        if inserted > 0 {
+            info!(inserted, "route learner: auto-pushed new routes");
+            let _ = repo.pool().notify("sentry_routes_changed").await;
+        }
     }
 }
 

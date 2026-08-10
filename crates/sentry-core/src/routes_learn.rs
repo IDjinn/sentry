@@ -203,4 +203,14 @@ mod tests {
     fn keeps_short_static_segments() {
         assert_eq!(shape_of("/api/v1/users"), "/api/v1/users");
     }
+
+    #[test]
+    fn learner_config_defaults_are_sane() {
+        let c = crate::config::RouteLearnerConfig::default();
+        assert!(!c.enabled, "disabled by default");
+        assert!(c.interval_secs >= 30, "interval at least 30s");
+        assert!(c.window_secs >= c.interval_secs, "window >= interval");
+        assert!(c.min_hits >= 1);
+        assert!(c.min_ips >= 1);
+    }
 }

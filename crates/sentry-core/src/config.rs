@@ -42,6 +42,9 @@ pub struct SentryConfig {
     /// Prometheus metrics server.
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Background route learner.
+    #[serde(default)]
+    pub route_learner: RouteLearnerConfig,
     /// Event sources.
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
@@ -297,6 +300,55 @@ fn default_metrics_host() -> String {
 }
 fn default_metrics_port() -> u16 {
     9100
+}
+
+/// Background route learner config.
+///
+/// When enabled, the daemon periodically scans recent events from Postgres
+/// (within `window_secs`), infers stable route shapes, and auto-pushes new
+/// routes to the DB + hot-reloads them via `NOTIFY sentry_routes_changed`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteLearnerConfig {
+    /// Enable continuous background learning (requires Postgres storage).
+    #[serde(default)]
+    pub enabled: bool,
+    /// How often (in seconds) to run a learning pass.
+    #[serde(default = "default_learner_interval")]
+    pub interval_secs: u64,
+    /// Look-back window for events (in seconds).
+    #[serde(default = "default_learner_window")]
+    pub window_secs: u64,
+    /// Minimum total hits for a shape to be considered stable.
+    #[serde(default = "default_learner_min_hits")]
+    pub min_hits: u32,
+    /// Minimum number of distinct IPs that hit the shape.
+    #[serde(default = "default_learner_min_ips")]
+    pub min_ips: u32,
+}
+
+impl Default for RouteLearnerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_learner_interval(),
+            window_secs: default_learner_window(),
+            min_hits: default_learner_min_hits(),
+            min_ips: default_learner_min_ips(),
+        }
+    }
+}
+
+fn default_learner_interval() -> u64 {
+    300
+}
+fn default_learner_window() -> u64 {
+    3600
+}
+fn default_learner_min_hits() -> u32 {
+    10
+}
+fn default_learner_min_ips() -> u32 {
+    2
 }
 
 /// LLM provider config.

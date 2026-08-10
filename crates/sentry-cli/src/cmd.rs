@@ -173,18 +173,7 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                     .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
                 let events: Vec<sentry_core::Event> = rows
                     .iter()
-                    .filter_map(|row| {
-                        let proto = serde_json::from_value::<sentry_core::ProtocolData>(
-                            row.protocol.clone(),
-                        )
-                        .ok()?;
-                        let ip: std::net::IpAddr = row.client_ip.parse().ok()?;
-                        Some(sentry_core::Event::new(
-                            sentry_core::SourceKind::Synthetic,
-                            ip,
-                            proto,
-                        ))
-                    })
+                    .filter_map(crate::daemon::event_row_to_event)
                     .collect();
                 let learned = sentry_core::routes_learn::learn(&events, &opts);
                 println!("Route learning ({} recent events):", rows.len());

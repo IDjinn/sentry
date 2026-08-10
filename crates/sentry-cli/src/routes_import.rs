@@ -173,7 +173,8 @@ fn detect_format(text: &str) -> color_eyre::Result<ImportFormat> {
     if v.get("openapi").is_some() {
         return Ok(ImportFormat::Openapi);
     }
-    let is_postman = v.get("info")
+    let is_postman = v
+        .get("info")
         .and_then(|i| i.get("_postman_variable_scope"))
         .is_some()
         || (v.get("item").is_some() && v.get("event").is_none() && v.get("log").is_none());

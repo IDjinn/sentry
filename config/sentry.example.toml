@@ -84,6 +84,17 @@ enabled = true
 host = "0.0.0.0"
 port = 9100
 
+# ── Route learner (continuous background) ─────────────────────────────────
+# When enabled, the daemon periodically scans recent events (within
+# window_secs), infers stable route shapes, and auto-pushes new routes to
+# the DB + hot-reloads them. Requires Postgres storage.
+[route_learner]
+enabled = false           # set true to enable continuous learning
+interval_secs = 300       # run a learning pass every N seconds (min 30)
+window_secs = 3600        # look back at events from the last N seconds
+min_hits = 10             # minimum hits for a shape to be considered stable
+min_ips = 2               # minimum distinct IPs that hit the shape
+
 # ── LLM (optional) ───────────────────────────────────────────────────────
 # provider = "none" disables LLM entirely (default).
 # OpenRouter routes to any model (Claude, GPT, Gemini, Qwen, Llama, …).

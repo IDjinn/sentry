@@ -32,8 +32,8 @@ pub use challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
 pub use config::{
     ActionConfig, ActionKind, CoreConfig, FeedConfig, GeoConfig, LlmConfig, MetricsConfig,
     PolicyConfig, PolicyOverrideConfig, PostgresConfig, RateLimitConfig, RouteDefConfig,
-    RoutesConfig, RuleDefConfig, RulePackConfig, RulesConfig, ScorerConfig, SentryConfig,
-    SourceConfig, StorageConfig,
+    RouteLearnerConfig, RoutesConfig, RuleDefConfig, RulePackConfig, RulesConfig, ScorerConfig,
+    SentryConfig, SourceConfig, StorageConfig,
 };
 pub use error::{CoreError, Result};
 pub use event::{
