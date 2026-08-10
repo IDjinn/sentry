@@ -90,7 +90,7 @@ pub struct StorageConfig {
 }
 
 /// Postgres connection.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostgresConfig {
     /// `postgres://user:pass@host:port/db`
     #[serde(default)]
@@ -98,6 +98,15 @@ pub struct PostgresConfig {
     /// Max connections in the pool.
     #[serde(default = "default_pg_max_conn")]
     pub max_connections: u32,
+}
+
+impl Default for PostgresConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            max_connections: default_pg_max_conn(),
+        }
+    }
 }
 
 fn default_pg_max_conn() -> u32 {
@@ -352,7 +361,7 @@ fn default_learner_min_ips() -> u32 {
 }
 
 /// LLM provider config.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     /// Provider: `none` | `openrouter` | `ollama` | `openai` | `anthropic`.
     #[serde(default = "default_llm_provider")]
@@ -372,6 +381,19 @@ pub struct LlmConfig {
     /// Cache TTL for LLM verdicts keyed by payload hash.
     #[serde(default = "default_llm_cache_ttl")]
     pub cache_ttl_secs: u64,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_llm_provider(),
+            model: String::new(),
+            base_url: None,
+            only_above: default_llm_threshold(),
+            concurrency: default_llm_concurrency(),
+            cache_ttl_secs: default_llm_cache_ttl(),
+        }
+    }
 }
 
 fn default_llm_provider() -> String {
@@ -402,7 +424,7 @@ pub struct RulesConfig {
 }
 
 /// A default rule pack entry.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RulePackConfig {
     /// Pack name: `vpn_proxy`, `tor`, `crawlers_bad`, `sensitive_paths`, …
     pub name: String,
@@ -412,6 +434,16 @@ pub struct RulePackConfig {
     /// Extra parameters (e.g. `countries = ["RU","CN"]`).
     #[serde(default)]
     pub params: HashMap<String, toml::Value>,
+}
+
+impl Default for RulePackConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            mode: default_pack_mode(),
+            params: HashMap::new(),
+        }
+    }
 }
 
 fn default_pack_mode() -> String {
@@ -436,7 +468,7 @@ pub struct RuleDefConfig {
 }
 
 /// A reputation feed to sync.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedConfig {
     /// Feed name (used as the rule tag prefix).
     pub name: String,
@@ -447,6 +479,17 @@ pub struct FeedConfig {
     pub refresh_hours: u32,
     /// Action to apply to feed entries.
     pub action: String,
+}
+
+impl Default for FeedConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            url: String::new(),
+            refresh_hours: default_feed_refresh(),
+            action: String::new(),
+        }
+    }
 }
 
 fn default_feed_refresh() -> u32 {
@@ -526,5 +569,46 @@ impl ActionKind {
 impl std::fmt::Display for ActionKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postgres_default_has_nonzero_pool() {
+        assert_eq!(PostgresConfig::default().max_connections, 10);
+    }
+
+    #[test]
+    fn postgres_serde_missing_field_uses_default() {
+        let toml = r#"url = "postgres://localhost/sentry""#;
+        let pg: PostgresConfig = toml::from_str(toml).unwrap();
+        assert_eq!(pg.max_connections, 10);
+    }
+
+    #[test]
+    fn llm_default_matches_serde_defaults() {
+        let c = LlmConfig::default();
+        assert_eq!(c.provider, "none");
+        assert_eq!(c.only_above, 30);
+        assert_eq!(c.concurrency, 4);
+        assert_eq!(c.cache_ttl_secs, 300);
+    }
+
+    #[test]
+    fn rule_pack_default_mode_is_shadow() {
+        assert_eq!(RulePackConfig::default().mode, "shadow");
+    }
+
+    #[test]
+    fn feed_default_refresh_is_24h() {
+        assert_eq!(FeedConfig::default().refresh_hours, 24);
+    }
+
+    #[test]
+    fn full_config_default_has_sane_storage_pool() {
+        assert_eq!(SentryConfig::default().storage.postgres.max_connections, 10);
     }
 }
