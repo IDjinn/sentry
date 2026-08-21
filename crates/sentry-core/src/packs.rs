@@ -369,11 +369,14 @@ fn rate_scan_rules(enforce: bool) -> Vec<Rule> {
         name: "rate-limit >10 404s per 60s (directory brute-force)".into(),
         priority: 15,
         enabled: true,
-        match_: RuleMatch::Rate {
-            count: 10,
-            per_secs: 60,
-            scope: crate::rules::RateScope::PerIp,
-        },
+        match_: RuleMatch::All(vec![
+            RuleMatch::Status(404),
+            RuleMatch::Rate {
+                count: 10,
+                per_secs: 60,
+                scope: crate::rules::RateScope::PerIp,
+            },
+        ]),
         action,
         ttl: None,
         source: RuleSource::DefaultPack,

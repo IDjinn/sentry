@@ -16,6 +16,7 @@ path = "src/main.rs"
 default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm"]
 rate-redis = ["dep:redis"]
+onnx = ["sentry-ai/onnx"]
 
 [dependencies]
 sentry-core = { workspace = true }

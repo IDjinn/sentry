@@ -190,6 +190,30 @@ impl EventRepo {
         Ok(rows)
     }
 
+    /// Update the verdict of an already-persisted event (async fork stages
+    /// such as the ML threat model may raise it after the initial insert).
+    pub async fn update_verdict(
+        &self,
+        id: Uuid,
+        verdict: Verdict,
+        risk_score: u8,
+        risk_level: RiskLevel,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE events
+               SET verdict = $2, risk_score = $3, risk_level = $4
+               WHERE id = $1"#,
+        )
+        .bind(id)
+        .bind(verdict_label(verdict))
+        .bind(risk_score as i16)
+        .bind(risk_level_label(risk_level))
+        .execute(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(())
+    }
+
     /// Count events by risk level.
     pub async fn count_by_level(&self) -> Result<Vec<(String, i64)>> {
         let rows: Vec<(String, i64)> = sqlx::query_as(
@@ -253,6 +277,31 @@ impl EventRepo {
         let rows: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT protocol->>'path' AS path, COUNT(*)::bigint AS n
                FROM events WHERE timestamp >= $1 AND protocol->>'path' IS NOT NULL
+               GROUP BY path ORDER BY n DESC LIMIT $2"#,
+        )
+        .bind(since)
+        .bind(limit)
+        .fetch_all(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(rows)
+    }
+
+    /// Top paths flagged `UnknownRoute` since `since`.
+    ///
+    /// Helps operators promote legitimate-but-unlisted paths to
+    /// `[[routes.known]]` (the learner intentionally never learns them).
+    pub async fn top_unknown_paths(
+        &self,
+        limit: i64,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            r#"SELECT protocol->>'path' AS path, COUNT(*)::bigint AS n
+               FROM events
+               WHERE timestamp >= $1
+                 AND protocol->>'path' IS NOT NULL
+                 AND signals::text LIKE '%"unknown_route"%'
                GROUP BY path ORDER BY n DESC LIMIT $2"#,
         )
         .bind(since)
@@ -447,6 +496,92 @@ impl IpStateRepo {
             .map_err(|e| StorageError::Query(e.to_string()))?;
         Ok(())
     }
+
+    /// Record a violation for an IP (offender memory), applying the same
+    /// window decay as the in-memory tracker: strikes whose window expired
+    /// reset to 1, otherwise they increment. `total_violations` never resets.
+    ///
+    /// Returns the resulting row.
+    pub async fn record_violation(&self, ip: IpAddr, window_secs: u64) -> Result<OffenderRow> {
+        let row = sqlx::query_as::<_, OffenderRow>(
+            r#"INSERT INTO ip_state (ip, status, strikes, total_violations, last_violation_at)
+               VALUES ($1::inet, 'watched', 1, 1, now())
+               ON CONFLICT (ip) DO UPDATE SET
+                   strikes = CASE
+                       WHEN ip_state.last_violation_at IS NULL
+                         OR ip_state.last_violation_at < now() - make_interval(secs => $2)
+                       THEN 1 ELSE ip_state.strikes + 1 END,
+                   total_violations = ip_state.total_violations + 1,
+                   last_violation_at = now(),
+                   updated_at = now()
+               RETURNING ip::text AS ip, strikes, total_violations, last_violation_at"#,
+        )
+        .bind(ip.to_string())
+        .bind(window_secs as f64)
+        .fetch_one(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(row)
+    }
+
+    /// Offender state for a single IP (strikes, totals, last violation).
+    pub async fn offender(&self, ip: IpAddr) -> Result<Option<OffenderRow>> {
+        let row = sqlx::query_as::<_, OffenderRow>(
+            r#"SELECT ip::text AS ip, strikes, total_violations, last_violation_at
+               FROM ip_state WHERE ip = $1::inet"#,
+        )
+        .bind(ip.to_string())
+        .fetch_optional(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(row)
+    }
+
+    /// Offenders with live strikes inside the window (startup pre-warm).
+    pub async fn recent_offenders(&self, window_secs: u64, limit: i64) -> Result<Vec<OffenderRow>> {
+        let rows = sqlx::query_as::<_, OffenderRow>(
+            r#"SELECT ip::text AS ip, strikes, total_violations, last_violation_at
+               FROM ip_state
+               WHERE strikes > 0
+                 AND last_violation_at >= now() - make_interval(secs => $1)
+               ORDER BY last_violation_at DESC
+               LIMIT $2"#,
+        )
+        .bind(window_secs as f64)
+        .bind(limit)
+        .fetch_all(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(rows)
+    }
+
+    /// Reset the strike counters for an IP (manual forgiveness). Keeps the
+    /// `total_violations` history.
+    pub async fn reset_offender(&self, ip: IpAddr) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE ip_state
+               SET strikes = 0, last_violation_at = NULL, updated_at = now()
+               WHERE ip = $1::inet"#,
+        )
+        .bind(ip.to_string())
+        .execute(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Row representation of the offender-memory columns in `ip_state`.
+#[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
+pub struct OffenderRow {
+    /// IP address (text).
+    pub ip: String,
+    /// Strikes accumulated in the current window.
+    pub strikes: i32,
+    /// Violations ever recorded.
+    pub total_violations: i64,
+    /// When the last violation happened.
+    pub last_violation_at: Option<DateTime<Utc>>,
 }
 
 // ─── RuleRepo ───────────────────────────────────────────────────────────────

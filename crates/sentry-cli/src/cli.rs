@@ -66,6 +66,9 @@ pub enum Command {
         /// Export format.
         #[arg(long)]
         export: Option<String>,
+        /// List top unknown paths (candidates for `[[routes.known]]`).
+        #[arg(long)]
+        unknown_paths: bool,
     },
     /// Show or validate configuration.
     Config {
@@ -134,6 +137,8 @@ pub enum IpCmd {
     Unblock,
     /// Show full history of an IP.
     Info,
+    /// Reset the strike counters (offender memory) for an IP.
+    Forgive,
 }
 
 #[derive(Debug, Subcommand)]
@@ -229,10 +234,26 @@ pub enum ConfigCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum ModelCmd {
-    /// Show model status (version, accuracy).
+    /// Show model status (provider, model file, threshold).
     Status,
     /// Reload the model from disk.
     Reload,
+    /// Export training features from stored events as CSV.
+    Export {
+        /// Look-back window in hours (default 30 days).
+        #[arg(long, default_value = "720")]
+        hours: u64,
+        /// Output CSV path (default `dataset.csv` in cwd).
+        #[arg(long, default_value = "dataset.csv")]
+        out: String,
+        /// Generate a synthetic seed dataset instead of reading Postgres
+        /// (no storage required; features still extracted by Rust).
+        #[arg(long)]
+        synthetic: bool,
+        /// Row count for `--synthetic` (default 4000, half benign).
+        #[arg(long, default_value = "4000")]
+        rows: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]

@@ -13,12 +13,14 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};
-use crate::config::{RouteDefConfig, ScorerConfig};
+use crate::config::{EscalationConfig, RouteDefConfig, ScorerConfig};
 use crate::event::Event;
 use crate::heuristics::HeuristicEngine;
+use crate::offender::OffenderTracker;
 use crate::policy::VerdictPolicy;
 use crate::ratelimit::RateLimitBackend;
 use crate::rules::{RuleSet, SharedRuleSet};
+use crate::scan::ScanTracker;
 
 /// Route definition for the route validator.
 ///
@@ -296,6 +298,9 @@ pub struct Pipeline {
     policy: VerdictPolicy,
     repetition: Option<RwLock<RepetitionTracker>>,
     rate_limiter: Option<Arc<dyn RateLimitBackend>>,
+    offender: Option<Arc<RwLock<OffenderTracker>>>,
+    escalation: EscalationConfig,
+    scan: Option<Arc<RwLock<ScanTracker>>>,
 }
 
 /// Output of processing a single event.
@@ -345,12 +350,32 @@ impl Pipeline {
             policy,
             repetition,
             rate_limiter: None,
+            offender: None,
+            escalation: EscalationConfig::default(),
+            scan: None,
         }
     }
 
     /// Attach a rate-limit backend (enables `RuleMatch::Rate` conditions).
     pub fn with_rate_limiter(mut self, backend: Arc<dyn RateLimitBackend>) -> Self {
         self.rate_limiter = Some(backend);
+        self
+    }
+
+    /// Attach the repeat-offender tracker and its escalation policy.
+    pub fn with_offender(
+        mut self,
+        tracker: Arc<RwLock<OffenderTracker>>,
+        escalation: EscalationConfig,
+    ) -> Self {
+        self.offender = Some(tracker);
+        self.escalation = escalation;
+        self
+    }
+
+    /// Attach the behavioral scan tracker.
+    pub fn with_scan_tracker(mut self, tracker: Arc<RwLock<ScanTracker>>) -> Self {
+        self.scan = Some(tracker);
         self
     }
 
@@ -400,7 +425,7 @@ impl Pipeline {
                 return ProcessedEvent {
                     event: evt.clone(),
                     analysis: result,
-                    decision,
+                    decision: self.apply_escalation(evt, decision),
                     rule_hit: Some(rule.id.clone()),
                 };
             }
@@ -409,6 +434,12 @@ impl Pipeline {
 
         let mut signals = self.heuristics.analyze(evt);
         signals.extend(self.routes.read().unwrap().validate(evt));
+        if let Some(ref scan) = self.scan {
+            if let Some(http) = evt.http() {
+                let mut tracker = scan.write().unwrap();
+                signals.extend(tracker.record(evt.client_ip, &http.path, http.status));
+            }
+        }
 
         let bonus = if let Some(ref rep) = self.repetition {
             let mut tracker = rep.write().unwrap();
@@ -433,46 +464,100 @@ impl Pipeline {
         ProcessedEvent {
             event: evt.clone(),
             analysis,
-            decision,
+            decision: self.apply_escalation(evt, decision),
             rule_hit: None,
         }
     }
 
+    /// Record a strike for a non-Allow decision and escalate the verdict if
+    /// the strike count crosses a configured threshold. `Allow` decisions
+    /// pass through untouched (no ratchet against benign hits).
+    fn apply_escalation(&self, evt: &Event, mut decision: Decision) -> Decision {
+        if decision.action == Verdict::Allow {
+            return decision;
+        }
+        if let Some(ref offender) = self.offender {
+            let mut tracker = offender.write().unwrap();
+            let (_, escalation) =
+                tracker.record_and_escalate(evt.client_ip, decision.action, &self.escalation);
+            if let Some((verdict, reason)) = escalation {
+                decision.action = verdict;
+                decision.override_reason = Some(reason);
+            }
+        }
+        decision
+    }
+
+    /// Weight for a signal kind: config override if set, else the signal's
+    /// own weight (looked up among `signals`, since kinds may repeat).
+    fn weight_for(&self, kind: SignalKind, signals: &[Signal]) -> u8 {
+        let key = match kind {
+            SignalKind::SqlInjection => "sql_injection",
+            SignalKind::Xss => "xss",
+            SignalKind::PathTraversal => "path_traversal",
+            SignalKind::Lfi => "lfi",
+            SignalKind::Log4Shell => "log4shell",
+            SignalKind::Rce => "rce",
+            SignalKind::UnknownRoute => "unknown_route",
+            SignalKind::MethodNotAllowed => "method_not_allowed",
+            SignalKind::ScanBehavior => "scan_behavior",
+            SignalKind::RandomScan => "random_scan",
+            SignalKind::AbnormalRate => "abnormal_rate",
+            SignalKind::SuspiciousUA => "suspicious_ua",
+            SignalKind::TorExitNode => "tor_exit_node",
+            SignalKind::KnownBadIp => "known_bad_ip",
+            SignalKind::SensitivePath => "sensitive_path",
+            SignalKind::VpnProxy => "vpn_proxy",
+            SignalKind::BadCrawler => "bad_crawler",
+            SignalKind::AnomalousPayload => "anomalous_payload",
+            SignalKind::LlmMalicious => "llm_malicious",
+            SignalKind::RuleHit => "rule_hit",
+            SignalKind::Custom => "custom",
+        };
+        self.scorer.weights.get(key).copied().unwrap_or_else(|| {
+            signals
+                .iter()
+                .find(|s| s.kind == kind)
+                .map(|s| s.weight)
+                .unwrap_or(0)
+        })
+    }
+
+    /// Weight for a concrete signal: config override if set, else the
+    /// signal's own weight.
+    fn weight_for_signal(&self, s: &Signal) -> u8 {
+        let key = match s.kind {
+            SignalKind::SqlInjection => "sql_injection",
+            SignalKind::Xss => "xss",
+            SignalKind::PathTraversal => "path_traversal",
+            SignalKind::Lfi => "lfi",
+            SignalKind::Log4Shell => "log4shell",
+            SignalKind::Rce => "rce",
+            SignalKind::UnknownRoute => "unknown_route",
+            SignalKind::MethodNotAllowed => "method_not_allowed",
+            SignalKind::ScanBehavior => "scan_behavior",
+            SignalKind::RandomScan => "random_scan",
+            SignalKind::AbnormalRate => "abnormal_rate",
+            SignalKind::SuspiciousUA => "suspicious_ua",
+            SignalKind::TorExitNode => "tor_exit_node",
+            SignalKind::KnownBadIp => "known_bad_ip",
+            SignalKind::SensitivePath => "sensitive_path",
+            SignalKind::VpnProxy => "vpn_proxy",
+            SignalKind::BadCrawler => "bad_crawler",
+            SignalKind::AnomalousPayload => "anomalous_payload",
+            SignalKind::LlmMalicious => "llm_malicious",
+            SignalKind::RuleHit => "rule_hit",
+            SignalKind::Custom => "custom",
+        };
+        self.scorer.weights.get(key).copied().unwrap_or(s.weight)
+    }
+
     /// Score signals using config-defined weights + repetition bonus.
     fn score_with_weights(&self, signals: Vec<Signal>, bonus: u8) -> AnalysisResult {
-        let weight_for = |kind: SignalKind| -> u8 {
-            let key = match kind {
-                SignalKind::SqlInjection => "sql_injection",
-                SignalKind::Xss => "xss",
-                SignalKind::PathTraversal => "path_traversal",
-                SignalKind::Lfi => "lfi",
-                SignalKind::Log4Shell => "log4shell",
-                SignalKind::Rce => "rce",
-                SignalKind::UnknownRoute => "unknown_route",
-                SignalKind::MethodNotAllowed => "method_not_allowed",
-                SignalKind::ScanBehavior => "scan_behavior",
-                SignalKind::AbnormalRate => "abnormal_rate",
-                SignalKind::SuspiciousUA => "suspicious_ua",
-                SignalKind::TorExitNode => "tor_exit_node",
-                SignalKind::KnownBadIp => "known_bad_ip",
-                SignalKind::SensitivePath => "sensitive_path",
-                SignalKind::VpnProxy => "vpn_proxy",
-                SignalKind::BadCrawler => "bad_crawler",
-                SignalKind::AnomalousPayload => "anomalous_payload",
-                SignalKind::LlmMalicious => "llm_malicious",
-                SignalKind::RuleHit => "rule_hit",
-                SignalKind::Custom => "custom",
-            };
-            self.scorer.weights.get(key).copied().unwrap_or_else(|| {
-                signals
-                    .iter()
-                    .find(|s| s.kind == kind)
-                    .map(|s| s.weight)
-                    .unwrap_or(0)
-            })
-        };
-
-        let base: u8 = signals.iter().map(|s| weight_for(s.kind)).sum();
+        let base: u8 = signals
+            .iter()
+            .map(|s| self.weight_for(s.kind, &signals))
+            .sum();
         let score = base.saturating_add(bonus).min(100);
         let level = RiskLevel::from_score(score);
         let verdict = match level {
@@ -536,6 +621,74 @@ impl Pipeline {
             analysis,
             decision,
             rule_hit: None,
+        }
+    }
+
+    /// Re-score an already-processed event with extra signals merged in,
+    /// without re-running any tracker.
+    ///
+    /// This is the feedback hook for async fork stages (the ML threat
+    /// model): the extra signals are weighted with the configured scorer
+    /// weights and added on top of the base score, so the fork can only ever
+    /// *raise* the risk, never lower it. Escalation uses the IP's current
+    /// strikes without recording a new one (the hot path already recorded
+    /// a strike for this event when it earned a non-Allow verdict).
+    pub fn rescore_from(
+        &self,
+        base: &ProcessedEvent,
+        extra_signals: Vec<Signal>,
+    ) -> ProcessedEvent {
+        if extra_signals.is_empty() {
+            return base.clone();
+        }
+        let extra_weight: u8 = extra_signals
+            .iter()
+            .map(|s| self.weight_for_signal(s))
+            .sum();
+        let mut signals = base.analysis.signals.clone();
+        signals.extend(extra_signals);
+        let score = base
+            .analysis
+            .risk_score
+            .saturating_add(extra_weight)
+            .min(100);
+        let level = RiskLevel::from_score(score);
+        let verdict = match level {
+            RiskLevel::Info | RiskLevel::Low => Verdict::Allow,
+            RiskLevel::Medium => Verdict::RateLimit,
+            RiskLevel::High => Verdict::Challenge,
+            RiskLevel::Critical => Verdict::Block,
+        };
+        let analysis = AnalysisResult {
+            risk_score: score,
+            risk_level: level,
+            signals,
+            verdict,
+        };
+        let (action, override_reason) = self.policy.decide(level, &base.event);
+        let mut decision = Decision {
+            analysis: analysis.clone(),
+            action,
+            override_reason,
+        };
+        if decision.action != Verdict::Allow {
+            if let Some(ref offender) = self.offender {
+                let tracker = offender.read().unwrap();
+                if let Some((verdict, reason)) = tracker.escalate_current(
+                    base.event.client_ip,
+                    decision.action,
+                    &self.escalation,
+                ) {
+                    decision.action = verdict;
+                    decision.override_reason = Some(reason);
+                }
+            }
+        }
+        ProcessedEvent {
+            event: base.event.clone(),
+            analysis,
+            decision,
+            rule_hit: base.rule_hit.clone(),
         }
     }
 }
@@ -742,5 +895,137 @@ mod tests {
             .signals
             .iter()
             .all(|s| s.kind != SignalKind::MethodNotAllowed));
+    }
+
+    fn http_evt_status(path: &str, status: u16) -> Event {
+        Event::new(
+            SourceKind::Synthetic,
+            std::net::IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            ProtocolData::Http(HttpData {
+                path: path.to_string(),
+                status: Some(status),
+                method: Some(crate::event::HttpMethod::Get),
+                user_agent: Some("Mozilla/5.0 (X11; Linux x86_64)".into()),
+                ..Default::default()
+            }),
+        )
+    }
+
+    fn escalation_cfg() -> crate::config::EscalationConfig {
+        crate::config::EscalationConfig {
+            enabled: true,
+            window_secs: 3600,
+            challenge_at: 3,
+            block_at: 5,
+            persist: false,
+        }
+    }
+
+    #[test]
+    fn env_sweep_escalates_to_challenge_then_block() {
+        let offender = Arc::new(RwLock::new(OffenderTracker::from_config(&escalation_cfg())));
+        let p = Pipeline::new(RuleSet::default(), RouteValidator::default())
+            .with_offender(Arc::clone(&offender), escalation_cfg());
+
+        let paths = [
+            "/.env",
+            "/.env.local",
+            "/.env.production",
+            "/.env.staging",
+            "/.env.test",
+        ];
+        let verdicts: Vec<Verdict> = paths
+            .iter()
+            .map(|path| p.process(&http_evt_status(path, 404)).decision.action)
+            .collect();
+        assert_eq!(
+            &verdicts[..3],
+            &[Verdict::RateLimit, Verdict::RateLimit, Verdict::Challenge]
+        );
+        assert_eq!(&verdicts[3..], &[Verdict::Challenge, Verdict::Block]);
+    }
+
+    #[test]
+    fn allow_events_do_not_record_strikes() {
+        let offender = Arc::new(RwLock::new(OffenderTracker::from_config(&escalation_cfg())));
+        let p = Pipeline::new(RuleSet::default(), RouteValidator::default())
+            .with_offender(Arc::clone(&offender), escalation_cfg());
+
+        for _ in 0..10 {
+            let r = p.process(&http_evt_status("/api/users", 200));
+            assert_eq!(r.decision.action, Verdict::Allow);
+        }
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(offender.read().unwrap().strikes(ip), 0);
+    }
+
+    #[test]
+    fn random_scan_burst_emits_signal() {
+        let scan = Arc::new(RwLock::new(ScanTracker::new(60, 8, 1000)));
+        let p =
+            Pipeline::new(RuleSet::default(), RouteValidator::default()).with_scan_tracker(scan);
+
+        let mut last = None;
+        for i in 0..8 {
+            last = Some(p.process(&http_evt_status(&format!("/f{i}.php"), 404)));
+        }
+        let r = last.unwrap();
+        assert!(r
+            .analysis
+            .signals
+            .iter()
+            .any(|s| s.kind == SignalKind::RandomScan));
+        assert!(r.analysis.risk_score >= 33);
+        assert_eq!(r.decision.action, Verdict::RateLimit);
+    }
+
+    #[test]
+    fn successful_traffic_never_triggers_scan_signals() {
+        let scan = Arc::new(RwLock::new(ScanTracker::new(60, 2, 2)));
+        let p =
+            Pipeline::new(RuleSet::default(), RouteValidator::default()).with_scan_tracker(scan);
+        for i in 0..10 {
+            let r = p.process(&http_evt_status(&format!("/api/items/{i}"), 200));
+            assert!(r
+                .analysis
+                .signals
+                .iter()
+                .all(|s| s.kind != SignalKind::RandomScan && s.kind != SignalKind::ScanBehavior));
+        }
+    }
+
+    #[test]
+    fn rescore_from_adds_weight_and_escalates_without_new_strike() {
+        let cfg = crate::config::EscalationConfig {
+            challenge_at: 1,
+            block_at: 2,
+            ..escalation_cfg()
+        };
+        let offender = Arc::new(RwLock::new(OffenderTracker::from_config(&cfg)));
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        offender
+            .write()
+            .unwrap()
+            .seed(ip, 2, 2, std::time::Duration::ZERO);
+        let p = Pipeline::new(RuleSet::default(), RouteValidator::default())
+            .with_offender(Arc::clone(&offender), cfg);
+
+        let base = p.process(&http_evt_status("/api/users", 200));
+        assert_eq!(base.decision.action, Verdict::Allow);
+
+        let extra = vec![Signal {
+            kind: SignalKind::AnomalousPayload,
+            weight: 40,
+            detail: None,
+        }];
+        let r = p.rescore_from(&base, extra);
+        assert_eq!(r.analysis.risk_score, 48);
+        assert_eq!(r.decision.action, Verdict::Block);
+        assert!(r
+            .decision
+            .override_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("offender escalation")));
+        assert_eq!(offender.read().unwrap().strikes(ip), 2);
     }
 }

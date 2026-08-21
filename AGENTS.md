@@ -170,7 +170,7 @@ não em runtime.
   - ✅ Fixtures + snapshot tests (11 fixtures nginx, 11 snapshots insta)
   - ✅ CI GitHub Actions (fmt, clippy, test matrix 3 OS, storage com Postgres)
   - ✅ Config example completo (`[geo]`, `[[routes.known]]`, `[scorer]`)
-- **F2** (exceto IA): Cloudflare hardening + roteador parametrizado/learn/import + rate-limit + métricas
+- **F2** (exceto LLM): Cloudflare hardening + roteador parametrizado/learn/import + rate-limit + métricas + escalonamento de reincidentes + detectores de scan + IA clássica (ONNX fork)
   - ✅ F2.4 Verdict policy (`policy.rs`, `VerdictPolicy`, `PolicyConfig`,
     `[[policy.override]]` DSL) — 6 testes
   - ✅ F2.5+CF Cloudflare status/test/pull CLI + reaper (deleta regras expiradas)
@@ -191,7 +191,26 @@ não em runtime.
   - ✅ F2.11 Import OpenAPI/Swagger 2/3 + Postman v2.1 + HAR (`routes_import.rs`:
     parsers JSON/YAML, auto-detect, dedup contra DB, NOTIFY) +
     `sentry routes import <path> [--format] [--dry-run]` — 12 testes
-  - ⏸️ F2.1/F2.2 IA local (ONNX/ML/LLM) — **adiada** (decisão ML vs LLM pendente)
+  - ✅ F2.1 IA local clássica (`sentry-ai`: `features.rs` com 25 features
+    normalizadas + `onnx_model.rs` via `ort`, feature `onnx`) rodando como
+    **fork assíncrono** no daemon (`[ai]`: mode fork|inline|shadow, trigger,
+    cache por hash, semaphore); resultado entra por `Pipeline::rescore_from`
+    (só eleva o score, nunca rebaixa)
+  - ✅ F2.2 Modelo v1 + treino: `sentry model export [--synthetic]` (features
+    extraídas pelo Rust — paridade treino/inferência garantida) +
+    `tools/train_model.py` (sklearn → ONNX com `zipmap: false`) + modelo seed
+    `models/anomaly_v1.onnx` commitado; build com `--features onnx` p/ carregar
+  - ✅ F2.12 Escalonamento de reincidentes (`offender.rs`: `OffenderTracker`
+    por IP com strikes/decay; `escalate` no pipeline só eleva verdict —
+    challenge_at/block_at) + persistência em `ip_state` (migration com
+    `strikes`/`total_violations`/`last_violation_at`) + pre-warm no startup
+    (reincidente pós-TTL de CF re-bloqueia no 1º evento violador) +
+    `sentry ip forgive`; `[escalation]` em config — 8 testes
+  - ✅ F2.13 Detectores de scan (`scan.rs`: `ScanTracker` janela 4xx por IP;
+    ≥8 paths distintos → `RandomScan` peso 25; ≥10 4xx → `ScanBehavior`
+    peso 35) + fix do pack `rate_scan_404` (filtra `Status(404)` de verdade)
+    + `sentry report --unknown-paths`; `[scan]` em config — 8 testes
+  - ⏸️ F3.5 LLM (OpenRouter/Ollama) — trait `LlmProvider` pronta, sem adapters
 - **F3**: Multi-source (TCP, syslog) + LLM (OpenRouter)
 - **F4**: Dashboard web
 
@@ -204,7 +223,8 @@ Backlog detalhado em `ARCHITECTURE.md` §15.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 98 testes passando (75 core + 8 routes-import + 4 fixtures + 3 nginx + 11 snapshots — destes 8 + 4 + 3 são de integração)
+# Resultado esperado: 130 testes passando sem features; 132 com
+# --features sentry-cli/onnx (adiciona os 2 testes de inferência ONNX)
 ```
 
 ## 8. Convenões de código

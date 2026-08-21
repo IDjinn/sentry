@@ -36,6 +36,15 @@ pub struct SentryConfig {
     /// Verdict policy (decider stage).
     #[serde(default)]
     pub policy: PolicyConfig,
+    /// Repeat-offender strike escalation.
+    #[serde(default)]
+    pub escalation: EscalationConfig,
+    /// Behavioral scan detection (random-path / 404 sweeps).
+    #[serde(default)]
+    pub scan: ScanConfig,
+    /// Local ML threat model (async fork stage).
+    #[serde(default)]
+    pub ai: AiConfig,
     /// Rate-limit backend for `RuleMatch::Rate` conditions.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -247,6 +256,182 @@ fn default_policy_challenge() -> String {
 }
 fn default_policy_block() -> String {
     "block".to_string()
+}
+
+/// Repeat-offender escalation: per-IP strikes that climb the verdict ladder.
+///
+/// Every event whose final verdict is not `Allow` records one strike for the
+/// client IP. Strikes accumulate over `window_secs` (which should outlive the
+/// edge-action TTL, e.g. Cloudflare access rules) so a returning offender is
+/// re-blocked on its first violating event instead of starting from zero.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationConfig {
+    /// Enable strike-based verdict escalation.
+    #[serde(default = "default_escalation_enabled")]
+    pub enabled: bool,
+    /// Strikes expire this many seconds after the last violation.
+    #[serde(default = "default_escalation_window")]
+    pub window_secs: u64,
+    /// Strikes needed to escalate a non-Allow verdict to at least `challenge`.
+    #[serde(default = "default_escalation_challenge_at")]
+    pub challenge_at: u32,
+    /// Strikes needed to escalate a non-Allow verdict to `block`.
+    #[serde(default = "default_escalation_block_at")]
+    pub block_at: u32,
+    /// Mirror strikes to the `ip_state` table (Postgres) and pre-warm the
+    /// in-memory tracker from it on startup.
+    #[serde(default = "default_escalation_persist")]
+    pub persist: bool,
+}
+
+impl Default for EscalationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_escalation_enabled(),
+            window_secs: default_escalation_window(),
+            challenge_at: default_escalation_challenge_at(),
+            block_at: default_escalation_block_at(),
+            persist: default_escalation_persist(),
+        }
+    }
+}
+
+fn default_escalation_enabled() -> bool {
+    true
+}
+fn default_escalation_window() -> u64 {
+    604_800 // 7 days — outlives the default 24h edge-action TTL
+}
+fn default_escalation_challenge_at() -> u32 {
+    3
+}
+fn default_escalation_block_at() -> u32 {
+    5
+}
+fn default_escalation_persist() -> bool {
+    true
+}
+
+/// Behavioral scan detection over per-IP sliding windows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanConfig {
+    /// Enable the scan trackers.
+    #[serde(default = "default_scan_enabled")]
+    pub enabled: bool,
+    /// Sliding window duration in seconds.
+    #[serde(default = "default_scan_window")]
+    pub window_secs: u64,
+    /// Distinct 4xx paths per IP in the window that trigger `RandomScan`.
+    #[serde(default = "default_scan_distinct_paths")]
+    pub distinct_paths: u32,
+    /// Total 4xx responses per IP in the window that trigger `ScanBehavior`.
+    #[serde(default = "default_scan_not_found")]
+    pub not_found: u32,
+}
+
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_scan_enabled(),
+            window_secs: default_scan_window(),
+            distinct_paths: default_scan_distinct_paths(),
+            not_found: default_scan_not_found(),
+        }
+    }
+}
+
+fn default_scan_enabled() -> bool {
+    true
+}
+fn default_scan_window() -> u64 {
+    60
+}
+fn default_scan_distinct_paths() -> u32 {
+    8
+}
+fn default_scan_not_found() -> u32 {
+    10
+}
+
+/// Local ML threat model (classic ML, ONNX) running as a pipeline fork.
+///
+/// The hot path (rules → heuristics → routes → scan → score → policy →
+/// escalation) stays synchronous and fast; the model runs off to the side
+/// (`fork` mode) and only feeds back through a re-score when it finds
+/// something the deterministic detectors missed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiConfig {
+    /// Enable the ML threat-model stage.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the ONNX model file.
+    #[serde(default = "default_ai_model_path")]
+    pub model_path: PathBuf,
+    /// Anomaly probability above which an `AnomalousPayload` signal is
+    /// emitted (0.0–1.0).
+    #[serde(default = "default_ai_threshold")]
+    pub threshold: f32,
+    /// Weight of the emitted signal (also overridable via
+    /// `[scorer.weights] anomalous_payload = N`).
+    #[serde(default = "default_ai_signal_weight")]
+    pub signal_weight: u8,
+    /// Execution mode: `fork` (async, non-blocking), `inline` (blocking,
+    /// before actions dispatch) or `shadow` (log only, never re-scores).
+    #[serde(default = "default_ai_mode")]
+    pub mode: String,
+    /// When to run the model: `always`, `above_score` or `quarantine_only`.
+    #[serde(default = "default_ai_trigger")]
+    pub trigger: String,
+    /// Minimum hot-path score for `trigger = "above_score"`.
+    #[serde(default = "default_ai_min_score")]
+    pub min_score: u8,
+    /// Max concurrent model inferences (fork mode).
+    #[serde(default = "default_ai_concurrency")]
+    pub concurrency: usize,
+    /// Result cache TTL keyed by payload hash, in seconds.
+    #[serde(default = "default_ai_cache_ttl")]
+    pub cache_ttl_secs: u64,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_path: default_ai_model_path(),
+            threshold: default_ai_threshold(),
+            signal_weight: default_ai_signal_weight(),
+            mode: default_ai_mode(),
+            trigger: default_ai_trigger(),
+            min_score: default_ai_min_score(),
+            concurrency: default_ai_concurrency(),
+            cache_ttl_secs: default_ai_cache_ttl(),
+        }
+    }
+}
+
+fn default_ai_model_path() -> PathBuf {
+    PathBuf::from("models/anomaly_v1.onnx")
+}
+fn default_ai_threshold() -> f32 {
+    0.7
+}
+fn default_ai_signal_weight() -> u8 {
+    25
+}
+fn default_ai_mode() -> String {
+    "fork".to_string()
+}
+fn default_ai_trigger() -> String {
+    "above_score".to_string()
+}
+fn default_ai_min_score() -> u8 {
+    20
+}
+fn default_ai_concurrency() -> usize {
+    4
+}
+fn default_ai_cache_ttl() -> u64 {
+    300
 }
 
 /// Rate-limit backend config.

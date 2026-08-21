@@ -109,6 +109,9 @@ pub enum SignalKind {
     MethodNotAllowed,
     /// Same IP produced many 404s in a short window.
     ScanBehavior,
+    /// IP hit many distinct unknown 4xx paths in a short window
+    /// (random-filename probing like `/a1b2.php`, `/.env.local`, …).
+    RandomScan,
     /// IP exceeded the configured rate limit.
     AbnormalRate,
     /// Suspicious or absent User-Agent.

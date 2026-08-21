@@ -6,3 +6,4 @@
 .env
 sentry.toml
 config/sentry.toml
+dataset.csv

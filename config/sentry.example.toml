@@ -50,6 +50,9 @@ repetition_window_secs = 60
 # sql_injection = 35
 # xss = 30
 # path_traversal = 25
+# random_scan = 25            # RandomScan signal ([scan] distinct-path sweeps)
+# scan_behavior = 35          # ScanBehavior signal ([scan] 404 counter)
+# anomalous_payload = 25      # ONNX model signal ([ai])
 
 # ── Verdict policy ─────────────────────────────────────────────────────────
 # Override the verdict applied at each risk level. Useful to soften the
@@ -67,6 +70,49 @@ critical = "block"
 # match = 'path ^/wp-admin$ AND NOT ip=10.0.0.0/8'
 # verdict = "block"
 # reason = "wp-admin only accessible from internal network"
+
+# ── Repeat-offender escalation ─────────────────────────────────────────────
+# Every event with a non-Allow verdict records 1 strike for the client IP.
+# Strikes climb the verdict ladder (they only ever raise, never lower):
+# challenge_at strikes → at least challenge, block_at strikes → block.
+# Strikes decay window_secs after the last violation and are persisted to
+# ip_state (Postgres), so memory survives restarts and outlives edge-rule
+# TTLs — a returning offender is re-blocked on its first violating event.
+[escalation]
+enabled = true
+window_secs = 604800        # 7 days (outlives the 24h edge-action TTL)
+challenge_at = 3            # N strikes → escalate to challenge
+block_at = 5                # N strikes → escalate to block
+persist = true              # mirror strikes to ip_state + pre-warm on startup
+
+# ── Behavioral scan detection ──────────────────────────────────────────────
+# Per-IP sliding window counting only 4xx responses:
+# ≥ distinct_paths distinct 4xx paths → RandomScan signal (weight 25, fires
+# on every qualifying event — cumulative). Covers `/.env*` sweeps and
+# random-filename probing (`/a1b2.php`, …) that no route template can match.
+# ≥ not_found 4xx responses (same path or not) → ScanBehavior (weight 35).
+[scan]
+enabled = true
+window_secs = 60
+distinct_paths = 8
+not_found = 10
+
+# ── Local ML threat model (classic ML, ONNX fork) ──────────────────────────
+# Runs beside the hot path: mode = "fork" (default) evaluates asynchronously
+# and feeds signals back via rescore_from (can only raise the score),
+# "inline" blocks before actions, "shadow" logs without acting.
+# Requires building sentry-cli with --features onnx.
+# Train: `sentry model export [--synthetic]` then tools/train_model.py.
+[ai]
+enabled = false
+model_path = "models/anomaly_v1.onnx"
+threshold = 0.7             # anomaly probability that emits a signal
+signal_weight = 25          # weight of the AnomalousPayload signal
+mode = "fork"               # fork | inline | shadow
+trigger = "above_score"     # above_score | always | quarantine_only
+min_score = 20              # hot-path score gate for above_score
+concurrency = 4             # max parallel inferences (fork mode)
+cache_ttl_secs = 300        # result cache keyed by payload hash
 
 # ── Rate-limit backend ────────────────────────────────────────────────────
 # Backend for `RuleMatch::Rate` conditions. `memory` is single-node

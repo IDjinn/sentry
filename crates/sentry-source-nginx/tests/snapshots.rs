@@ -104,6 +104,7 @@ fn signal_label(k: sentry_core::SignalKind) -> &'static str {
         UnknownRoute => "unknown_route",
         MethodNotAllowed => "method_not_allowed",
         ScanBehavior => "scan_behavior",
+        RandomScan => "random_scan",
         AbnormalRate => "abnormal_rate",
         SuspiciousUA => "suspicious_ua",
         TorExitNode => "tor_exit_node",

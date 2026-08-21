@@ -89,29 +89,29 @@ flowchart TB
 
 ## 3. Stack Técnica
 
-| Camada            | Crate / Tecnologia                                  | Justificativa                                          |
-|-------------------|-----------------------------------------------------|--------------------------------------------------------|
-| Async runtime     | `tokio`                                             | Padrão de facto, multi-plataforma                      |
-| CLI               | `clap` (derive) + `ratatui` para TUI live          | Ergonomia, subcomandos, painel ao vivo                 |
-| Config            | `serde` + `toml` + `figment` (env+file merge)      | Override por env var em prod                           |
-| Logs/Tracing      | `tracing` + `tracing-subscriber`                   | Structured logging, spans por requisição               |
-| Parser nginx      | `nom` ou `regex` + `serde`                         | Linhas de log access_log custom format                 |
-| HTTP client       | `reqwest` (rustls)                                 | Cloudflare API, webhooks, geolookup                    |
-| ML/IA local       | `ort` (ONNX Runtime) + `candle` fallback           | Inferência local sem depender de API externa           |
-| LLM (opcional)    | trait `LlmProvider` + adapters: **OpenRouter** (rota p/ qualquer modelo), `async-openai`, `ollama-rs` | Análise de payload complexa sob demanda, provider-agnostic |
-| Storage           | `sqlx` com **Postgres** default (migrations sqlx), SQLite opcional via feature | Mesmo schema, troca por feature flag; Postgres suporta HA e múltiplos nós desde cedo |
-| Geolookup         | `maxminddb` (DB local)                             | Sem chamada externa por evento                         |
-| IPC/Embeddable    | `core` como lib crate (`sentry-core`)              | Futuro dashboard consome a mesma lib                    |
-| Serialização      | `serde` + `serde_json`                             | Eventos, export, API futura                            |
-| Erros             | `thiserror` (lib) + `color-eyre` (bin)             | Ergonomia + backtraces legíveis                        |
-| Testes            | `proptest` + `insta` (snapshots) + `wiremock`      | Payloads maliciosos, fixtures de log                   |
-| Build/Release     | `cargo-dist` ou `cross`                            | Binários multi-OS                                      |
+| Camada         | Crate / Tecnologia                                                                                    | Justificativa                                                                        |
+| -------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Async runtime  | `tokio`                                                                                               | Padrão de facto, multi-plataforma                                                    |
+| CLI            | `clap` (derive) + `ratatui` para TUI live                                                             | Ergonomia, subcomandos, painel ao vivo                                               |
+| Config         | `serde` + `toml` + `figment` (env+file merge)                                                         | Override por env var em prod                                                         |
+| Logs/Tracing   | `tracing` + `tracing-subscriber`                                                                      | Structured logging, spans por requisição                                             |
+| Parser nginx   | `nom` ou `regex` + `serde`                                                                            | Linhas de log access_log custom format                                               |
+| HTTP client    | `reqwest` (rustls)                                                                                    | Cloudflare API, webhooks, geolookup                                                  |
+| ML/IA local    | `ort` (ONNX Runtime) + `candle` fallback                                                              | Inferência local sem depender de API externa                                         |
+| LLM (opcional) | trait `LlmProvider` + adapters: **OpenRouter** (rota p/ qualquer modelo), `async-openai`, `ollama-rs` | Análise de payload complexa sob demanda, provider-agnostic                           |
+| Storage        | `sqlx` com **Postgres** default (migrations sqlx), SQLite opcional via feature                        | Mesmo schema, troca por feature flag; Postgres suporta HA e múltiplos nós desde cedo |
+| Geolookup      | `maxminddb` (DB local)                                                                                | Sem chamada externa por evento                                                       |
+| IPC/Embeddable | `core` como lib crate (`sentry-core`)                                                                 | Futuro dashboard consome a mesma lib                                                 |
+| Serialização   | `serde` + `serde_json`                                                                                | Eventos, export, API futura                                                          |
+| Erros          | `thiserror` (lib) + `color-eyre` (bin)                                                                | Ergonomia + backtraces legíveis                                                      |
+| Testes         | `proptest` + `insta` (snapshots) + `wiremock`                                                         | Payloads maliciosos, fixtures de log                                                 |
+| Build/Release  | `cargo-dist` ou `cross`                                                                               | Binários multi-OS                                                                    |
 
 ---
 
 ## 4. Modelo de Dados
 
-O `Event` é **modular por design**: campos comuns a qualquer origem vivem no top-level; o que é específico de protocolo fica em `ProtocolData` (enum extensível). Hoje `Http` cobre nginx; amanhã `Tcp`, `Udp`, `Tls` etc. entram sem mudar o core — basta a source popular a variante correspondente. As heurísticas e o scorer operam sobre o `Event` e fazem *pattern matching* em `protocol`, ignorando campos ausentes.
+O `Event` é **modular por design**: campos comuns a qualquer origem vivem no top-level; o que é específico de protocolo fica em `ProtocolData` (enum extensível). Hoje `Http` cobre nginx; amanhã `Tcp`, `Udp`, `Tls` etc. entram sem mudar o core — basta a source popular a variante correspondente. As heurísticas e o scorer operam sobre o `Event` e fazem _pattern matching_ em `protocol`, ignorando campos ausentes.
 
 ```rust
 // sentry-core/src/event.rs
@@ -197,20 +197,21 @@ impl Event {
 > **Regra**: nenhum estágio do pipeline pode assumir `ProtocolData::Http`. Heurísticas HTTP verificam `evt.http()` e retornam `None` para outras variantes; heurísticas TCP fazem o análogo. Assim o mesmo pipeline roda para nginx hoje e para captura TCP amanhã.
 
 pub struct AnalysisResult {
-    pub risk_score: u8,               // 0..=100
-    pub risk_level: RiskLevel,        // Info|Low|Medium|High|Critical
-    pub signals: Vec<Signal>,         // o que disparou
-    pub verdict: Verdict,             // Allow|Challenge|Block|Quarantine
+pub risk_score: u8, // 0..=100
+pub risk_level: RiskLevel, // Info|Low|Medium|High|Critical
+pub signals: Vec<Signal>, // o que disparou
+pub verdict: Verdict, // Allow|Challenge|Block|Quarantine
 }
 
 pub enum Signal {
-    PathTraversal, SqlInjection, Xss, CmdInjection,
-    UnknownRoute, ScanBehavior, AbnormalRate,
-    SuspiciousUA, TorExitNode, KnownBadIp,
-    AnomalousPayload(/* modelo */),
-    Custom(String),
+PathTraversal, SqlInjection, Xss, CmdInjection,
+UnknownRoute, ScanBehavior, AbnormalRate,
+SuspiciousUA, TorExitNode, KnownBadIp,
+AnomalousPayload(/_ modelo _/),
+Custom(String),
 }
-```
+
+````
 
 ---
 
@@ -222,51 +223,90 @@ sequenceDiagram
     participant I as Ingestor
     participant P as Pipeline
     participant H as Heurísticas
-    participant A as IA (ONNX)
-    participant R as Roteiro (rotas válidas)
+    participant R as Rotas
+    participant SC as Scan trackers
     participant S as Scorer
-    participant D as Decisor
+    participant D as Decisor (policy)
+    participant E as Escalonamento (strikes)
+    participant AI as IA (ONNX, fork)
     participant CF as Cloudflare API
-    participant DB as SQLite
+    participant DB as Postgres
 
     N->>I: linha de access_log
-    I->>I: parse + normalizar p/ Event
-    I->>P: Event
-    par fan-out paralelo
-        P->>H: regex/sigs (SQLi, XSS, LFI...)
-        P->>A: payload suspeito? embeddings
-        P->>R: path existe? método permitido?
-    end
+    I->>P: Event (dedupe + geo)
+    P->>H: regex/sigs (SQLi, XSS, LFI...)
+    P->>R: path existe? método permitido?
+    P->>SC: janela 4xx por IP
     H-->>S: signals + pesos
-    A-->>S: score anomalia
-    R-->>S: -delta se rota inválida
-    S->>S: combinar → risk_score + level
+    R-->>S: UnknownRoute / MethodNotAllowed
+    SC-->>S: RandomScan / ScanBehavior
+    S->>S: score + level (bônus de repetição)
     S->>D: AnalysisResult
-    D->>D: aplicar política (ex: High+IP novo = Challenge)
-    alt Decision == Block
-        D->>CF: firewall_rules: block IP
-        D->>DB: registrar incidente
-    else Decision == Challenge
-        D->>CF: challenge IP (JS/Turnstile)
+    D->>E: verdict não-Allow → +1 strike
+    E->>E: strikes ≥ challenge_at/block_at → eleva verdict
+    par fork assíncrono (não bloqueia o hot path)
+        D->>AI: se score ≥ ai.min_score
+        AI-->>D: AnomalousPayload → rescore_from (só eleva)
+    end
+    alt Block/Challenge/RateLimit
+        D->>CF: access rule (block/challenge)
+        D->>DB: evento + strike persistido
     else Allow
         D->>DB: métricas only
     end
-    D-->>N: (não interfere no nginx na fase 1; modo inline no futuro)
+    D-->>N: (não interfere no nginx; modo inline no futuro)
 ```
+
+### 5.1 Estágios do pipeline (ordem fixa, knobs configuráveis)
+
+O hot path é **síncrono e determinístico**; a IA roda ao lado, como fork:
+
+```
+rules (fast path) → heurísticas → rotas → scan → scorer → policy → escalation
+                                                                 └→ IA (fork/inline/shadow) → rescore_from
+```
+
+- **scan** (`[scan]`): janela deslizante por IP contando apenas respostas 4xx.
+  ≥ `distinct_paths` paths **distintos** → `RandomScan` (peso 25, acumulativo —
+  cobre sweeps de `/.env*`, `/a1b2.php`…); ≥ `not_found` respostas 4xx →
+  `ScanBehavior` (peso 35). Paths unknown **nunca** são aprendidos como rota
+  (anti-poisoning — aprender silenciaria o próprio sinal); use
+  `sentry report --unknown-paths` para promover rotas legítimas à config.
+- **escalation** (`[escalation]`): cada verdict não-Allow conta 1 strike por
+  IP. `challenge_at` strikes → eleva p/ Challenge; `block_at` → Block (só
+  eleva, nunca rebaixa; Allow não conta strike). Strikes decaem após
+  `window_secs` (default 7d — sobrevive ao TTL de edge rules de 24h) e são
+  espelhados na tabela `ip_state` (`strikes`/`total_violations`/
+  `last_violation_at`) com pre-warm no startup: reincidente pós-expiração é
+  re-bloqueado no primeiro evento violador. `sentry ip forgive <ip>` reseta.
+- **IA** (`[ai]`): modelo clássico (regressão logística sobre 25 features
+  extraídas em Rust — `sentry-ai/src/features.rs`) via ONNX (`--features
+  onnx`). `mode = "fork"` (default, assíncrono com semaphore + cache por
+  hash de payload), `inline` (bloqueante antes das actions) ou `shadow`
+  (só loga). `trigger` = `above_score|always|quarantine_only`. O resultado
+  entra por `Pipeline::rescore_from`, que **só soma** (a IA nunca reduz o
+  score). Treino: `sentry model export [--synthetic]` → CSV com as mesmas
+  features da inferência → `python tools/train_model.py` → ONNX.
 
 ---
 
 ## 6. Níveis de Risco e Vereditos
 
-| Score  | Level    | Cor       | Veredito padrão                  |
-|--------|----------|-----------|----------------------------------|
-| 0–9    | Info     | cinza     | Allow                            |
-| 10–29  | Low      | azul      | Allow + observação               |
-| 30–49  | Medium   | amarelo   | Rate-limit crescente             |
-| 50–74  | High     | laranja   | Challenge (Cloudflare)           |
-| 75–100 | Critical | vermelho  | Block IP + alerta                |
+| Score  | Level    | Cor      | Veredito padrão        |
+| ------ | -------- | -------- | ---------------------- |
+| 0–9    | Info     | cinza    | Allow                  |
+| 10–29  | Low      | azul     | Allow + observação     |
+| 30–49  | Medium   | amarelo  | Rate-limit crescente   |
+| 50–74  | High     | laranja  | Challenge (Cloudflare) |
+| 75–100 | Critical | vermelho | Block IP + alerta      |
 
 Política configurável por rota/IP-range/ASN. Ex: `/admin/*` tem threshold mais baixo.
+
+Acima da política roda o **escalonamento de reincidentes** (`[escalation]`): cada
+verdict não-Allow soma 1 strike por IP; `challenge_at` strikes elevam o verdict
+para Challenge e `block_at` para Block (defaults 3/5, janela de 7d, persistido
+em `ip_state`). Um IP que "sempre dá MED 48" é escalado após algumas repetições
+em vez de ficar para sempre 2 pontos abaixo do threshold de High.
 
 ---
 
@@ -348,7 +388,7 @@ flowchart LR
 
 ## 10. Rules Engine — Blacklist/Allowlist (WAF-style)
 
-O Sentry tem um **motor de regras determinístico** que roda **antes** das heurísticas e da IA — é o "fast path". Inspirado nas Custom Rules / WAF da Cloudflare: cada regra é um *match* + *action*, avaliada em ordem de prioridade, com **short-circuit**. Regras são a primeira linha de defesa (bloqueio instantâneo de VPNs, crawlers, ASNs, países) e também a fonte de **allowlists** (IPs/ASNs confiáveis que bypassam todo o scoring).
+O Sentry tem um **motor de regras determinístico** que roda **antes** das heurísticas e da IA — é o "fast path". Inspirado nas Custom Rules / WAF da Cloudflare: cada regra é um _match_ + _action_, avaliada em ordem de prioridade, com **short-circuit**. Regras são a primeira linha de defesa (bloqueio instantâneo de VPNs, crawlers, ASNs, países) e também a fonte de **allowlists** (IPs/ASNs confiáveis que bypassam todo o scoring).
 
 ### 10.1 Modelo
 
@@ -416,33 +456,34 @@ flowchart LR
     HEUR --> PERSIST
 ```
 
-Ordem: **Allowlist** (trust absoluto) > **Blocklist explícita** > **Reputation/VPN/Tor defaults** > **Crawler/UA defaults** > **path sensíveis** > (cai para heurísticas+IA). Allowlist é o *escape hatch* para evitar falso-positivo em IPs próprios (healthchecks, monitoring, CI).
+Ordem: **Allowlist** (trust absoluto) > **Blocklist explícita** > **Reputation/VPN/Tor defaults** > **Crawler/UA defaults** > **path sensíveis** > (cai para heurísticas+IA). Allowlist é o _escape hatch_ para evitar falso-positivo em IPs próprios (healthchecks, monitoring, CI).
 
 ### 10.3 Default Rule Packs (pré-configurados, ligar/desligar por config)
 
 Packs shipados com o Sentry, ativáveis com uma linha. Cada pack é um conjunto de regras com `tags` para fácil inspeção/edição via CLI.
 
-| Pack            | Default | O que faz                                                                     |
-|-----------------|---------|-------------------------------------------------------------------------------|
-| `vpn_proxy`     | on      | Block/Challenge IPs classificados como VPN/proxy (reputation = Vpn/Proxy)     |
-| `tor`           | on      | Block exit nodes Tor (reputation = Tor)                                        |
-| `datacenter_abuse` | on   | Challenge ASNs de datacenter fora de allowlist (DigitalOcean, OVH, Hetzner, etc. — alvos de bots) |
-| `crawlers_bad`  | on      | Block UAs de scanners/ferramentas de ataque: `sqlmap`, `nikto`, `nmap`, `masscan`, `zgrab`, `curl/8.*` suspeito, `python-requests` sem contexto |
-| `crawlers_good` | off     | **Allow** bots legítimos (Googlebot, Bingbot, etc.) — verificação via reverse-DNS conforme spec do Google |
-| `empty_ua`      | on      | Challenge/block requisições sem User-Agent (raro em tráfego legítimo)         |
-| `sensitive_paths` | on (enforce) | **Block** hits em arquivos/dirs sensíveis por default (ver §10.3.1 para lista completa) |
-| `country_blocklist` | off | Block países não atendidos (configura lista ISO)                           |
-| `country_allowlist` | off | Allow só países da lista (mais restritivo, modo opt-in)                    |
-| `http_anomaly`  | on      | Block métodos raros não usados (`TRACE`, `CONNECT`), HTTP/0.9, headers malformados |
-| `rate_scan`     | on      | Rate-limit/Block IP com >N 404 em janela (directory brute-force)             |
+| Pack                | Default      | O que faz                                                                                                                                       |
+| ------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `vpn_proxy`         | on           | Block/Challenge IPs classificados como VPN/proxy (reputation = Vpn/Proxy)                                                                       |
+| `tor`               | on           | Block exit nodes Tor (reputation = Tor)                                                                                                         |
+| `datacenter_abuse`  | on           | Challenge ASNs de datacenter fora de allowlist (DigitalOcean, OVH, Hetzner, etc. — alvos de bots)                                               |
+| `crawlers_bad`      | on           | Block UAs de scanners/ferramentas de ataque: `sqlmap`, `nikto`, `nmap`, `masscan`, `zgrab`, `curl/8.*` suspeito, `python-requests` sem contexto |
+| `crawlers_good`     | off          | **Allow** bots legítimos (Googlebot, Bingbot, etc.) — verificação via reverse-DNS conforme spec do Google                                       |
+| `empty_ua`          | on           | Challenge/block requisições sem User-Agent (raro em tráfego legítimo)                                                                           |
+| `sensitive_paths`   | on (enforce) | **Block** hits em arquivos/dirs sensíveis por default (ver §10.3.1 para lista completa)                                                         |
+| `country_blocklist` | off          | Block países não atendidos (configura lista ISO)                                                                                                |
+| `country_allowlist` | off          | Allow só países da lista (mais restritivo, modo opt-in)                                                                                         |
+| `http_anomaly`      | on           | Block métodos raros não usados (`TRACE`, `CONNECT`), HTTP/0.9, headers malformados                                                              |
+| `rate_scan`         | on           | Rate-limit/Block IP com >N 404 em janela (directory brute-force)                                                                                |
 
-**Semântica de default `on`**: packs vêm ativos mas em modo `Log` ou `Challenge` (não `Block` direto) no primeiro deploy — modo *shadow* para validar antes de endurecer. Usuário promove para `Block` após confirmar zero falso-positivo. Controlado por `mode = "shadow" | "enforce"` por pack. **Exceção**: `sensitive_paths` já vem em `enforce` por default (acesso a `.env`/`.git` é sempre malicioso).
+**Semântica de default `on`**: packs vêm ativos mas em modo `Log` ou `Challenge` (não `Block` direto) no primeiro deploy — modo _shadow_ para validar antes de endurecer. Usuário promove para `Block` após confirmar zero falso-positivo. Controlado por `mode = "shadow" | "enforce"` por pack. **Exceção**: `sensitive_paths` já vem em `enforce` por default (acesso a `.env`/`.git` é sempre malicioso).
 
 ### 10.3.1 Pack `sensitive_paths` — lista completa (default enforce)
 
 Arquivos e diretórios cujo acesso é **sempre bloqueado** por default. Cobertura dividida em categorias; cada entrada é uma regra `path regex` → `Block`. A lista é extensível via config/DB.
 
 **Credenciais & configuração:**
+
 ```
 \.env(\.local|\.production|\.development)?$      # .env, .env.local, ...
 \.env\.[a-z]+$                                    # qualquer variante .env.*
@@ -457,6 +498,7 @@ configuration\.php                                # Joomla
 ```
 
 **SCM & metadata de diretório:**
+
 ```
 /\.git/                                           # .git/, HEAD, config, index
 /\.svn/
@@ -468,6 +510,7 @@ configuration\.php                                # Joomla
 ```
 
 **Cloud & infraestrutura:**
+
 ```
 /\.aws/                                           # credentials, config
 /\.ssh/                                           # id_rsa, id_ed25519, authorized_keys
@@ -479,6 +522,7 @@ configuration\.php                                # Joomla
 ```
 
 **Arquivos de build & artefatos:**
+
 ```
 /(package-lock\.json|yarn\.lock|composer\.lock)   # opcional: info de versão p/ recon
 /(docker-compose\.yml|docker-compose\.yaml)       # expõe topologia de serviços
@@ -489,6 +533,7 @@ configuration\.php                                # Joomla
 ```
 
 **Painéis admin & ferramentas conhecidas:**
+
 ```
 /(wp-admin|wp-login\.php)                         # WordPress
 /(phpmyadmin|pma|phpMyAdmin)                      # phpMyAdmin
@@ -504,6 +549,7 @@ configuration\.php                                # Joomla
 ```
 
 **Backup & dump:**
+
 ```
 /\.(sql|bak|backup|old|swp|tmp|orig|save|copy)$
 /(dump|backup|db)\.(sql|tar|gz|zip|tgz)
@@ -511,6 +557,7 @@ configuration\.php                                # Joomla
 ```
 
 **Sistema & expostos perigosos:**
+
 ```
 /\.well-known/security\.txt$        # ALLOW (legítimo — RFC 9116) → allowlist explícita
 /\.DS_Store
@@ -520,7 +567,8 @@ configuration\.php                                # Joomla
 ```
 
 **Implementação técnica:**
-- Cada categoria é um *sub-pack* toggleável individualmente (`sentry rules packs list` mostra estado granular).
+
+- Cada categoria é um _sub-pack_ toggleável individualmente (`sentry rules packs list` mostra estado granular).
 - A allowlist interna **sempre** permite `/.well-known/security.txt` (RFC 9116 — documento público de divulgação responsável) mesmo com o pack ativo.
 - Match case-insensitive (`.ENV` == `.env`) para evitar bypass trivial.
 - Considera encodings: `%2e` (`.`), `%2f` (`/`), `..;/` (path traversal smuggling), double-encoding — normalização pré-match.
@@ -698,6 +746,7 @@ sentry cloudflare pull          # importa logs existentes
 ### 11.1 Interface interativa TUI (`ratatui`)
 
 A CLI tem **dois modos de `tail`**:
+
 - `sentry tail` (ou `sentry tail --tui`) → abre **TUI interativa fullscreen** com `ratatui` + `crossterm`. Modo default quando o terminal é TTY.
 - `sentry tail --stream` → modo **não-interativo**, uma linha por evento (JSON ou texto colorido). Ideal para pipe (`| jq`, `| grep`), logs estruturados ou redirecionamento. Ativado automaticamente quando stdin/stdout não é TTY (detecção via `std::io::IsTerminal`).
 
@@ -830,113 +879,23 @@ stateDiagram-v2
 
 ---
 
-## 15. Plano de Execução — Backlog
-
-Legenda: **F1** = Fase 1 (MVP nginx), **F2** = Cloudflare + IA local, **F3** = Multi-source + LLM, **F4** = Dashboard.
-
-### Fase 0 — Fundação
-- [x] **F0.1** Inicializar workspace Cargo + crates skeleton — `Cargo.toml:1-13` (9 crates)
-- [x] **F0.2** Definir `sentry-core`: `Event`, `RawEvent`, `Signal`, `RiskLevel`, `Decision`, erros — `event.rs`, `analysis.rs`, `error.rs`
-- [x] **F0.3** Traits `Source`, `Action`, `Registry` — `source.rs`, `action.rs`, `registry.rs`, `challenge.rs`
-- [x] **F0.4** Config loader (figment: TOML + env) — `sentry-core/src/config.rs`, `sentry-cli/src/config.rs:13-42`
-- [~] **F0.5** `tracing` setup com spans por evento — `logging.rs` init ok; **faltam spans por evento**
-- [x] **F0.6** CI: fmt, clippy (-D warnings), testes, build multi-OS — `.github/workflows/ci.yml` (lint + test matrix ubuntu/windows/macos + storage com Postgres)
-
-### Fase 1 — MVP nginx (read-only + console)
-- [x] **F1.1** `sentry-source-nginx`: tail de arquivo com `notify`/`tokio`, parse de formato custom `$var` — `source.rs` (rotação), `parser.rs` (`LogFormat::compile`)
-- [x] **F1.2** Ingestor: normalização → `Event`, dedupe, enriquecimento geo (maxminddb local) — `sentry-geo` pronto; daemon com geo enrichment + dedupe LRU TTL 10s (`daemon.rs`)
-- [x] **F1.3** `sentry-storage`: schema Postgres (events, incidents, ip_state, rules, routes) — 5 repos em `repo.rs`; migrations `init.sql` + `routes.sql`; daemon persiste (async spawn)
-- [x] **F1.4** Heurísticas: regex SQLi/XSS/LFI/RCE/path-traversal/log4shell, assinaturas — 9 detectores em `heuristics.rs` (SQLi/XSS/PathTraversal/LFI/Log4Shell/CmdInjection/SensitivePath/BadCrawler/EmptyUserAgent)
-- [x] **F1.5** Roteador de rotas: config allowlist + modo `learn` — `RouteValidator` em `pipeline.rs` com globs; `RouteValidator::from_config`; modo `learn` pendente (F2)
-- [x] **F1.5b** Rules Engine: trait `Rule`/`RuleMatch`/`RuleAction`, avaliador com short-circuit, hot-reload via Postgres LISTEN/NOTIFY, DSL parser para `match` — tipos + avaliador em `rules.rs`; DSL recursive-descent em `rules/dsl.rs` (14 testes); LISTEN/NOTIFY `sentry_rules_changed`
-- [x] **F1.5c** Pack `sensitive_paths` (enforce default): lista completa §10.3.1 com normalização de encoding + allowlist `/.well-known/security.txt` — 6 regex + allowlist em `packs.rs`; URL-decode no matcher (`rules.rs`)
-- [x] **F1.5d** Packs default: `vpn_proxy`, `tor`, `crawlers_bad`, `crawlers_good`, `empty_ua`, `http_anomaly`, `rate_scan`, `country_blocklist` em modo shadow; `sentry rules` CLI completa (list/show/add/block/allow/enable/disable/delete/packs/test)
-- [x] **F1.6** Scorer: combinar sinais → `risk_score`/`level` (pesos em config) — `from_signals` + `score_with_weights` em `pipeline.rs`; `ScorerConfig` (weights + repetition bonus + window); bônus de repetição (`RepetitionTracker`)
-- [~] **F1.7** Pipeline assíncrono: `tokio` mpsc, fan-out heurística+rota, fan-in no scorer — fan-in mpsc no daemon; `process()` é sequencial, sem fan-out
-- [x] **F1.8** CLI: `sentry`, `tail` (com cores), `incidents list/show`, `ip block/unblock/info`, `routes list`, `rules *`, `report`, `config validate/show`, `test`, `model`, `cloudflare` — handlers reais em `cmd.rs`
-- [x] **F1.9** TUI `ratatui`: standalone lê eventos recentes do Postgres, scrollável, atalhos j/k/Space/g/G/q/Esc — `tui.rs` (~250 linhas)
-- [x] **F1.10** Fixtures de logs nginx + testes de parse (`insta` snapshots) — 11 fixtures + 11 snapshots em `sentry-source-nginx/tests/`
-- [x] **F1.11** Testes de heurísticas com `proptest` (payloads maliciosos catalogados) — 6 proptests em `heuristics.rs`
-
-### Fase 2 — Cloudflare + IA local
-- [~] **F2.1** `sentry-ai`: trait `ThreatModel`, impl ONNX via `ort` — trait em `threat.rs`; feature `onnx` existe; **adiado** (decisão ML vs LLM pendente)
-- [ ] **F2.2** Treinar modelo v1 (dataset de payloads) — **adiado** (depende de F2.1)
-- [x] **F2.3** `sentry-action-cloudflare`: client API (firewall rules, challenge modes), cache de IPs, TTL — `sentry-action-cloudflare/src/lib.rs` (ChallengeProvider, cache, TTL)
-- [x] **F2.4** Decisor: política de verdict → action mapping — `policy.rs` com `VerdictPolicy`, `PolicyConfig` em `config.rs`, `[[policy.override]]` DSL; daemon wired; 6 testes
-- [x] **F2.5** `sentry cloudflare status/test/pull` — `cloudflare status` (verify token+zone, list access rules), `cloudflare test` (dry-run), `cloudflare pull` (list sentry rules); reaper task que deleta regras expiradas; idempotência de regras duplicadas; `verify()`/`list_access_rules()`/`delete_access_rule()`/`expired_keys()`/`forget()` no provider; registro local antes da req (dedup de concorrência)
-- [x] **F2.6** Rate-limiting por IP/ASN (sliding window em memória + Redis opt) — `ratelimit.rs` (`RateLimitBackend`, `InMemoryRateLimiter`), `rate_redis.rs` (`RedisRateLimiter`), `RuleMatch::Rate` wired com backend, daemon build + prune task, `[rate_limit]` em config; 7 testes
-- [x] **F2.7** Alertas: `sentry-action-webhook` (Discord/Slack/Telegram genérico) — `sentry-action-webhook/src/lib.rs` (POST JSON com contexto)
-- [x] **F2.8** Métricas: counters/histogramas Prometheus + `/metrics` HTTP server — `metrics.rs` (`prometheus` + `hyper`), `report --from/--export json|csv`, aggregations em `repo.rs` (`count_by_level_since`, `count_by_verdict_since`, `top_ips`, `top_paths`, `queries_per_hour`); `[metrics]` em config
-- [x] **F2.9** Roteador: rotas parametrizadas (`/users/{id}/posts/{post_id}`) — `template_match` com placeholders nomeados, trailing `/*`, `allows_method` + `MethodNotAllowed` signal; 7 testes em `pipeline.rs`
-- [x] **F2.10** Roteador: auto-aprendizado (modo `learn`) — `routes_learn.rs` (`RouteLearner`: shape inference, min_hits/min_ips); `RouteValidator::merge(config ∪ db)`; startup carrega rotas do DB; `routes_hot_reload` via `LISTEN/NOTIFY sentry_routes_changed`; `sentry routes learn [--dry-run] [--min-hits N] [--min-ips N]`; **learner contínuo em background** (`[route_learner]` com `enabled/interval_secs/window_secs/min_hits/min_ips`, auto-push via NOTIFY); 7 testes
-- [x] **F2.11** Roteador: import de specs OpenAPI/Swagger 2.0/3.x + Postman + HAR — `routes_import.rs` (parsers JSON/YAML, auto-detect, dedup contra DB, NOTIFY); `sentry routes import <path> [--format openapi|swagger|postman|har|auto] [--dry-run]`; 12 testes (8 unit + 4 fixtures)
-
-### Fase 3 — Multi-source + LLM
-- [ ] **F3.1** `sentry-source-http`: middleware axum que recebe cópia da req (modo sidecar/inline leve) — sem crate
-- [ ] **F3.2** `sentry-source-tcp`: captura via `pnet` (filtro por porta), reconstrução de stream HTTP quando possível — sem crate
-- [ ] **F3.3** `sentry-source-cloudflare`: pull de logs existentes (polling) — sem crate
-- [ ] **F3.4** `sentry-source-syslog`: receptor RFC 5424 (UDP/TCP) para equipamentos de rede — sem crate
-- [~] **F3.5** LLM provider trait (`ollama`/`openai`): prompt enxuto, JSON schema strict, cache de verdicts — trait `LlmProvider` em `llm.rs`; **zero adapters**
-- [ ] **F3.6** Pipeline de retreinamento: exportar incidentes confirmados → dataset → novo modelo
-- [ ] **F3.7** Reputation feeds: importar blocklists públicas (Emerging Threats, Spamhaus) periodicamente — config schema + `ReputationTier` existem; sem fetcher
-- [ ] **F3.8** Detecção de comportamento: scan, brute-force, credential stuffing (janelas deslizantes) — signal kinds existem; sem detectores. Sub-padrões a cobrir:
-  - **Random-filename scan (`.php`/`.asp`/`.jsp`/`.html` probing)**: mesmo IP hitando muitos paths curtos/aleatórios de extensão de script com 404 (`/lm13.php`, `/1aa.php`, `/aaa.php`, `/cccc.php`, `/666.php`...). Sinais: alta cardinalidade de paths distintos por IP em janela curta + baixa taxa de 200 + nomes não-parametrizáveis (sem segmento dinâmico conhecido, fora da árvore de rotas). Distinto de F2.9/F2.10 (rotas parametrizadas/aprendidas) pois aqui o path é literalmente arbitrário — nenhum template se aplica. Heurística candidata: `RandomScan` em `heuristics.rs` com janela deslizante por IP (e.g. ≥8 paths distintos de extensão web em ≤60s, todos 4xx, e entropia/normalização do basename acima de threshold) → sinal acumulativo + bônus de repetição; ajustar peso em `§16` (sugerido 25, acumula sim). Caso real de referência: `20.199.183.210` varrendo 25+ arquivos `.php` aleatórios, todos `404 [UnknownRoute]`, sem UA suspeito — hoje classificado apenas `LOW` por `Rota inexistente` (peso 8).
-  - **404-scan genérico** (qualquer extensão/path, sem payload malicioso): contador deslizante de 404 por IP, threshold separado do `rate_scan` pack (hoje `rate_scan` é só burst de reqs, não discrimina 4xx).
-  - **Brute-force de auth** (401/403 concentrados em poucas rotas): janela deslizante por IP+rota, taxa de 401/403 acima de N.
-  - **Credential stuffing** (rotas de login com variação alta de payloads + user-agents rotativos): janela por IP+rota + distinct-UAs.
-  - **Directory brute-force** (`/admin`, `/wp-admin`, `/backup`, `/db.sql`, wordlists comuns): integrar com reputation/wordlist `tools/wordlists` (F3.x) — distinguir de scanner legítimo por `crawlers_good` + taxa de 200.
-- [ ] **F3.9** Modos de posicionamento do Sentry na borda — duas topologias suportadas, configuráveis via `[deployment] mode = "..."`:
-  - **Inline / edge (ativo)**: Sentry na borda, **antes** das regras do nginx/upstream (reverse proxy/TCP listener). Bloqueia/contesta antes do app receber. Sub-variantes:
-    - `edge-http` (F3.9a): reverse proxy HTTP(S) na porta `:80`/`:443` (ou outra via `listen`), termina TLS ou repassa, aplica verdict antes de fazer `proxy_pass` para o backend. Concorrente com F3.1 (axum middleware) e F3.9 proxy — unificar num `sentry-edge` crate. Em modo ativo, `Action::Block` descarta a conn/retorna 403/444; `Challenge` retorna challenge JS; `RateLimit` aplica `429`.
-    - `edge-tcp` (F3.9b): listener TCP em portas comuns arbitrárias (`:22`, `:3306`, `:6379`, `:5432`...) para serviços expostos sem HTTP — heurísticas específicas por protocolo (banner-grab, auth brute-force). Reusa `sentry-source-tcp` (F3.2) em modo inline.
-    - `edge-sidecar` (F3.9c): sidecar/envoy filter/WASM — modo inline leve sem assumir porta pública; útil em k8s (daemonset por node) — ver F4 deploy.
-    - Posicionamento "antes do nginx" exigirá documentar ordem de chain: `client → sentry-edge → nginx → app` e que regras de rate-limit/WAF do nginx **não** substituem o Sentry (Sentry atua na camada de decisão de ameaça; nginx mantém suas regras de app).
-  - **Passive / out-of-band (read-only)**: modo atual (F1), sem inline. Ouve tráfego sem interceptar — três fontes passivas possíveis:
-    - `passive-log` (F3.9d): tail de access.log (já feito por `sentry-source-nginx`, F1.1) — zero risco, mas só detecta **depois** do app responder (404 já foi servido). Apenas alerta/blocklist futura.
-    - `passive-mirror` (F3.9e): porta espelho (switch SPAN / `iptables TEE` / `mirror` em Cilium/eBPF) → Sentry escuta cópia read-only do tráfego sem ser path ativo. Detecta em tempo real mas só age **ex-post** (webhook, Cloudflare API, blocklist downstream).
-    - `passive-tap` (F3.9f): sniffing promíscuo via `pnet`/`libpcap` (sem IP na interface) — útil em appliances de rede; variantes de `sentry-source-tcp` (F3.2) em modo tap.
-  - **Critério de escolha** (documentar em `docs/DEPLOY.md`): inline se o serviço não tolera ataque reaching o app (RCE/0-day risk); passive se a infra não permite mudar path/SSL ou se o objetivo é só observabilidade. **Default = passive** (mantém paridade com F1; inline exige opt-in explícito + health-check do backend).
-  - **Métrica chave de comparação**: tempo entre request chegar e verdict aplicado — inline alvo ≤50ms; passive é pós-resposta (apenas para o próximo request do mesmo IP).
-
-### Fase 4 — Operação & Dashboard
-- [ ] **F4.1** Modo serviço: integração systemd unit / Windows Service / launchd plist
-- [ ] **F4.2** Backend HTTP minimalista (axum) expondo JSON sobre a lib `sentry-core`
-- [ ] **F4.3** Dashboard web (Tauri ou SPA) consumindo o backend
-- [ ] **F4.4** Auth + RBAC para dashboard
-- [ ] **F4.5** Alertas bidirecionais (ack/resolve no dashboard)
-- [ ] **F4.6** Export SIEM (CEF/LEEF, syslog forward)
-- [ ] **F4.7** Alta disponibilidade: estado em Redis/Postgres compartilhado
-
-### Cross-cutting (contínuo)
-- [ ] **X.1** Documentação de plugin (`docs/PLUGIN_DEV.md`) — sem `docs/`
-- [ ] **X.2** Catálogo de threat models (`docs/THREAT_MODELS.md`) — sem `docs/`
-- [ ] **X.3** Benchmarks de throughput (criterion) — meta: 10k req/s parsed
-- [~] **X.4** Hardening: segredos via env/secret manager, nunca em config commitada — env vars ok; sem secret manager
-- [ ] **X.5** Release automation: `cargo-dist` ou `cross` → GitHub Releases multi-OS
-- [ ] **X.6** Telemetria opt-in de uso (não de dados) para guiar roadmap
-
-> **Legenda**: `[x]` = feito · `[~]` = parcial (ver nota) · `[ ]` = pendente
-> **Devs notáveis**: storage é Postgres (não SQLite); `sentry-auto` não tem crate (só CLI stub); 9 packs default implementados; DSL de `match` completo (recursive-descent, 14 testes); TUI ratatui standalone lê do Postgres; 57 testes (53 core + 3 nginx + 1 snapshot); CI GitHub Actions (fmt/clippy/test 3 OS + storage).
-
----
-
 ## 16. Modelo de Risco — Pesos Iniciais (referência)
 
-| Sinal                         | Peso | Acumula? |
-|-------------------------------|------|----------|
-| SQLi (regex)                  | 60   | não      |
-| XSS (regex)                   | 45   | não      |
-| Path traversal (`../`, `%2e`) | 40   | sim      |
-| Log4Shell (`${jndi:`)         | 80   | não      |
-| RCE/cmd injection             | 70   | não      |
-| Rota inexistente              | 8    | sim      |
-| >10 404/IP em 60s             | 35   | —        |
-| User-agent vazio/suspeito     | 10   | sim      |
-| Random-filename scan (`.php` probing, janela 60s) | 25 | sim |  *(F3.8 — pendente)*
-| Tor exit node                 | 15   | —        |
-| IP em reputation feed         | 50   | —        |
-| Anomalia ONNX > 0.8           | 50   | não      |
-| Acesso a path sensível        | 30   | sim      |
+| Sinal                                             | Peso | Acumula? |                        |
+| ------------------------------------------------- | ---- | -------- | ---------------------- |
+| SQLi (regex)                                      | 60   | não      |                        |
+| XSS (regex)                                       | 45   | não      |                        |
+| Path traversal (`../`, `%2e`)                     | 40   | sim      |                        |
+| Log4Shell (`${jndi:`)                             | 80   | não      |                        |
+| RCE/cmd injection                                 | 70   | não      |                        |
+| Rota inexistente                                  | 8    | sim      |                        |
+| >10 404/IP em 60s (`ScanBehavior`, `[scan]`)      | 35   | sim      |                        |
+| User-agent vazio/suspeito                         | 10   | sim      |                        |
+| Random-filename scan (`RandomScan`, `[scan]`)     | 25   | sim      | ≥8 paths 4xx distintos/IP em 60s |
+| Tor exit node                                     | 15   | —        |                        |
+| IP em reputation feed                             | 50   | —        |                        |
+| Anomalia ONNX (`AnomalousPayload`, `[ai]`)        | 25   | não      | threshold default 0.70; peso via `[scorer.weights] anomalous_payload` |
+| Acesso a path sensível                            | 30   | sim      |                        |
 
 Pesos combinam (soma com cap 100), com bônus para repetição em janela. **Tudo ajustável em config.**
 
@@ -1033,18 +992,18 @@ flowchart TB
 
 Cada perfil é um "preset" que conhece a estrutura do framework e gera regras específicas. Perfis são **plugins** (`sentry-profile-*`) que registram um detector e um gerador de regras.
 
-| Framework       | Detecção (sinais)                              | Regras geradas                                                            |
-|-----------------|------------------------------------------------|---------------------------------------------------------------------------|
-| **WordPress**   | `wp-config.php`, `wp-login.php`, `wp-admin/`   | Block `wp-login.php` brute-force rate-limit, allowlist `/wp-admin/admin-ajax.php`, protect `wp-content/uploads`, block `xmlrpc.php` abuse |
-| **Laravel**     | `artisan`, `composer.json` com `laravel/framework` | Protect `/.env`, block `storage/logs`, allowlist `/storage/app/public`, rate-limit `/login` |
-| **Next.js**     | `next.config.js`, `package.json` com `next`    | Allowlist `/_next/static/*` (CDN assets), protect `/api/admin/*`, block `/.next/` |
-| **Django**      | `manage.py`, `wsgi.py`, `settings.py`         | Protect `settings.py`, block `admin/` brute-force, allowlist `/static/` |
-| **Flask**       | `requirements.txt` com `flask`, `app.py`       | Detect rotas via `@app.route` (AST scan), proteger `/.env` |
-| **Rails**       | `Gemfile` com `rails`, `config/routes.rb`     | Parse `routes.rb` para rotas válidas, protect `/admin/*` |
-| **Express**     | `package.json` com `express`                   | Detect rotas via AST de `app.js`/`routes/` |
-| **ASP.NET**     | `*.csproj` com `Microsoft.AspNetCore`          | Protect `web.config`, allowlist `/wwwroot/*` |
-| **Nginx conf**  | `nginx.conf` ou `sites-enabled/*`              | Parse `location` blocks → rotas conhecidas exatas |
-| **Docker**      | `docker-compose.yml`, `Dockerfile`             | Detect portas expostas, serviços internos, gerar monitor de cada porta |
+| Framework      | Detecção (sinais)                                  | Regras geradas                                                                                                                            |
+| -------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| **WordPress**  | `wp-config.php`, `wp-login.php`, `wp-admin/`       | Block `wp-login.php` brute-force rate-limit, allowlist `/wp-admin/admin-ajax.php`, protect `wp-content/uploads`, block `xmlrpc.php` abuse |
+| **Laravel**    | `artisan`, `composer.json` com `laravel/framework` | Protect `/.env`, block `storage/logs`, allowlist `/storage/app/public`, rate-limit `/login`                                               |
+| **Next.js**    | `next.config.js`, `package.json` com `next`        | Allowlist `/_next/static/*` (CDN assets), protect `/api/admin/*`, block `/.next/`                                                         |
+| **Django**     | `manage.py`, `wsgi.py`, `settings.py`              | Protect `settings.py`, block `admin/` brute-force, allowlist `/static/`                                                                   |
+| **Flask**      | `requirements.txt` com `flask`, `app.py`           | Detect rotas via `@app.route` (AST scan), proteger `/.env`                                                                                |
+| **Rails**      | `Gemfile` com `rails`, `config/routes.rb`          | Parse `routes.rb` para rotas válidas, protect `/admin/*`                                                                                  |
+| **Express**    | `package.json` com `express`                       | Detect rotas via AST de `app.js`/`routes/`                                                                                                |
+| **ASP.NET**    | `*.csproj` com `Microsoft.AspNetCore`              | Protect `web.config`, allowlist `/wwwroot/*`                                                                                              |
+| **Nginx conf** | `nginx.conf` ou `sites-enabled/*`                  | Parse `location` blocks → rotas conhecidas exatas                                                                                         |
+| **Docker**     | `docker-compose.yml`, `Dockerfile`                 | Detect portas expostas, serviços internos, gerar monitor de cada porta                                                                    |
 
 ### 20.3 Detecção (Scanner)
 
@@ -1126,13 +1085,13 @@ crates/
 
 Para frameworks onde as rotas estão no código (Rails, Django, Express, Flask), o `--deep` faz **AST parsing** com `syn` (Rust não — preciso de parsers específicos):
 
-| Framework  | Arquivo              | Parser                          |
-|------------|----------------------|---------------------------------|
-| Rails      | `config/routes.rb`   | `tree-sitter-ruby`              |
-| Django    | `urls.py`            | `tree-sitter-python`            |
-| Express   | `routes/*.js`        | `tree-sitter-javascript`        |
-| Flask     | `app.py`             | `tree-sitter-python`            |
-| Laravel   | `routes/web.php`     | `tree-sitter-php`               |
+| Framework | Arquivo            | Parser                   |
+| --------- | ------------------ | ------------------------ |
+| Rails     | `config/routes.rb` | `tree-sitter-ruby`       |
+| Django    | `urls.py`          | `tree-sitter-python`     |
+| Express   | `routes/*.js`      | `tree-sitter-javascript` |
+| Flask     | `app.py`           | `tree-sitter-python`     |
+| Laravel   | `routes/web.php`   | `tree-sitter-php`        |
 
 `tree-sitter` é a escolha: parsers incrementais rápidos, multi-linguagem, uma única crate `tree-sitter` com bindings. Extrair `@app.route("/foo")` ou `get "/bar"` → `RouteDef { path: "/foo", methods: ["GET"] }`.
 

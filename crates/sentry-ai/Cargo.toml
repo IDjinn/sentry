@@ -22,4 +22,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["download-binaries"], optional = true }
+# `tls-rustls` is required with ureq 3.x in the graph: ort-sys's
+# download-binaries build script uses ureq's TLS module, which is
+# feature-gated off unless a TLS feature is enabled.
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-rustls"], optional = true }

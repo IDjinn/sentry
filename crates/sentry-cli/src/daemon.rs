@@ -14,6 +14,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "onnx")]
+use sentry_ai::ThreatModel;
 use sentry_core::challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
 use sentry_core::config::{ActionKind, SentryConfig};
 use sentry_core::event::Event;
@@ -169,21 +171,106 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     // Build the pipeline with config-driven scorer + verdict policy.
     let policy = sentry_core::VerdictPolicy::from_config(&cfg.policy)
         .map_err(|e| color_eyre::eyre::eyre!("invalid [policy] config: {e}"))?;
-    let pipeline = Arc::new(
-        Pipeline::with_config(
-            Arc::clone(&shared_rules),
-            route_validator,
-            cfg.scorer.clone(),
-            policy,
-        )
-        .with_rate_limiter(build_rate_limiter(&cfg)?),
-    );
+
+    // Behavioral scan tracker (per-IP 4xx windows → RandomScan/ScanBehavior).
+    let scan_tracker = cfg.scan.enabled.then(|| {
+        Arc::new(std::sync::RwLock::new(
+            sentry_core::scan::ScanTracker::from_config(&cfg.scan),
+        ))
+    });
+
+    // Repeat-offender memory (strikes → verdict escalation ladder).
+    let offender_tracker = cfg.escalation.enabled.then(|| {
+        Arc::new(std::sync::RwLock::new(
+            sentry_core::offender::OffenderTracker::from_config(&cfg.escalation),
+        ))
+    });
+
+    let mut pipeline_builder = Pipeline::with_config(
+        Arc::clone(&shared_rules),
+        route_validator,
+        cfg.scorer.clone(),
+        policy,
+    )
+    .with_rate_limiter(build_rate_limiter(&cfg)?);
+    if let Some(ref t) = scan_tracker {
+        pipeline_builder = pipeline_builder.with_scan_tracker(Arc::clone(t));
+    }
+    if let Some(ref t) = offender_tracker {
+        pipeline_builder = pipeline_builder.with_offender(Arc::clone(t), cfg.escalation.clone());
+    }
+    let pipeline = Arc::new(pipeline_builder);
     info!(
         weights = cfg.scorer.weights.len(),
         repetition_bonus = cfg.scorer.repetition_bonus,
         rate_backend = cfg.rate_limit.backend.as_str(),
+        scan_detection = cfg.scan.enabled,
+        escalation = cfg.escalation.enabled,
         "pipeline built"
     );
+
+    // Pre-warm the offender memory from persisted strikes so repeat offenders
+    // are escalated immediately after a restart (and after edge-rule TTLs).
+    if let (Some(ref tracker), Some(ref repo)) = (&offender_tracker, &repo) {
+        if cfg.escalation.persist {
+            match repo
+                .ip_state()
+                .recent_offenders(cfg.escalation.window_secs, 10_000)
+                .await
+            {
+                Ok(rows) => {
+                    let now = chrono::Utc::now();
+                    let seeded = rows
+                        .iter()
+                        .filter(|r| {
+                            let Some(last) = r.last_violation_at else {
+                                return false;
+                            };
+                            let Ok(elapsed) = (now - last).to_std() else {
+                                return false;
+                            };
+                            let Ok(ip) = r.ip.parse::<IpAddr>() else {
+                                return false;
+                            };
+                            tracker.write().unwrap().seed(
+                                ip,
+                                r.strikes.max(0) as u32,
+                                r.total_violations.max(0) as u64,
+                                elapsed,
+                            );
+                            true
+                        })
+                        .count();
+                    info!(offenders = seeded, "offender memory pre-warmed from db");
+                }
+                Err(e) => warn!(error = %e, "failed to pre-warm offender memory"),
+            }
+        }
+    }
+
+    // Prune the offender/scan windows periodically.
+    if let Some(ref t) = offender_tracker {
+        let t = Arc::clone(t);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                t.write().unwrap().prune();
+            }
+        });
+    }
+    if let Some(ref t) = scan_tracker {
+        let t = Arc::clone(t);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                t.write().unwrap().prune();
+            }
+        });
+    }
 
     // Start the routes LISTEN/NOTIFY hot-reload task (only with storage).
     if let Some(ref repo) = repo {
@@ -206,6 +293,18 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
 
     // Build the plugin registry from config.
     let (registry, cf_provider) = build_registry(&cfg)?;
+
+    // Local ML threat model: runs as a fork off the hot path (or inline /
+    // shadow, per [ai] config) and feeds signals back via rescore_from.
+    let ai_fork = build_ai_fork(&cfg);
+    if let Some(ref ai) = ai_fork {
+        info!(
+            model = ai.model.name(),
+            mode = ai.mode.as_str(),
+            trigger = ai.trigger.as_str(),
+            "ai threat model loaded"
+        );
+    }
 
     if registry.source_count() == 0 {
         warn!("no sources configured — daemon will idle. Add [[source]] entries in sentry.toml");
@@ -283,8 +382,29 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         }
 
         let start = Instant::now();
-        let result = pipeline.process(&evt);
+        let mut result = pipeline.process(&evt);
         let duration = start.elapsed();
+
+        // Inline AI mode: block before persistence/actions so the stored
+        // verdict and the dispatched actions already include the model's say.
+        if let Some(ref ai) = ai_fork {
+            if ai.is_inline() && ai.should_run(&result) {
+                let signals = ai.evaluate(&result.event).await;
+                if !signals.is_empty() {
+                    let updated = pipeline.rescore_from(&result, signals);
+                    if updated.decision.action != result.decision.action {
+                        info!(
+                            ip = %evt.client_ip,
+                            from = ?result.decision.action,
+                            to = ?updated.decision.action,
+                            score = updated.analysis.risk_score,
+                            "ai (inline) changed verdict"
+                        );
+                    }
+                    result = updated;
+                }
+            }
+        }
 
         print_event(
             &result.event,
@@ -332,6 +452,49 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
 
         metrics.record_event(result.decision.action, result.analysis.risk_level, duration);
 
+        // Fork AI mode: evaluate off the hot path; a changed verdict updates
+        // the persisted event and re-dispatches actions.
+        if let Some(ref ai) = ai_fork {
+            if !ai.is_inline() && ai.should_run(&result) {
+                ai.spawn_fork(
+                    result.clone(),
+                    Arc::clone(&pipeline),
+                    registry.clone(),
+                    repo.clone(),
+                );
+            }
+        }
+
+        // Mirror offender strikes to Postgres and log escalations.
+        if result.decision.action != sentry_core::Verdict::Allow {
+            if let Some(ref offender) = offender_tracker {
+                let strikes = offender.read().unwrap().strikes(evt.client_ip);
+                if let (Some(ref repo), true) = (&repo, cfg.escalation.persist) {
+                    let repo = Arc::clone(repo);
+                    let ip = evt.client_ip;
+                    let window = cfg.escalation.window_secs;
+                    tokio::spawn(async move {
+                        if let Err(e) = repo.ip_state().record_violation(ip, window).await {
+                            warn!(error = %e, "failed to persist offender strike");
+                        }
+                    });
+                }
+                if result
+                    .decision
+                    .override_reason
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("offender escalation"))
+                {
+                    info!(
+                        ip = %evt.client_ip,
+                        strikes,
+                        verdict = ?result.decision.action,
+                        "verdict escalated (repeat offender)"
+                    );
+                }
+            }
+        }
+
         processed_count += 1;
         if result.decision.action != sentry_core::Verdict::Allow {
             blocked_count += 1;
@@ -362,6 +525,183 @@ fn verdict_str(v: sentry_core::Verdict) -> &'static str {
         sentry_core::Verdict::Challenge => "challenge",
         sentry_core::Verdict::Block => "block",
         sentry_core::Verdict::Quarantine => "quarantine",
+    }
+}
+
+/// Cached model verdict keyed by payload hash: (inserted_at, signals).
+type AiCache = Arc<std::sync::RwLock<HashMap<u64, (Instant, Vec<sentry_core::Signal>)>>>;
+
+/// Local ML threat model running beside the hot path.
+///
+/// The hot path (rules → heuristics → routes → scan → score → policy →
+/// escalation) stays synchronous; the model runs off to the side and only
+/// feeds back through [`Pipeline::rescore_from`], which can raise (never
+/// lower) the risk score. Modes:
+///
+/// - `fork` (default): async, non-blocking, bounded by a semaphore;
+/// - `inline`: awaited before persistence/actions;
+/// - `shadow`: evaluates and logs, never acts.
+struct AiFork {
+    model: Arc<dyn sentry_ai::ThreatModel>,
+    mode: String,
+    trigger: String,
+    min_score: u8,
+    cache_ttl: Duration,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    cache: AiCache,
+}
+
+impl AiFork {
+    fn is_inline(&self) -> bool {
+        self.mode == "inline"
+    }
+
+    /// Whether the hot-path result should be evaluated by the model.
+    fn should_run(&self, r: &sentry_core::ProcessedEvent) -> bool {
+        match self.trigger.as_str() {
+            "always" => true,
+            "quarantine_only" => r.decision.action == sentry_core::Verdict::Quarantine,
+            // "above_score" (default)
+            _ => r.analysis.risk_score >= self.min_score,
+        }
+    }
+
+    fn payload_hash(evt: &Event) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        evt.client_ip.hash(&mut hasher);
+        if let Some(http) = evt.http() {
+            http.path.hash(&mut hasher);
+            http.query.hash(&mut hasher);
+            http.user_agent.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Evaluate the model with a TTL cache keyed by payload hash.
+    async fn evaluate(&self, evt: &Event) -> Vec<sentry_core::Signal> {
+        let key = Self::payload_hash(evt);
+        if let Some((ts, cached)) = self.cache.read().unwrap().get(&key) {
+            if ts.elapsed() < self.cache_ttl {
+                return cached.clone();
+            }
+        }
+        let _permit = self.semaphore.acquire().await;
+        match self.model.analyze(evt).await {
+            Ok(signals) => {
+                let mut cache = self.cache.write().unwrap();
+                cache.retain(|_, (ts, _)| ts.elapsed() < self.cache_ttl);
+                cache.insert(key, (Instant::now(), signals.clone()));
+                signals
+            }
+            Err(e) => {
+                warn!(error = %e, "ai threat model inference failed");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Spawn the fork evaluation for a processed event.
+    fn spawn_fork(
+        self: &Arc<Self>,
+        base: sentry_core::ProcessedEvent,
+        pipeline: Arc<Pipeline>,
+        registry: sentry_core::registry::Registry,
+        repo: Option<Arc<sentry_storage::Repo>>,
+    ) {
+        let fork = Arc::clone(self);
+        tokio::spawn(async move {
+            let signals = fork.evaluate(&base.event).await;
+            if signals.is_empty() {
+                return;
+            }
+            let updated = pipeline.rescore_from(&base, signals);
+            if updated.decision.action == base.decision.action {
+                return;
+            }
+            let ip = base.event.client_ip;
+            if fork.mode == "shadow" {
+                info!(
+                    ip = %ip,
+                    would = ?updated.decision.action,
+                    score = updated.analysis.risk_score,
+                    "ai (shadow) would change verdict"
+                );
+                return;
+            }
+            info!(
+                ip = %ip,
+                from = ?base.decision.action,
+                to = ?updated.decision.action,
+                score = updated.analysis.risk_score,
+                "ai fork changed verdict"
+            );
+            if let Some(ref repo) = repo {
+                if let Err(e) = repo
+                    .events()
+                    .update_verdict(
+                        base.event.id,
+                        updated.decision.action,
+                        updated.analysis.risk_score,
+                        updated.analysis.risk_level,
+                    )
+                    .await
+                {
+                    warn!(error = %e, "ai fork: failed to update event verdict");
+                }
+            }
+            for action in registry.actions() {
+                if action.applies_to(&updated.decision) {
+                    if let Err(e) = action.execute(&updated.event, &updated.decision).await {
+                        warn!(action = action.name(), error = %e, "ai fork action failed");
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Build the AI fork from config when `[ai] enabled = true`.
+fn build_ai_fork(cfg: &SentryConfig) -> Option<Arc<AiFork>> {
+    if !cfg.ai.enabled {
+        return None;
+    }
+    #[cfg(feature = "onnx")]
+    {
+        let model = match sentry_ai::onnx_model::OnnxThreatModel::load(
+            &cfg.ai.model_path,
+            sentry_ai::onnx_model::OnnxThreatModelConfig {
+                threshold: cfg.ai.threshold,
+                signal_weight: cfg.ai.signal_weight,
+            },
+        ) {
+            Ok(m) => {
+                info!(model = m.name(), describe = %m.describe(), "onnx model loaded");
+                Arc::new(m) as Arc<dyn sentry_ai::ThreatModel>
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    path = %cfg.ai.model_path.display(),
+                    "failed to load ai model — ai stage disabled for this run"
+                );
+                return None;
+            }
+        };
+        Some(Arc::new(AiFork {
+            model,
+            mode: cfg.ai.mode.clone(),
+            trigger: cfg.ai.trigger.clone(),
+            min_score: cfg.ai.min_score,
+            cache_ttl: Duration::from_secs(cfg.ai.cache_ttl_secs),
+            semaphore: Arc::new(tokio::sync::Semaphore::new(cfg.ai.concurrency.max(1))),
+            cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        }))
+    }
+    #[cfg(not(feature = "onnx"))]
+    {
+        warn!("ai.enabled = true but sentry-cli was built without --features onnx — ai stage disabled");
+        None
     }
 }
 
