@@ -703,9 +703,12 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
             CloudflareCmd::Status => {
                 let provider = build_cf_provider()?;
                 match provider.verify().await {
-                    Ok((valid, zone_name)) => {
-                        println!("Cloudflare token: valid({valid})");
-                        println!("Cloudflare zone:  {zone_name}");
+                    Ok(info) => {
+                        println!("Cloudflare token: valid({})", info.token_valid);
+                        println!("Cloudflare zone:  {}", info.zone);
+                        if let Some(acct) = &info.account_id {
+                            println!("Cloudflare account: {acct}");
+                        }
                         match provider.list_access_rules().await {
                             Ok(rules) => {
                                 let ours = rules
@@ -718,6 +721,16 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                             }
                             Err(e) => println!("Access rules:     list failed: {e}"),
                         }
+                        if provider.list_mode_enabled() {
+                            match provider.list_summary().await {
+                                Some((name, count)) => {
+                                    println!("IP List {name}: {count} items");
+                                }
+                                None => println!(
+                                    "IP List:          unreachable (account/list permissions?)"
+                                ),
+                            }
+                        }
                     }
                     Err(e) => println!("Cloudflare verify failed: {e}"),
                 }
@@ -726,9 +739,12 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 let provider = build_cf_provider()?;
                 println!("Verifying token + zone (no changes will be made)…");
                 match provider.verify().await {
-                    Ok((valid, zone_name)) => {
-                        println!("Token valid: {valid}");
-                        println!("Zone:        {zone_name}");
+                    Ok(info) => {
+                        println!("Token valid: {}", info.token_valid);
+                        println!("Zone:        {}", info.zone);
+                        if let Some(acct) = &info.account_id {
+                            println!("Account:     {acct}");
+                        }
                         match provider.list_access_rules().await {
                             Ok(rules) => {
                                 println!("Sample access rules (up to 5):");
@@ -809,12 +825,21 @@ async fn connect_storage(cfg: &SentryConfig) -> color_eyre::Result<sentry_storag
     Ok(sentry_storage::Repo::new(pool))
 }
 
-/// Build a Cloudflare provider from env vars (`SENTRY_CF_TOKEN`, `SENTRY_CF_ZONE`).
+/// Build a Cloudflare provider from env vars (`SENTRY_CF_TOKEN`,
+/// `SENTRY_CF_ZONE`; optionally `SENTRY_CF_ACCOUNT` and
+/// `SENTRY_CF_IPV6_PREFIX` for the IP List mode).
 fn build_cf_provider() -> color_eyre::Result<sentry_action_cloudflare::CloudflareProvider> {
     let token = std::env::var("SENTRY_CF_TOKEN")
         .map_err(|_| color_eyre::eyre::eyre!("SENTRY_CF_TOKEN env var not set"))?;
     let zone = std::env::var("SENTRY_CF_ZONE")
         .map_err(|_| color_eyre::eyre::eyre!("SENTRY_CF_ZONE env var not set"))?;
+    let ipv6_prefix = std::env::var("SENTRY_CF_IPV6_PREFIX")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .filter(|p| (1..128).contains(p));
+    let account = std::env::var("SENTRY_CF_ACCOUNT")
+        .ok()
+        .filter(|s| !s.is_empty());
     Ok(sentry_action_cloudflare::CloudflareProvider::new(
         sentry_action_cloudflare::CloudflareProviderConfig {
             token,
@@ -822,6 +847,9 @@ fn build_cf_provider() -> color_eyre::Result<sentry_action_cloudflare::Cloudflar
             default_mode: sentry_core::challenge::EdgeMode::ManagedChallenge,
             ttl: std::time::Duration::from_secs(86400),
             max_failures: 3,
+            ipv6_prefix,
+            list_name: "sentry_blocks".to_string(),
+            account,
         },
     ))
 }

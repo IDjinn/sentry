@@ -357,10 +357,19 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             adopted = report.adopted,
             restamped = report.restamped,
             deleted = report.deleted,
+            list_items = report.list_items,
+            list_adopted = report.list_adopted,
+            list_deleted = report.list_deleted,
+            lists_disabled = report.lists_disabled,
             "cloudflare startup reconcile"
         );
         if cf.is_disabled() {
             warn!("cloudflare action disabled — no edge rules will be applied until restart");
+        }
+        if report.lists_disabled {
+            warn!(
+                "cloudflare ipv6 prefix list mode disabled — ipv6 blocks fall back to exact-address access rules (needs Account Filter Lists + Zone Rulesets token permissions)"
+            );
         }
     }
 
@@ -1234,6 +1243,21 @@ fn parse_max_failures(opts: &HashMap<String, toml::Value>) -> u32 {
     }
 }
 
+/// Parse the opt-in `ipv6_prefix` option (F2.14): block/rate-limit verdicts
+/// for IPv6 clients go to a /<prefix> Cloudflare IP List item instead of an
+/// exact /128 access rule. 128 (exact) is the default and disables it.
+fn parse_ipv6_prefix(opts: &HashMap<String, toml::Value>) -> Option<u8> {
+    let raw = opts.get("ipv6_prefix")?.as_integer()?;
+    match u8::try_from(raw) {
+        Ok(p) if (1..128).contains(&p) => Some(p),
+        Ok(128) => None,
+        _ => {
+            warn!(raw, "invalid ipv6_prefix (expected 1..=128) — ignoring");
+            None
+        }
+    }
+}
+
 fn build_challenge_action(
     provider_name: &str,
     options: &HashMap<String, toml::Value>,
@@ -1255,6 +1279,11 @@ fn build_challenge_action(
                 );
                 return Ok(None);
             }
+            // Optional override; otherwise the account id is derived from
+            // the zone lookup at reconcile time.
+            let account = std::env::var("SENTRY_CF_ACCOUNT")
+                .ok()
+                .filter(|s| !s.is_empty());
             let cf = Arc::new(sentry_action_cloudflare::CloudflareProvider::new(
                 sentry_action_cloudflare::CloudflareProviderConfig {
                     token,
@@ -1262,6 +1291,13 @@ fn build_challenge_action(
                     default_mode: EdgeMode::ManagedChallenge,
                     ttl,
                     max_failures: parse_max_failures(options),
+                    ipv6_prefix: parse_ipv6_prefix(options),
+                    list_name: options
+                        .get("list_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("sentry_blocks")
+                        .to_string(),
+                    account,
                 },
             ));
             (cf.clone(), Some(cf))

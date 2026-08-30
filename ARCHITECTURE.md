@@ -372,6 +372,80 @@ flowchart LR
 - Modos: `block`, `js_challenge`, `managed_challenge`, `rate_limit`.
 - **Importante**: na fase 1 o Sentry é **read-only + Cloudflare action**. Não há inline proxy. Inline é fase futura (`sentry-proxy`).
 
+### 8.1 IP real do cliente (atrás de CDN/proxy)
+
+Atrás da Cloudflare, `$remote_addr` no access log do nginx é o IP do **edge** da
+CDN, não do cliente — bloquear/ranquear esse IP seria inútil. A resolução do IP
+real é **automática** no `sentry-source-nginx`, por precedência fixa (o
+primeiro que parseia vence, independente da ordem no `log_format`):
+
+1. `$http_cf_connecting_ip` (Cloudflare)
+2. `$http_true_client_ip` (Cloudflare Enterprise / outros CDNs)
+3. `$http_x_real_ip`
+4. `$http_x_forwarded_for` / `$proxy_add_x_forwarded_for` (primeiro da cadeia)
+5. `$remote_addr` / `$remote_addr_v6`
+
+Basta incluir o header no `log_format` do nginx (e no `format` do source) —
+ex.: `... "$http_user_agent" "$http_cf_connecting_ip"`. Quando o header está
+ausente (tráfego direto), o nginx loga `-` e o parser cai para o próximo
+candidato. Além disso, **todo token `http_*` capturado** vira um header no
+`HttpData.headers` do evento (ex.: `http_cf_connecting_ip` →
+`cf-connecting-ip`), habilitando regras DSL `header.X` sobre logs. Geo/ASN,
+dedupe, storage e actions consomem o IP já resolvido automaticamente.
+
+Exemplo de `log_format` recomendado atrás da Cloudflare:
+
+```nginx
+log_format sentry '$remote_addr - $remote_user [$time_local] "$request" '
+                  '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
+                  '"$http_cf_connecting_ip"';
+```
+
+### 8.2 Bloqueio /64 IPv6 via IP Lists (F2.14)
+
+IP Access Rules da Cloudflare aceitam **endereços exatos** (`ip`/`ip6`) —
+verificado ao vivo em 2026-08-30: zone e account endpoints rejeitam target
+`ip6_range`, e `ip6` rejeita CIDR. Um host IPv6 com privacy extensions
+rotaciona o interface ID dentro do /64 e escapa de regras /128. A solução é
+um **IP List** account-level (aceita CIDR, incl. /64) alimentado pelo Sentry
++ **uma** custom rule na zona:
+
+```text
+(ip.src in $sentry_blocks)  →  action: block
+```
+
+- **Opt-in**: `[action.options] ipv6_prefix = 64` (default 128 = access
+  rules exatas, comportamento anterior). `list_name` default `sentry_blocks`.
+- **Account id**: derivado automaticamente do `GET /zones/{zone}`
+  (`result.account.id`); override via `SENTRY_CF_ACCOUNT`.
+- **Roteamento de verdict**: IPv6 `Block`/`RateLimit` → item /64 na lista
+  (action da rule é `block`; `rate_limit` não é expressível por item — mesmo
+  fallback dos access rules). IPv6 `Challenge` → access rule /128 (desafio é
+  interativo/per-browser). IPv4 → access rules (inalterado).
+- **TTL**: no `comment` de cada item, mesmo formato dos notes de access
+  rules (`sentry:<ts>:<ttl>`) — reaper deleta expirados, reconcile adota
+  vivos, POST de item é idempotente (duplicata sobrescreve o comment).
+- **Dedupe cache** keyed pelo endereço de rede do /64 (rotação colapsa na
+  mesma chave).
+- **Degradação suave**: sem permissões (`Account Filter Lists: Edit`,
+  `Zone Rulesets: Edit`) ou limite de plano → modo lista soft-disable com
+  warning, IPv6 cai para access rules exatas, reaper re-tenta provisioning a
+  cada ciclo. Falhas de lista **não** contam no circuit breaker principal.
+- **Planos**: IP Lists disponíveis em todos (Free inclui 1 lista/10k itens;
+  Pro/Business 10 listas) — cf. docs Cloudflare WAF Lists.
+
+Fluxo no `apply()`:
+
+```mermaid
+flowchart LR
+    V[Verdict Block/RateLimit + IPv6] --> P{ipv6_prefix configurado?}
+    P -->|não| AR[Access rule /128]
+    P -->|sim| L[Lista disponível?]
+    L -->|sim| IL["POST item /64 (comment sentry:ts:ttl)"]
+    L -->|não| AR
+    V2[Verdict Challenge / IPv4] --> AR
+```
+
 ---
 
 ## 9. Detecção de Rotas Válidas

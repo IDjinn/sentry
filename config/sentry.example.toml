@@ -238,6 +238,22 @@ type = "nginx"
 path = "/var/log/nginx/access.log"
 format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"'
 
+# Behind Cloudflare (or another reverse proxy) add the CDN's client-IP header
+# to your nginx log_format AND to `format` below — the parser resolves the
+# real client IP automatically when the header is present (falls back to
+# $remote_addr for direct traffic, where nginx logs "-"):
+#
+# [[source]]
+# type = "nginx"
+# [source.options]
+# path = "/var/log/nginx/access.log"
+# format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" "$http_cf_connecting_ip"'
+#
+# Precedence: $http_cf_connecting_ip > $http_true_client_ip > $http_x_real_ip
+#             > $http_x_forwarded_for (first of chain) > $remote_addr.
+# Every captured $http_* token also becomes an event header (e.g.
+# cf-connecting-ip), usable in DSL rules via `header.cf-connecting-ip = ...`.
+
 # [[source]]
 # type = "cloudflare"
 # [source.options]
@@ -277,6 +293,21 @@ max_failures = 3               # circuit breaker: disable the provider after N c
 # token: env SENTRY_CF_TOKEN
 # zone:   env SENTRY_CF_ZONE
 # Backward-compatible alias: `type = "cloudflare"` (no `provider`) is equivalent.
+
+# IPv6 /64 edge blocking (F2.14). IP Access Rules accept exact addresses
+# only, so an IPv6 host that rotates its interface ID inside its /64 slips
+# through a /128 rule. With `ipv6_prefix = 64`, block/rate-limit verdicts for
+# IPv6 clients are applied to their /64 network via a Cloudflare IP List
+# (account-level, `sentry_blocks` by default) + one zone custom rule
+# (`ip.src in $sentry_blocks`, action block). TTL is encoded per item
+# (`sentry:<ts>:<ttl>` comment) and the reaper expires items across
+# restarts. Challenges keep exact-address access rules; IPv4 is unchanged.
+# Requires the extra token permissions Account → Filter Lists: Edit and
+# Zone → Rulesets: Edit; without them list mode soft-disables (warning) and
+# IPv6 blocks fall back to exact-address access rules.
+# ipv6_prefix = 64             # 1..=128; absent/128 keeps exact-address rules
+# list_name = "sentry_blocks"  # ^[a-z0-9_]+$, max 50 chars
+# account:   env SENTRY_CF_ACCOUNT (optional — derived from the zone when unset)
 
 [[action]]
 type = "webhook"

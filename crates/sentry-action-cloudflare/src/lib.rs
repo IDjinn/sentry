@@ -25,8 +25,17 @@
 //! Wired into the daemon either as `type = "cloudflare"` (backward-compatible
 //! alias) or as `type = "challenge"`, `provider = "cloudflare"` (canonical
 //! provider-agnostic form). See `sentry-core::challenge`.
+//!
+//! IPv6 prefix blocking (F2.14): IP Access Rules accept exact addresses
+//! only, so with `ipv6_prefix` configured (e.g. 64) block/rate-limit
+//! verdicts for IPv6 clients are applied to their prefix network via a
+//! Cloudflare **IP List** plus a single custom firewall rule
+//! (`ip.src in $sentry_blocks`). See the [`lists`] module for the design;
+//! exact-address access rules remain the fallback for everything else.
 
 #![forbid(unsafe_code)]
+
+mod lists;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -61,6 +70,15 @@ pub struct CloudflareProviderConfig {
     /// Consecutive failed inserts after which the provider disables itself
     /// for the remainder of the process lifetime (circuit breaker).
     pub max_failures: u32,
+    /// IPv6 prefix length (e.g. 64) routed to the IP List + custom rule
+    /// (F2.14). `None` keeps exact-address access rules for IPv6.
+    pub ipv6_prefix: Option<u8>,
+    /// Name of the Cloudflare IP List managed when `ipv6_prefix` is set
+    /// (lowercase letters, digits and underscores only).
+    pub list_name: String,
+    /// Account id override (env `SENTRY_CF_ACCOUNT`). When unset it is
+    /// derived automatically from the zone lookup (`GET /zones/{id}`).
+    pub account: Option<String>,
 }
 
 /// Cloudflare [`ChallengeProvider`] implementation.
@@ -73,6 +91,14 @@ pub struct CloudflareProvider {
     consecutive_failures: AtomicU32,
     /// Set when the circuit breaker trips or the token is invalid.
     disabled: AtomicBool,
+    /// Resolved account id (config override or derived from the zone
+    /// lookup). Needed for the account-scoped IP Lists API.
+    account_id: RwLock<Option<String>>,
+    /// Resolved IP List id (provisioned at reconcile or lazily).
+    list_id: RwLock<Option<String>>,
+    /// Soft-disable for list mode (permission or plan failure). Access rules
+    /// keep working; the reaper retries provisioning.
+    lists_disabled: AtomicBool,
 }
 
 impl CloudflareProvider {
@@ -88,6 +114,9 @@ impl CloudflareProvider {
             cache: Arc::new(RwLock::new(HashMap::new())),
             consecutive_failures: AtomicU32::new(0),
             disabled: AtomicBool::new(false),
+            account_id: RwLock::new(None),
+            list_id: RwLock::new(None),
+            lists_disabled: AtomicBool::new(false),
         }
     }
 
@@ -209,7 +238,8 @@ impl CloudflareProvider {
         )
     }
 
-    /// Verify the API token and zone. Returns `(token_valid, zone_name)`.
+    /// Verify the API token and zone. Returns a [`VerifyInfo`] with the zone
+    /// name and the account id (used by the IP Lists API).
     ///
     /// Uses the zone lookup as the source of truth: the legacy
     /// `/user/tokens/verify` endpoint rejects Account API tokens (prefix
@@ -221,7 +251,7 @@ impl CloudflareProvider {
     ///
     /// Used by `sentry cloudflare status` / `test` and by
     /// [`CloudflareProvider::reconcile`].
-    pub async fn verify(&self) -> Result<(bool, String)> {
+    pub async fn verify(&self) -> Result<VerifyInfo> {
         let resp = self
             .http
             .get(self.zones_url())
@@ -237,15 +267,17 @@ impl CloudflareProvider {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
         if !token_valid {
-            return Ok((false, String::new()));
+            return Ok(VerifyInfo {
+                token_valid: false,
+                ..Default::default()
+            });
         }
-        let zone_name = body
-            .get("result")
-            .and_then(|r| r.get("name"))
-            .and_then(|n| n.as_str())
-            .unwrap_or("")
-            .to_string();
-        Ok((token_valid, zone_name))
+        let (zone, account_id) = lists::parse_zone_lookup(&body);
+        Ok(VerifyInfo {
+            token_valid: true,
+            zone,
+            account_id,
+        })
     }
 
     /// List IP Access Rules for the zone (paginated).
@@ -344,10 +376,13 @@ impl CloudflareProvider {
         let mut report = ReconcileReport::default();
 
         match self.verify().await {
-            Ok((valid, zone)) => {
-                report.token_valid = valid;
-                report.zone = zone;
-                if !valid || report.zone.is_empty() {
+            Ok(info) => {
+                report.token_valid = info.token_valid;
+                report.zone = info.zone.clone();
+                if let Some(acct) = &info.account_id {
+                    *self.account_id.write().await = Some(acct.clone());
+                }
+                if !info.token_valid || report.zone.is_empty() {
                     self.disabled.store(true, Ordering::Relaxed);
                     report.disabled = true;
                     error!(
@@ -416,6 +451,8 @@ impl CloudflareProvider {
                 PlannedAction::Skip => {}
             }
         }
+
+        self.reconcile_lists(&mut report).await;
         report
     }
 
@@ -451,8 +488,23 @@ impl CloudflareProvider {
                 Err(e) => warn!(error = %e, rule_id = %rule.id, "cloudflare reaper: delete failed"),
             }
         }
+        if self.cfg.ipv6_prefix.is_some() {
+            reaped += self.reap_list_items().await?;
+        }
         Ok(reaped)
     }
+}
+
+/// Result of [`CloudflareProvider::verify`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct VerifyInfo {
+    /// Whether the token is valid and the zone readable.
+    pub token_valid: bool,
+    /// Zone name (empty when inaccessible).
+    pub zone: String,
+    /// Account id owning the zone (required by the IP Lists API; absent on
+    /// failure or when the response omits it).
+    pub account_id: Option<String>,
 }
 
 /// A single Cloudflare IP Access Rule entry (subset of fields).
@@ -507,6 +559,16 @@ pub struct ReconcileReport {
     pub deleted: usize,
     /// Whether the provider ended up disabled by this reconcile.
     pub disabled: bool,
+    /// IP List items found at the edge (IPv6 prefix mode).
+    pub list_items: usize,
+    /// Live list items re-adopted into the local dedup cache.
+    pub list_adopted: usize,
+    /// Legacy-noted list items re-stamped with the timestamped format.
+    pub list_restamped: usize,
+    /// Expired list items deleted at the edge.
+    pub list_deleted: usize,
+    /// Whether list mode ended up soft-disabled by this reconcile.
+    pub lists_disabled: bool,
 }
 
 /// What reconcile/reap should do with a Sentry-noted edge rule.
@@ -611,15 +673,47 @@ impl ChallengeProvider for CloudflareProvider {
             debug!(ip = %ip, "cloudflare provider disabled — skipping apply");
             return Ok(());
         }
-        if self.is_cached(ip).await {
-            return Ok(());
-        }
-
         let ttl = if opts.ttl.is_zero() {
             self.cfg.ttl
         } else {
             opts.ttl
         };
+
+        // IPv6 prefix blocking (F2.14): block/rate-limit verdicts go to the
+        // /<prefix> IP List item instead of an exact /128 access rule, so a
+        // rotating interface ID cannot slip through. List-mode failures fall
+        // back to the exact-address access rule below.
+        if let (Some(prefix), IpAddr::V6(v6)) = (self.cfg.ipv6_prefix, ip) {
+            if lists::v6_uses_list(verdict)
+                && self.lists_active()
+                && self.apply_list_item(v6, prefix, ttl).await
+            {
+                self.prune().await;
+                return Ok(());
+            }
+        }
+
+        self.apply_access_rule(ip, verdict, opts, ttl).await
+    }
+}
+
+impl CloudflareProvider {
+    /// Exact-address IP Access Rule path (IPv4 always; IPv6 challenges and
+    /// the fallback when list mode is unavailable).
+    async fn apply_access_rule(
+        &self,
+        ip: IpAddr,
+        verdict: Verdict,
+        opts: &EdgeOptions,
+        ttl: Duration,
+    ) -> Result<()> {
+        if self.is_disabled() {
+            return Ok(());
+        }
+        if self.is_cached(ip).await {
+            return Ok(());
+        }
+
         let mode = self.resolve_mode(verdict, opts);
         let cf_mode = self.access_rule_mode(mode);
         let target = Self::access_rule_target(ip);
@@ -719,6 +813,9 @@ mod tests {
             default_mode: EdgeMode::ManagedChallenge,
             ttl: Duration::from_secs(3600),
             max_failures,
+            ipv6_prefix: None,
+            list_name: "sentry_blocks".into(),
+            account: None,
         })
     }
 

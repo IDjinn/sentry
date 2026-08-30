@@ -106,6 +106,14 @@ payloads encodados (`%27` = `'`, `+` ou `%20` = espaço) não façam bypass.
 Ao escrever novas heurísticas, sempre use `http_text(http)` em vez de ler
 `http.path` / `http.query` diretamente.
 
+### IP real do cliente (CDN/proxy)
+
+O parser do nginx resolve o IP real automaticamente por precedência fixa
+(`$http_cf_connecting_ip` > `$http_true_client_ip` > `$http_x_real_ip` >
+XFF primeiro da cadeia > `$remote_addr`) e expõe todo token `http_*` do
+`log_format` como header em `HttpData.headers` (`cf_connecting_ip` →
+`cf-connecting-ip`). Detalhes em `ARCHITECTURE.md` §8.1.
+
 ## 6. Rules Engine
 
 Roda **antes** de heurísticas e IA (fast path). Ordem de precedência:
@@ -153,6 +161,11 @@ não em runtime.
     http_anomaly/vpn_proxy/tor/rate_scan/country_blocklist) — 9 packs
   - ✅ Pipeline (rules→heuristics→route→scorer→decider, hot-reload) — 5 testes
   - ✅ Nginx source (parser + tail com rotação) — 3 testes
+  - ✅ Resolução automática de IP real no parser nginx (CF-Connecting-IP >
+    True-Client-IP > X-Real-IP > XFF primeiro da cadeia > remote_addr) +
+    todo token `http_*` do log_format vira header em `HttpData.headers`
+    (`cf_connecting_ip` → `cf-connecting-ip`, habilita regras DSL `header.X`)
+    — 5 testes; ver `ARCHITECTURE.md` §8.1
   - ✅ Daemon com wiring end-to-end (sources→pipeline→actions coloridas)
   - ✅ Actions type-safe via `ActionKind` (Blocklist/Webhook/Cloudflare/Log)
   - ✅ Edge actions provider-agnostic via trait `ChallengeProvider`
@@ -171,7 +184,7 @@ não em runtime.
   - ✅ Fixtures + snapshot tests (11 fixtures nginx, 11 snapshots insta)
   - ✅ CI GitHub Actions (fmt, clippy, test matrix 3 OS, storage com Postgres)
   - ✅ Config example completo (`[geo]`, `[[routes.known]]`, `[scorer]`)
-- **F2** (exceto F2.14): Cloudflare hardening + roteador parametrizado/learn/import + rate-limit + métricas + escalonamento de reincidentes + detectores de scan + IA clássica (ONNX fork)
+- **F2** (concluída): Cloudflare hardening + roteador parametrizado/learn/import + rate-limit + métricas + escalonamento de reincidentes + detectores de scan + IA clássica (ONNX fork)
   - ✅ F2.4 Verdict policy (`policy.rs`, `VerdictPolicy`, `PolicyConfig`,
     `[[policy.override]]` DSL) — 6 testes
   - ✅ F2.5+CF Cloudflare status/test/pull CLI + reaper restart-safe (deleta
@@ -215,8 +228,16 @@ não em runtime.
     ≥8 paths distintos → `RandomScan` peso 25; ≥10 4xx → `ScanBehavior`
     peso 35) + fix do pack `rate_scan_404` (filtra `Status(404)` de verdade)
     + `sentry report --unknown-paths`; `[scan]` em config — 8 testes
-  - ⏸️ F2.14 Edge blocking por /64 IPv6 via IP Lists da Cloudflare (IP Access
-    Rules aceitam só IP exato — evidência da API e design em `BACKLOG.md`)
+  - ✅ F2.14 Edge blocking por /64 IPv6 via IP Lists da Cloudflare (IP Access
+    Rules aceitam só IP exato): `lists.rs` mantém IP List account-level
+    (`sentry_blocks`) + custom rule `ip.src in $sentry_blocks` (action block),
+    provisionados no reconcile; opt-in `[action.options] ipv6_prefix = 64`;
+    verdicts Block/RateLimit em IPv6 → item /64 com TTL no comment
+    (`sentry:<ts>:<ttl>`), Challenge/IPv4 seguem em access rules; dedupe
+    cache keyed pelo /64; account id auto-derivado do zone lookup
+    (`SENTRY_CF_ACCOUNT` override); soft-disable + fallback access rules sem
+    permissões (Account Filter Lists / Zone Rulesets) com self-heal no reaper
+    — 10 testes; ver `ARCHITECTURE.md` §8.2
 - **F3** (exceto F3.1/F3.2/F3.3/F3.6/F3.7/F3.9): Multi-source (syslog) + LLM
   (OpenRouter/Ollama) + detecção comportamental
   - ✅ F3.4 Syslog source (crate `sentry-source-syslog`: parser RFC 5424 com
@@ -258,7 +279,7 @@ Backlog detalhado em `ARCHITECTURE.md` §15.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 183 testes passando sem features; 185 com
+# Resultado esperado: 198 testes passando sem features; 200 com
 # --features sentry-cli/onnx (adiciona os 2 testes de inferência ONNX)
 ```
 
