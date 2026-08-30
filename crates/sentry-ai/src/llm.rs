@@ -16,6 +16,15 @@ use serde::{Deserialize, Serialize};
 use sentry_core::analysis::{RiskLevel, Signal, Verdict};
 use sentry_core::event::ProtocolData;
 
+pub mod mock;
+pub mod ollama;
+pub mod openrouter;
+pub mod prompt;
+
+pub use mock::MockLlmProvider;
+pub use ollama::OllamaProvider;
+pub use openrouter::OpenRouterProvider;
+
 /// Request to classify a payload.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClassifyRequest {

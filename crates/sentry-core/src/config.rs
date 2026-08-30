@@ -42,6 +42,10 @@ pub struct SentryConfig {
     /// Behavioral scan detection (random-path / 404 sweeps).
     #[serde(default)]
     pub scan: ScanConfig,
+    /// Behavioral attack detection (auth brute-force, credential stuffing,
+    /// directory brute-force).
+    #[serde(default)]
+    pub behavior: BehaviorConfig,
     /// Local ML threat model (async fork stage).
     #[serde(default)]
     pub ai: AiConfig,
@@ -51,6 +55,9 @@ pub struct SentryConfig {
     /// Prometheus metrics server.
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Web dashboard + JSON API server (`sentry serve`).
+    #[serde(default)]
+    pub server: ServerConfig,
     /// Background route learner.
     #[serde(default)]
     pub route_learner: RouteLearnerConfig,
@@ -353,6 +360,63 @@ fn default_scan_not_found() -> u32 {
     10
 }
 
+/// Behavioral attack detection over per-IP sliding windows (F3.8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BehaviorConfig {
+    /// Enable the behavior trackers.
+    #[serde(default = "default_behavior_enabled")]
+    pub enabled: bool,
+    /// Sliding window duration in seconds (5 minutes per the F3 criteria).
+    #[serde(default = "default_behavior_window")]
+    pub window_secs: u64,
+    /// Auth failures (401/403) per IP on login routes that trigger
+    /// `AuthBruteForce`.
+    #[serde(default = "default_behavior_auth_failures")]
+    pub auth_failures: u32,
+    /// Distinct User-Agents failing auth that trigger `CredentialStuffing`.
+    #[serde(default = "default_behavior_distinct_uas")]
+    pub distinct_uas: u32,
+    /// Wordlist-path 404s per IP that trigger `DirectoryBruteForce`.
+    #[serde(default = "default_behavior_wordlist_hits")]
+    pub wordlist_hits: u32,
+    /// Substrings identifying authentication routes (empty = built-in list).
+    #[serde(default)]
+    pub login_patterns: Vec<String>,
+    /// Well-known probe paths (empty = built-in wordlist).
+    #[serde(default)]
+    pub wordlist_paths: Vec<String>,
+}
+
+impl Default for BehaviorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_behavior_enabled(),
+            window_secs: default_behavior_window(),
+            auth_failures: default_behavior_auth_failures(),
+            distinct_uas: default_behavior_distinct_uas(),
+            wordlist_hits: default_behavior_wordlist_hits(),
+            login_patterns: Vec::new(),
+            wordlist_paths: Vec::new(),
+        }
+    }
+}
+
+fn default_behavior_enabled() -> bool {
+    true
+}
+fn default_behavior_window() -> u64 {
+    300
+}
+fn default_behavior_auth_failures() -> u32 {
+    10
+}
+fn default_behavior_distinct_uas() -> u32 {
+    3
+}
+fn default_behavior_wordlist_hits() -> u32 {
+    5
+}
+
 /// Local ML threat model (classic ML, ONNX) running as a pipeline fork.
 ///
 /// The hot path (rules → heuristics → routes → scan → score → policy →
@@ -496,6 +560,35 @@ fn default_metrics_port() -> u16 {
     9100
 }
 
+/// Web dashboard + JSON API server config (F4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// Bind address. Defaults to loopback because the dashboard has no
+    /// built-in auth yet (F4.4) — front it with an authenticating reverse
+    /// proxy before binding wider.
+    #[serde(default = "default_server_host")]
+    pub host: String,
+    /// Bind port (default 8080).
+    #[serde(default = "default_server_port")]
+    pub port: u16,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: default_server_host(),
+            port: default_server_port(),
+        }
+    }
+}
+
+fn default_server_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_server_port() -> u16 {
+    8080
+}
+
 /// Background route learner config.
 ///
 /// When enabled, the daemon periodically scans recent events from Postgres
@@ -557,6 +650,10 @@ pub struct LlmConfig {
     /// API base URL override (for self-hosted Ollama / OpenAI-compatible).
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Execution mode: `fork` (async re-score + action re-dispatch) or
+    /// `shadow` (log what the LLM would decide, never act).
+    #[serde(default = "default_llm_mode")]
+    pub mode: String,
     /// Only invoke LLM for events with risk score above this threshold.
     #[serde(default = "default_llm_threshold")]
     pub only_above: u8,
@@ -574,6 +671,7 @@ impl Default for LlmConfig {
             provider: default_llm_provider(),
             model: String::new(),
             base_url: None,
+            mode: default_llm_mode(),
             only_above: default_llm_threshold(),
             concurrency: default_llm_concurrency(),
             cache_ttl_secs: default_llm_cache_ttl(),
@@ -583,6 +681,9 @@ impl Default for LlmConfig {
 
 fn default_llm_provider() -> String {
     "none".to_string()
+}
+fn default_llm_mode() -> String {
+    "fork".to_string()
 }
 fn default_llm_threshold() -> u8 {
     30
@@ -777,6 +878,7 @@ mod tests {
     fn llm_default_matches_serde_defaults() {
         let c = LlmConfig::default();
         assert_eq!(c.provider, "none");
+        assert_eq!(c.mode, "fork");
         assert_eq!(c.only_above, 30);
         assert_eq!(c.concurrency, 4);
         assert_eq!(c.cache_ttl_secs, 300);

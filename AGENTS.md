@@ -68,6 +68,7 @@ sentry/
 │   ├── sentry-ai/             # trait ThreatModel (ONNX) + trait LlmProvider
 │   ├── sentry-geo/            # maxminddb geo/ASN enrichment
 │   ├── sentry-source-nginx/   # plugin Source: tail de access.log
+│   ├── sentry-source-syslog/  # plugin Source: receptor syslog RFC 5424/3164 (UDP/TCP)
 │   ├── sentry-action-cloudflare/  # plugin Action: block/challenge via API CF
 │   ├── sentry-action-webhook/     # plugin Action: alertas Discord/Slack/etc
 │   ├── sentry-action-blocklist/   # plugin Action: blocklist local em memória
@@ -170,7 +171,7 @@ não em runtime.
   - ✅ Fixtures + snapshot tests (11 fixtures nginx, 11 snapshots insta)
   - ✅ CI GitHub Actions (fmt, clippy, test matrix 3 OS, storage com Postgres)
   - ✅ Config example completo (`[geo]`, `[[routes.known]]`, `[scorer]`)
-- **F2** (exceto LLM): Cloudflare hardening + roteador parametrizado/learn/import + rate-limit + métricas + escalonamento de reincidentes + detectores de scan + IA clássica (ONNX fork)
+- **F2** (concluída): Cloudflare hardening + roteador parametrizado/learn/import + rate-limit + métricas + escalonamento de reincidentes + detectores de scan + IA clássica (ONNX fork)
   - ✅ F2.4 Verdict policy (`policy.rs`, `VerdictPolicy`, `PolicyConfig`,
     `[[policy.override]]` DSL) — 6 testes
   - ✅ F2.5+CF Cloudflare status/test/pull CLI + reaper (deleta regras expiradas)
@@ -210,9 +211,37 @@ não em runtime.
     ≥8 paths distintos → `RandomScan` peso 25; ≥10 4xx → `ScanBehavior`
     peso 35) + fix do pack `rate_scan_404` (filtra `Status(404)` de verdade)
     + `sentry report --unknown-paths`; `[scan]` em config — 8 testes
-  - ⏸️ F3.5 LLM (OpenRouter/Ollama) — trait `LlmProvider` pronta, sem adapters
-- **F3**: Multi-source (TCP, syslog) + LLM (OpenRouter)
-- **F4**: Dashboard web
+- **F3** (exceto F3.1/F3.2/F3.3/F3.6/F3.7/F3.9): Multi-source (syslog) + LLM
+  (OpenRouter/Ollama) + detecção comportamental
+  - ✅ F3.4 Syslog source (crate `sentry-source-syslog`: parser RFC 5424 com
+    fallback RFC 3164, receptor UDP/TCP com framing RFC 6587,
+    `ProtocolData::Syslog(SyslogData)`, `RawEvent.transport` distingue UDP;
+    wired no daemon via `[[source]] type = "syslog"`) — 11 testes
+  - ✅ F3.5 LLM adapters (`sentry-ai/src/llm/`: `OpenRouterProvider` com
+    `response_format: json_schema` + `SENTRY_LLM_KEY`, `OllamaProvider`
+    local keyless, `MockLlmProvider`; `prompt.rs` com schema strict, context
+    builder e parse tolerante; daemon `LlmFork` espelha o `AiFork` —
+    fork/shadow, semaphore, cache TTL por payload hash, re-entra por
+    `rescore_from` só elevando, sinal `LlmMalicious` peso = score×confidence)
+    — 24 testes
+  - ✅ F3.8 Detecção comportamental (`behavior.rs`: `BehaviorTracker` janela
+    300s por IP; `AuthBruteForce` 401/403 em rotas de login peso 35,
+    `CredentialStuffing` ≥3 UAs distintos peso 40, `DirectoryBruteForce`
+    wordlist 404 peso 30 com isenção de bons crawlers; `[behavior]` em
+    config, wired no pipeline + prune no daemon) — 12 testes
+  - ⏸️ F3.1 (middleware axum), F3.2 (captura TCP/pnet), F3.3 (pull CF logs),
+    F3.6 (retreinamento), F3.7 (reputation feeds), F3.9 (modos de borda)
+- **F4** (F4.2/F4.3 entregues): Operação & Dashboard
+  - ✅ F4.2 Backend HTTP (`server.rs`: `sentry serve` — processo separado,
+    axum; `/api/events?limit&level`, `/api/stats` 24h, `/api/incidents` +
+    resolve, `/api/ips/blocked` + block/unblock/forgive com NOTIFY, health;
+    `[server] host/port`, default loopback — sem auth até F4.4)
+  - ✅ F4.3 Dashboard web (SPA sem build-step embutida via `include_str!`
+    em `assets/dashboard/`: feed de eventos ao vivo com filtro de level,
+    stats 24h, incidents com resolve, IPs bloqueados com unblock/forgive,
+    block manual; polling 2s, sem CDN)
+  - ⏸️ F4.1 (service mode), F4.4 (auth+RBAC), F4.5 (alertas bidirecionais
+    completos), F4.6 (SIEM export), F4.7 (HA)
 
 Backlog detalhado em `ARCHITECTURE.md` §15.
 
@@ -223,7 +252,7 @@ Backlog detalhado em `ARCHITECTURE.md` §15.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 130 testes passando sem features; 132 com
+# Resultado esperado: 173 testes passando sem features; 175 com
 # --features sentry-cli/onnx (adiciona os 2 testes de inferência ONNX)
 ```
 

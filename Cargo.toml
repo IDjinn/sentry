@@ -6,6 +6,7 @@ members = [
     "crates/sentry-ai",
     "crates/sentry-geo",
     "crates/sentry-source-nginx",
+    "crates/sentry-source-syslog",
     "crates/sentry-action-cloudflare",
     "crates/sentry-action-webhook",
     "crates/sentry-action-blocklist",
@@ -51,6 +52,9 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
 http-body-util = "0.1"
 
+# Dashboard / JSON API server (F4)
+axum = "0.8"
+
 # Errors
 thiserror = "1"
 anyhow = "1"
@@ -94,6 +98,7 @@ sentry-storage = { path = "crates/sentry-storage" }
 sentry-ai = { path = "crates/sentry-ai" }
 sentry-geo = { path = "crates/sentry-geo" }
 sentry-source-nginx = { path = "crates/sentry-source-nginx" }
+sentry-source-syslog = { path = "crates/sentry-source-syslog" }
 sentry-action-cloudflare = { path = "crates/sentry-action-cloudflare" }
 sentry-action-webhook = { path = "crates/sentry-action-webhook" }
 sentry-action-blocklist = { path = "crates/sentry-action-blocklist" }

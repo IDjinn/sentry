@@ -24,6 +24,18 @@ impl PgPool {
         Ok(Self { pool })
     }
 
+    /// Build a lazy pool that defers connecting until the first query.
+    ///
+    /// Useful for tooling and tests that need a `Repo` without a live
+    /// database (queries fail at runtime instead of at construction).
+    pub fn connect_lazy(url: &str) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy(url)
+            .map_err(|e| StorageError::Connect(e.to_string()))?;
+        Ok(Self { pool })
+    }
+
     /// Access the underlying sqlx pool.
     pub fn inner(&self) -> &SqlxPgPool {
         &self.pool

@@ -13,6 +13,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};
+use crate::behavior::BehaviorTracker;
 use crate::config::{EscalationConfig, RouteDefConfig, ScorerConfig};
 use crate::event::Event;
 use crate::heuristics::HeuristicEngine;
@@ -301,6 +302,7 @@ pub struct Pipeline {
     offender: Option<Arc<RwLock<OffenderTracker>>>,
     escalation: EscalationConfig,
     scan: Option<Arc<RwLock<ScanTracker>>>,
+    behavior: Option<Arc<RwLock<BehaviorTracker>>>,
 }
 
 /// Output of processing a single event.
@@ -353,6 +355,7 @@ impl Pipeline {
             offender: None,
             escalation: EscalationConfig::default(),
             scan: None,
+            behavior: None,
         }
     }
 
@@ -376,6 +379,13 @@ impl Pipeline {
     /// Attach the behavioral scan tracker.
     pub fn with_scan_tracker(mut self, tracker: Arc<RwLock<ScanTracker>>) -> Self {
         self.scan = Some(tracker);
+        self
+    }
+
+    /// Attach the behavioral attack tracker (auth brute-force, credential
+    /// stuffing, directory brute-force).
+    pub fn with_behavior_tracker(mut self, tracker: Arc<RwLock<BehaviorTracker>>) -> Self {
+        self.behavior = Some(tracker);
         self
     }
 
@@ -440,6 +450,17 @@ impl Pipeline {
                 signals.extend(tracker.record(evt.client_ip, &http.path, http.status));
             }
         }
+        if let Some(ref behavior) = self.behavior {
+            if let Some(http) = evt.http() {
+                let mut tracker = behavior.write().unwrap();
+                signals.extend(tracker.record(
+                    evt.client_ip,
+                    &http.path,
+                    http.status,
+                    http.user_agent.as_deref(),
+                ));
+            }
+        }
 
         let bonus = if let Some(ref rep) = self.repetition {
             let mut tracker = rep.write().unwrap();
@@ -502,6 +523,9 @@ impl Pipeline {
             SignalKind::MethodNotAllowed => "method_not_allowed",
             SignalKind::ScanBehavior => "scan_behavior",
             SignalKind::RandomScan => "random_scan",
+            SignalKind::AuthBruteForce => "auth_brute_force",
+            SignalKind::CredentialStuffing => "credential_stuffing",
+            SignalKind::DirectoryBruteForce => "directory_brute_force",
             SignalKind::AbnormalRate => "abnormal_rate",
             SignalKind::SuspiciousUA => "suspicious_ua",
             SignalKind::TorExitNode => "tor_exit_node",
@@ -537,6 +561,9 @@ impl Pipeline {
             SignalKind::MethodNotAllowed => "method_not_allowed",
             SignalKind::ScanBehavior => "scan_behavior",
             SignalKind::RandomScan => "random_scan",
+            SignalKind::AuthBruteForce => "auth_brute_force",
+            SignalKind::CredentialStuffing => "credential_stuffing",
+            SignalKind::DirectoryBruteForce => "directory_brute_force",
             SignalKind::AbnormalRate => "abnormal_rate",
             SignalKind::SuspiciousUA => "suspicious_ua",
             SignalKind::TorExitNode => "tor_exit_node",
@@ -991,6 +1018,40 @@ mod tests {
                 .signals
                 .iter()
                 .all(|s| s.kind != SignalKind::RandomScan && s.kind != SignalKind::ScanBehavior));
+        }
+    }
+
+    #[test]
+    fn auth_brute_force_burst_emits_signal() {
+        let behavior = Arc::new(RwLock::new(BehaviorTracker::new(300, 3, 100, 100)));
+        let p = Pipeline::new(RuleSet::default(), RouteValidator::default())
+            .with_behavior_tracker(behavior);
+
+        let mut last = None;
+        for _ in 0..3 {
+            last = Some(p.process(&http_evt_status("/login", 401)));
+        }
+        let r = last.unwrap();
+        assert!(r
+            .analysis
+            .signals
+            .iter()
+            .any(|s| s.kind == SignalKind::AuthBruteForce));
+        assert!(r.analysis.risk_score >= 35);
+    }
+
+    #[test]
+    fn normal_traffic_never_triggers_behavior_signals() {
+        let behavior = Arc::new(RwLock::new(BehaviorTracker::new(300, 2, 2, 2)));
+        let p = Pipeline::new(RuleSet::default(), RouteValidator::default())
+            .with_behavior_tracker(behavior);
+        for i in 0..10 {
+            let r = p.process(&http_evt_status(&format!("/api/items/{i}"), 200));
+            assert!(r.analysis.signals.iter().all(|s| {
+                s.kind != SignalKind::AuthBruteForce
+                    && s.kind != SignalKind::CredentialStuffing
+                    && s.kind != SignalKind::DirectoryBruteForce
+            }));
         }
     }
 

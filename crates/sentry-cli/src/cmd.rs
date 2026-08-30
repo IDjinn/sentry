@@ -16,6 +16,10 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
             let cfg = cfg.ok_or_else(|| color_eyre::eyre::eyre!("config required for `run`"))?;
             crate::daemon::run(cfg).await?;
         }
+        Command::Serve => {
+            let cfg = require_config(&cfg)?;
+            crate::server::run(cfg).await?;
+        }
         Command::Tail { stream, .. } => {
             if stream {
                 tail_stream().await?;

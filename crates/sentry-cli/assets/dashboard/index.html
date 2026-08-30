@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sentry — Access Monitor</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="logo">&#128737;</span>
+      <h1>Sentry</h1>
+      <span id="conn" class="dot dot-off" title="API status"></span>
+    </div>
+    <select id="level-filter">
+      <option value="">all levels</option>
+      <option value="info">info</option>
+      <option value="low">low</option>
+      <option value="medium">medium</option>
+      <option value="high">high</option>
+      <option value="critical">critical</option>
+    </select>
+  </header>
+
+  <section id="stats" class="stats">
+    <div class="stat"><span class="stat-value" id="stat-events">–</span><span class="stat-label">events / 24h</span></div>
+    <div class="stat"><span class="stat-value" id="stat-blocked">–</span><span class="stat-label">acted on / 24h</span></div>
+    <div class="stat"><span class="stat-value" id="stat-top-ip">–</span><span class="stat-label">top talker</span></div>
+    <div class="stat"><span class="stat-value" id="stat-top-path">–</span><span class="stat-label">top path</span></div>
+  </section>
+
+  <main class="grid">
+    <section class="panel">
+      <h2>Live events</h2>
+      <table class="events">
+        <thead>
+          <tr><th>time</th><th>ip</th><th>method</th><th>path</th><th>status</th><th>level</th><th>verdict</th><th>signals</th></tr>
+        </thead>
+        <tbody id="events-body"></tbody>
+      </table>
+      <p id="events-empty" class="empty">no events yet</p>
+    </section>
+
+    <div class="column">
+      <section class="panel">
+        <h2>Incidents</h2>
+        <ul id="incidents" class="list"></ul>
+        <p id="incidents-empty" class="empty">no unresolved incidents</p>
+      </section>
+
+      <section class="panel">
+        <h2>Blocked IPs</h2>
+        <ul id="blocked" class="list"></ul>
+        <p id="blocked-empty" class="empty">nothing blocked</p>
+      </section>
+
+      <section class="panel">
+        <h2>Manual block</h2>
+        <form id="block-form" class="block-form">
+          <input id="block-ip" type="text" placeholder="203.0.113.7" autocomplete="off" required>
+          <button type="submit">Block</button>
+        </form>
+      </section>
+    </div>
+  </main>
+
+  <footer>Sentry dashboard — read-only polling over the JSON API · no auth (F4.4 pending), keep on loopback</footer>
+  <script src="/app.js"></script>
+</body>
+</html>

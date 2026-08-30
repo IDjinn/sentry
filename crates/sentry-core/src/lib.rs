@@ -12,6 +12,7 @@
 
 pub mod action;
 pub mod analysis;
+pub mod behavior;
 pub mod challenge;
 pub mod config;
 pub mod error;
@@ -30,17 +31,19 @@ pub mod source;
 
 pub use action::Action;
 pub use analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};
+pub use behavior::BehaviorTracker;
 pub use challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
 pub use config::{
-    ActionConfig, ActionKind, AiConfig, CoreConfig, EscalationConfig, FeedConfig, GeoConfig,
-    LlmConfig, MetricsConfig, PolicyConfig, PolicyOverrideConfig, PostgresConfig, RateLimitConfig,
-    RouteDefConfig, RouteLearnerConfig, RoutesConfig, RuleDefConfig, RulePackConfig, RulesConfig,
-    ScanConfig, ScorerConfig, SentryConfig, SourceConfig, StorageConfig,
+    ActionConfig, ActionKind, AiConfig, BehaviorConfig, CoreConfig, EscalationConfig, FeedConfig,
+    GeoConfig, LlmConfig, MetricsConfig, PolicyConfig, PolicyOverrideConfig, PostgresConfig,
+    RateLimitConfig, RouteDefConfig, RouteLearnerConfig, RoutesConfig, RuleDefConfig,
+    RulePackConfig, RulesConfig, ScanConfig, ScorerConfig, SentryConfig, ServerConfig,
+    SourceConfig, StorageConfig,
 };
 pub use error::{CoreError, Result};
 pub use event::{
     Direction, Event, GeoInfo, HttpData, HttpMethod, ProtocolData, ProtocolKind, RawData, RawEvent,
-    SourceKind, TcpData, TcpFlags, TcpStage, TlsData, Transport, UdpData,
+    SourceKind, SyslogData, TcpData, TcpFlags, TcpStage, TlsData, Transport, UdpData,
 };
 pub use heuristics::{Heuristic, HeuristicEngine};
 pub use offender::OffenderTracker;

@@ -18,5 +18,8 @@ pub mod threat;
 pub mod onnx_model;
 
 pub use features::{extract, FEATURE_NAMES};
-pub use llm::{ClassifyRequest, ClassifyResponse, ExplainRequest, LlmProvider};
+pub use llm::{
+    ClassifyRequest, ClassifyResponse, ExplainRequest, LlmProvider, MockLlmProvider,
+    OllamaProvider, OpenRouterProvider,
+};
 pub use threat::ThreatModel;

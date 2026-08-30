@@ -143,6 +143,7 @@ impl LogFormat {
         Ok(RawEvent {
             source: SourceKind::Nginx,
             timestamp,
+            transport: sentry_core::event::Transport::Tcp,
             client_ip,
             client_port: None,
             server_port: None,

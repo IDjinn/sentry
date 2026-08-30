@@ -112,6 +112,14 @@ pub enum SignalKind {
     /// IP hit many distinct unknown 4xx paths in a short window
     /// (random-filename probing like `/a1b2.php`, `/.env.local`, …).
     RandomScan,
+    /// Repeated 401/403 on authentication routes from one IP.
+    AuthBruteForce,
+    /// Many distinct User-Agents failing auth on login routes
+    /// (credential stuffing with fingerprint rotation).
+    CredentialStuffing,
+    /// Systematic probing of well-known sensitive paths (`/admin`,
+    /// `/wp-admin`, `/backup`, …) answered with 404.
+    DirectoryBruteForce,
     /// IP exceeded the configured rate limit.
     AbnormalRate,
     /// Suspicious or absent User-Agent.

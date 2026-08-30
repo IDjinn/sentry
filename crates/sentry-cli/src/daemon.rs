@@ -63,15 +63,22 @@ impl DedupeCache {
     }
 }
 
-/// Build the dedup key for an event (IP + path + method).
+/// Build the dedup key for an event (IP + path + method for HTTP; IP + hash
+/// of the raw record otherwise, so distinct syslog/TCP messages from one IP
+/// are not collapsed).
 fn dedup_key(evt: &Event) -> String {
-    let path = evt.http().map(|h| h.path.as_str()).unwrap_or("");
-    let method = evt
-        .http()
-        .and_then(|h| h.method)
-        .map(|m| format!("{m:?}"))
-        .unwrap_or_default();
-    format!("{}:{}:{}", evt.client_ip, method, path)
+    match evt.http() {
+        Some(http) => {
+            let method = http.method.map(|m| format!("{m:?}")).unwrap_or_default();
+            format!("{}:{}:{}", evt.client_ip, method, http.path)
+        }
+        None => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            evt.raw.hash(&mut hasher);
+            format!("{}:raw:{:016x}", evt.client_ip, hasher.finish())
+        }
+    }
 }
 
 /// Run the daemon.
@@ -179,6 +186,14 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         ))
     });
 
+    // Behavioral attack tracker (auth brute-force / credential stuffing /
+    // directory sweeps).
+    let behavior_tracker = cfg.behavior.enabled.then(|| {
+        Arc::new(std::sync::RwLock::new(
+            sentry_core::behavior::BehaviorTracker::from_config(&cfg.behavior),
+        ))
+    });
+
     // Repeat-offender memory (strikes → verdict escalation ladder).
     let offender_tracker = cfg.escalation.enabled.then(|| {
         Arc::new(std::sync::RwLock::new(
@@ -196,6 +211,9 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     if let Some(ref t) = scan_tracker {
         pipeline_builder = pipeline_builder.with_scan_tracker(Arc::clone(t));
     }
+    if let Some(ref t) = behavior_tracker {
+        pipeline_builder = pipeline_builder.with_behavior_tracker(Arc::clone(t));
+    }
     if let Some(ref t) = offender_tracker {
         pipeline_builder = pipeline_builder.with_offender(Arc::clone(t), cfg.escalation.clone());
     }
@@ -205,6 +223,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         repetition_bonus = cfg.scorer.repetition_bonus,
         rate_backend = cfg.rate_limit.backend.as_str(),
         scan_detection = cfg.scan.enabled,
+        behavior_detection = cfg.behavior.enabled,
         escalation = cfg.escalation.enabled,
         "pipeline built"
     );
@@ -271,6 +290,17 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             }
         });
     }
+    if let Some(ref t) = behavior_tracker {
+        let t = Arc::clone(t);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                t.write().unwrap().prune();
+            }
+        });
+    }
 
     // Start the routes LISTEN/NOTIFY hot-reload task (only with storage).
     if let Some(ref repo) = repo {
@@ -305,6 +335,10 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             "ai threat model loaded"
         );
     }
+
+    // Remote LLM classifier (Layer 2): escalates suspicious or quarantined
+    // events off the hot path, bounded by a semaphore and a verdict cache.
+    let llm_fork = build_llm_fork(&cfg);
 
     if registry.source_count() == 0 {
         warn!("no sources configured — daemon will idle. Add [[source]] entries in sentry.toml");
@@ -465,6 +499,19 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             }
         }
 
+        // LLM fork (Layer 2): same contract as the AI fork, but the verdict
+        // comes from the configured remote provider.
+        if let Some(ref llm) = llm_fork {
+            if llm.should_run(&result) {
+                llm.spawn_fork(
+                    result.clone(),
+                    Arc::clone(&pipeline),
+                    registry.clone(),
+                    repo.clone(),
+                );
+            }
+        }
+
         // Mirror offender strikes to Postgres and log escalations.
         if result.decision.action != sentry_core::Verdict::Allow {
             if let Some(ref offender) = offender_tracker {
@@ -531,6 +578,20 @@ fn verdict_str(v: sentry_core::Verdict) -> &'static str {
 /// Cached model verdict keyed by payload hash: (inserted_at, signals).
 type AiCache = Arc<std::sync::RwLock<HashMap<u64, (Instant, Vec<sentry_core::Signal>)>>>;
 
+/// Cache key shared by the AI and LLM fork stages: client identity plus the
+/// HTTP payload shape (path/query/UA).
+fn payload_hash(evt: &Event) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    evt.client_ip.hash(&mut hasher);
+    if let Some(http) = evt.http() {
+        http.path.hash(&mut hasher);
+        http.query.hash(&mut hasher);
+        http.user_agent.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// Local ML threat model running beside the hot path.
 ///
 /// The hot path (rules → heuristics → routes → scan → score → policy →
@@ -567,15 +628,7 @@ impl AiFork {
     }
 
     fn payload_hash(evt: &Event) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        evt.client_ip.hash(&mut hasher);
-        if let Some(http) = evt.http() {
-            http.path.hash(&mut hasher);
-            http.query.hash(&mut hasher);
-            http.user_agent.hash(&mut hasher);
-        }
-        hasher.finish()
+        payload_hash(evt)
     }
 
     /// Evaluate the model with a TTL cache keyed by payload hash.
@@ -705,6 +758,218 @@ fn build_ai_fork(cfg: &SentryConfig) -> Option<Arc<AiFork>> {
     }
 }
 
+/// Remote LLM classifier running beside the hot path (Layer 2).
+///
+/// Mirrors [`AiFork`] but calls the configured [`sentry_ai::LlmProvider`].
+/// Only suspicious or quarantined events are escalated (cost control), and
+/// verdicts re-enter through [`Pipeline::rescore_from`], which can only
+/// raise the risk score. `shadow` mode logs what the LLM would decide
+/// without ever acting.
+struct LlmFork {
+    provider: Arc<dyn sentry_ai::LlmProvider>,
+    mode: String,
+    only_above: u8,
+    cache_ttl: Duration,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    cache: AiCache,
+}
+
+impl LlmFork {
+    /// Whether the hot-path result should be escalated to the LLM.
+    fn should_run(&self, r: &sentry_core::ProcessedEvent) -> bool {
+        r.decision.action == sentry_core::Verdict::Quarantine
+            || r.analysis.risk_score >= self.only_above
+    }
+
+    /// Classify the event with a TTL cache keyed by payload hash.
+    async fn evaluate(&self, evt: &Event) -> Vec<sentry_core::Signal> {
+        let key = payload_hash(evt);
+        if let Some((ts, cached)) = self.cache.read().unwrap().get(&key) {
+            if ts.elapsed() < self.cache_ttl {
+                return cached.clone();
+            }
+        }
+        let _permit = self.semaphore.acquire().await;
+        let req = sentry_ai::ClassifyRequest {
+            protocol: evt.protocol.clone(),
+            context: sentry_ai::llm::prompt::context_from_event(evt),
+            schema: sentry_ai::llm::prompt::classify_schema(),
+        };
+        match self.provider.classify(req).await {
+            Ok(resp) => {
+                let signals = llm_signals(&resp);
+                let mut cache = self.cache.write().unwrap();
+                cache.retain(|_, (ts, _)| ts.elapsed() < self.cache_ttl);
+                cache.insert(key, (Instant::now(), signals.clone()));
+                signals
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    provider = self.provider.name(),
+                    "llm classify failed"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Spawn the fork evaluation for a processed event.
+    fn spawn_fork(
+        self: &Arc<Self>,
+        base: sentry_core::ProcessedEvent,
+        pipeline: Arc<Pipeline>,
+        registry: sentry_core::registry::Registry,
+        repo: Option<Arc<sentry_storage::Repo>>,
+    ) {
+        let fork = Arc::clone(self);
+        tokio::spawn(async move {
+            let signals = fork.evaluate(&base.event).await;
+            if signals.is_empty() {
+                return;
+            }
+            let updated = pipeline.rescore_from(&base, signals);
+            if updated.decision.action == base.decision.action {
+                return;
+            }
+            let ip = base.event.client_ip;
+            if fork.mode == "shadow" {
+                info!(
+                    ip = %ip,
+                    would = ?updated.decision.action,
+                    score = updated.analysis.risk_score,
+                    "llm (shadow) would change verdict"
+                );
+                return;
+            }
+            info!(
+                ip = %ip,
+                from = ?base.decision.action,
+                to = ?updated.decision.action,
+                score = updated.analysis.risk_score,
+                "llm fork changed verdict"
+            );
+            if let Some(ref repo) = repo {
+                if let Err(e) = repo
+                    .events()
+                    .update_verdict(
+                        base.event.id,
+                        updated.decision.action,
+                        updated.analysis.risk_score,
+                        updated.analysis.risk_level,
+                    )
+                    .await
+                {
+                    warn!(error = %e, "llm fork: failed to update event verdict");
+                }
+            }
+            for action in registry.actions() {
+                if action.applies_to(&updated.decision) {
+                    if let Err(e) = action.execute(&updated.event, &updated.decision).await {
+                        warn!(action = action.name(), error = %e, "llm fork action failed");
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Map an LLM classification to pipeline signals.
+///
+/// Benign answers produce no signal (the fork can only raise risk, so a
+/// zero-weight signal would be noise); malicious ones emit `LlmMalicious`
+/// weighted by `risk_score * confidence`.
+fn llm_signals(resp: &sentry_ai::ClassifyResponse) -> Vec<sentry_core::Signal> {
+    let benign = resp.verdict == sentry_core::Verdict::Allow && resp.risk_score < 20;
+    if benign {
+        return Vec::new();
+    }
+    let confidence = resp.confidence.clamp(0.0, 1.0);
+    let weight = (resp.risk_score as f32 * confidence).round() as u8;
+    if weight == 0 {
+        return Vec::new();
+    }
+    let detail = resp
+        .explanation
+        .clone()
+        .or_else(|| (!resp.signals.is_empty()).then(|| resp.signals.join(", ")));
+    vec![sentry_core::Signal {
+        kind: sentry_core::SignalKind::LlmMalicious,
+        weight,
+        detail,
+    }]
+}
+
+/// Build the LLM fork from `[llm]` config when `provider != "none"`.
+fn build_llm_fork(cfg: &SentryConfig) -> Option<Arc<LlmFork>> {
+    if cfg.llm.provider.is_empty() || cfg.llm.provider == "none" {
+        return None;
+    }
+    let provider: Arc<dyn sentry_ai::LlmProvider> = match cfg.llm.provider.as_str() {
+        "openrouter" => {
+            let key = std::env::var("SENTRY_LLM_KEY").unwrap_or_default();
+            if key.is_empty() {
+                warn!("llm.provider = \"openrouter\" but SENTRY_LLM_KEY env unset — llm stage disabled for this run");
+                return None;
+            }
+            Arc::new(sentry_ai::OpenRouterProvider::new(
+                sentry_ai::llm::openrouter::OpenRouterConfig {
+                    api_key: key,
+                    model: non_empty_or(&cfg.llm.model, "openai/gpt-4o-mini"),
+                    base_url: non_empty_or(
+                        cfg.llm.base_url.as_deref().unwrap_or(""),
+                        sentry_ai::llm::openrouter::DEFAULT_BASE_URL,
+                    ),
+                },
+            ))
+        }
+        "ollama" => Arc::new(sentry_ai::OllamaProvider::new(
+            sentry_ai::llm::ollama::OllamaConfig {
+                model: non_empty_or(&cfg.llm.model, "llama3.1"),
+                base_url: non_empty_or(
+                    cfg.llm.base_url.as_deref().unwrap_or(""),
+                    sentry_ai::llm::ollama::DEFAULT_BASE_URL,
+                ),
+            },
+        )),
+        "mock" => Arc::new(sentry_ai::MockLlmProvider::default()),
+        other => {
+            warn!(
+                provider = other,
+                "unknown llm.provider — known: openrouter | ollama | mock"
+            );
+            return None;
+        }
+    };
+    let mode = match cfg.llm.mode.as_str() {
+        "shadow" => "shadow",
+        _ => "fork",
+    };
+    info!(
+        provider = provider.name(),
+        model = provider.model_id(),
+        mode,
+        only_above = cfg.llm.only_above,
+        "llm provider loaded"
+    );
+    Some(Arc::new(LlmFork {
+        provider,
+        mode: mode.to_string(),
+        only_above: cfg.llm.only_above,
+        cache_ttl: Duration::from_secs(cfg.llm.cache_ttl_secs),
+        semaphore: Arc::new(tokio::sync::Semaphore::new(cfg.llm.concurrency.max(1))),
+        cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+    }))
+}
+
+fn non_empty_or(value: &str, fallback: &str) -> String {
+    if value.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        value.trim().to_string()
+    }
+}
+
 /// Thin wrapper so the daemon can call the metrics server without importing
 /// the crate-internal module path in every call site.
 async fn serve_metrics(m: crate::metrics::Metrics, addr: std::net::SocketAddr) {
@@ -815,6 +1080,29 @@ fn build_registry(
                     },
                 )?;
                 builder.register_source(ns);
+            }
+            "syslog" => {
+                let bind = src
+                    .options
+                    .get("bind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(sentry_source_syslog::DEFAULT_BIND)
+                    .to_string();
+                let transport = src
+                    .options
+                    .get("transport")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("udp");
+                let transport: sentry_source_syslog::SyslogTransport = transport
+                    .parse()
+                    .map_err(|e| color_eyre::eyre::eyre!("source `syslog`: {e}"))?;
+                let ss = sentry_source_syslog::SyslogSource::new(
+                    sentry_source_syslog::SyslogSourceConfig {
+                        bind_addr: bind,
+                        transport,
+                    },
+                )?;
+                builder.register_source(ss);
             }
             other => {
                 info!(

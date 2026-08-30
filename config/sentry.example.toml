@@ -97,6 +97,21 @@ window_secs = 60
 distinct_paths = 8
 not_found = 10
 
+# ── Behavioral attack detection ────────────────────────────────────────────
+# Per-IP sliding window (5 min) over auth routes and probe paths:
+# ≥ auth_failures 401/403 on login routes → AuthBruteForce (weight 35)
+# ≥ distinct_uas distinct User-Agents failing auth → CredentialStuffing (40)
+# ≥ wordlist_hits 404s on well-known paths → DirectoryBruteForce (30);
+#   known-good crawlers (Googlebot, Bingbot, …) are exempt.
+[behavior]
+enabled = true
+window_secs = 300
+auth_failures = 10
+distinct_uas = 3
+wordlist_hits = 5
+# login_patterns = ["login", "signin", "auth"]   # empty = built-in list
+# wordlist_paths = ["/admin", "/wp-admin"]       # empty = built-in wordlist
+
 # ── Local ML threat model (classic ML, ONNX fork) ──────────────────────────
 # Runs beside the hot path: mode = "fork" (default) evaluates asynchronously
 # and feeds signals back via rescore_from (can only raise the score),
@@ -146,10 +161,11 @@ min_ips = 2               # minimum distinct IPs that hit the shape
 # OpenRouter routes to any model (Claude, GPT, Gemini, Qwen, Llama, …).
 # Set SENTRY_LLM_KEY env var for the API key; never put it here.
 [llm]
-provider = "none"            # none | openrouter | ollama | openai | anthropic
-model = ""                   # e.g. "anthropic/claude-3.5-sonnet" (openrouter)
+provider = "none"            # none | openrouter | ollama | mock
+model = ""                   # default: openai/gpt-4o-mini (openrouter) | llama3.1 (ollama)
 base_url = ""                # override for self-hosted (e.g. http://localhost:11434 for ollama)
-only_above = 30              # only invoke LLM for events with risk score > 30
+mode = "fork"                # fork (async re-score + action re-dispatch) | shadow (log only)
+only_above = 30              # escalate to the LLM above this score (or on quarantine)
 concurrency = 4
 cache_ttl_secs = 300
 
@@ -227,6 +243,23 @@ format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_byt
 # [source.options]
 # zone = "example.com"
 # poll_secs = 30
+
+# Syslog receiver (RFC 5424 with RFC 3164 fallback) for firewalls, network
+# equipment and services that ship logs via syslog. The peer address becomes
+# the client IP; each message becomes a ProtocolData::Syslog event.
+# TCP supports newline framing and RFC 6587 octet-counting.
+# [[source]]
+# type = "syslog"
+# [source.options]
+# bind = "0.0.0.0:5140"   # ports < 1024 need root; 5140 avoids that
+# transport = "udp"       # udp | tcp
+
+# ── Web dashboard / JSON API (`sentry serve`) ──────────────────────────────
+# Separate process from the daemon; requires Postgres. No auth yet (F4.4) —
+# keep on loopback or front it with an authenticating reverse proxy.
+[server]
+host = "127.0.0.1"
+port = 8080
 
 # ── Actions ──────────────────────────────────────────────────────────────
 [[action]]

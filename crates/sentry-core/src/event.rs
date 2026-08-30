@@ -25,7 +25,7 @@ pub enum SourceKind {
     Tcp,
     /// `sentry-source-cloudflare` — Cloudflare logs pulled via API.
     CloudflareLogs,
-    /// `sentry-source-syslog` — RFC 5424 receiver (future).
+    /// `sentry-source-syslog` — RFC 5424 receiver.
     Syslog,
     /// Synthetic / test source.
     Synthetic,
@@ -264,6 +264,14 @@ impl Event {
         }
     }
 
+    /// Returns the syslog payload if this is a syslog event, else `None`.
+    pub fn syslog(&self) -> Option<&SyslogData> {
+        match &self.protocol {
+            ProtocolData::Syslog(d) => Some(d),
+            _ => None,
+        }
+    }
+
     /// `true` if this event carries an HTTP payload.
     pub fn is_http(&self) -> bool {
         matches!(self.protocol, ProtocolData::Http(_))
@@ -276,6 +284,7 @@ impl Event {
             ProtocolData::Tcp(_) => ProtocolKind::Tcp,
             ProtocolData::Udp(_) => ProtocolKind::Udp,
             ProtocolData::TlsHandshake(_) => ProtocolKind::Tls,
+            ProtocolData::Syslog(_) => ProtocolKind::Other,
             ProtocolData::Raw(_) => ProtocolKind::Other,
         }
     }
@@ -293,6 +302,9 @@ pub struct RawEvent {
     pub source: SourceKind,
     /// Wall-clock observation time.
     pub timestamp: DateTime<Utc>,
+    /// L4 transport that carried the observation (UDP for syslog receivers,
+    /// TCP for log tails and captures).
+    pub transport: Transport,
     /// Client IP, when the source can extract it.
     pub client_ip: Option<IpAddr>,
     /// Client source port.
@@ -321,7 +333,7 @@ impl RawEvent {
             id: Uuid::new_v4(),
             timestamp: self.timestamp,
             source: self.source,
-            transport: Transport::Tcp,
+            transport: self.transport,
             direction: Direction::Inbound,
             client_ip,
             client_port: self.client_port,
@@ -350,6 +362,8 @@ pub enum ProtocolData {
     Udp(UdpData),
     /// TLS handshake metadata.
     TlsHandshake(TlsData),
+    /// RFC 5424/3164 syslog message received by `sentry-source-syslog`.
+    Syslog(SyslogData),
     /// Fallback for protocols without a dedicated variant.
     Raw(RawData),
 }
@@ -461,4 +475,27 @@ pub struct RawData {
     pub note: String,
     /// Raw captured bytes.
     pub bytes: Vec<u8>,
+}
+
+/// Syslog message payload (RFC 5424 with RFC 3164 fallback).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyslogData {
+    /// Facility code (0–23).
+    pub facility: u8,
+    /// Severity code (0–7, 0 = emergency).
+    pub severity: u8,
+    /// SYSLOG-VERSION (RFC 5424), `None` for RFC 3164 messages.
+    pub version: Option<u16>,
+    /// Timestamp parsed from the header, when present.
+    pub timestamp: Option<DateTime<Utc>>,
+    /// HOSTNAME field, when present.
+    pub hostname: Option<String>,
+    /// APP-NAME field, when present.
+    pub app_name: Option<String>,
+    /// PROCID field, when present.
+    pub proc_id: Option<String>,
+    /// MSGID field, when present.
+    pub msg_id: Option<String>,
+    /// Free-form message content (after STRUCTURED-DATA).
+    pub message: String,
 }

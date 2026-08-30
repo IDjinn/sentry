@@ -25,6 +25,8 @@ pub struct Cli {
 pub enum Command {
     /// Start the monitor daemon (foreground).
     Run,
+    /// Start the web dashboard + JSON API server (requires Postgres).
+    Serve,
     /// Live tail of events.
     Tail {
         /// Filter by risk levels (comma-separated, e.g. `High,Critical`).
