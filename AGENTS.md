@@ -171,7 +171,7 @@ não em runtime.
   - ✅ Fixtures + snapshot tests (11 fixtures nginx, 11 snapshots insta)
   - ✅ CI GitHub Actions (fmt, clippy, test matrix 3 OS, storage com Postgres)
   - ✅ Config example completo (`[geo]`, `[[routes.known]]`, `[scorer]`)
-- **F2** (concluída): Cloudflare hardening + roteador parametrizado/learn/import + rate-limit + métricas + escalonamento de reincidentes + detectores de scan + IA clássica (ONNX fork)
+- **F2** (exceto F2.14): Cloudflare hardening + roteador parametrizado/learn/import + rate-limit + métricas + escalonamento de reincidentes + detectores de scan + IA clássica (ONNX fork)
   - ✅ F2.4 Verdict policy (`policy.rs`, `VerdictPolicy`, `PolicyConfig`,
     `[[policy.override]]` DSL) — 6 testes
   - ✅ F2.5+CF Cloudflare status/test/pull CLI + reaper restart-safe (deleta
@@ -215,6 +215,8 @@ não em runtime.
     ≥8 paths distintos → `RandomScan` peso 25; ≥10 4xx → `ScanBehavior`
     peso 35) + fix do pack `rate_scan_404` (filtra `Status(404)` de verdade)
     + `sentry report --unknown-paths`; `[scan]` em config — 8 testes
+  - ⏸️ F2.14 Edge blocking por /64 IPv6 via IP Lists da Cloudflare (IP Access
+    Rules aceitam só IP exato — evidência da API e design em `BACKLOG.md`)
 - **F3** (exceto F3.1/F3.2/F3.3/F3.6/F3.7/F3.9): Multi-source (syslog) + LLM
   (OpenRouter/Ollama) + detecção comportamental
   - ✅ F3.4 Syslog source (crate `sentry-source-syslog`: parser RFC 5424 com
