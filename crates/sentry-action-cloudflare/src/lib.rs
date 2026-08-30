@@ -211,17 +211,24 @@ impl CloudflareProvider {
 
     /// Verify the API token and zone. Returns `(token_valid, zone_name)`.
     ///
+    /// Uses the zone lookup as the source of truth: the legacy
+    /// `/user/tokens/verify` endpoint rejects Account API tokens (prefix
+    /// `cfat_`) with `1000 Invalid API Token` even when they hold full
+    /// firewall access, which permanently disabled the provider at startup.
+    /// `GET /zones/{id}` succeeds only for a token that is both valid and
+    /// able to read the configured zone — access the provider requires
+    /// anyway to manage access rules.
+    ///
     /// Used by `sentry cloudflare status` / `test` and by
     /// [`CloudflareProvider::reconcile`].
     pub async fn verify(&self) -> Result<(bool, String)> {
-        let verify_url = "https://api.cloudflare.com/client/v4/user/tokens/verify";
         let resp = self
             .http
-            .get(verify_url)
+            .get(self.zones_url())
             .bearer_auth(&self.cfg.token)
             .send()
             .await
-            .map_err(|e| CoreError::Challenge(format!("verify request: {e}")))?;
+            .map_err(|e| CoreError::Challenge(format!("zone request: {e}")))?;
         let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         let token_valid = status.is_success()
@@ -232,16 +239,7 @@ impl CloudflareProvider {
         if !token_valid {
             return Ok((false, String::new()));
         }
-        let zone_url = self.zones_url();
-        let zresp = self
-            .http
-            .get(&zone_url)
-            .bearer_auth(&self.cfg.token)
-            .send()
-            .await
-            .map_err(|e| CoreError::Challenge(format!("zone request: {e}")))?;
-        let zbody: serde_json::Value = zresp.json().await.unwrap_or_default();
-        let zone_name = zbody
+        let zone_name = body
             .get("result")
             .and_then(|r| r.get("name"))
             .and_then(|n| n.as_str())
