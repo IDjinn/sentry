@@ -710,7 +710,9 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                             Ok(rules) => {
                                 let ours = rules
                                     .iter()
-                                    .filter(|r| r.notes.as_deref() == Some("sentry"))
+                                    .filter(|r| {
+                                        sentry_action_cloudflare::is_sentry_note(r.notes.as_deref())
+                                    })
                                     .count();
                                 println!("Access rules:     {} (sentry: {})", rules.len(), ours);
                             }
@@ -752,7 +754,9 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                     Ok(rules) => {
                         let ours: Vec<_> = rules
                             .into_iter()
-                            .filter(|r| r.notes.as_deref() == Some("sentry"))
+                            .filter(|r| {
+                                sentry_action_cloudflare::is_sentry_note(r.notes.as_deref())
+                            })
                             .collect();
                         println!(
                             "Found {} sentry-created access rules at the edge.",
@@ -817,6 +821,7 @@ fn build_cf_provider() -> color_eyre::Result<sentry_action_cloudflare::Cloudflar
             zone,
             default_mode: sentry_core::challenge::EdgeMode::ManagedChallenge,
             ttl: std::time::Duration::from_secs(86400),
+            max_failures: 3,
         },
     ))
 }

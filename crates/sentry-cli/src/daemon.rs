@@ -344,9 +344,29 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         warn!("no sources configured — daemon will idle. Add [[source]] entries in sentry.toml");
     }
 
+    // Cloudflare startup reconcile: verifies the token, re-adopts edge rules
+    // created by previous runs (re-populating the dedup cache so restarts
+    // don't hit CF duplicate-rule errors) and deletes expired ones. Disables
+    // the provider when the token/zone is invalid.
+    if let Some(cf) = cf_provider.as_ref() {
+        let report = cf.reconcile().await;
+        info!(
+            token_valid = report.token_valid,
+            zone = %report.zone,
+            sentry_rules = report.sentry_rules,
+            adopted = report.adopted,
+            restamped = report.restamped,
+            deleted = report.deleted,
+            "cloudflare startup reconcile"
+        );
+        if cf.is_disabled() {
+            warn!("cloudflare action disabled — no edge rules will be applied until restart");
+        }
+    }
+
     // Spawn the Cloudflare reaper: periodically lists access rules at the
-    // edge, finds the ones Sentry created (notes = "sentry"), and deletes
-    // those whose local TTL has expired.
+    // edge, finds the ones Sentry created, and deletes those whose encoded
+    // TTL has expired.
     if let Some(cf) = cf_provider.as_ref() {
         let cf = Arc::clone(cf);
         tokio::spawn(async move {
@@ -1203,6 +1223,17 @@ fn parse_edge_mode(opts: &HashMap<String, toml::Value>) -> Option<EdgeMode> {
     }
 }
 
+fn parse_max_failures(opts: &HashMap<String, toml::Value>) -> u32 {
+    match opts
+        .get("max_failures")
+        .and_then(|v| v.as_integer())
+        .and_then(|i| u32::try_from(i).ok())
+    {
+        Some(n) if n > 0 => n,
+        _ => 3,
+    }
+}
+
 fn build_challenge_action(
     provider_name: &str,
     options: &HashMap<String, toml::Value>,
@@ -1230,6 +1261,7 @@ fn build_challenge_action(
                     zone,
                     default_mode: EdgeMode::ManagedChallenge,
                     ttl,
+                    max_failures: parse_max_failures(options),
                 },
             ));
             (cf.clone(), Some(cf))
@@ -1249,49 +1281,21 @@ fn build_challenge_action(
 
 /// Background task: Cloudflare access-rule reaper.
 ///
-/// Periodically lists access rules at the edge that Sentry created
-/// (`notes = "sentry"`) and deletes those whose local TTL has expired.
-/// This keeps the edge clean — the access-rules API has no TTL of its own,
-/// so without reaping Sentry-created rules would accumulate forever.
+/// Periodically deletes edge rules created by Sentry whose note-encoded TTL
+/// (`sentry:<created_unix>:<ttl_secs>`) has lapsed. Unlike the provider's
+/// in-memory cache, the encoded expiry survives restarts. No-op while the
+/// provider is disabled (invalid token or tripped circuit breaker).
 async fn cloudflare_reaper(cf: Arc<sentry_action_cloudflare::CloudflareProvider>) {
     let mut interval = tokio::time::interval(Duration::from_secs(300));
     interval.tick().await; // skip the immediate tick
     loop {
         interval.tick().await;
-        let expired = cf.expired_keys().await;
-        if expired.is_empty() {
-            continue;
-        }
-        let rules = match cf.list_access_rules().await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "cloudflare reaper: list failed");
-                continue;
+        match cf.reap_expired().await {
+            Ok(reaped) if reaped > 0 => {
+                info!(reaped, "cloudflare reaper: deleted expired access rules");
             }
-        };
-        let mut reaped = 0u32;
-        for rule in rules {
-            // Only touch rules Sentry created.
-            if rule.notes.as_deref() != Some("sentry") {
-                continue;
-            }
-            let Ok(ip) = rule.configuration.value.parse::<IpAddr>() else {
-                continue;
-            };
-            if expired.contains(&ip) {
-                match cf.delete_access_rule(&rule.id).await {
-                    Ok(_) => {
-                        cf.forget(ip).await;
-                        reaped += 1;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, rule_id = %rule.id, "cloudflare reaper: delete failed")
-                    }
-                }
-            }
-        }
-        if reaped > 0 {
-            info!(reaped, "cloudflare reaper: deleted expired access rules");
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "cloudflare reaper: list failed"),
         }
     }
 }

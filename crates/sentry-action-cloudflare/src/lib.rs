@@ -7,14 +7,20 @@
 //! "firewallrules.api.maintenance_mode") and no longer accepts modifications.
 //!
 //! Keeps a local in-memory cache of IPs already acted on (with TTL) to avoid
-//! hammering the API. Note that the access-rules API itself has no `ttl`
-//! parameter — rules are permanent at the edge until manually removed; the
-//! local cache only guards Sentry's own de-duplication window.
+//! hammering the API. The access-rules API itself has no `ttl` parameter —
+//! rules are permanent at the edge until manually removed — so every rule
+//! Sentry creates encodes its creation timestamp and TTL in the `notes` field
+//! (`sentry:<created_unix>:<ttl_secs>`). That makes expiry recoverable across
+//! restarts: [`CloudflareProvider::reconcile`] runs at daemon startup, verifies
+//! the token, re-adopts live rules into the local cache (preventing duplicate
+//! inserts) and deletes expired ones, while [`CloudflareProvider::reap_expired`]
+//! periodically removes rules whose encoded TTL has lapsed.
 //!
-//! The provider also exposes [`CloudflareProvider::list_access_rules`],
-//! [`CloudflareProvider::delete_access_rule`] and [`CloudflareProvider::verify`]
-//! for the `sentry cloudflare status` / `test` CLI commands and for the
-//! background reaper that removes expired rules.
+//! The provider self-disables (circuit breaker) after `max_failures`
+//! consecutive failed inserts, or immediately at reconcile time when the
+//! token/zone is invalid, so a misconfigured deployment does not generate an
+//! endless stream of doomed requests. Disabling is permanent for the process
+//! lifetime — fix the configuration and restart.
 //!
 //! Wired into the daemon either as `type = "cloudflare"` (backward-compatible
 //! alias) or as `type = "challenge"`, `provider = "cloudflare"` (canonical
@@ -24,16 +30,20 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use sentry_core::analysis::Verdict;
 use sentry_core::challenge::{ChallengeProvider, EdgeMode, EdgeOptions};
-use sentry_core::error::Result;
+use sentry_core::error::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
+
+/// Prefix tagging access rules created by Sentry.
+const NOTE_PREFIX: &str = "sentry";
 
 /// Cloudflare provider configuration.
 #[derive(Debug, Clone)]
@@ -48,6 +58,9 @@ pub struct CloudflareProviderConfig {
     /// How long to keep an IP blocked/challenged, when not overridden by
     /// [`EdgeOptions::ttl`].
     pub ttl: Duration,
+    /// Consecutive failed inserts after which the provider disables itself
+    /// for the remainder of the process lifetime (circuit breaker).
+    pub max_failures: u32,
 }
 
 /// Cloudflare [`ChallengeProvider`] implementation.
@@ -56,6 +69,10 @@ pub struct CloudflareProvider {
     http: reqwest::Client,
     /// Cache of IP → expiry instant. Prevents duplicate API calls.
     cache: Arc<RwLock<HashMap<IpAddr, Instant>>>,
+    /// Consecutive failed inserts (reset on any success, duplicate included).
+    consecutive_failures: AtomicU32,
+    /// Set when the circuit breaker trips or the token is invalid.
+    disabled: AtomicBool,
 }
 
 impl CloudflareProvider {
@@ -69,7 +86,34 @@ impl CloudflareProvider {
             cfg,
             http,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            consecutive_failures: AtomicU32::new(0),
+            disabled: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the provider has disabled itself (invalid token or circuit
+    /// breaker tripped). Permanent until the process restarts.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::Relaxed)
+    }
+
+    /// Count one failed insert toward the circuit breaker; trips (disables)
+    /// the provider at `max_failures` consecutive failures.
+    fn register_failure(&self) {
+        let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if !self.disabled.load(Ordering::Relaxed) && failures >= self.cfg.max_failures {
+            self.disabled.store(true, Ordering::Relaxed);
+            error!(
+                failures,
+                max = self.cfg.max_failures,
+                "cloudflare provider disabled after consecutive failed inserts — fix configuration and restart"
+            );
+        }
+    }
+
+    /// Count one success: resets the consecutive-failure counter.
+    fn register_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
     }
 
     /// Returns `true` if `ip` is already in the cache and not expired.
@@ -102,19 +146,6 @@ impl CloudflareProvider {
     /// are active at the edge within their TTL window).
     pub async fn tracked_count(&self) -> usize {
         self.cache.read().await.len()
-    }
-
-    /// Return the IPs whose local cache entry has expired (i.e. should be
-    /// reaped at the edge). Used by the daemon's background reaper.
-    pub async fn expired_keys(&self) -> Vec<IpAddr> {
-        let now = Instant::now();
-        self.cache
-            .read()
-            .await
-            .iter()
-            .filter(|(_, exp)| **exp <= now)
-            .map(|(ip, _)| *ip)
-            .collect()
     }
 
     /// Forget an IP locally (after the reaper deleted it at the edge or the
@@ -180,7 +211,8 @@ impl CloudflareProvider {
 
     /// Verify the API token and zone. Returns `(token_valid, zone_name)`.
     ///
-    /// Used by `sentry cloudflare status` / `test`.
+    /// Used by `sentry cloudflare status` / `test` and by
+    /// [`CloudflareProvider::reconcile`].
     pub async fn verify(&self) -> Result<(bool, String)> {
         let verify_url = "https://api.cloudflare.com/client/v4/user/tokens/verify";
         let resp = self
@@ -189,9 +221,7 @@ impl CloudflareProvider {
             .bearer_auth(&self.cfg.token)
             .send()
             .await
-            .map_err(|e| {
-                sentry_core::error::CoreError::Challenge(format!("verify request: {e}"))
-            })?;
+            .map_err(|e| CoreError::Challenge(format!("verify request: {e}")))?;
         let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         let token_valid = status.is_success()
@@ -209,7 +239,7 @@ impl CloudflareProvider {
             .bearer_auth(&self.cfg.token)
             .send()
             .await
-            .map_err(|e| sentry_core::error::CoreError::Challenge(format!("zone request: {e}")))?;
+            .map_err(|e| CoreError::Challenge(format!("zone request: {e}")))?;
         let zbody: serde_json::Value = zresp.json().await.unwrap_or_default();
         let zone_name = zbody
             .get("result")
@@ -222,7 +252,9 @@ impl CloudflareProvider {
 
     /// List IP Access Rules for the zone (paginated).
     ///
-    /// Used by `sentry cloudflare status` and the reaper task.
+    /// Used by `sentry cloudflare status`, the startup reconcile and the
+    /// reaper task. Fails on non-2xx (e.g. invalid token) instead of silently
+    /// returning an empty list.
     pub async fn list_access_rules(&self) -> Result<Vec<AccessRule>> {
         let mut all = Vec::new();
         let mut page = 1u32;
@@ -239,12 +271,15 @@ impl CloudflareProvider {
                 .await
             {
                 Ok(r) => r,
-                Err(e) => {
-                    return Err(sentry_core::error::CoreError::Challenge(format!(
-                        "list access rules: {e}"
-                    )))
-                }
+                Err(e) => return Err(CoreError::Challenge(format!("list access rules: {e}"))),
             };
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(CoreError::Challenge(format!(
+                    "list access rules: HTTP {status}: {body}"
+                )));
+            }
             let body: AccessRulesResponse = resp.json().await.unwrap_or_default();
             let got = body.result.len();
             all.extend(body.result);
@@ -265,17 +300,160 @@ impl CloudflareProvider {
             .bearer_auth(&self.cfg.token)
             .send()
             .await
-            .map_err(|e| {
-                sentry_core::error::CoreError::Challenge(format!("delete access rule: {e}"))
-            })?;
+            .map_err(|e| CoreError::Challenge(format!("delete access rule: {e}")))?;
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(sentry_core::error::CoreError::Challenge(format!(
+            return Err(CoreError::Challenge(format!(
                 "delete access rule {rule_id} failed: {body}"
             )));
         }
         info!(rule_id, "deleted cloudflare access rule");
         Ok(())
+    }
+
+    /// Rewrite the `notes` of an existing access rule (used to migrate legacy
+    /// `"sentry"` notes to the timestamped format).
+    pub async fn update_access_rule_note(&self, rule_id: &str, note: &str) -> Result<()> {
+        let url = format!("{}/firewall/access_rules/rules/{rule_id}", self.zones_url());
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(&self.cfg.token)
+            .json(&serde_json::json!({ "notes": note }))
+            .send()
+            .await
+            .map_err(|e| CoreError::Challenge(format!("update access rule: {e}")))?;
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(CoreError::Challenge(format!(
+                "update access rule {rule_id} failed: {body}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Startup reconciliation with the edge. Verifies the token (disabling the
+    /// provider when invalid), lists the zone's access rules, deletes the ones
+    /// whose encoded TTL has lapsed and re-adopts the live ones into the local
+    /// dedup cache — so a restart does not re-insert rules that already exist
+    /// (CF error 10009 `firewallaccessrules.api.duplicate_of_existing`).
+    ///
+    /// Legacy rules noted with plain `"sentry"` (created before the
+    /// timestamped format) have unknown age: they are adopted with a fresh
+    /// TTL and re-stamped with the current format, so the reaper can expire
+    /// them naturally.
+    pub async fn reconcile(&self) -> ReconcileReport {
+        let mut report = ReconcileReport::default();
+
+        match self.verify().await {
+            Ok((valid, zone)) => {
+                report.token_valid = valid;
+                report.zone = zone;
+                if !valid || report.zone.is_empty() {
+                    self.disabled.store(true, Ordering::Relaxed);
+                    report.disabled = true;
+                    error!(
+                        zone = %report.zone,
+                        "cloudflare token/zone invalid — provider disabled until restart"
+                    );
+                    return report;
+                }
+            }
+            // Transport failure: token validity is unknown (e.g. network not
+            // up yet). Don't disable — the insert circuit breaker covers a
+            // persistently broken setup.
+            Err(e) => {
+                warn!(error = %e, "cloudflare reconcile: verify request failed");
+                return report;
+            }
+        }
+
+        let rules = match self.list_access_rules().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "cloudflare reconcile: list access rules failed");
+                return report;
+            }
+        };
+
+        let now = unix_now();
+        for rule in rules {
+            if !is_sentry_note(rule.notes.as_deref()) {
+                continue;
+            }
+            report.sentry_rules += 1;
+            let Ok(ip) = rule.configuration.value.parse::<IpAddr>() else {
+                continue;
+            };
+            match plan_rule(rule.notes.as_deref(), now, self.cfg.ttl.as_secs()) {
+                PlannedAction::Delete => match self.delete_access_rule(&rule.id).await {
+                    Ok(_) => {
+                        self.forget(ip).await;
+                        report.deleted += 1;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, rule_id = %rule.id, "cloudflare reconcile: delete failed")
+                    }
+                },
+                PlannedAction::Adopt {
+                    remaining_secs,
+                    restamp,
+                } => {
+                    if restamp {
+                        let note = build_note(self.cfg.ttl.as_secs());
+                        match self.update_access_rule_note(&rule.id, &note).await {
+                            Ok(_) => report.restamped += 1,
+                            Err(e) => warn!(
+                                error = %e,
+                                rule_id = %rule.id,
+                                "cloudflare reconcile: note migration failed"
+                            ),
+                        }
+                    }
+                    if remaining_secs > 0 {
+                        self.record(ip, Duration::from_secs(remaining_secs)).await;
+                        report.adopted += 1;
+                    }
+                }
+                PlannedAction::Skip => {}
+            }
+        }
+        report
+    }
+
+    /// Delete the Sentry-created access rules whose encoded TTL has lapsed.
+    /// Returns how many were removed. No-op while the provider is disabled.
+    ///
+    /// Used by the daemon's background reaper; unlike the local cache, the
+    /// note-encoded expiry survives restarts.
+    pub async fn reap_expired(&self) -> Result<usize> {
+        if self.is_disabled() {
+            return Ok(0);
+        }
+        let rules = self.list_access_rules().await?;
+        let now = unix_now();
+        let mut reaped = 0usize;
+        for rule in rules {
+            if !is_sentry_note(rule.notes.as_deref()) {
+                continue;
+            }
+            if plan_rule(rule.notes.as_deref(), now, self.cfg.ttl.as_secs())
+                != PlannedAction::Delete
+            {
+                continue;
+            }
+            let Ok(ip) = rule.configuration.value.parse::<IpAddr>() else {
+                continue;
+            };
+            match self.delete_access_rule(&rule.id).await {
+                Ok(_) => {
+                    self.forget(ip).await;
+                    reaped += 1;
+                }
+                Err(e) => warn!(error = %e, rule_id = %rule.id, "cloudflare reaper: delete failed"),
+            }
+        }
+        Ok(reaped)
     }
 }
 
@@ -290,7 +468,8 @@ pub struct AccessRule {
     /// Configuration: target + value.
     #[serde(default)]
     pub configuration: AccessRuleConfig,
-    /// Notes (Sentry marks rules with `"sentry"`).
+    /// Notes (Sentry tags rules with `sentry:<created_unix>:<ttl_secs>`; the
+    /// pre-timestamp format used a plain `"sentry"`).
     #[serde(default)]
     pub notes: Option<String>,
 }
@@ -313,6 +492,116 @@ struct AccessRulesResponse {
     result: Vec<AccessRule>,
 }
 
+/// Summary of a [`CloudflareProvider::reconcile`] run, for logging.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Whether `verify()` confirmed the token (and the zone is readable).
+    pub token_valid: bool,
+    /// Zone name from `verify()` (empty when inaccessible).
+    pub zone: String,
+    /// Sentry-created rules found at the edge (current + legacy format).
+    pub sentry_rules: usize,
+    /// Live rules re-adopted into the local dedup cache.
+    pub adopted: usize,
+    /// Legacy rules re-stamped with the timestamped note format.
+    pub restamped: usize,
+    /// Expired rules deleted at the edge.
+    pub deleted: usize,
+    /// Whether the provider ended up disabled by this reconcile.
+    pub disabled: bool,
+}
+
+/// What reconcile/reap should do with a Sentry-noted edge rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannedAction {
+    Delete,
+    Adopt { remaining_secs: u64, restamp: bool },
+    Skip,
+}
+
+fn plan_rule(notes: Option<&str>, now_unix: u64, default_ttl_secs: u64) -> PlannedAction {
+    match parse_note(notes) {
+        NoteKind::Foreign => PlannedAction::Skip,
+        NoteKind::SentryLegacy => PlannedAction::Adopt {
+            remaining_secs: default_ttl_secs,
+            restamp: true,
+        },
+        NoteKind::Sentry {
+            created_unix,
+            ttl_secs,
+        } => {
+            if note_expired(created_unix, ttl_secs, now_unix) {
+                PlannedAction::Delete
+            } else {
+                let remaining_secs = created_unix
+                    .saturating_add(ttl_secs)
+                    .saturating_sub(now_unix);
+                PlannedAction::Adopt {
+                    remaining_secs,
+                    restamp: false,
+                }
+            }
+        }
+    }
+}
+
+/// Provenance of an access rule, parsed from its `notes` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteKind {
+    /// Current format: `sentry:<created_unix>:<ttl_secs>`.
+    Sentry { created_unix: u64, ttl_secs: u64 },
+    /// Pre-timestamp format: plain `"sentry"` (age unknown).
+    SentryLegacy,
+    /// Not created by Sentry.
+    Foreign,
+}
+
+fn parse_note(notes: Option<&str>) -> NoteKind {
+    let Some(n) = notes else {
+        return NoteKind::Foreign;
+    };
+    if n == NOTE_PREFIX {
+        return NoteKind::SentryLegacy;
+    }
+    let Some(rest) = n.strip_prefix(NOTE_PREFIX) else {
+        return NoteKind::Foreign;
+    };
+    let Some(rest) = rest.strip_prefix(':') else {
+        return NoteKind::Foreign;
+    };
+    let mut parts = rest.splitn(2, ':');
+    match (parts.next(), parts.next()) {
+        (Some(created), Some(ttl)) => match (created.parse::<u64>(), ttl.parse::<u64>()) {
+            (Ok(created_unix), Ok(ttl_secs)) => NoteKind::Sentry {
+                created_unix,
+                ttl_secs,
+            },
+            _ => NoteKind::Foreign,
+        },
+        _ => NoteKind::Foreign,
+    }
+}
+
+/// Whether an access rule was created by Sentry (current or legacy format).
+pub fn is_sentry_note(notes: Option<&str>) -> bool {
+    !matches!(parse_note(notes), NoteKind::Foreign)
+}
+
+fn build_note(ttl_secs: u64) -> String {
+    format!("{NOTE_PREFIX}:{}:{ttl_secs}", unix_now())
+}
+
+fn note_expired(created_unix: u64, ttl_secs: u64, now_unix: u64) -> bool {
+    now_unix >= created_unix.saturating_add(ttl_secs)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[async_trait]
 impl ChallengeProvider for CloudflareProvider {
     fn name(&self) -> &'static str {
@@ -320,6 +609,10 @@ impl ChallengeProvider for CloudflareProvider {
     }
 
     async fn apply(&self, ip: IpAddr, verdict: Verdict, opts: &EdgeOptions) -> Result<()> {
+        if self.is_disabled() {
+            debug!(ip = %ip, "cloudflare provider disabled — skipping apply");
+            return Ok(());
+        }
         if self.is_cached(ip).await {
             return Ok(());
         }
@@ -349,7 +642,7 @@ impl ChallengeProvider for CloudflareProvider {
                 "target": target,
                 "value": ip.to_string(),
             },
-            "notes": "sentry",
+            "notes": build_note(ttl.as_secs()),
         });
 
         match self
@@ -364,16 +657,19 @@ impl ChallengeProvider for CloudflareProvider {
                 let status = resp.status();
                 let body_text = resp.text().await.unwrap_or_default();
                 if status.is_success() {
+                    self.register_success();
                     info!(ip = %ip, mode = cf_mode, "cloudflare access rule created");
                 } else if is_duplicate_rule(&body_text) {
                     // Idempotent: rule already exists for this IP — the cache
                     // entry we pre-registered is correct, nothing to undo.
+                    self.register_success();
                     info!(ip = %ip, mode = cf_mode, "cloudflare access rule already exists");
                 } else {
                     // API rejected the rule. Evict our optimistic cache entry
                     // so a later retry can attempt the call again.
                     warn!(ip = %ip, status = %status, body = %body_text, "cloudflare API error");
                     self.evict(ip).await;
+                    self.register_failure();
                 }
             }
             Err(e) => {
@@ -381,6 +677,7 @@ impl ChallengeProvider for CloudflareProvider {
                 // the same TTL window instead of being silently skipped.
                 warn!(ip = %ip, error = %e, "cloudflare request failed");
                 self.evict(ip).await;
+                self.register_failure();
             }
         }
 
@@ -390,9 +687,186 @@ impl ChallengeProvider for CloudflareProvider {
 }
 
 /// Detect whether a Cloudflare API error body means the access rule already
-/// exists (error code 9999 or a message mentioning "exists").
+/// exists. The documented code is 10009
+/// (`firewallaccessrules.api.duplicate_of_existing`); 9999 and the message
+/// forms are kept for compatibility. Parsed as JSON — a plain substring match
+/// breaks on whitespace variations like `"code": 10009`.
 fn is_duplicate_rule(body: &str) -> bool {
-    body.contains("\"code\":9999")
-        || body.contains("already exists")
-        || body.contains("Access rule already exists")
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    v.get("errors")
+        .and_then(|e| e.as_array())
+        .map(|errors| {
+            errors.iter().any(|e| {
+                let code = e.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+                let message = e.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                code == 10009
+                    || code == 9999
+                    || message.contains("duplicate_of_existing")
+                    || message.contains("already exists")
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(max_failures: u32) -> CloudflareProvider {
+        CloudflareProvider::new(CloudflareProviderConfig {
+            token: "test-token".into(),
+            zone: "test-zone".into(),
+            default_mode: EdgeMode::ManagedChallenge,
+            ttl: Duration::from_secs(3600),
+            max_failures,
+        })
+    }
+
+    #[test]
+    fn duplicate_detects_cf_10009() {
+        let body = r#"{
+          "result": null,
+          "success": false,
+          "errors": [
+            {
+              "code": 10009,
+              "message": "firewallaccessrules.api.duplicate_of_existing"
+            }
+          ],
+          "messages": []
+        }"#;
+        assert!(is_duplicate_rule(body));
+    }
+
+    #[test]
+    fn duplicate_detects_9999_and_message_forms() {
+        assert!(is_duplicate_rule(
+            r#"{"errors":[{"code":9999,"message":"oops"}]}"#
+        ));
+        assert!(is_duplicate_rule(
+            r#"{"errors":[{"code":0,"message":"Access rule already exists"}]}"#
+        ));
+        assert!(is_duplicate_rule(
+            r#"{"errors":[{"code":0,"message":"firewallaccessrules.api.duplicate_of_existing"}]}"#
+        ));
+    }
+
+    #[test]
+    fn duplicate_ignores_other_bodies() {
+        assert!(!is_duplicate_rule(
+            r#"{"errors":[{"code":10000,"message":"firewallaccessrules.api.invalid"}]}"#
+        ));
+        assert!(!is_duplicate_rule(
+            r#"{"success":true,"errors":[],"result":{"id":"abc"}}"#
+        ));
+        assert!(!is_duplicate_rule("not json at all"));
+        assert!(!is_duplicate_rule(""));
+    }
+
+    #[test]
+    fn note_roundtrip_current_format() {
+        let before = unix_now();
+        let note = build_note(86400);
+        let after = unix_now();
+        match parse_note(Some(&note)) {
+            NoteKind::Sentry {
+                created_unix,
+                ttl_secs,
+            } => {
+                assert_eq!(ttl_secs, 86400);
+                assert!((before..=after).contains(&created_unix));
+            }
+            other => panic!("expected Sentry, got {other:?}"),
+        }
+        assert!(is_sentry_note(Some(&note)));
+    }
+
+    #[test]
+    fn note_parses_legacy_and_rejects_foreign() {
+        assert_eq!(parse_note(Some("sentry")), NoteKind::SentryLegacy);
+        assert!(is_sentry_note(Some("sentry")));
+        assert_eq!(parse_note(None), NoteKind::Foreign);
+        assert_eq!(parse_note(Some("")), NoteKind::Foreign);
+        assert_eq!(parse_note(Some("manual rule")), NoteKind::Foreign);
+        assert_eq!(parse_note(Some("sentry:abc:def")), NoteKind::Foreign);
+        assert_eq!(parse_note(Some("sentry:123")), NoteKind::Foreign);
+        assert!(!is_sentry_note(Some("sentry:123")));
+        assert!(!is_sentry_note(Some("manual rule")));
+    }
+
+    #[test]
+    fn note_expiry_boundaries() {
+        assert!(!note_expired(1000, 500, 1499));
+        assert!(note_expired(1000, 500, 1500));
+        assert!(note_expired(1000, 500, 2000));
+        assert!(note_expired(u64::MAX, u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn plan_rule_covers_all_kinds() {
+        let now = 10_000u64;
+        assert_eq!(
+            plan_rule(Some("sentry:1000:500"), now, 3600),
+            PlannedAction::Delete
+        );
+        assert_eq!(
+            plan_rule(Some("sentry:9500:3600"), now, 3600),
+            PlannedAction::Adopt {
+                remaining_secs: 3_100,
+                restamp: false
+            }
+        );
+        assert_eq!(
+            plan_rule(Some("sentry"), now, 3600),
+            PlannedAction::Adopt {
+                remaining_secs: 3600,
+                restamp: true
+            }
+        );
+        assert_eq!(plan_rule(None, now, 3600), PlannedAction::Skip);
+        assert_eq!(
+            plan_rule(Some("someone else"), now, 3600),
+            PlannedAction::Skip
+        );
+    }
+
+    #[test]
+    fn breaker_disables_after_max_failures() {
+        let cf = provider(3);
+        assert!(!cf.is_disabled());
+        cf.register_failure();
+        cf.register_failure();
+        assert!(!cf.is_disabled());
+        cf.register_failure();
+        assert!(cf.is_disabled());
+    }
+
+    #[test]
+    fn breaker_resets_on_success() {
+        let cf = provider(3);
+        cf.register_failure();
+        cf.register_failure();
+        cf.register_success();
+        cf.register_failure();
+        cf.register_failure();
+        assert!(!cf.is_disabled());
+    }
+
+    #[tokio::test]
+    async fn disabled_apply_is_noop() {
+        let cf = provider(1);
+        cf.register_failure();
+        assert!(cf.is_disabled());
+        let opts = EdgeOptions {
+            ttl: Duration::from_secs(60),
+            mode: None,
+        };
+        let ip: IpAddr = "203.0.113.10".parse().unwrap();
+        ChallengeProvider::apply(&cf, ip, Verdict::Block, &opts)
+            .await
+            .unwrap();
+        assert_eq!(cf.tracked_count().await, 0);
+    }
 }

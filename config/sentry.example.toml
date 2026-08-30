@@ -273,6 +273,7 @@ provider = "cloudflare"        # cloudflare | aws_waf | fastly | ... (extensible
 [action.options]
 mode = "managed_challenge"     # block | js_challenge | managed_challenge | rate_limit
 ttl_secs = 86400
+max_failures = 3               # circuit breaker: disable the provider after N consecutive failed inserts (until restart)
 # token: env SENTRY_CF_TOKEN
 # zone:   env SENTRY_CF_ZONE
 # Backward-compatible alias: `type = "cloudflare"` (no `provider`) is equivalent.

@@ -174,9 +174,13 @@ não em runtime.
 - **F2** (concluída): Cloudflare hardening + roteador parametrizado/learn/import + rate-limit + métricas + escalonamento de reincidentes + detectores de scan + IA clássica (ONNX fork)
   - ✅ F2.4 Verdict policy (`policy.rs`, `VerdictPolicy`, `PolicyConfig`,
     `[[policy.override]]` DSL) — 6 testes
-  - ✅ F2.5+CF Cloudflare status/test/pull CLI + reaper (deleta regras expiradas)
-    + idempotência (duplicate-rule) + registro local antes da req —
-    `verify()`/`list_access_rules()`/`delete_access_rule()`/`expired_keys()`/`forget()`
+  - ✅ F2.5+CF Cloudflare status/test/pull CLI + reaper restart-safe (deleta
+    regras cujo note `sentry:<ts>:<ttl>` expirou) + reconcile no startup
+    (verify token, adota regras vivas do edge no cache local, deleta
+    expiradas, re-stampa legadas) + idempotência (duplicate-rule CF 10009) +
+    registro local antes da req + circuit breaker (`max_failures`, default 3,
+    desativa o provider até restart) —
+    `verify()`/`list_access_rules()`/`delete_access_rule()`/`reconcile()`/`reap_expired()`/`forget()` — 10 testes
   - ✅ F2.6 Rate-limit (`ratelimit.rs`: `RateLimitBackend` + `InMemoryRateLimiter`
     sliding-window; `rate_redis.rs`: `RedisRateLimiter` feature `rate-redis`) —
     daemon wired + prune task; 7 testes
@@ -252,7 +256,7 @@ Backlog detalhado em `ARCHITECTURE.md` §15.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 173 testes passando sem features; 175 com
+# Resultado esperado: 183 testes passando sem features; 185 com
 # --features sentry-cli/onnx (adiciona os 2 testes de inferência ONNX)
 ```
 
