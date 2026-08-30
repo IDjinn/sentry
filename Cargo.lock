@@ -2478,6 +2478,7 @@ dependencies = [
  "sentry-ai",
  "sentry-core",
  "sentry-geo",
+ "sentry-reputation",
  "sentry-source-nginx",
  "sentry-source-syslog",
  "sentry-storage",
@@ -2524,6 +2525,20 @@ dependencies = [
  "maxminddb",
  "sentry-core",
  "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "sentry-reputation"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures",
+ "ipnet",
+ "reqwest",
+ "sentry-core",
+ "thiserror 1.0.69",
+ "tokio",
  "tracing",
 ]
 

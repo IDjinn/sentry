@@ -5,6 +5,7 @@ members = [
     "crates/sentry-storage",
     "crates/sentry-ai",
     "crates/sentry-geo",
+    "crates/sentry-reputation",
     "crates/sentry-source-nginx",
     "crates/sentry-source-syslog",
     "crates/sentry-action-cloudflare",
@@ -97,6 +98,7 @@ sentry-core = { path = "crates/sentry-core" }
 sentry-storage = { path = "crates/sentry-storage" }
 sentry-ai = { path = "crates/sentry-ai" }
 sentry-geo = { path = "crates/sentry-geo" }
+sentry-reputation = { path = "crates/sentry-reputation" }
 sentry-source-nginx = { path = "crates/sentry-source-nginx" }
 sentry-source-syslog = { path = "crates/sentry-source-syslog" }
 sentry-action-cloudflare = { path = "crates/sentry-action-cloudflare" }

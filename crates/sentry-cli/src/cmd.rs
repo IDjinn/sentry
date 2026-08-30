@@ -456,6 +456,20 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 }
             }
         }
+        Command::Feeds { action } => match action {
+            FeedsCmd::List => {
+                let cfg = require_config(&cfg)?;
+                list_feeds(cfg);
+            }
+            FeedsCmd::Refresh => {
+                let cfg = require_config(&cfg)?;
+                refresh_feeds(cfg).await?;
+            }
+            FeedsCmd::Check { ip } => {
+                let cfg = require_config(&cfg)?;
+                check_feed_ip(cfg, &ip).await?;
+            }
+        },
         Command::Report {
             from,
             export,
@@ -823,6 +837,91 @@ async fn connect_storage(cfg: &SentryConfig) -> color_eyre::Result<sentry_storag
         .await
         .map_err(|e| color_eyre::eyre::eyre!("postgres connection failed: {e}"))?;
     Ok(sentry_storage::Repo::new(pool))
+}
+
+fn list_feeds(cfg: &SentryConfig) {
+    let feeds: Vec<_> = cfg.rules.feeds.iter().filter(|f| f.enabled).collect();
+    if feeds.is_empty() {
+        println!("No reputation feeds configured (see [rules.feeds] in sentry.example.toml).");
+        return;
+    }
+    println!(
+        "{:<14} {:<11} {:<9} {:<8} URL",
+        "NAME", "TIER", "REFRESH", "ACTION"
+    );
+    for f in feeds {
+        let refresh = format!("{}h", f.refresh_hours);
+        let action = if f.action.is_empty() { "-" } else { &f.action };
+        println!(
+            "{:<14} {:<11} {:<9} {:<8} {}",
+            f.name, f.tier, refresh, action, f.url
+        );
+    }
+}
+
+async fn refresh_feeds(cfg: &SentryConfig) -> color_eyre::Result<()> {
+    let svc = std::sync::Arc::new(sentry_reputation::ReputationService::new(&cfg.rules.feeds));
+    if !svc.is_active() {
+        println!("No reputation feeds configured.");
+        return Ok(());
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(120), svc.refresh_all())
+        .await
+        .map_err(|_| color_eyre::eyre::eyre!("feed refresh timed out"))?;
+    print_feed_status(&svc).await;
+    Ok(())
+}
+
+async fn check_feed_ip(cfg: &SentryConfig, ip: &str) -> color_eyre::Result<()> {
+    let ip: std::net::IpAddr = ip
+        .parse()
+        .map_err(|e| color_eyre::eyre::eyre!("invalid IP `{ip}`: {e}"))?;
+    let svc = std::sync::Arc::new(sentry_reputation::ReputationService::new(&cfg.rules.feeds));
+    if !svc.is_active() {
+        println!("No reputation feeds configured.");
+        return Ok(());
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(120), svc.refresh_all())
+        .await
+        .map_err(|_| color_eyre::eyre::eyre!("feed refresh timed out"))?;
+    print_feed_status(&svc).await;
+    match svc.store().read().unwrap().lookup(ip) {
+        Some(rep) => println!("{ip}: {} (feed: {})", tier_label(rep.tier), rep.source),
+        None => println!("{ip}: no match in any feed"),
+    }
+    Ok(())
+}
+
+async fn print_feed_status(svc: &sentry_reputation::ReputationService) {
+    let statuses = svc.statuses().await;
+    if statuses.is_empty() {
+        println!("No reputation feeds configured.");
+        return;
+    }
+    println!(
+        "{:<14} {:>8} {:<20} ERROR",
+        "NAME", "ENTRIES", "LAST REFRESH"
+    );
+    for (name, st) in statuses {
+        let when = st
+            .last_refresh
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "-".into());
+        let err = st.last_error.unwrap_or_else(|| "-".into());
+        println!("{:<14} {:>8} {:<20} {}", name, st.entries, when, err);
+    }
+}
+
+fn tier_label(tier: sentry_core::ReputationTier) -> &'static str {
+    match tier {
+        sentry_core::ReputationTier::Unknown => "unknown",
+        sentry_core::ReputationTier::Clean => "clean",
+        sentry_core::ReputationTier::Suspicious => "suspicious",
+        sentry_core::ReputationTier::Malicious => "malicious",
+        sentry_core::ReputationTier::Datacenter => "datacenter",
+        sentry_core::ReputationTier::VpnProxy => "vpn/proxy",
+        sentry_core::ReputationTier::Tor => "tor",
+    }
 }
 
 /// Build a Cloudflare provider from env vars (`SENTRY_CF_TOKEN`,

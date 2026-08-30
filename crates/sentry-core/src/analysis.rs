@@ -114,6 +114,10 @@ pub enum SignalKind {
     RandomScan,
     /// Repeated 401/403 on authentication routes from one IP.
     AuthBruteForce,
+    /// A successful (2xx) auth hit on a login route from an IP that just
+    /// accumulated several auth failures — the strongest single indicator
+    /// that a brute force succeeded; alert on it instead of on the failures.
+    SuspiciousLoginSuccess,
     /// Many distinct User-Agents failing auth on login routes
     /// (credential stuffing with fingerprint rotation).
     CredentialStuffing,

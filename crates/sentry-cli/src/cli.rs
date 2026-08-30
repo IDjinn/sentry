@@ -60,6 +60,11 @@ pub enum Command {
         #[command(subcommand)]
         action: RulesCmd,
     },
+    /// Manage reputation feeds (Tor exits, blocklists, …).
+    Feeds {
+        #[command(subcommand)]
+        action: FeedsCmd,
+    },
     /// Generate aggregate reports.
     Report {
         /// Time window (e.g. `24h`, `7d`).
@@ -224,6 +229,16 @@ pub enum RulesCmd {
         #[arg(long)]
         ua: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FeedsCmd {
+    /// List configured feeds (name, tier, refresh, URL).
+    List,
+    /// Fetch all feeds once and show entry counts (no daemon needed).
+    Refresh,
+    /// Refresh feeds, then look up an IP against them.
+    Check { ip: String },
 }
 
 #[derive(Debug, Subcommand)]

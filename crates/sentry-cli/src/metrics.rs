@@ -30,6 +30,9 @@ pub struct Metrics {
     pub signals: prometheus::CounterVec,
     pub actions: prometheus::CounterVec,
     pub pipeline_duration: prometheus::Histogram,
+    pub feed_entries: prometheus::GaugeVec,
+    pub feed_up: prometheus::GaugeVec,
+    pub feed_refresh_ts: prometheus::GaugeVec,
 }
 
 impl Metrics {
@@ -75,6 +78,30 @@ impl Metrics {
             .buckets(vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]),
         )
         .unwrap();
+        let feed_entries = prometheus::GaugeVec::new(
+            prometheus::Opts::new(
+                "sentry_feed_entries",
+                "Entries currently held per reputation feed.",
+            ),
+            &["feed"],
+        )
+        .unwrap();
+        let feed_up = prometheus::GaugeVec::new(
+            prometheus::Opts::new(
+                "sentry_feed_up",
+                "1 when the feed's last refresh succeeded, 0 when it errored.",
+            ),
+            &["feed"],
+        )
+        .unwrap();
+        let feed_refresh_ts = prometheus::GaugeVec::new(
+            prometheus::Opts::new(
+                "sentry_feed_last_refresh_timestamp_seconds",
+                "Unix timestamp of the last successful refresh per feed.",
+            ),
+            &["feed"],
+        )
+        .unwrap();
 
         for m in [&events_processed, &events_blocked, &dedupe_drops] {
             registry.register(Box::new(m.clone())).ok();
@@ -91,6 +118,12 @@ impl Metrics {
             .register(Box::new(pipeline_duration.clone()))
             .map_err(|e| warn!(error = %e, "register histogram"))
             .ok();
+        for m in [&feed_entries, &feed_up, &feed_refresh_ts] {
+            registry
+                .register(Box::new(m.clone()))
+                .map_err(|e| warn!(error = %e, "register feed metrics"))
+                .ok();
+        }
 
         Self {
             registry,
@@ -100,6 +133,9 @@ impl Metrics {
             signals,
             actions,
             pipeline_duration,
+            feed_entries,
+            feed_up,
+            feed_refresh_ts,
         }
     }
 

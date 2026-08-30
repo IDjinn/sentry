@@ -30,6 +30,8 @@ pub const AUTH_BRUTE_FORCE_WEIGHT: u8 = 35;
 pub const CREDENTIAL_STUFFING_WEIGHT: u8 = 40;
 /// Default weight of the `DirectoryBruteForce` signal.
 pub const DIRECTORY_BRUTE_FORCE_WEIGHT: u8 = 30;
+/// Default weight of the `SuspiciousLoginSuccess` signal.
+pub const SUSPICIOUS_LOGIN_SUCCESS_WEIGHT: u8 = 45;
 
 /// Substrings identifying authentication routes.
 pub const DEFAULT_LOGIN_PATTERNS: &[&str] = &[
@@ -88,6 +90,7 @@ pub struct BehaviorTracker {
     auth_failures: u32,
     distinct_uas: u32,
     wordlist_hits: u32,
+    suspicious_success_min_failures: u32,
     login_patterns: Vec<String>,
     wordlist: Vec<String>,
     auth: HashMap<IpAddr, Vec<AuthHit>>,
@@ -113,6 +116,7 @@ impl BehaviorTracker {
             auth_failures: cfg.auth_failures,
             distinct_uas: cfg.distinct_uas,
             wordlist_hits: cfg.wordlist_hits,
+            suspicious_success_min_failures: cfg.suspicious_success_min_failures,
             login_patterns,
             wordlist,
             auth: HashMap::new(),
@@ -183,6 +187,31 @@ impl BehaviorTracker {
                         self.window.as_secs()
                     )),
                 });
+            }
+        }
+
+        // A successful auth from an IP that just piled up failures is the
+        // moment the brute force (maybe) worked — the highest-value alert in
+        // the window. Alerts on the success instead of only on the failures,
+        // which fire constantly and get ignored. The window is consumed so a
+        // follow-up session doesn't re-fire on every request.
+        if matches!(status, Some(s) if (200..300).contains(&s)) && self.is_login_path(&path_lower) {
+            if let Some(hits) = self.auth.get_mut(&ip) {
+                hits.retain(|h| now.duration_since(h.ts) < self.window);
+                if self.suspicious_success_min_failures > 0
+                    && hits.len() as u32 >= self.suspicious_success_min_failures
+                {
+                    signals.push(Signal {
+                        kind: SignalKind::SuspiciousLoginSuccess,
+                        weight: SUSPICIOUS_LOGIN_SUCCESS_WEIGHT,
+                        detail: Some(format!(
+                            "login success after {} auth failures in {}s",
+                            hits.len(),
+                            self.window.as_secs()
+                        )),
+                    });
+                    self.auth.remove(&ip);
+                }
             }
         }
 
@@ -343,6 +372,64 @@ mod tests {
         let other = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99));
         assert!(t.record(ip(), "/login", Some(401), Some(UA)).is_empty());
         assert!(t.record(other, "/login", Some(401), Some(UA)).is_empty());
+    }
+
+    #[test]
+    fn success_after_brute_force_fires_and_consumes_window() {
+        let mut t = BehaviorTracker::new(300, 3, 100, 5);
+        t.record(ip(), "/login", Some(401), Some(UA));
+        t.record(ip(), "/login", Some(401), Some(UA));
+        // Below the threshold of 3: a success is just a success.
+        assert!(t.record(ip(), "/login", Some(200), Some(UA)).is_empty());
+        // Fail again to reach 3, then succeed.
+        for _ in 0..3 {
+            t.record(ip(), "/login", Some(401), Some(UA));
+        }
+        let sigs = t.record(ip(), "/login", Some(200), Some(UA));
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].kind, SignalKind::SuspiciousLoginSuccess);
+        assert_eq!(sigs[0].weight, 45);
+        assert!(sigs[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("5 auth failures"));
+        // Window consumed: the next success does not re-fire.
+        assert!(t.record(ip(), "/login", Some(200), Some(UA)).is_empty());
+    }
+
+    #[test]
+    fn success_without_failures_is_ignored() {
+        let mut t = BehaviorTracker::new(300, 3, 100, 5);
+        assert!(t.record(ip(), "/login", Some(200), Some(UA)).is_empty());
+        assert!(t.record(ip(), "/login", Some(302), Some(UA)).is_empty());
+    }
+
+    #[test]
+    fn success_on_non_auth_route_never_fires() {
+        let mut t = BehaviorTracker::new(300, 2, 100, 5);
+        for _ in 0..5 {
+            t.record(ip(), "/login", Some(401), Some(UA));
+        }
+        assert!(t.record(ip(), "/api/users", Some(200), Some(UA)).is_empty());
+        // The failures survive for the real login route.
+        assert_eq!(
+            t.record(ip(), "/login", Some(200), Some(UA))[0].kind,
+            SignalKind::SuspiciousLoginSuccess
+        );
+    }
+
+    #[test]
+    fn suspicious_success_can_be_disabled() {
+        let cfg = BehaviorConfig {
+            suspicious_success_min_failures: 0,
+            ..BehaviorConfig::default()
+        };
+        let mut t = BehaviorTracker::from_config(&cfg);
+        for _ in 0..10 {
+            t.record(ip(), "/login", Some(401), Some(UA));
+        }
+        assert!(t.record(ip(), "/login", Some(200), Some(UA)).is_empty());
     }
 
     #[test]

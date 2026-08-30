@@ -67,6 +67,7 @@ sentry/
 │   ├── sentry-storage/        # Postgres (sqlx) + migrations/*.sql
 │   ├── sentry-ai/             # trait ThreatModel (ONNX) + trait LlmProvider
 │   ├── sentry-geo/            # maxminddb geo/ASN enrichment
+│   ├── sentry-reputation/     # reputation feeds (Tor/Spamhaus/FireHOL) + SSRF-guarded fetcher
 │   ├── sentry-source-nginx/   # plugin Source: tail de access.log
 │   ├── sentry-source-syslog/  # plugin Source: receptor syslog RFC 5424/3164 (UDP/TCP)
 │   ├── sentry-action-cloudflare/  # plugin Action: block/challenge via API CF
@@ -238,8 +239,8 @@ não em runtime.
     (`SENTRY_CF_ACCOUNT` override); soft-disable + fallback access rules sem
     permissões (Account Filter Lists / Zone Rulesets) com self-heal no reaper
     — 10 testes; ver `ARCHITECTURE.md` §8.2
-- **F3** (exceto F3.1/F3.2/F3.3/F3.6/F3.7/F3.9): Multi-source (syslog) + LLM
-  (OpenRouter/Ollama) + detecção comportamental
+- **F3** (exceto F3.1/F3.2/F3.3/F3.6/F3.9): Multi-source (syslog) + LLM
+  (OpenRouter/Ollama) + detecção comportamental + reputation feeds
   - ✅ F3.4 Syslog source (crate `sentry-source-syslog`: parser RFC 5424 com
     fallback RFC 3164, receptor UDP/TCP com framing RFC 6587,
     `ProtocolData::Syslog(SyslogData)`, `RawEvent.transport` distingue UDP;
@@ -254,10 +255,24 @@ não em runtime.
   - ✅ F3.8 Detecção comportamental (`behavior.rs`: `BehaviorTracker` janela
     300s por IP; `AuthBruteForce` 401/403 em rotas de login peso 35,
     `CredentialStuffing` ≥3 UAs distintos peso 40, `DirectoryBruteForce`
-    wordlist 404 peso 30 com isenção de bons crawlers; `[behavior]` em
-    config, wired no pipeline + prune no daemon) — 12 testes
-  - ⏸️ F3.1 (middleware axum), F3.2 (captura TCP/pnet), F3.3 (pull CF logs),
-    F3.6 (retreinamento), F3.7 (reputation feeds), F3.9 (modos de borda)
+    wordlist 404 peso 30 com isenção de bons crawlers,
+    `SuspiciousLoginSuccess` 2xx em rota de login após ≥3 falhas de auth
+    peso 45 — alerta no sucesso, não nas falhas; `[behavior]` em
+    config, wired no pipeline + prune no daemon) — 16 testes
+  - ✅ F3.7 Reputation feeds (crate `sentry-reputation`: fetcher http/https
+    com guarda SSRF — rejeita localhost/loopback/privado/reservado no URL
+    pós-DNS e em cada redirect, timeout 30s, cap 10 MB; `ReputationStore`
+    longest-prefix-wins v4+v6 com replace por feed; `parse_feed` genérico
+    cobre DROP/exit-addresses/netset/lista plana; `Event.reputation` +
+    `RuleMatch::Reputation` funcionais — packs `tor`/`vpn_proxy` disparam de
+    verdade; sinais `TorExitNode` 15/`KnownBadIp` 50/`VpnProxy` 20 no
+    pipeline; regra sintética `feed:<name>` quando a feed declara `action`;
+    refresh em background; métricas `sentry_feed_*`; CLI
+    `sentry feeds list|refresh|check <ip>`; `[[rules.feeds]]` com
+    `tier`/`enabled`) — 15 testes (10 core + 5 crate)
+  - ⏸️ F3.1 (middleware axum), F3.2 (captura TCP/pnet + fingerprint TCP
+    estilo MuonFP/p0f — ver F3.10 no BACKLOG), F3.3 (pull CF logs),
+    F3.6 (retreinamento), F3.9 (modos de borda)
 - **F4** (F4.2/F4.3 entregues): Operação & Dashboard
   - ✅ F4.2 Backend HTTP (`server.rs`: `sentry serve` — processo separado,
     axum; `/api/events?limit&level`, `/api/stats` 24h, `/api/incidents` +
@@ -279,7 +294,7 @@ Backlog detalhado em `ARCHITECTURE.md` §15.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 198 testes passando sem features; 200 com
+# Resultado esperado: 217 testes passando sem features; 219 com
 # --features sentry-cli/onnx (adiciona os 2 testes de inferência ONNX)
 ```
 

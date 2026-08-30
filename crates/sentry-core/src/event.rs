@@ -174,6 +174,16 @@ pub struct GeoInfo {
     pub lon: Option<f32>,
 }
 
+/// Reputation enrichment attached to an event when the client IP is present
+/// in one of the synced reputation feeds (F3.7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReputationInfo {
+    /// Tier assigned by the matching feed.
+    pub tier: crate::rules::ReputationTier,
+    /// Feed that produced the entry (e.g. `tor_exit`, `spamhaus_drop`).
+    pub source: String,
+}
+
 /// The normalized, protocol-agnostic event that flows through the pipeline.
 ///
 /// Fields common to every protocol live directly on the struct; protocol
@@ -202,6 +212,9 @@ pub struct Event {
     pub geo: Option<GeoInfo>,
     /// Autonomous System Number of the client IP, when known.
     pub asn: Option<u32>,
+    /// Reputation enrichment from synced feeds (populated by ingestor).
+    #[serde(default)]
+    pub reputation: Option<ReputationInfo>,
     /// Bytes received from the client.
     pub bytes_in: Option<u64>,
     /// Bytes sent back to the client.
@@ -229,6 +242,7 @@ impl Event {
             server_port: None,
             geo: None,
             asn: None,
+            reputation: None,
             bytes_in: None,
             bytes_out: None,
             duration_ms: None,
@@ -340,6 +354,7 @@ impl RawEvent {
             server_port: self.server_port,
             geo: None,
             asn: None,
+            reputation: None,
             bytes_in: self.bytes_in,
             bytes_out: self.bytes_out,
             duration_ms: self.duration_ms,

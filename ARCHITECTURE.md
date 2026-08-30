@@ -656,7 +656,7 @@ configuration\.php                                # Joomla
 2. **Postgres (`rules` table)** — regras dinâmicas criadas via CLI/dashboard, hot-reload sem reiniciar.
 3. **Cloudflare sync** — importa Custom Rules/WAF da CF como regras locais (espelho) para decisão local em modo inline futuro.
 4. **Auto-learned** — IPs confirmados como maliciosos pelo decisor viram regra dinâmica `Block` com TTL (feedback loop).
-5. **Reputation feeds** — blocklists públicas (Spamhaus DROP, Emerging Threats, FireHOL) sincronizadas periodicamente → viram regras `Block` tagadas `feed:spamhaus`.
+5. **Reputation feeds** (F3.7, implementado) — blocklists públicas (Tor exit nodes, Spamhaus DROP, FireHOL, …) sincronizadas pela crate `sentry-reputation` (`refresh_hours`, guarda SSRF no fetch, cap de 10 MB). Entradas viram **enriquecimento** (`Event.reputation`) consultado por `RuleMatch::Reputation` e pelos packs `tor`/`vpn_proxy`; uma feed com `action` configurada gera uma regra sintética tagada `feed:<name>`.
 
 Hot-reload: o daemon observa a tabela `rules` (Postgres `LISTEN/NOTIFY`) e atualiza um `Arc<RwLock<RuleSet>>` em memória sem restart. Avaliação é indexada por IP-hash/ASN/country para não iterar todas as regras por evento.
 
@@ -674,7 +674,9 @@ sentry rules block-asn <asn>
 sentry rules enable <id>
 sentry rules disable <id>
 sentry rules delete <id>
-sentry rules import-feed spamhaus      # sincroniza reputation feed
+sentry feeds list                   # feeds configuradas (nome/tier/refresh)
+sentry feeds refresh                # busca todas uma vez e mostra entradas
+sentry feeds check <ip>             # consulta um IP contra as feeds
 sentry rules packs list                # mostra packs e estado (shadow/enforce/off)
 sentry rules packs enable vpn_proxy --mode enforce
 sentry rules packs disable crawlers_good
@@ -725,10 +727,12 @@ priority = 20
 match = 'asn=14061 AND time outside(09:00-18:00 America/Sao_Paulo)'
 action = "challenge"
 
-# reputation feeds
-[[rules.feed]]
+# reputation feeds (F3.7) — fetched periodically by sentry-reputation;
+# tier tags the entries, optional action generates one rule per feed
+[[rules.feeds]]
 name = "spamhaus_drop"
 url  = "https://www.spamhaus.org/drop/drop.txt"
+tier = "malicious"
 refresh_hours = 24
 action = "block"
 ```
@@ -967,7 +971,9 @@ stateDiagram-v2
 | User-agent vazio/suspeito                         | 10   | sim      |                        |
 | Random-filename scan (`RandomScan`, `[scan]`)     | 25   | sim      | ≥8 paths 4xx distintos/IP em 60s |
 | Tor exit node                                     | 15   | —        |                        |
-| IP em reputation feed                             | 50   | —        |                        |
+| IP em reputation feed                             | 50   | —        | feed com tier `malicious`; `KnownBadIp` |
+| VPN/proxy/datacenter (feed)                       | 20   | —        | `VpnProxy`, tier `vpn`/`datacenter` |
+| Login bem-sucedido pós-brute-force                | 45   | não      | `SuspiciousLoginSuccess`, `[behavior] suspicious_success_min_failures` |
 | Anomalia ONNX (`AnomalousPayload`, `[ai]`)        | 25   | não      | threshold default 0.70; peso via `[scorer.weights] anomalous_payload` |
 | Acesso a path sensível                            | 30   | sim      |                        |
 

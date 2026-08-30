@@ -24,6 +24,7 @@ pub mod pipeline;
 pub mod policy;
 pub mod ratelimit;
 pub mod registry;
+pub mod reputation;
 pub mod routes_learn;
 pub mod rules;
 pub mod scan;
@@ -43,7 +44,8 @@ pub use config::{
 pub use error::{CoreError, Result};
 pub use event::{
     Direction, Event, GeoInfo, HttpData, HttpMethod, ProtocolData, ProtocolKind, RawData, RawEvent,
-    SourceKind, SyslogData, TcpData, TcpFlags, TcpStage, TlsData, Transport, UdpData,
+    ReputationInfo, SourceKind, SyslogData, TcpData, TcpFlags, TcpStage, TlsData, Transport,
+    UdpData,
 };
 pub use heuristics::{Heuristic, HeuristicEngine};
 pub use offender::OffenderTracker;
@@ -52,8 +54,13 @@ pub use pipeline::{Pipeline, ProcessedEvent, RouteDef, RouteLike, RouteValidator
 pub use policy::VerdictPolicy;
 pub use ratelimit::{InMemoryRateLimiter, RateLimitBackend};
 pub use registry::{Registry, RegistryBuilder};
+pub use reputation::{
+    feed_rule, parse_feed, reputation_signals, ReputationStore, KNOWN_BAD_IP_WEIGHT,
+    TOR_EXIT_NODE_WEIGHT, VPN_PROXY_WEIGHT,
+};
 pub use rules::{
-    dsl, shared, Rule, RuleAction, RuleId, RuleMatch, RuleSet, RuleSource, SharedRuleSet,
+    dsl, shared, ReputationTier, Rule, RuleAction, RuleId, RuleMatch, RuleSet, RuleSource,
+    SharedRuleSet,
 };
 pub use scan::ScanTracker;
 pub use source::Source;

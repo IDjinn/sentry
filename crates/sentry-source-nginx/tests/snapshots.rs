@@ -106,6 +106,7 @@ fn signal_label(k: sentry_core::SignalKind) -> &'static str {
         ScanBehavior => "scan_behavior",
         RandomScan => "random_scan",
         AuthBruteForce => "auth_brute_force",
+        SuspiciousLoginSuccess => "suspicious_login_success",
         CredentialStuffing => "credential_stuffing",
         DirectoryBruteForce => "directory_brute_force",
         AbnormalRate => "abnormal_rate",

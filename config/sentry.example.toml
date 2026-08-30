@@ -103,12 +103,16 @@ not_found = 10
 # ≥ distinct_uas distinct User-Agents failing auth → CredentialStuffing (40)
 # ≥ wordlist_hits 404s on well-known paths → DirectoryBruteForce (30);
 #   known-good crawlers (Googlebot, Bingbot, …) are exempt.
+# ≥ suspicious_success_min_failures failures followed by a 2xx on a login
+#   route → SuspiciousLoginSuccess (45): alert on the (maybe) successful
+#   brute force, not on the failures. 0 disables it.
 [behavior]
 enabled = true
 window_secs = 300
 auth_failures = 10
 distinct_uas = 3
 wordlist_hits = 5
+suspicious_success_min_failures = 3
 # login_patterns = ["login", "signin", "auth"]   # empty = built-in list
 # wordlist_paths = ["/admin", "/wp-admin"]       # empty = built-in wordlist
 
@@ -224,12 +228,36 @@ priority = 20
 match = 'asn=14061 AND time outside(09:00-18:00 America/Sao_Paulo)'
 action = "challenge"
 
-# Reputation feeds to sync periodically.
-# [[rules.feed]]
+# Reputation feeds (F3.7): public IP blocklists fetched periodically and
+# attached to events as enrichment. tier = unknown | clean | suspicious |
+# malicious | datacenter | vpn | tor. An optional `action` generates one
+# enforcement rule per feed; without it the feed only enriches — match it via
+# the `tor` / `vpn_proxy` packs (finally functional with a feed present) or
+# `reputation = …` rules of your own. Feed URLs are untrusted input:
+# http/https only, loopback/private/reserved hosts are rejected.
+# Manage with `sentry feeds list | refresh | check <ip>`.
+#
+# [[rules.feeds]]
+# name = "tor_exit"
+# url  = "https://check.torproject.org/exit-addresses"
+# tier = "tor"
+# refresh_hours = 24
+#
+# [[rules.feeds]]
 # name = "spamhaus_drop"
 # url  = "https://www.spamhaus.org/drop/drop.txt"
+# tier = "malicious"
 # refresh_hours = 24
-# action = "block"
+# action = "block"          # optional: one synthetic rule per feed
+#
+# [[rules.feeds]]
+# name = "firehol_level1"   # aggregates Spamhaus DROP/eDROP, DShield, …
+# url  = "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset"
+# tier = "malicious"
+# refresh_hours = 24
+#
+# enabled = true is the default; set enabled = false to pause a feed without
+# removing it.
 
 # ── Sources ──────────────────────────────────────────────────────────────
 [[source]]

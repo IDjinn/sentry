@@ -379,6 +379,11 @@ pub struct BehaviorConfig {
     /// Wordlist-path 404s per IP that trigger `DirectoryBruteForce`.
     #[serde(default = "default_behavior_wordlist_hits")]
     pub wordlist_hits: u32,
+    /// Auth failures that must precede a successful login on an auth route
+    /// for the success itself to fire `SuspiciousLoginSuccess`. `0` disables
+    /// the detector.
+    #[serde(default = "default_behavior_suspicious_success")]
+    pub suspicious_success_min_failures: u32,
     /// Substrings identifying authentication routes (empty = built-in list).
     #[serde(default)]
     pub login_patterns: Vec<String>,
@@ -395,6 +400,7 @@ impl Default for BehaviorConfig {
             auth_failures: default_behavior_auth_failures(),
             distinct_uas: default_behavior_distinct_uas(),
             wordlist_hits: default_behavior_wordlist_hits(),
+            suspicious_success_min_failures: default_behavior_suspicious_success(),
             login_patterns: Vec::new(),
             wordlist_paths: Vec::new(),
         }
@@ -415,6 +421,9 @@ fn default_behavior_distinct_uas() -> u32 {
 }
 fn default_behavior_wordlist_hits() -> u32 {
     5
+}
+fn default_behavior_suspicious_success() -> u32 {
+    3
 }
 
 /// Local ML threat model (classic ML, ONNX) running as a pipeline fork.
@@ -758,13 +767,24 @@ pub struct RuleDefConfig {
 pub struct FeedConfig {
     /// Feed name (used as the rule tag prefix).
     pub name: String,
-    /// URL to fetch the feed from.
+    /// URL to fetch the feed from (http/https; loopback/private hosts are
+    /// rejected).
     pub url: String,
     /// Refresh interval in hours.
     #[serde(default = "default_feed_refresh")]
     pub refresh_hours: u32,
-    /// Action to apply to feed entries.
+    /// Reputation tier entries are tagged with: `unknown` | `clean` |
+    /// `suspicious` | `malicious` | `datacenter` | `vpn` | `tor`.
+    #[serde(default = "default_feed_tier")]
+    pub tier: String,
+    /// Optional action for the synthetic feed rule (`block`, `challenge`,
+    /// `rate_limit`, …). Empty = enrichment only (match via the `tor` /
+    /// `vpn_proxy` packs or user rules).
+    #[serde(default)]
     pub action: String,
+    /// Whether the feed is fetched at all.
+    #[serde(default = "default_feed_enabled")]
+    pub enabled: bool,
 }
 
 impl Default for FeedConfig {
@@ -773,13 +793,23 @@ impl Default for FeedConfig {
             name: String::new(),
             url: String::new(),
             refresh_hours: default_feed_refresh(),
+            tier: default_feed_tier(),
             action: String::new(),
+            enabled: default_feed_enabled(),
         }
     }
 }
 
 fn default_feed_refresh() -> u32 {
     24
+}
+
+fn default_feed_tier() -> String {
+    "malicious".to_string()
+}
+
+fn default_feed_enabled() -> bool {
+    true
 }
 
 /// A source plugin entry.

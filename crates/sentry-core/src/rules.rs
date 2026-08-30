@@ -140,6 +140,12 @@ impl RuleSet {
         self.rules.is_empty()
     }
 
+    /// Append rules (e.g. generated feed rules) and re-sort by priority.
+    pub fn extend(&mut self, rules: impl IntoIterator<Item = Rule>) {
+        self.rules.extend(rules);
+        self.rules.sort_by_key(|r| r.priority);
+    }
+
     /// Iterate over rules in evaluation order.
     pub fn iter(&self) -> impl Iterator<Item = &Rule> {
         self.rules.iter()
@@ -322,6 +328,24 @@ pub enum ReputationTier {
     Tor,
 }
 
+impl ReputationTier {
+    /// Parse a tier name as used in config and the rule DSL
+    /// (`tor`, `vpn`, `malicious`, …). Accepts the aliases understood by the
+    /// DSL for backwards compatibility.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "unknown" => Some(Self::Unknown),
+            "clean" | "allowlist" | "allowlisted" => Some(Self::Clean),
+            "suspicious" => Some(Self::Suspicious),
+            "malicious" | "blocklist" | "blocklisted" | "bad" => Some(Self::Malicious),
+            "datacenter" | "hosting" => Some(Self::Datacenter),
+            "vpn" | "proxy" | "vpn_proxy" | "vpnproxy" => Some(Self::VpnProxy),
+            "tor" => Some(Self::Tor),
+            _ => None,
+        }
+    }
+}
+
 /// Scope of a rate check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -432,12 +456,11 @@ impl RuleMatch {
                             .unwrap_or(false)
                 })
                 .unwrap_or(false),
-            Self::Reputation(_tier) => {
-                // Reputation is attached to the event as an enrichment
-                // field in a future iteration; for now we can't match.
-                // TODO: store reputation on Event and check here.
-                false
-            }
+            Self::Reputation(tier) => evt
+                .reputation
+                .as_ref()
+                .map(|r| r.tier == *tier)
+                .unwrap_or(false),
             Self::Status(code) => evt
                 .http()
                 .and_then(|h| h.status)

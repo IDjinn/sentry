@@ -95,10 +95,36 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         .iter()
         .map(|p| (p.name.clone(), p.mode.clone()))
         .collect();
-    let rules = build_default_ruleset(&pack_modes);
+    let mut rules = build_default_ruleset(&pack_modes);
+    // Feeds with an `action` get one synthetic enforcement rule each; feeds
+    // without one only enrich (the tor/vpn_proxy packs or user rules match
+    // on `reputation = …` themselves).
+    for feed in cfg.rules.feeds.iter().filter(|f| f.enabled) {
+        match sentry_core::reputation::feed_rule(feed) {
+            Ok(Some(rule)) => rules.extend(std::iter::once(rule)),
+            Ok(None) => {}
+            Err(e) => warn!(feed = %feed.name, error = %e, "invalid feed config — skipped"),
+        }
+    }
     info!(rule_count = rules.len(), "ruleset built from default packs");
 
     let shared_rules: SharedRuleSet = shared(rules);
+
+    // Reputation feeds (F3.7): fetch once at startup so enrichment is live
+    // before the first event, then refresh in the background. A failing
+    // feed keeps its previous entries.
+    let reputation = if cfg.rules.feeds.iter().any(|f| f.enabled) {
+        let svc = Arc::new(sentry_reputation::ReputationService::new(&cfg.rules.feeds));
+        tokio::time::timeout(Duration::from_secs(120), svc.refresh_all())
+            .await
+            .map_err(|_| warn!("reputation feed startup sync timed out — continuing"))
+            .ok();
+        svc.log_summary().await;
+        svc.spawn_refresh_tasks();
+        Some(svc)
+    } else {
+        None
+    };
 
     // Open geo databases (graceful no-op if files absent).
     let geo = match sentry_geo::GeoLookup::open(&cfg.geo.city_db, &cfg.geo.asn_db) {
@@ -392,6 +418,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         let source = Arc::clone(source);
         let tx = event_tx.clone();
         let geo_clone = geo.as_ref().map(Arc::clone);
+        let reputation_clone = reputation.as_ref().map(Arc::clone);
         tokio::spawn(async move {
             info!(source = source.name(), "starting source");
             match source.stream().await {
@@ -403,6 +430,9 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                         let mut evt = raw.into_event(ip);
                         if let Some(ref g) = geo_clone {
                             g.enrich(&mut evt);
+                        }
+                        if let Some(ref r) = reputation_clone {
+                            r.enrich(&mut evt);
                         }
                         if tx.try_send(evt).is_err() {
                             warn!(source = source.name(), "event channel full, dropping event");
@@ -433,6 +463,33 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         let m = metrics.clone();
         tokio::spawn(async move {
             serve_metrics(m, addr).await;
+        });
+    }
+
+    // Mirror feed status into Prometheus gauges (entries / last refresh /
+    // up=1|0) by polling the service; the fetcher itself stays metrics-free.
+    if let Some(svc) = reputation.as_ref() {
+        let svc = Arc::clone(svc);
+        let m = metrics.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                for (name, st) in svc.statuses().await {
+                    m.feed_entries
+                        .with_label_values(&[&name])
+                        .set(st.entries as f64);
+                    m.feed_up
+                        .with_label_values(&[&name])
+                        .set(u8::from(st.last_error.is_some()) as f64);
+                    if let Some(ts) = st.last_refresh {
+                        m.feed_refresh_ts
+                            .with_label_values(&[&name])
+                            .set(ts.timestamp() as f64);
+                    }
+                }
+            }
         });
     }
 

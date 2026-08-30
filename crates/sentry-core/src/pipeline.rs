@@ -443,6 +443,7 @@ impl Pipeline {
         drop(ruleset);
 
         let mut signals = self.heuristics.analyze(evt);
+        signals.extend(crate::reputation::reputation_signals(evt));
         signals.extend(self.routes.read().unwrap().validate(evt));
         if let Some(ref scan) = self.scan {
             if let Some(http) = evt.http() {
@@ -524,6 +525,7 @@ impl Pipeline {
             SignalKind::ScanBehavior => "scan_behavior",
             SignalKind::RandomScan => "random_scan",
             SignalKind::AuthBruteForce => "auth_brute_force",
+            SignalKind::SuspiciousLoginSuccess => "suspicious_login_success",
             SignalKind::CredentialStuffing => "credential_stuffing",
             SignalKind::DirectoryBruteForce => "directory_brute_force",
             SignalKind::AbnormalRate => "abnormal_rate",
@@ -562,6 +564,7 @@ impl Pipeline {
             SignalKind::ScanBehavior => "scan_behavior",
             SignalKind::RandomScan => "random_scan",
             SignalKind::AuthBruteForce => "auth_brute_force",
+            SignalKind::SuspiciousLoginSuccess => "suspicious_login_success",
             SignalKind::CredentialStuffing => "credential_stuffing",
             SignalKind::DirectoryBruteForce => "directory_brute_force",
             SignalKind::AbnormalRate => "abnormal_rate",
@@ -620,6 +623,7 @@ impl Pipeline {
     /// [`process`](Self::process) path.
     pub fn rescore(&self, evt: &Event, extra_signals: Vec<Signal>) -> ProcessedEvent {
         let mut signals = self.heuristics.analyze(evt);
+        signals.extend(crate::reputation::reputation_signals(evt));
         signals.extend(self.routes.read().unwrap().validate(evt));
         signals.extend(extra_signals);
 
