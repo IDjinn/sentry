@@ -3,7 +3,17 @@
 //! Supports the standard `$var` tokens nginx emits in `log_format`. We don't
 //! implement a full nginx log parser — we convert the format string into a
 //! regex at construction time and match each line against it.
+//!
+//! Client IP resolution is automatic and precedence-based: header-borne real
+//! IPs (`$http_cf_connecting_ip` > `$http_true_client_ip` >
+//! `$http_x_real_ip`) win over forwarded chains (`$http_x_forwarded_for` /
+//! `$proxy_add_x_forwarded_for`, first entry) which win over `$remote_addr`
+//! (`$remote_addr_v6`). Behind a CDN such as Cloudflare, `remote_addr` is the
+//! edge address — include the CDN's client-IP header in the `log_format` and
+//! the real client is resolved with no extra configuration. Every captured
+//! `http_*` token is also exposed as a request header on the event.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 use chrono::{DateTime, Utc};
@@ -65,7 +75,16 @@ impl LogFormat {
             .captures(line)
             .ok_or_else(|| ParseError::NoMatch(line.to_string()))?;
 
-        let mut client_ip: Option<IpAddr> = None;
+        // Real client IP resolution. Behind a reverse proxy/CDN (Cloudflare,
+        // etc.) `$remote_addr` is the proxy's edge address, so header-borne
+        // candidates take precedence when they parse. `-` (nginx's empty
+        // marker) never parses, so absent headers fall through cleanly.
+        let mut cf_ip: Option<IpAddr> = None;
+        let mut true_client_ip: Option<IpAddr> = None;
+        let mut x_real_ip: Option<IpAddr> = None;
+        let mut forwarded_ip: Option<IpAddr> = None;
+        let mut remote_ip: Option<IpAddr> = None;
+        let mut headers: HashMap<String, String> = HashMap::new();
         let mut method: Option<HttpMethod> = None;
         let mut path = String::new();
         let mut query: Option<String> = None;
@@ -80,11 +99,15 @@ impl LogFormat {
             let Some(val) = caps.name(name) else { continue };
             let val = val.as_str();
             match name.as_str() {
-                "remote_addr" | "proxy_add_x_forwarded_for" | "http_x_forwarded_for" => {
+                "remote_addr" | "remote_addr_v6" => remote_ip = val.parse().ok(),
+                "proxy_add_x_forwarded_for" | "http_x_forwarded_for" => {
                     // XFF can be a list; take the first (clientmost) IP.
                     let first = val.split(',').next().unwrap_or("").trim();
-                    client_ip = first.parse().ok();
+                    forwarded_ip = first.parse().ok();
                 }
+                "http_cf_connecting_ip" => cf_ip = val.parse().ok(),
+                "http_true_client_ip" => true_client_ip = val.parse().ok(),
+                "http_x_real_ip" => x_real_ip = val.parse().ok(),
                 "request" => {
                     // "$request" = "METHOD PATH HTTP/1.1"
                     let parts: Vec<&str> = val.splitn(3, ' ').collect();
@@ -123,7 +146,21 @@ impl LogFormat {
                 }
                 _ => {}
             }
+            // Every `http_*` token is a request header: expose it as such
+            // (nginx maps `-` to hyphens, e.g. `http_cf_connecting_ip` →
+            // `cf-connecting-ip`) so DSL `header.X` rules match log input.
+            if val != "-" {
+                if let Some(header) = name.strip_prefix("http_") {
+                    headers.insert(header.replace('_', "-").to_lowercase(), val.to_string());
+                }
+            }
         }
+
+        let client_ip = cf_ip
+            .or(true_client_ip)
+            .or(x_real_ip)
+            .or(forwarded_ip)
+            .or(remote_ip);
 
         let protocol = ProtocolData::Http(HttpData {
             method,
@@ -135,7 +172,7 @@ impl LogFormat {
             status,
             user_agent,
             referer,
-            headers: Default::default(),
+            headers,
             body: None,
             cookies: None,
         });
@@ -170,9 +207,9 @@ fn parse_nginx_time(s: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
 fn make_capture(name: &str) -> String {
     match name {
         // IPs: a sequence of hex digits, dots and colons.
-        "remote_addr" | "proxy_add_x_forwarded_for" | "http_x_forwarded_for" | "remote_addr_v6" => {
-            r"[0-9a-fA-F:.]+".to_string()
-        }
+        "remote_addr" | "remote_addr_v6" => r"[0-9a-fA-F:.]+".to_string(),
+        // XFF carries a comma-separated chain: "client, proxy1, proxy2".
+        "proxy_add_x_forwarded_for" | "http_x_forwarded_for" => r"[0-9a-fA-F:., ]+".to_string(),
         // Numeric tokens.
         "status" | "body_bytes_sent" | "bytes_sent" | "request_time" | "b" | "s" => {
             r"\d+(?:\.\d+)?".to_string()
@@ -237,5 +274,85 @@ mod tests {
         let fmt = LogFormat::compile(r#"$remote_addr "$request" $status"#).unwrap();
         let line = "garbage line";
         assert!(fmt.parse_line(line).is_err());
+    }
+
+    #[test]
+    fn cf_connecting_ip_overrides_edge_ip() {
+        let fmt = LogFormat::compile(
+            r#"$remote_addr - - [$time_local] "$request" $status $body_bytes_sent "$http_user_agent" "$http_cf_connecting_ip""#,
+        )
+        .unwrap();
+        let line = r#"104.16.1.2 - - [10/Jan/2026:13:55:36 +0000] "GET / HTTP/1.1" 200 512 "curl/8.0" "2001:db8:abcd:12::42""#;
+        let evt = fmt.parse_line(line).expect("line matches");
+        let expected: IpAddr = "2001:db8:abcd:12::42".parse().unwrap();
+        assert_eq!(evt.client_ip, Some(expected));
+        let http = match evt.protocol {
+            ProtocolData::Http(ref h) => h,
+            _ => panic!("expected http"),
+        };
+        assert_eq!(
+            http.headers.get("cf-connecting-ip").map(String::as_str),
+            Some("2001:db8:abcd:12::42")
+        );
+        assert_eq!(
+            http.headers.get("user-agent").map(String::as_str),
+            Some("curl/8.0")
+        );
+    }
+
+    #[test]
+    fn real_ip_header_absent_falls_back_to_remote_addr() {
+        let fmt = LogFormat::compile(
+            r#"$remote_addr "$request" $status "$http_user_agent" "$http_cf_connecting_ip""#,
+        )
+        .unwrap();
+        let line = r#"203.0.113.10 "GET / HTTP/1.1" 200 "Mozilla/5.0" "-""#;
+        let evt = fmt.parse_line(line).expect("line matches");
+        assert_eq!(
+            evt.client_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)))
+        );
+        let http = match evt.protocol {
+            ProtocolData::Http(ref h) => h,
+            _ => panic!("expected http"),
+        };
+        assert!(!http.headers.contains_key("cf-connecting-ip"));
+    }
+
+    #[test]
+    fn x_real_ip_used_when_cf_header_missing() {
+        let fmt = LogFormat::compile(r#"$remote_addr "$request" $status $http_x_real_ip"#).unwrap();
+        let line = r#"104.16.1.2 "GET / HTTP/1.1" 200 198.51.100.7"#;
+        let evt = fmt.parse_line(line).expect("line matches");
+        assert_eq!(
+            evt.client_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)))
+        );
+    }
+
+    #[test]
+    fn xff_chain_takes_first_ip() {
+        let fmt = LogFormat::compile(r#"$remote_addr "$request" $status "$http_x_forwarded_for""#)
+            .unwrap();
+        let line = r#"10.0.0.9 "GET / HTTP/1.1" 200 "198.51.100.7, 10.0.0.1, 10.0.0.2""#;
+        let evt = fmt.parse_line(line).expect("line matches");
+        assert_eq!(
+            evt.client_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)))
+        );
+    }
+
+    #[test]
+    fn cf_header_wins_over_xff_and_x_real_ip() {
+        let fmt = LogFormat::compile(
+            r#"$remote_addr "$request" $status $http_x_real_ip "$http_x_forwarded_for" "$http_cf_connecting_ip""#,
+        )
+        .unwrap();
+        let line = r#"104.16.1.2 "GET / HTTP/1.1" 200 198.51.100.7 "198.51.100.99, 10.0.0.1" "192.0.2.33""#;
+        let evt = fmt.parse_line(line).expect("line matches");
+        assert_eq!(
+            evt.client_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 33)))
+        );
     }
 }
