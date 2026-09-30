@@ -1260,6 +1260,19 @@ fn build_llm_fork(cfg: &SentryConfig) -> Option<Arc<LlmFork>> {
                 },
             ))
         }
+        "openai" => Arc::new(sentry_ai::OpenRouterProvider::new(
+            sentry_ai::llm::openrouter::OpenRouterConfig {
+                // OpenAI-compatible local servers (LM Studio, vLLM,
+                // llama.cpp server…) need no key; SENTRY_LLM_KEY is sent as
+                // bearer when set, and base_url points at the server.
+                api_key: std::env::var("SENTRY_LLM_KEY").unwrap_or_default(),
+                model: non_empty_or(&cfg.llm.model, "local-model"),
+                base_url: non_empty_or(
+                    cfg.llm.base_url.as_deref().unwrap_or(""),
+                    "http://localhost:1234/v1",
+                ),
+            },
+        )),
         "ollama" => Arc::new(sentry_ai::OllamaProvider::new(
             sentry_ai::llm::ollama::OllamaConfig {
                 model: non_empty_or(&cfg.llm.model, "llama3.1"),
@@ -1273,7 +1286,7 @@ fn build_llm_fork(cfg: &SentryConfig) -> Option<Arc<LlmFork>> {
         other => {
             warn!(
                 provider = other,
-                "unknown llm.provider — known: openrouter | ollama | mock"
+                "unknown llm.provider — known: openrouter | openai | ollama | mock"
             );
             return None;
         }
@@ -1284,6 +1297,7 @@ fn build_llm_fork(cfg: &SentryConfig) -> Option<Arc<LlmFork>> {
     };
     info!(
         provider = provider.name(),
+        provider_kind = %cfg.llm.provider,
         model = provider.model_id(),
         mode,
         only_above = cfg.llm.only_above,
@@ -1579,12 +1593,34 @@ fn build_registry(
                 ));
             }
             ActionKind::Webhook => {
-                let url = act
-                    .options
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| color_eyre::eyre::eyre!("webhook action requires `url`"))?
-                    .to_string();
+                // The target URL is a credential for hosted chat webhooks
+                // (Discord etc.); `url_env` keeps it out of the config file.
+                // An unset url_env skips the action with a warning instead of
+                // failing the daemon — the alert channel is optional.
+                let url = match act.options.get("url_env").and_then(|v| v.as_str()) {
+                    Some(env_name) => match std::env::var(env_name)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                    {
+                        Some(url) => url,
+                        None => {
+                            warn!(
+                                env = env_name,
+                                "webhook url_env unset or empty — webhook action skipped"
+                            );
+                            continue;
+                        }
+                    },
+                    None => act
+                        .options
+                        .get("url")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            color_eyre::eyre::eyre!("webhook action requires `url` or `url_env`")
+                        })?
+                        .to_string(),
+                };
                 let timeout = parse_ttl_secs(&act.options, 10);
                 let on_levels = act
                     .options
