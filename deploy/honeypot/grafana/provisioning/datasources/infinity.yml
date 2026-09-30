@@ -1,0 +1,12 @@
+# Infinity datasource (yesoreyeram-infinity-datasource, installed via
+# GF_INSTALL_PLUGINS): renders the sentry metrics server's JSON endpoints
+# as table panels. The event-log URL is per-query in the dashboard
+# (host.docker.internal:9100 resolves to the daemon's metrics bind).
+apiVersion: 1
+
+datasources:
+  - name: Infinity
+    uid: infinity
+    type: yesoreyeram-infinity-datasource
+    access: proxy
+    editable: false
