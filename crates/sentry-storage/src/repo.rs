@@ -441,10 +441,13 @@ impl IncidentRepo {
         notes: Option<&str>,
     ) -> Result<Uuid> {
         let id = Uuid::new_v4();
+        // The unique index is partial (`WHERE event_id IS NOT NULL`), so the
+        // conflict target must repeat the predicate or Postgres rejects the
+        // inference with "no unique or exclusion constraint matching".
         let inserted = sqlx::query_scalar::<_, Uuid>(
             r#"INSERT INTO incidents (id, event_id, client_ip, risk_level, action, notes)
                VALUES ($1, $2, $3::inet, $4, $5, $6)
-               ON CONFLICT (event_id) DO NOTHING
+               ON CONFLICT (event_id) WHERE event_id IS NOT NULL DO NOTHING
                RETURNING id"#,
         )
         .bind(id)

@@ -51,6 +51,14 @@ backend = "memory"
 # ── Rules engine ───────────────────────────────────────────────────────────
 [rules]
 
+# Loopback hosts the rsyslog forwarder; firehol_level1 treats 127.0.0.0/8 as
+# a bogon, which would block every forwarded auth event. Allow it explicitly.
+[[rules.custom]]
+name = "allow loopback (syslog forwarder)"
+priority = 1
+match = 'ip=127.0.0.0/8'
+action = "allow"
+
 # Enforce packs that map to real actions on this box (blocklist + log).
 [[rules.pack]]
 name = "sensitive_paths"
@@ -128,7 +136,7 @@ transport = "udp"
 [[source]]
 type = "tcp"
 [source.options]
-interface = "eth0"
+interface = "ens5"
 ports = "21,22,23,25,80,110,135,139,443,445,1433,3306,3389,5432,5900,6379,8080,8443,27017"
 
 # ── Known routes (the decoy site) — everything else is UnknownRoute ────────
