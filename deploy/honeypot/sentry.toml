@@ -70,9 +70,13 @@ mode = "enforce"
 name = "crawlers_bad"
 mode = "enforce"
 
+# crawlers_good must stay OFF on a honeypot: its allow list matches curl/8,
+# Go-http-client and Puppeteer (meant for health checks in production), and
+# an Allow short-circuits the pipeline before heuristics — every script-
+# kiddie scan would sail through undetected.
 [[rules.pack]]
 name = "crawlers_good"
-mode = "enforce"
+mode = "off"
 
 [[rules.pack]]
 name = "rate_scan"
