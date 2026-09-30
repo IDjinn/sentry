@@ -87,6 +87,24 @@ pub enum Command {
         #[arg(long)]
         unknown_paths: bool,
     },
+    /// Export raw events for SIEM consumption (F4.6).
+    Export {
+        /// Look-back window (e.g. `24h`, `7d`).
+        #[arg(long, default_value = "24h")]
+        from: String,
+        /// Output format.
+        #[arg(long, default_value = "cef")]
+        format: String,
+        /// Write to a file instead of stdout.
+        #[arg(long)]
+        out: Option<String>,
+        /// Keep tailing new events after the initial window.
+        #[arg(long)]
+        follow: bool,
+        /// Syslog forward target with `--follow` (`udp://host:514` or `tcp://…`).
+        #[arg(long)]
+        to: Option<String>,
+    },
     /// Show or validate configuration.
     Config {
         #[command(subcommand)]

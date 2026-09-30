@@ -493,6 +493,29 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 crate::service::run_windows_service()?;
             }
         },
+        Command::Export {
+            from,
+            format,
+            out,
+            follow,
+            to,
+        } => {
+            let cfg = require_config(&cfg)?;
+            let repo = connect_storage(cfg).await?;
+            let since = chrono::Utc::now()
+                - parse_duration(&from)
+                    .map_err(|e| color_eyre::eyre::eyre!("invalid --from: {e}"))?;
+            let fmt = format.to_ascii_lowercase();
+            if !matches!(fmt.as_str(), "cef" | "leef" | "json") {
+                return Err(color_eyre::eyre::eyre!(
+                    "expected cef | leef | json for --format"
+                ));
+            }
+            if to.is_some() && !follow {
+                return Err(color_eyre::eyre::eyre!("--to requires --follow"));
+            }
+            export_siem(&repo, since, &fmt, out.as_deref(), follow, to.as_deref()).await?;
+        }
         Command::Report {
             from,
             export,
@@ -1161,6 +1184,132 @@ fn synthetic_event(rng: &mut Lcg, malicious: bool) -> (sentry_core::Event, u8) {
         }),
     );
     (evt, u8::from(malicious))
+}
+
+/// Render one stored event in the requested SIEM format.
+fn render_siem(row: &sentry_storage::repo::EventRow, fmt: &str) -> String {
+    match fmt {
+        "leef" => crate::siem::leef(row),
+        "json" => serde_json::to_string(row).unwrap_or_default(),
+        _ => crate::siem::cef(row),
+    }
+}
+
+/// F4.6: batch export to stdout/file, optionally following new events and
+/// forwarding them as RFC5424-wrapped lines to a `udp://`/`tcp://` endpoint.
+async fn export_siem(
+    repo: &sentry_storage::Repo,
+    since: chrono::DateTime<chrono::Utc>,
+    fmt: &str,
+    out: Option<&str>,
+    follow: bool,
+    to: Option<&str>,
+) -> color_eyre::Result<()> {
+    use std::collections::HashSet;
+    use std::io::Write;
+
+    let mut writer: Box<dyn Write> = match out {
+        Some(path) => Box::new(std::io::BufWriter::new(
+            std::fs::File::create(path)
+                .map_err(|e| color_eyre::eyre::eyre!("cannot create {path}: {e}"))?,
+        )),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout().lock())),
+    };
+
+    let mut seen: HashSet<uuid::Uuid> = HashSet::new();
+    let mut cursor = since;
+    let rows = repo
+        .events()
+        .recent_since(since)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
+    let mut written = 0u64;
+    for row in &rows {
+        seen.insert(row.id);
+        if row.timestamp > cursor {
+            cursor = row.timestamp;
+        }
+        writeln!(writer, "{}", render_siem(row, fmt))
+            .map_err(|e| color_eyre::eyre::eyre!("write failed: {e}"))?;
+        written += 1;
+    }
+    writer
+        .flush()
+        .map_err(|e| color_eyre::eyre::eyre!("flush failed: {e}"))?;
+    println!("exported {written} event(s) since {since} as {fmt}");
+    drop(writer);
+
+    if !follow {
+        return Ok(());
+    }
+
+    // Syslog forward loop: poll for new events and ship them wrapped.
+    let target = to.ok_or_else(|| color_eyre::eyre::eyre!("--to is required with --follow"))?;
+    let (scheme, addr) = target.split_once("://").ok_or_else(|| {
+        color_eyre::eyre::eyre!("--to must be udp://host:port or tcp://host:port")
+    })?;
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "udp" | "tcp") {
+        return Err(color_eyre::eyre::eyre!("--to scheme must be udp or tcp"));
+    }
+    let socket = if scheme == "udp" {
+        let s = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        s.connect(addr)
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("udp connect to {addr}: {e}"))?;
+        Some(s)
+    } else {
+        None
+    };
+    let mut tcp: Option<tokio::net::TcpStream> = None;
+    println!("following events → {target} (rfc5424-wrapped {fmt})");
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let rows = match repo.events().recent_since(cursor).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "siem follow: query failed");
+                continue;
+            }
+        };
+        for row in rows {
+            if !seen.insert(row.id) {
+                continue;
+            }
+            if row.timestamp > cursor {
+                cursor = row.timestamp;
+            }
+            let frame = format!(
+                "{}\n",
+                crate::siem::syslog_frame(&row, &render_siem(&row, fmt))
+            );
+            let mut sent = false;
+            if let Some(ref s) = socket {
+                sent = s.send(frame.as_bytes()).await.is_ok();
+            } else {
+                use tokio::io::AsyncWriteExt as _;
+                loop {
+                    if let Some(stream) = tcp.as_mut() {
+                        if stream.write_all(frame.as_bytes()).await.is_ok() {
+                            sent = true;
+                            break;
+                        }
+                    }
+                    tcp = None;
+                    match tokio::net::TcpStream::connect(addr).await {
+                        Ok(s) => tcp = Some(s),
+                        Err(e) => {
+                            tracing::warn!(error = %e, addr, "siem forward: reconnect failed");
+                            break;
+                        }
+                    }
+                }
+            }
+            if !sent {
+                tracing::warn!("siem forward: dropped one event (target unreachable)");
+            }
+        }
+    }
 }
 
 /// Generate a synthetic seed dataset (features extracted by Rust — same
