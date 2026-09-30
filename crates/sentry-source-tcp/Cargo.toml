@@ -1,0 +1,27 @@
+[package]
+name = "sentry-source-tcp"
+description = "Passive TCP capture + SYN fingerprint source plugin for Sentry (F3.2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# Raw packet capture (pnet). Requires elevated privileges: Npcap on Windows,
+# CAP_NET_RAW on Linux. Everything pure (fingerprint, flow table) builds
+# without it; only the capture loop is gated.
+pcap = ["dep:pnet"]
+
+[dependencies]
+sentry-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+pnet = { version = "0.35", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

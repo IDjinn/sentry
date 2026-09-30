@@ -423,6 +423,11 @@ pub struct TcpData {
     pub stream_id: Option<u64>,
     /// Stage of the connection lifecycle.
     pub stage: TcpStage,
+    /// Passive SYN fingerprint (`window:options:MSS:wscale`, MuonFP/p0f
+    /// style) when this event is a captured SYN — matched against known
+    /// masscan/zmap/nmap signatures by the `tcp_scanner` heuristic.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 /// Observed TCP flags.

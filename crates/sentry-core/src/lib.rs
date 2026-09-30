@@ -29,6 +29,7 @@ pub mod routes_learn;
 pub mod rules;
 pub mod scan;
 pub mod source;
+pub mod tcpfp;
 
 pub use action::{Action, ActionContext};
 pub use analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};

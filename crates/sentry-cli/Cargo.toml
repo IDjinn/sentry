@@ -17,6 +17,7 @@ default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm"]
 rate-redis = ["dep:redis"]
 onnx = ["sentry-ai/onnx"]
+pcap = ["sentry-source-tcp/pcap"]
 
 [dependencies]
 sentry-core = { workspace = true }
@@ -27,6 +28,7 @@ sentry-reputation = { workspace = true }
 sentry-source-nginx = { workspace = true }
 sentry-source-syslog = { workspace = true }
 sentry-source-cloudflare = { workspace = true }
+sentry-source-tcp = { workspace = true }
 sentry-action-cloudflare = { workspace = true }
 sentry-action-webhook = { workspace = true }
 sentry-action-blocklist = { workspace = true }

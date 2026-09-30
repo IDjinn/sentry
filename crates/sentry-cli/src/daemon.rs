@@ -1360,6 +1360,34 @@ fn build_registry(
                 )?;
                 builder.register_source(cfs);
             }
+            "tcp" => {
+                let interface = src
+                    .options
+                    .get("interface")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .ok_or_else(|| color_eyre::eyre::eyre!("source `tcp` requires `interface`"))?;
+                let ports = src
+                    .options
+                    .get("ports")
+                    .and_then(|v| v.as_str())
+                    .map(|csv| {
+                        csv.split(',')
+                            .filter_map(|p| p.trim().parse::<u16>().ok())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let payload_cap = parse_ttl_secs(&src.options, 8192) as usize;
+                let flow_cap = parse_ttl_secs(&src.options, 65_536) as usize;
+                let ts =
+                    sentry_source_tcp::TcpCaptureSource::new(sentry_source_tcp::TcpSourceConfig {
+                        interface,
+                        ports,
+                        payload_cap,
+                        flow_cap,
+                    })?;
+                builder.register_source(ts);
+            }
             other => {
                 info!(
                     source = other,

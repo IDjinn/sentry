@@ -117,6 +117,7 @@ fn signal_label(k: sentry_core::SignalKind) -> &'static str {
         VpnProxy => "vpn_proxy",
         BadCrawler => "bad_crawler",
         AnomalousPayload => "anomalous_payload",
+        TcpScanner => "tcp_scanner",
         LlmMalicious => "llm_malicious",
         RuleHit => "rule_hit",
         Custom => "custom",

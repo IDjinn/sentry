@@ -298,8 +298,7 @@ format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_byt
 # bind = "0.0.0.0:5140"   # ports < 1024 need root; 5140 avoids that
 # transport = "udp"       # udp | tcp
 
-# ── Cloudflare logs pull (F3.3) ────────────────────────────────────────────
-# Polls the zone Logs API (`GET /zones/{id}/logs/received`, NDJSON) and feeds
+# ── Cloudflare logs pull (F3.3) ────────────────────────────────────────────# Polls the zone Logs API (`GET /zones/{id}/logs/received`, NDJSON) and feeds
 # the same pipeline as the nginx tail. Requires an Enterprise entitlement for
 # received logs; token via env (default SENTRY_CF_TOKEN, Logs:Read).
 # [[source]]
@@ -309,6 +308,18 @@ format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_byt
 # poll_secs = 30                  # min 5
 # start = "2026-09-30T00:00:00Z"  # first poll cursor (default: now)
 # api_base = "https://api.cloudflare.com/client/v4"
+
+# ── Passive TCP capture (F3.2) ─────────────────────────────────────────────
+# Raw packet capture with SYN fingerprinting (masscan/zmap/nmap detection).
+# Requires the build feature `pcap` (sentry-cli/pcap) AND elevated
+# privileges at runtime: Npcap on Windows, CAP_NET_RAW on Linux.
+# [[source]]
+# type = "tcp"
+# [source.options]
+# interface = "eth0"    # capture interface (required)
+# ports = "80,443,8443" # destination-port filter; empty = all
+# payload_cap = 8192    # reassembled bytes kept per flow
+# flow_cap = 65536      # max tracked flows (FIFO eviction)
 
 # ── Web dashboard / JSON API (`sentry serve`) ──────────────────────────────
 # Separate process from the daemon; requires Postgres.

@@ -140,6 +140,9 @@ pub enum SignalKind {
     BadCrawler,
     /// Anomaly score from the ONNX model exceeded threshold.
     AnomalousPayload,
+    /// SYN fingerprint matched a known high-rate port scanner
+    /// (masscan / zmap / nmap-style, F3.2 passive TCP capture).
+    TcpScanner,
     /// LLM classified the payload as malicious.
     LlmMalicious,
     /// A custom rule matched (the rule id is carried in `detail`).

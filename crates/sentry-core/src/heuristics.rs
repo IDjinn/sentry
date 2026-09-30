@@ -39,6 +39,7 @@ impl HeuristicEngine {
                 Box::new(SensitivePath),
                 Box::new(BadCrawler),
                 Box::new(EmptyUserAgent),
+                Box::new(TcpScanner),
             ],
         }
     }
@@ -372,6 +373,30 @@ impl Heuristic for EmptyUserAgent {
                 detail: Some("empty".into()),
             }],
             _ => vec![],
+        }
+    }
+}
+
+/// Passive TCP SYN fingerprint match (F3.2): flags captured SYNs whose
+/// `window:options:MSS:wscale` code matches a known high-rate scanner
+/// (masscan / zmap / nmap-style probes).
+pub struct TcpScanner;
+impl Heuristic for TcpScanner {
+    fn name(&self) -> &'static str {
+        "tcp_scanner"
+    }
+    fn analyze(&self, evt: &Event) -> Vec<Signal> {
+        let code = match evt.tcp().and_then(|t| t.fingerprint.as_deref()) {
+            Some(c) => c,
+            None => return vec![],
+        };
+        match crate::tcpfp::scanner_name(code) {
+            Some(tool) => vec![Signal {
+                kind: SignalKind::TcpScanner,
+                weight: 30,
+                detail: Some(format!("{code} ({tool})")),
+            }],
+            None => vec![],
         }
     }
 }
