@@ -355,11 +355,20 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     let ai_fork = build_ai_fork(&cfg);
     if let Some(ref ai) = ai_fork {
         info!(
-            model = ai.model.name(),
+            model = ai.model().name(),
             mode = ai.mode.as_str(),
             trigger = ai.trigger.as_str(),
             "ai threat model loaded"
         );
+        // F3.6: `sentry model reload` notifies `sentry_model_changed`; the
+        // daemon swaps the ONNX model in place without a restart.
+        #[cfg(feature = "onnx")]
+        if let Some(ref repo) = repo {
+            let pool = repo.pool().clone();
+            let ai_cfg = cfg.ai.clone();
+            let reload_fork = Arc::clone(ai);
+            tokio::spawn(model_hot_reload(pool, ai_cfg, reload_fork));
+        }
     }
 
     // Remote LLM classifier (Layer 2): escalates suspicious or quarantined
@@ -739,7 +748,9 @@ fn payload_hash(evt: &Event) -> u64 {
 /// - `inline`: awaited before persistence/actions;
 /// - `shadow`: evaluates and logs, never acts.
 struct AiFork {
-    model: Arc<dyn sentry_ai::ThreatModel>,
+    /// Loaded model, swappable at runtime via `NOTIFY sentry_model_changed`
+    /// (F3.6 retraining loop: `sentry model reload`).
+    model: Arc<std::sync::RwLock<Arc<dyn sentry_ai::ThreatModel>>>,
     mode: String,
     trigger: String,
     min_score: u8,
@@ -749,6 +760,15 @@ struct AiFork {
 }
 
 impl AiFork {
+    fn model(&self) -> Arc<dyn sentry_ai::ThreatModel> {
+        self.model.read().unwrap().clone()
+    }
+
+    #[cfg(feature = "onnx")]
+    fn swap_model(&self, model: Arc<dyn sentry_ai::ThreatModel>) {
+        *self.model.write().unwrap() = model;
+    }
+
     fn is_inline(&self) -> bool {
         self.mode == "inline"
     }
@@ -776,7 +796,7 @@ impl AiFork {
             }
         }
         let _permit = self.semaphore.acquire().await;
-        match self.model.analyze(evt).await {
+        match self.model().analyze(evt).await {
             Ok(signals) => {
                 let mut cache = self.cache.write().unwrap();
                 cache.retain(|_, (ts, _)| ts.elapsed() < self.cache_ttl);
@@ -882,7 +902,9 @@ fn build_ai_fork(cfg: &SentryConfig) -> Option<Arc<AiFork>> {
             }
         };
         Some(Arc::new(AiFork {
-            model,
+            model: Arc::new(std::sync::RwLock::new(
+                model as Arc<dyn sentry_ai::ThreatModel>,
+            )),
             mode: cfg.ai.mode.clone(),
             trigger: cfg.ai.trigger.clone(),
             min_score: cfg.ai.min_score,
@@ -1151,6 +1173,57 @@ async fn rules_hot_reload(pool: sentry_storage::PgPool, rules: SharedRuleSet) {
             }
             Err(e) => {
                 warn!(error = %e, "failed to start LISTEN, retrying in 5s…");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// F3.6 retraining loop endpoint: on `NOTIFY sentry_model_changed`, reload
+/// the ONNX model from disk and swap it into the running fork. A failed load
+/// keeps the previous model running.
+#[cfg(feature = "onnx")]
+async fn model_hot_reload(
+    pool: sentry_storage::PgPool,
+    ai_cfg: sentry_core::config::AiConfig,
+    fork: Arc<AiFork>,
+) {
+    const CHANNEL: &str = "sentry_model_changed";
+    loop {
+        match pool.listen(CHANNEL).await {
+            Ok(mut listener) => {
+                info!(
+                    channel = CHANNEL,
+                    "listening for model change notifications"
+                );
+                while listener.recv().await.is_ok() {
+                    match sentry_ai::onnx_model::OnnxThreatModel::load(
+                        &ai_cfg.model_path,
+                        sentry_ai::onnx_model::OnnxThreatModelConfig {
+                            threshold: ai_cfg.threshold,
+                            signal_weight: ai_cfg.signal_weight,
+                        },
+                    ) {
+                        Ok(m) => {
+                            fork.swap_model(Arc::new(m));
+                            info!(
+                                path = %ai_cfg.model_path.display(),
+                                "onnx model hot-reloaded"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                path = %ai_cfg.model_path.display(),
+                                "model reload failed — keeping previous model"
+                            );
+                        }
+                    }
+                }
+                warn!("LISTEN connection closed, reconnecting in 5s…");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to start model LISTEN, retrying in 5s…");
             }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;

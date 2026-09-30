@@ -672,13 +672,28 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 );
             }
             ModelCmd::Reload => {
-                println!("Model reload happens on daemon restart (hot reload is planned for F3).");
+                let cfg = require_config(&cfg)?;
+                if cfg.storage.postgres.url.is_empty() {
+                    return Err(color_eyre::eyre::eyre!(
+                        "`sentry model reload` requires Postgres storage (the daemon listens on NOTIFY sentry_model_changed)"
+                    ));
+                }
+                let repo = connect_storage(cfg).await?;
+                repo.pool()
+                    .notify("sentry_model_changed")
+                    .await
+                    .map_err(|e| color_eyre::eyre::eyre!("notify failed: {e}"))?;
+                println!(
+                    "Reload notification sent — the daemon will re-read {} from disk (F3.6 loop: export → train → replace → reload).",
+                    cfg.ai.model_path.display()
+                );
             }
             ModelCmd::Export {
                 hours,
                 out,
                 synthetic,
                 rows,
+                confirmed,
             } => {
                 if synthetic {
                     export_synthetic(rows, &out)?;
@@ -687,6 +702,17 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 let cfg = require_config(&cfg)?;
                 let repo = connect_storage(cfg).await?;
                 let since = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+                let incident_ids: std::collections::HashSet<uuid::Uuid> = if confirmed {
+                    let ids = repo
+                        .events()
+                        .incident_event_ids(since)
+                        .await
+                        .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
+                    println!("Confirmed positives from incidents: {} event(s)", ids.len());
+                    ids.into_iter().collect()
+                } else {
+                    Default::default()
+                };
                 let rows = repo
                     .events()
                     .recent_since(since)
@@ -704,9 +730,14 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                     let Some(evt) = crate::daemon::event_row_to_event(row) else {
                         continue;
                     };
-                    // Label: verdicts the pipeline acted on are the positives.
-                    let label =
-                        matches!(row.verdict.as_str(), "block" | "challenge" | "rate_limit") as u8;
+                    // Default label: verdicts the pipeline acted on are the
+                    // positives. `--confirmed`: incident-linked events are the
+                    // operator-confirmed positives, everything else negative.
+                    let label = if confirmed {
+                        incident_ids.contains(&row.id) as u8
+                    } else {
+                        matches!(row.verdict.as_str(), "block" | "challenge" | "rate_limit") as u8
+                    };
                     let features: Vec<String> = sentry_ai::features::extract(&evt)
                         .iter()
                         .map(|f| format!("{f:.6}"))
@@ -717,8 +748,9 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 }
                 w.flush().ok();
                 println!(
-                    "Exported {written} rows ({hours}h window) to {out} \
-                     — train with: python tools/train_model.py --csv {out}"
+                    "Exported {written} rows ({hours}h window{}) to {out} \
+                     — train with: python tools/train_model.py --csv {out}",
+                    if confirmed { ", confirmed labels" } else { "" }
                 );
             }
         },

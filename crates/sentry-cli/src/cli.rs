@@ -289,6 +289,10 @@ pub enum ModelCmd {
         /// Row count for `--synthetic` (default 4000, half benign).
         #[arg(long, default_value = "4000")]
         rows: u64,
+        /// Label from confirmed incidents (F4.5 feedback) instead of pipeline
+        /// verdicts: incident-linked events → 1, everything else → 0.
+        #[arg(long)]
+        confirmed: bool,
     },
 }
 

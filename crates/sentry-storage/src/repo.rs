@@ -214,6 +214,24 @@ impl EventRepo {
         Ok(())
     }
 
+    /// Event ids referenced by at least one incident, within the window.
+    ///
+    /// Feeds `sentry model export --confirmed`: incident-linked events are
+    /// the operator-confirmed positives of the retraining dataset (F3.6).
+    pub async fn incident_event_ids(&self, since: DateTime<Utc>) -> Result<Vec<Uuid>> {
+        let rows: Vec<Uuid> = sqlx::query_scalar(
+            r#"SELECT DISTINCT i.event_id
+               FROM incidents i
+               JOIN events e ON e.id = i.event_id
+               WHERE i.event_id IS NOT NULL AND e.timestamp >= $1"#,
+        )
+        .bind(since)
+        .fetch_all(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(rows)
+    }
+
     /// Count events by risk level.
     pub async fn count_by_level(&self) -> Result<Vec<(String, i64)>> {
         let rows: Vec<(String, i64)> = sqlx::query_as(
