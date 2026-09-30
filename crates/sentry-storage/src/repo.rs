@@ -302,8 +302,10 @@ impl EventRepo {
 
     /// Top client IPs by event count since `since`.
     pub async fn top_ips(&self, limit: i64, since: DateTime<Utc>) -> Result<Vec<(String, i64)>> {
+        // client_ip is INET; sqlx decodes it into ip types, not String —
+        // cast to text for the (ip, count) aggregate.
         let rows: Vec<(String, i64)> = sqlx::query_as(
-            r#"SELECT client_ip, COUNT(*)::bigint AS n
+            r#"SELECT client_ip::text, COUNT(*)::bigint AS n
                FROM events WHERE timestamp >= $1
                GROUP BY client_ip ORDER BY n DESC LIMIT $2"#,
         )
