@@ -1,0 +1,98 @@
+# edge-sidecar (F3.9c) — inline Sentry edge as a sidecar/front container.
+#
+# Topology: the `sentry-edge` container owns the Service port and forwards
+# allowed traffic to the app container on localhost — the app port is never
+# exposed. Same image as the daemon, different command.
+#
+#   kubectl apply -f deploy/k8s/edge-sidecar.yaml
+#
+# The app is assumed to serve plain HTTP on 8080. Replace the image with your
+# registry build of this repository.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-with-sentry-edge
+  labels:
+    app: myapp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: myapp
+  template:
+    metadata:
+      labels:
+        app: myapp
+    spec:
+      containers:
+        # ── The protected application (never exposed directly) ──
+        - name: app
+          image: myapp:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SENTRY_STORAGE__POSTGRES__URL
+              valueFrom:
+                secretKeyRef:
+                  name: sentry-secrets
+                  key: postgres-url
+        # ── The inline Sentry edge (owns the public port) ──
+        - name: sentry-edge
+          image: ghcr.io/lucas/sentry:latest
+          args: ["run"]
+          ports:
+            - containerPort: 80
+              name: edge
+          volumeMounts:
+            - name: sentry-config
+              mountPath: /etc/sentry
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 80
+            initialDelaySeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: sentry-config
+          configMap:
+            name: sentry-edge-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentry-edge-config
+data:
+  sentry.toml: |
+    [deployment]
+    mode = "inline"
+
+    [edge]
+    listen = "0.0.0.0:80"
+    upstream = "http://127.0.0.1:8080"
+    health_path = "/"
+    health_timeout_secs = 5
+    body_capture_kb = 0
+
+    # Storage is shared with the daemon so rules/incidents stay in sync.
+    [storage.postgres]
+    url = ""            # injected via SENTRY_STORAGE__POSTGRES__URL env
+
+    [[action]]
+    type = "log"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp
+spec:
+  selector:
+    app: myapp
+  ports:
+    - port: 80
+      targetPort: 80
+      name: http

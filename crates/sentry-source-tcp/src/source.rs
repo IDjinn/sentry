@@ -8,8 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sentry_core::event::{RawEvent, SourceKind, TcpData, TcpFlags, Transport};
-use sentry_core::source::{event_channel, Source};
+use sentry_core::event::RawEvent;
+#[cfg(feature = "pcap")]
+use sentry_core::event::{SourceKind, TcpData, TcpFlags, Transport};
+#[cfg(feature = "pcap")]
+use sentry_core::source::event_channel;
+use sentry_core::source::Source;
+#[cfg(feature = "pcap")]
 use sentry_core::tcpfp::SynFingerprint;
 use tokio::sync::mpsc;
 

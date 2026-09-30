@@ -1,0 +1,28 @@
+[package]
+name = "sentry-edge"
+description = "Inline edge (WAF/reverse proxy + middleware + TCP listener) for Sentry (F3.1/F3.9)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# TLS termination for the inline HTTP listener (axum-server + rustls).
+edge-tls = ["dep:axum-server"]
+
+[dependencies]
+sentry-core = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+axum-server = { version = "0.7", optional = true, default-features = false, features = ["tls-rustls"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = { workspace = true }

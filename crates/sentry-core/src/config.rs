@@ -61,6 +61,12 @@ pub struct SentryConfig {
     /// Background route learner.
     #[serde(default)]
     pub route_learner: RouteLearnerConfig,
+    /// Deployment positioning (passive | inline) (F3.9).
+    #[serde(default)]
+    pub deployment: DeploymentConfig,
+    /// Inline edge settings (used when deployment.mode = "inline").
+    #[serde(default)]
+    pub edge: EdgeConfig,
     /// Event sources.
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
@@ -686,6 +692,88 @@ fn default_session_ttl() -> u64 {
 }
 fn default_webhook_secret_env() -> String {
     "SENTRY_WEBHOOK_SECRET".to_string()
+}
+
+/// Deployment positioning (F3.9): where Sentry sits relative to the app.
+///
+/// `passive` (default) reads logs/mirrors traffic and acts ex-post via
+/// actions; `inline` runs the [`EdgeConfig`] reverse proxy in front of the
+/// upstream and enforces verdicts before the app sees the request.
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentConfig {
+    /// `passive` | `inline`.
+    #[serde(default)]
+    pub mode: String,
+    /// Instance label for metrics and multi-node deployments (F4.7).
+    /// Empty = derive from the hostname.
+    #[serde(default)]
+    pub instance_id: String,
+}
+
+impl DeploymentConfig {
+    /// Whether inline (edge) mode is requested.
+    pub fn is_inline(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("inline")
+    }
+}
+
+/// Inline edge settings (F3.1/F3.9) — required when
+/// `[deployment] mode = "inline"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeConfig {
+    /// Public HTTP listen address (default `0.0.0.0:80`).
+    #[serde(default = "default_edge_listen")]
+    pub listen: String,
+    /// Protected upstream base URL (`http://127.0.0.1:8080`).
+    #[serde(default)]
+    pub upstream: String,
+    /// Path used for the mandatory startup health check (default `/`).
+    #[serde(default = "default_edge_health_path")]
+    pub health_path: String,
+    /// Health check timeout in seconds (default 5).
+    #[serde(default = "default_edge_health_timeout")]
+    pub health_timeout_secs: u64,
+    /// Request-body bytes captured for inspection, in KiB (0 = off).
+    #[serde(default)]
+    pub body_capture_kb: usize,
+    /// TLS certificate path (feature `edge-tls`); both cert and key enable TLS.
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+    /// TLS private key path (feature `edge-tls`).
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+    /// Optional inline TCP listener for non-HTTP services (`0.0.0.0:2222`).
+    #[serde(default)]
+    pub tcp_listen: Option<String>,
+    /// Real backend for the TCP listener (`127.0.0.1:22`).
+    #[serde(default)]
+    pub tcp_upstream: Option<String>,
+}
+
+impl Default for EdgeConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_edge_listen(),
+            upstream: String::new(),
+            health_path: default_edge_health_path(),
+            health_timeout_secs: default_edge_health_timeout(),
+            body_capture_kb: 0,
+            tls_cert: None,
+            tls_key: None,
+            tcp_listen: None,
+            tcp_upstream: None,
+        }
+    }
+}
+
+fn default_edge_listen() -> String {
+    "0.0.0.0:80".to_string()
+}
+fn default_edge_health_path() -> String {
+    "/".to_string()
+}
+fn default_edge_health_timeout() -> u64 {
+    5
 }
 
 /// Background route learner config.

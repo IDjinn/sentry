@@ -420,7 +420,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
 
     // Fan-in: merge all source streams into one channel.
     let buffer = cfg.core.channel_buffer.max(256);
-    let (event_tx, mut event_rx) = mpsc::channel::<Event>(buffer);
+    let (event_tx, mut event_rx) = mpsc::channel::<Incoming>(buffer);
 
     // Start each source.
     for source in registry.sources() {
@@ -443,7 +443,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                         if let Some(ref r) = reputation_clone {
                             r.enrich(&mut evt);
                         }
-                        if tx.try_send(evt).is_err() {
+                        if tx.try_send(Incoming::Raw(Box::new(evt))).is_err() {
                             warn!(source = source.name(), "event channel full, dropping event");
                         }
                     }
@@ -454,6 +454,83 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 }
             }
         });
+    }
+
+    // Inline edge (F3.9): the reverse proxy (and optional TCP front) share
+    // this process's pipeline — stateful trackers count once — and hand the
+    // already-decided events back through the fan-in for persistence and
+    // action dispatch.
+    if cfg.deployment.is_inline() {
+        if cfg.edge.upstream.is_empty() {
+            return Err(color_eyre::eyre::eyre!(
+                "[deployment] mode = \"inline\" requires [edge] upstream"
+            ));
+        }
+        let enricher = make_enricher(&geo, &reputation);
+        let (dec_tx, mut dec_rx) = mpsc::channel::<sentry_core::ProcessedEvent>(buffer);
+        let proxy_cfg = sentry_edge::proxy::EdgeProxyConfig {
+            listen: cfg.edge.listen.clone(),
+            upstream: cfg.edge.upstream.clone(),
+            health_path: cfg.edge.health_path.clone(),
+            health_timeout_secs: cfg.edge.health_timeout_secs,
+            tls_cert: cfg.edge.tls_cert.clone(),
+            tls_key: cfg.edge.tls_key.clone(),
+        };
+        let runtime = sentry_edge::EdgeRuntime::new(
+            Arc::clone(&pipeline),
+            enricher.clone(),
+            cfg.edge.body_capture_kb.saturating_mul(1024),
+        );
+        let edge_pipeline = cfg.edge.upstream.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sentry_edge::proxy::serve(runtime, proxy_cfg, dec_tx).await {
+                error!(error = %e, upstream = %edge_pipeline, "edge proxy terminated");
+            }
+        });
+        let pump_tx = event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(pe) = dec_rx.recv().await {
+                if pump_tx.try_send(Incoming::Processed(Box::new(pe))).is_err() {
+                    warn!("event channel full, dropping edge event");
+                }
+            }
+        });
+        if let (Some(tcp_listen), Some(tcp_upstream)) =
+            (cfg.edge.tcp_listen.clone(), cfg.edge.tcp_upstream.clone())
+        {
+            let tcp_runtime = sentry_edge::EdgeRuntime::new(Arc::clone(&pipeline), enricher, 0);
+            let (tcp_dec_tx, mut tcp_dec_rx) = mpsc::channel::<sentry_core::ProcessedEvent>(buffer);
+            let tcp_cfg = sentry_edge::tcp_listener::TcpEdgeConfig {
+                listen: tcp_listen.clone(),
+                upstream: tcp_upstream.clone(),
+                connect_timeout_secs: cfg.edge.health_timeout_secs,
+            };
+            let tcp_log_listen = tcp_listen.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    sentry_edge::tcp_listener::serve_tcp(tcp_runtime, tcp_cfg, tcp_dec_tx).await
+                {
+                    error!(error = %e, listen = %tcp_log_listen, "edge-tcp terminated");
+                }
+            });
+            let tcp_pump_tx = event_tx.clone();
+            tokio::spawn(async move {
+                while let Some(pe) = tcp_dec_rx.recv().await {
+                    if tcp_pump_tx
+                        .try_send(Incoming::Processed(Box::new(pe)))
+                        .is_err()
+                    {
+                        warn!("event channel full, dropping edge-tcp event");
+                    }
+                }
+            });
+            info!(listen = %tcp_listen, upstream = %tcp_upstream, "edge-tcp front enabled");
+        }
+        info!(
+            listen = %cfg.edge.listen,
+            upstream = %cfg.edge.upstream,
+            "inline edge enabled (deployment.mode = inline)"
+        );
     }
     drop(event_tx);
 
@@ -502,16 +579,22 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         });
     }
 
-    while let Some(evt) = event_rx.recv().await {
-        let key = dedup_key(&evt);
-        if dedupe.check_and_mark(&key) {
-            dropped_dupes += 1;
-            metrics.dedupe_drops.inc();
-            continue;
-        }
-
+    while let Some(incoming) = event_rx.recv().await {
         let start = Instant::now();
-        let mut result = pipeline.process(&evt);
+        let mut result = match incoming {
+            Incoming::Raw(evt) => {
+                let evt = *evt;
+                let key = dedup_key(&evt);
+                if dedupe.check_and_mark(&key) {
+                    dropped_dupes += 1;
+                    metrics.dedupe_drops.inc();
+                    continue;
+                }
+                pipeline.process(&evt)
+            }
+            // Edge decisions are final: persist + dispatch actions only.
+            Incoming::Processed(pe) => *pe,
+        };
         let duration = start.elapsed();
 
         // Inline AI mode: block before persistence/actions so the stored
@@ -523,7 +606,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                     let updated = pipeline.rescore_from(&result, signals);
                     if updated.decision.action != result.decision.action {
                         info!(
-                            ip = %evt.client_ip,
+                            ip = %result.event.client_ip,
                             from = ?result.decision.action,
                             to = ?updated.decision.action,
                             score = updated.analysis.risk_score,
@@ -614,10 +697,10 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         // Mirror offender strikes to Postgres and log escalations.
         if result.decision.action != sentry_core::Verdict::Allow {
             if let Some(ref offender) = offender_tracker {
-                let strikes = offender.read().unwrap().strikes(evt.client_ip);
+                let strikes = offender.read().unwrap().strikes(result.event.client_ip);
                 if let (Some(ref repo), true) = (&repo, cfg.escalation.persist) {
                     let repo = Arc::clone(repo);
-                    let ip = evt.client_ip;
+                    let ip = result.event.client_ip;
                     let window = cfg.escalation.window_secs;
                     tokio::spawn(async move {
                         if let Err(e) = repo.ip_state().record_violation(ip, window).await {
@@ -632,7 +715,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                     .is_some_and(|r| r.starts_with("offender escalation"))
                 {
                     info!(
-                        ip = %evt.client_ip,
+                        ip = %result.event.client_ip,
                         strikes,
                         verdict = ?result.decision.action,
                         "verdict escalated (repeat offender)"
@@ -672,6 +755,34 @@ fn verdict_str(v: sentry_core::Verdict) -> &'static str {
         sentry_core::Verdict::Block => "block",
         sentry_core::Verdict::Quarantine => "quarantine",
     }
+}
+
+/// Fan-in item: a fresh event from a source, or an already-decided event
+/// from the inline edge (the pipeline ran inside the edge process — shared
+/// Arc — so it must not run again).
+enum Incoming {
+    Raw(Box<Event>),
+    Processed(Box<sentry_core::ProcessedEvent>),
+}
+
+/// Combined geo + reputation enrichment hook for the inline edge.
+fn make_enricher(
+    geo: &Option<Arc<sentry_geo::GeoLookup>>,
+    reputation: &Option<Arc<sentry_reputation::ReputationService>>,
+) -> Option<sentry_edge::Enricher> {
+    if geo.is_none() && reputation.is_none() {
+        return None;
+    }
+    let geo = geo.clone();
+    let reputation = reputation.clone();
+    Some(Arc::new(move |evt: &mut Event| {
+        if let Some(ref g) = geo {
+            g.enrich(evt);
+        }
+        if let Some(ref r) = reputation {
+            r.enrich(evt);
+        }
+    }))
 }
 
 /// Resolve the incident for a High/Critical event (F4.5).

@@ -446,6 +446,47 @@ flowchart LR
     V2[Verdict Challenge / IPv4] --> AR
 ```
 
+### 8.3 Modos de deployment (F3.9)
+
+`[deployment] mode` escolhe onde o Sentry senta em relação à aplicação:
+
+```text
+passive (default)   client → nginx → app        Sentry lê access.log / syslog /
+                                                pcap e age ex-post (webhook, CF API,
+                                                blocklist). Zero risco de path.
+
+inline              client → sentry-edge → nginx → app
+                    Sentry é o front: aplica o verdict ANTES do upstream
+                    (Block→403 · RateLimit→429 · Challenge→challenge page ·
+                    Allow→proxy). Alvo de latência de verdict: ≤50 ms.
+```
+
+- **`edge-http` (F3.9a, crate `sentry-edge`)**: reverse proxy inline. O
+  startup exige **opt-in explícito** (`mode = "inline"`) **+ health check do
+  backend** — edge sobre backend morto vira outage. Eventos decididos
+  retornam ao daemon pelo mesmo fan-in (`Incoming::Processed`): persistência,
+  actions e forks disparam uma única vez; o `Arc<Pipeline>` é compartilhado,
+  então rate-limiter/scan/behavior/offender **não** contam em dobro.
+- **`sentry_middleware` (F3.1)**: o mesmo runtime exposto como middleware
+  axum (`from_fn_with_state(rt, sentry_edge::middleware::handler)`) em modos
+  `Inline` (bloqueia antes do handler) ou `Shadow` (anexa a decisão e
+  segue) — para apps Rust que embutem o Sentry sem proxy hop.
+- **`edge-tcp` (F3.9b)**: listener TCP inline para serviços não-HTTP —
+  verdict no connect (Block/Quarantine fecha a conexão), depois pipe
+  bidirecional para o backend real. Fingerprint SYN não existe em
+  userspace-accept; o pipeline roda com evento `Tcp(Syn)` sintético.
+- **`passive-log` (F3.9d)**: tail de access.log (F1, já entregue).
+- **`passive-mirror`/`passive-tap` (F3.9e/f)**: SPAN/`iptables TEE`/sniffer
+  promíscuo via `sentry-source-tcp` em capture mode (feature `pcap`).
+- **`edge-sidecar` (F3.9c)**: mesmo binário em container sidecar/DaemonSet
+  (`deploy/k8s/edge-sidecar.yaml`).
+- **Regra de cadeia**: `client → sentry-edge → nginx → app` — o Sentry é a
+  camada de decisão de ameaça; rate-limit/WAF de app do nginx continuam
+  sendo do nginx (complementares, não substitutos).
+- **Critério de escolha**: inline quando o serviço não pode tolerar o
+  ataque chegar na app (RCE/0-day); passive quando a infra não pode mudar
+  de path/SSL ou o objetivo é observabilidade. Default = passive.
+
 ---
 
 ## 9. Detecção de Rotas Válidas

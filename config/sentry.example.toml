@@ -347,6 +347,30 @@ mode = "none"                      # keep "none" only on loopback
 # token_sha256 = "<64 hex chars>"   # or token_env = "SENTRY_DASH_TOKEN" (raw token)
 # role = "viewer"
 
+# ── Deployment mode (F3.9) ────────────────────────────────────────────────
+# passive (default): read-only sources, act ex-post via actions.
+# inline: sentry-edge reverse proxy in front of the app (WAF mode) —
+# requires [edge] upstream + a healthy backend at startup.
+[deployment]
+mode = "passive"             # passive | inline
+# instance_id = "node-1"     # metrics label for multi-node setups (F4.7)
+
+# ── Inline edge (used when [deployment] mode = "inline") ──────────────────
+# Chain: client → sentry-edge → nginx → app. The startup health check
+# against the upstream is mandatory; verdicts apply BEFORE proxying
+# (Block→403 · RateLimit→429 · Challenge→challenge page · Allow→proxy).
+[edge]
+listen = "0.0.0.0:80"
+upstream = "http://127.0.0.1:8080"
+health_path = "/"
+health_timeout_secs = 5
+body_capture_kb = 0          # request-body bytes kept for inspection (KiB)
+# tls_cert = "/etc/sentry/edge.crt"   # requires build feature `edge-tls`
+# tls_key = "/etc/sentry/edge.key"
+# Inline TCP front for non-HTTP services (verdict on connect):
+# tcp_listen = "0.0.0.0:2222"
+# tcp_upstream = "127.0.0.1:22"
+
 # ── Actions ──────────────────────────────────────────────────────────────
 [[action]]
 type = "blocklist"
