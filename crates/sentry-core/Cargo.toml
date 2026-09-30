@@ -29,7 +29,13 @@ chrono = { workspace = true }
 http = { workspace = true }
 ipnet = { workspace = true }
 regex = { workspace = true }
+aho-corasick = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"
 proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "perf"
+harness = false

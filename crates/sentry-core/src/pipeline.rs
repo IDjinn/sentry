@@ -262,17 +262,25 @@ impl RepetitionTracker {
     }
 
     /// Record signals for an IP and return bonus weight for repetitions.
+    ///
+    /// Per-IP history is capped: a chatty client inside the window would
+    /// otherwise grow the Vec unboundedly and make every record O(window
+    /// events). The cap is far above any realistic repetition rate (F5).
     pub fn record(&mut self, ip: IpAddr, signals: &[Signal]) -> u8 {
+        const MAX_ENTRIES: usize = 128;
         let now = Instant::now();
         let window = std::time::Duration::from_secs(self.window_secs);
         let entries = self.history.entry(ip).or_default();
 
         entries.retain(|(_, ts)| now.duration_since(*ts) < window);
+        if entries.len() + signals.len() > MAX_ENTRIES {
+            let excess = entries.len() + signals.len() - MAX_ENTRIES;
+            entries.drain(..excess.min(entries.len()));
+        }
 
         let mut bonus = 0u8;
         for s in signals {
-            let count = entries.iter().filter(|(k, _)| *k == s.kind).count();
-            if count > 0 {
+            if entries.iter().any(|(k, _)| *k == s.kind) {
                 bonus = bonus.saturating_add(5);
             }
             entries.push((s.kind, now));

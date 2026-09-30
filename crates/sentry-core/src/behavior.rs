@@ -155,8 +155,13 @@ impl BehaviorTracker {
         let path_lower = path.to_ascii_lowercase();
 
         if matches!(status, Some(401 | 403)) && self.is_login_path(&path_lower) {
+            const MAX_AUTH_HITS: usize = 64;
             let hits = self.auth.entry(ip).or_default();
             hits.retain(|h| now.duration_since(h.ts) < self.window);
+            if hits.len() >= MAX_AUTH_HITS {
+                let overflow = hits.len() - MAX_AUTH_HITS + 1;
+                hits.drain(..overflow);
+            }
             hits.push(AuthHit {
                 ua: user_agent.map(str::to_string),
                 ts: now,
@@ -219,8 +224,13 @@ impl BehaviorTracker {
             && self.is_wordlist_path(&path_lower)
             && !self.is_good_bot(user_agent)
         {
+            const MAX_WORDLIST_HITS: usize = 64;
             let hits = self.wordlist_windows.entry(ip).or_default();
             hits.retain(|t| now.duration_since(*t) < self.window);
+            if hits.len() >= MAX_WORDLIST_HITS {
+                let overflow = hits.len() - MAX_WORDLIST_HITS + 1;
+                hits.drain(..overflow);
+            }
             hits.push(now);
             if self.wordlist_hits > 0 && hits.len() as u32 >= self.wordlist_hits {
                 signals.push(Signal {

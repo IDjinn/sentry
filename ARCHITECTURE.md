@@ -1275,3 +1275,63 @@ Para frameworks onde as rotas estão no código (Rails, Django, Express, Flask),
 2. `cargo new --lib` do workspace + crates skeleton. ✅ (F0 concluído)
 3. Implementar F1.1 (source nginx) — é o gancho de valor mais rápido.
 4. Iniciar `sentry-auto` em paralelo (A.1–A.3) para WordPress como primeiro perfil.
+
+## 22. Performance (F5 — parte prática, entregue)
+
+Benchmarks criterion em `crates/sentry-core/benches/perf.rs`
+(`cargo bench -p sentry-core`; 5 cenários, sample 40, 3 s). Ambiente:
+Windows 11, MSVC, stable-x86_64, release (codegen-units=1, thin LTO).
+
+| Benchmark (1 evento) | Antes | Depois | Ganho |
+| --- | --- | --- | --- |
+| heuristics/clean | 1,90 µs | 0,48 µs | 4,0× |
+| heuristics/attack | 2,94 µs | 1,59 µs | 1,8× |
+| rules/clean | **3,37 ms** | 2,47 µs | **~1 360×** |
+| pipeline/clean (end-to-end) | **3,49 ms** | 4,36 µs | **~800×** |
+| pipeline/attack (end-to-end) | 3,27 ms | 5,79 µs | ~565× |
+
+Onde o tempo estava e o que mudou:
+
+1. **Regex compilada por regra por evento** (`rules.rs`): era o gargalo
+   dominante — cada `Path regex`/`Header regex` recompilava o `Regex`
+   (centenas de µs cada) a evento. Agora `REGEX_CACHE` global
+   (`HashMap<String, Option<Arc<Regex>>>`, `LazyLock`) compila uma vez por
+   padrão por processo; padrões inválidos também são cacheados (não
+   re-parseiam por evento). Input é sempre config/DB — nunca dado do
+   atacante —, então o cache é limitado pelo tamanho do ruleset.
+2. **`IpNet`/IP parseado por regra por evento**: `IP_CACHE` com a mesma
+   forma (`IpSpec` = Net | Single | Range) para os packs densos em CIDR
+   (vpn_proxy, tor, country_blocklist).
+3. **`url_decode` por condição de path**: o path era decodificado para cada
+   regra com `Path`; agora é decodificado **uma vez por avaliação**
+   (`EvalCtx.decoded_path`) e compartilhado pela árvore `All`/`Any`/`Not`.
+4. **Heurísticas — prefilter Aho-Corasick** (`heuristics.rs`): um único
+   autômato (SIMD via memchr, `ascii_case_insensitive`) sobre ~90 tokens
+   literais necessários das 8 famílias de regex roda **uma passada** por
+   evento sobre path+query decodificados, UA, referer e headers; famílias
+   sem trigger presente não executam regex. Em tráfego limpo, zero regex.
+   `find_overlapping_iter` é obrigatório: triggers de famílias diferentes
+   se sobrepõem (`/.` × `../`) e a semântica non-overlapping faria o
+   primeiro trigger matar o bit da outra família (coberto por testes de
+   equivalência gated×ungated + proptest de literalidade dos triggers).
+5. **Decode-once nas heurísticas**: path/query eram URL-decodificados por
+   detector (até 6× por evento); agora `DecodedHttp` é construído uma vez
+   e compartilhado via trait `Heuristic::analyze(evt, text)`.
+6. **Trackers com história limitada** (`RepetitionTracker`,
+   `BehaviorTracker` auth/wordlist): janelas por IP cresciam sem teto —
+   um bruteforcer sustentado tornava cada evento O(janela inteira) e
+   realocava HashSet por evento (amplificação exatamente quando sob
+   ataque). Caps: repetição 128 entradas/IP, auth/wordlist 64 hits/IP
+   (mesmo padrão do `max_hits` do `ScanTracker`).
+7. **Dedupe sem alocação** (`daemon.rs`): chave do LRU virou `u64`
+   (`dedup_hash`, streaming no hasher — sem `String` intermediário);
+   sweep de expirados no máximo 1×/TTL em vez de `retain` por evento
+   (que era O(n) no tamanho do cache a cada evento). O mesmo hash serve
+   de `payload_hash` para o dedupe cross-node (F4.7).
+8. **Ingest em lote** (`daemon.rs`): `recv_many(64)` no fan-in drena até
+   64 eventos prontos por wakeup (trickle load = semântica de `recv`).
+
+Limites honestos: números de microbenchmark (cache quente, 1 IP sintético);
+throughput real é dominado por I/O do source e latência do Postgres. Os
+trackers scan/behavior/repetition permanecem por-IP em memória — a escala
+multi-node não muda isso (ver §8.4).

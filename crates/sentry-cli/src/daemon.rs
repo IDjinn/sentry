@@ -35,10 +35,12 @@ struct ChallengeActionWithProvider {
     provider: Option<Arc<sentry_action_cloudflare::CloudflareProvider>>,
 }
 
-/// Deduplication cache: prevents processing the same event (by key) within a TTL window.
+/// Deduplication cache: prevents processing the same event (by hash) within
+/// a TTL window.
 struct DedupeCache {
-    entries: HashMap<String, Instant>,
+    entries: HashMap<u64, Instant>,
     ttl: Duration,
+    last_sweep: Instant,
 }
 
 impl DedupeCache {
@@ -46,39 +48,53 @@ impl DedupeCache {
         Self {
             entries: HashMap::new(),
             ttl,
+            last_sweep: Instant::now(),
         }
     }
 
     /// Returns `true` if the key was already seen recently (i.e. should be skipped).
-    fn check_and_mark(&mut self, key: &str) -> bool {
+    ///
+    /// Expired entries are swept at most once per TTL, not per event — the
+    /// O(n) `retain` on every check made the cache itself a hot-path cost at
+    /// scale (F5). Hit path is allocation-free.
+    fn check_and_mark(&mut self, key: u64) -> bool {
         let now = Instant::now();
-        self.entries
-            .retain(|_, ts| now.duration_since(*ts) < self.ttl);
-        if self.entries.contains_key(key) {
-            true
-        } else {
-            self.entries.insert(key.to_string(), now);
-            false
+        if now.duration_since(self.last_sweep) >= self.ttl {
+            self.entries
+                .retain(|_, ts| now.duration_since(*ts) < self.ttl);
+            self.last_sweep = now;
+        }
+        match self.entries.get(&key) {
+            Some(_) => true,
+            None => {
+                self.entries.insert(key, now);
+                false
+            }
         }
     }
 }
 
-/// Build the dedup key for an event (IP + path + method for HTTP; IP + hash
-/// of the raw record otherwise, so distinct syslog/TCP messages from one IP
-/// are not collapsed).
-fn dedup_key(evt: &Event) -> String {
+/// Hash the dedup identity for an event (F5): IP + method + path for HTTP,
+/// IP + hash of the raw record otherwise — the same identity the cache used
+/// as a `String`, computed without intermediate allocations. Also used as
+/// the cross-node `payload_hash` (F4.7), so all nodes must run the same
+/// version for consistent dedupe.
+fn dedup_hash(evt: &Event) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    evt.client_ip.hash(&mut h);
     match evt.http() {
         Some(http) => {
-            let method = http.method.map(|m| format!("{m:?}")).unwrap_or_default();
-            format!("{}:{}:{}", evt.client_ip, method, http.path)
+            "http".hash(&mut h);
+            http.method.map(|m| m as u8).hash(&mut h);
+            http.path.hash(&mut h);
         }
         None => {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            evt.raw.hash(&mut hasher);
-            format!("{}:raw:{:016x}", evt.client_ip, hasher.finish())
+            "raw".hash(&mut h);
+            evt.raw.hash(&mut h);
         }
     }
+    h.finish()
 }
 
 /// Resolve the instance identity for metrics (F4.7): the configured
@@ -604,167 +620,175 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         });
     }
 
-    while let Some(incoming) = event_rx.recv().await {
-        let start = Instant::now();
-        let mut result = match incoming {
-            Incoming::Raw(evt) => {
-                let evt = *evt;
-                let key = dedup_key(&evt);
-                if dedupe.check_and_mark(&key) {
-                    dropped_dupes += 1;
-                    metrics.dedupe_drops.inc();
-                    continue;
-                }
-                pipeline.process(&evt)
-            }
-            // Edge decisions are final: persist + dispatch actions only.
-            Incoming::Processed(pe) => *pe,
-        };
-        let duration = start.elapsed();
-
-        // Inline AI mode: block before persistence/actions so the stored
-        // verdict and the dispatched actions already include the model's say.
-        if let Some(ref ai) = ai_fork {
-            if ai.is_inline() && ai.should_run(&result) {
-                let signals = ai.evaluate(&result.event).await;
-                if !signals.is_empty() {
-                    let updated = pipeline.rescore_from(&result, signals);
-                    if updated.decision.action != result.decision.action {
-                        info!(
-                            ip = %result.event.client_ip,
-                            from = ?result.decision.action,
-                            to = ?updated.decision.action,
-                            score = updated.analysis.risk_score,
-                            "ai (inline) changed verdict"
-                        );
+    // Batched ingest (F5): `recv_many` drains up to 64 ready events per
+    // wakeup, amortizing task/lock overhead under burst; under trickle load
+    // it behaves exactly like `recv` (returns as soon as one event arrives).
+    let mut batch: Vec<Incoming> = Vec::with_capacity(64);
+    loop {
+        let n = event_rx.recv_many(&mut batch, 64).await;
+        if n == 0 {
+            break; // channel closed
+        }
+        for incoming in batch.drain(..) {
+            let start = Instant::now();
+            let mut result = match incoming {
+                Incoming::Raw(evt) => {
+                    let evt = *evt;
+                    let key = dedup_hash(&evt);
+                    if dedupe.check_and_mark(key) {
+                        dropped_dupes += 1;
+                        metrics.dedupe_drops.inc();
+                        continue;
                     }
-                    result = updated;
+                    pipeline.process(&evt)
                 }
-            }
-        }
+                // Edge decisions are final: persist + dispatch actions only.
+                Incoming::Processed(pe) => *pe,
+            };
+            let duration = start.elapsed();
 
-        print_event(
-            &result.event,
-            &result.analysis.risk_level,
-            &result
-                .analysis
-                .signals
-                .iter()
-                .map(|s| format!("{:?}", s.kind))
-                .collect::<Vec<_>>(),
-        );
-
-        if let Some(ref repo) = repo {
-            let signals_json = serde_json::to_value(&result.analysis.signals).unwrap_or_default();
-            let repo = Arc::clone(repo);
-            let result_clone = result.clone();
-            tokio::spawn(async move {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                dedup_key(&result_clone.event).hash(&mut hasher);
-                let events = repo.events();
-                if let Err(e) = events
-                    .insert_with_hash(
-                        &result_clone.event,
-                        result_clone.analysis.risk_score,
-                        result_clone.analysis.risk_level,
-                        result_clone.decision.action,
-                        &signals_json,
-                        Some(hasher.finish() as i64),
-                    )
-                    .await
-                {
-                    warn!(error = %e, "failed to persist event");
-                }
-            });
-        }
-
-        for action in registry.actions() {
-            if action.applies_to(&result.decision) {
-                metrics
-                    .actions
-                    .with_label_values(&[action.name(), verdict_str(result.decision.action)])
-                    .inc();
-                let ctx = incident_context(&repo, &result).await;
-                if let Err(e) = action
-                    .execute_with_context(&result.event, &result.decision, &ctx)
-                    .await
-                {
-                    warn!(action = action.name(), error = %e, "action failed");
-                }
-            }
-        }
-
-        metrics.record_event(result.decision.action, result.analysis.risk_level, duration);
-
-        // Fork AI mode: evaluate off the hot path; a changed verdict updates
-        // the persisted event and re-dispatches actions.
-        if let Some(ref ai) = ai_fork {
-            if !ai.is_inline() && ai.should_run(&result) {
-                ai.spawn_fork(
-                    result.clone(),
-                    Arc::clone(&pipeline),
-                    registry.clone(),
-                    repo.clone(),
-                );
-            }
-        }
-
-        // LLM fork (Layer 2): same contract as the AI fork, but the verdict
-        // comes from the configured remote provider.
-        if let Some(ref llm) = llm_fork {
-            if llm.should_run(&result) {
-                llm.spawn_fork(
-                    result.clone(),
-                    Arc::clone(&pipeline),
-                    registry.clone(),
-                    repo.clone(),
-                );
-            }
-        }
-
-        // Mirror offender strikes to Postgres and log escalations.
-        if result.decision.action != sentry_core::Verdict::Allow {
-            if let Some(ref offender) = offender_tracker {
-                let strikes = offender.read().unwrap().strikes(result.event.client_ip);
-                if let (Some(ref repo), true) = (&repo, cfg.escalation.persist) {
-                    let repo = Arc::clone(repo);
-                    let ip = result.event.client_ip;
-                    let window = cfg.escalation.window_secs;
-                    tokio::spawn(async move {
-                        if let Err(e) = repo.ip_state().record_violation(ip, window).await {
-                            warn!(error = %e, "failed to persist offender strike");
+            // Inline AI mode: block before persistence/actions so the stored
+            // verdict and the dispatched actions already include the model's say.
+            if let Some(ref ai) = ai_fork {
+                if ai.is_inline() && ai.should_run(&result) {
+                    let signals = ai.evaluate(&result.event).await;
+                    if !signals.is_empty() {
+                        let updated = pipeline.rescore_from(&result, signals);
+                        if updated.decision.action != result.decision.action {
+                            info!(
+                                ip = %result.event.client_ip,
+                                from = ?result.decision.action,
+                                to = ?updated.decision.action,
+                                score = updated.analysis.risk_score,
+                                "ai (inline) changed verdict"
+                            );
                         }
-                    });
+                        result = updated;
+                    }
                 }
-                if result
-                    .decision
-                    .override_reason
-                    .as_deref()
-                    .is_some_and(|r| r.starts_with("offender escalation"))
-                {
-                    info!(
-                        ip = %result.event.client_ip,
-                        strikes,
-                        verdict = ?result.decision.action,
-                        "verdict escalated (repeat offender)"
+            }
+
+            print_event(
+                &result.event,
+                &result.analysis.risk_level,
+                &result
+                    .analysis
+                    .signals
+                    .iter()
+                    .map(|s| format!("{:?}", s.kind))
+                    .collect::<Vec<_>>(),
+            );
+
+            if let Some(ref repo) = repo {
+                let signals_json =
+                    serde_json::to_value(&result.analysis.signals).unwrap_or_default();
+                let repo = Arc::clone(repo);
+                let result_clone = result.clone();
+                tokio::spawn(async move {
+                    let events = repo.events();
+                    if let Err(e) = events
+                        .insert_with_hash(
+                            &result_clone.event,
+                            result_clone.analysis.risk_score,
+                            result_clone.analysis.risk_level,
+                            result_clone.decision.action,
+                            &signals_json,
+                            Some(dedup_hash(&result_clone.event) as i64),
+                        )
+                        .await
+                    {
+                        warn!(error = %e, "failed to persist event");
+                    }
+                });
+            }
+
+            for action in registry.actions() {
+                if action.applies_to(&result.decision) {
+                    metrics
+                        .actions
+                        .with_label_values(&[action.name(), verdict_str(result.decision.action)])
+                        .inc();
+                    let ctx = incident_context(&repo, &result).await;
+                    if let Err(e) = action
+                        .execute_with_context(&result.event, &result.decision, &ctx)
+                        .await
+                    {
+                        warn!(action = action.name(), error = %e, "action failed");
+                    }
+                }
+            }
+
+            metrics.record_event(result.decision.action, result.analysis.risk_level, duration);
+
+            // Fork AI mode: evaluate off the hot path; a changed verdict updates
+            // the persisted event and re-dispatches actions.
+            if let Some(ref ai) = ai_fork {
+                if !ai.is_inline() && ai.should_run(&result) {
+                    ai.spawn_fork(
+                        result.clone(),
+                        Arc::clone(&pipeline),
+                        registry.clone(),
+                        repo.clone(),
                     );
                 }
             }
-        }
 
-        processed_count += 1;
-        if result.decision.action != sentry_core::Verdict::Allow {
-            blocked_count += 1;
-        }
+            // LLM fork (Layer 2): same contract as the AI fork, but the verdict
+            // comes from the configured remote provider.
+            if let Some(ref llm) = llm_fork {
+                if llm.should_run(&result) {
+                    llm.spawn_fork(
+                        result.clone(),
+                        Arc::clone(&pipeline),
+                        registry.clone(),
+                        repo.clone(),
+                    );
+                }
+            }
 
-        if processed_count % 100 == 0 {
-            info!(
-                processed = processed_count,
-                acted_upon = blocked_count,
-                dropped_dupes = dropped_dupes,
-                "stats"
-            );
+            // Mirror offender strikes to Postgres and log escalations.
+            if result.decision.action != sentry_core::Verdict::Allow {
+                if let Some(ref offender) = offender_tracker {
+                    let strikes = offender.read().unwrap().strikes(result.event.client_ip);
+                    if let (Some(ref repo), true) = (&repo, cfg.escalation.persist) {
+                        let repo = Arc::clone(repo);
+                        let ip = result.event.client_ip;
+                        let window = cfg.escalation.window_secs;
+                        tokio::spawn(async move {
+                            if let Err(e) = repo.ip_state().record_violation(ip, window).await {
+                                warn!(error = %e, "failed to persist offender strike");
+                            }
+                        });
+                    }
+                    if result
+                        .decision
+                        .override_reason
+                        .as_deref()
+                        .is_some_and(|r| r.starts_with("offender escalation"))
+                    {
+                        info!(
+                            ip = %result.event.client_ip,
+                            strikes,
+                            verdict = ?result.decision.action,
+                            "verdict escalated (repeat offender)"
+                        );
+                    }
+                }
+            }
+
+            processed_count += 1;
+            if result.decision.action != sentry_core::Verdict::Allow {
+                blocked_count += 1;
+            }
+
+            if processed_count % 100 == 0 {
+                info!(
+                    processed = processed_count,
+                    acted_upon = blocked_count,
+                    dropped_dupes = dropped_dupes,
+                    "stats"
+                );
+            }
         }
     }
 

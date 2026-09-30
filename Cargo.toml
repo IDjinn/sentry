@@ -64,6 +64,10 @@ argon2 = "0.5"
 sha2 = "0.10"
 hmac = "0.12"
 
+# Performance (F5): SIMD-accelerated multi-pattern matching, benchmarks
+aho-corasick = "1.1"
+criterion = "0.5"
+
 # Errors
 thiserror = "1"
 anyhow = "1"

@@ -9,8 +9,9 @@
 //! Rules come from three sources: static config, the dynamic `rules` table
 //! in Postgres (hot-reloaded via LISTEN/NOTIFY), and reputation feeds.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -23,6 +24,80 @@ use crate::event::{Event, HttpMethod, ProtocolKind};
 use crate::ratelimit::RateLimitBackend;
 
 pub mod dsl;
+
+/// Process-lifetime regex cache for rule patterns (F5).
+///
+/// Compiling a `Regex` costs hundreds of microseconds; the old code did it
+/// per rule per event, dominating the pipeline at ~3 ms/event. Rules are
+/// user-defined (config/DB/feeds) and finite, so the cache is bounded by the
+/// ruleset size and never sees attacker-controlled input.
+static REGEX_CACHE: LazyLock<RwLock<HashMap<String, Option<Arc<Regex>>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Compiled-or-invalid regex by pattern. `None` = pattern failed to compile
+/// (cached so broken rules don't re-parse on every event).
+fn cached_regex(pattern: &str) -> Option<Arc<Regex>> {
+    let hit = REGEX_CACHE
+        .read()
+        .ok()
+        .and_then(|c| c.get(pattern).cloned());
+    if let Some(cached) = hit {
+        return cached;
+    }
+    let compiled = Regex::new(pattern).ok().map(Arc::new);
+    if let Ok(mut c) = REGEX_CACHE.write() {
+        c.insert(pattern.to_string(), compiled.clone());
+    }
+    compiled
+}
+
+/// A parsed IP specification (CIDR / single / range).
+#[derive(Debug, Clone, Copy)]
+enum IpSpec {
+    Net(IpNet),
+    Single(IpAddr),
+    Range(IpAddr, IpAddr),
+}
+
+impl IpSpec {
+    fn contains(&self, ip: IpAddr) -> bool {
+        match *self {
+            IpSpec::Net(n) => n.contains(&ip),
+            IpSpec::Single(s) => s == ip,
+            IpSpec::Range(a, b) => ip_in_range(ip, a, b),
+        }
+    }
+}
+
+/// Process-lifetime cache of parsed IP specs (F5) — `spec.parse::<IpNet>()`
+/// per rule per event was measurable on CIDR-heavy packs (vpn_proxy, tor).
+static IP_CACHE: LazyLock<RwLock<HashMap<String, Option<IpSpec>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+fn cached_ip_spec(spec: &str) -> Option<IpSpec> {
+    let hit = IP_CACHE.read().ok().and_then(|c| c.get(spec).copied());
+    if let Some(cached) = hit {
+        return cached;
+    }
+    let parsed = parse_ip_spec(spec);
+    if let Ok(mut c) = IP_CACHE.write() {
+        c.insert(spec.to_string(), parsed);
+    }
+    parsed
+}
+
+fn parse_ip_spec(spec: &str) -> Option<IpSpec> {
+    if let Ok(net) = spec.parse::<IpNet>() {
+        return Some(IpSpec::Net(net));
+    }
+    if let Ok(single) = spec.parse::<IpAddr>() {
+        return Some(IpSpec::Single(single));
+    }
+    let (a, b) = spec.split_once('-')?;
+    let a = a.trim().parse::<IpAddr>().ok()?;
+    let b = b.trim().parse::<IpAddr>().ok()?;
+    Some(IpSpec::Range(a, b))
+}
 
 /// Stable identifier for a rule.
 pub type RuleId = String;
@@ -383,9 +458,9 @@ impl RuleMatch {
     /// Evaluate the match against an event.
     ///
     /// Kept deliberately straightforward: this is the fast path, so we avoid
-    /// heap allocation in the common "no match" case. Regexes are compiled
-    /// lazily on first use and cached (future optimization: pre-compile in
-    /// `RuleSet::new`).
+    /// heap allocation in the common "no match" case. Regexes and IP specs
+    /// are compiled/parsed once per process (F5 caches); the URL-decoded path
+    /// is computed once per evaluation, not once per path condition.
     pub fn matches(&self, evt: &Event) -> bool {
         self.matches_with(evt, None)
     }
@@ -395,6 +470,19 @@ impl RuleMatch {
     /// `Time` conditions still require wall-clock evaluation (future work)
     /// and never match here.
     pub fn matches_with(&self, evt: &Event, backend: Option<&dyn RateLimitBackend>) -> bool {
+        let decoded_path = evt.http().map(|h| crate::rules::url_decode(&h.path));
+        let ctx = EvalCtx {
+            decoded_path: decoded_path.as_deref(),
+        };
+        self.matches_ctx(evt, backend, &ctx)
+    }
+
+    fn matches_ctx(
+        &self,
+        evt: &Event,
+        backend: Option<&dyn RateLimitBackend>,
+        ctx: &EvalCtx,
+    ) -> bool {
         match self {
             Self::Ip { cidr } => match_ip(cidr, evt.client_ip),
             Self::Asn(asn) => evt.asn == Some(*asn),
@@ -404,9 +492,9 @@ impl RuleMatch {
                 .and_then(|g| g.country.as_deref())
                 .map(|cc| cc.eq_ignore_ascii_case(c))
                 .unwrap_or(false),
-            Self::Path { op, pattern } => evt
-                .http()
-                .map(|h| match_path(op, pattern, &h.path))
+            Self::Path { op, pattern } => ctx
+                .decoded_path
+                .map(|decoded| match_path(op, pattern, decoded))
                 .unwrap_or(false),
             Self::Method(m) => evt
                 .http()
@@ -487,11 +575,17 @@ impl RuleMatch {
                 // Time windows need wall-clock + timezone handling; future work.
                 false
             }
-            Self::All(items) => items.iter().all(|m| m.matches_with(evt, backend)),
-            Self::Any(items) => items.iter().any(|m| m.matches_with(evt, backend)),
-            Self::Not(inner) => !inner.matches_with(evt, backend),
+            Self::All(items) => items.iter().all(|m| m.matches_ctx(evt, backend, ctx)),
+            Self::Any(items) => items.iter().any(|m| m.matches_ctx(evt, backend, ctx)),
+            Self::Not(inner) => !inner.matches_ctx(evt, backend, ctx),
         }
     }
+}
+
+/// Per-evaluation scratch shared by the whole match tree (F5): the decoded
+/// path used by every `Path` condition, computed once.
+struct EvalCtx<'a> {
+    decoded_path: Option<&'a str>,
 }
 
 /// Build the backend key for a rate condition scope.
@@ -510,26 +604,10 @@ fn rate_scope_key(scope: RateScope, evt: &Event) -> Option<String> {
 }
 
 /// Check whether `ip` is contained in `spec` (single IP, CIDR or range).
+///
+/// Specs are parsed once and cached (F5); invalid specs never match.
 fn match_ip(spec: &str, ip: IpAddr) -> bool {
-    // Try CIDR first.
-    if let Ok(net) = spec.parse::<IpNet>() {
-        return net.contains(&ip);
-    }
-    // Try single IP.
-    if let Ok(single) = spec.parse::<IpAddr>() {
-        return single == ip;
-    }
-    // Try range `a-b`.
-    if let Some((a, b)) = spec.split_once('-') {
-        let Ok(a) = a.trim().parse::<IpAddr>() else {
-            return false;
-        };
-        let Ok(b) = b.trim().parse::<IpAddr>() else {
-            return false;
-        };
-        return ip_in_range(ip, a, b);
-    }
-    false
+    cached_ip_spec(spec).is_some_and(|s| s.contains(ip))
 }
 
 /// Check whether `ip` falls between `lo` and `hi` (inclusive).
@@ -596,14 +674,13 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Apply a path match operator on the URL-decoded path.
-fn match_path(op: &PathOp, pattern: &str, path: &str) -> bool {
-    let decoded = url_decode(path);
+/// Apply a path match operator on the already URL-decoded path.
+fn match_path(op: &PathOp, pattern: &str, decoded: &str) -> bool {
     match op {
         PathOp::Equals => decoded == pattern,
-        PathOp::Glob => glob_match(pattern, &decoded),
-        PathOp::Regex => Regex::new(pattern)
-            .map(|re| re.is_match(&decoded))
+        PathOp::Glob => glob_match(pattern, decoded),
+        PathOp::Regex => cached_regex(pattern)
+            .map(|re| re.is_match(decoded))
             .unwrap_or(false),
         PathOp::StartsWith => decoded.starts_with(pattern),
     }
@@ -614,7 +691,7 @@ fn match_str_op(op: &StrOp, value: &str) -> bool {
     match op {
         StrOp::Equals { value: v } => value == v,
         StrOp::Contains { value: v } => value.contains(v),
-        StrOp::Regex { pattern } => Regex::new(pattern)
+        StrOp::Regex { pattern } => cached_regex(pattern)
             .map(|re| re.is_match(value))
             .unwrap_or(false),
         StrOp::StartsWith { value: v } => value.starts_with(v),
