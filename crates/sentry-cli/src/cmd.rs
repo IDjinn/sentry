@@ -639,11 +639,27 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
         Command::Config { action } => match action {
             ConfigCmd::Validate => {
                 let cfg = require_config(&cfg)?;
+                let mut errors: Vec<String> = Vec::new();
+                for parsed in sentry_core::rules::rules_from_config(&cfg.rules.custom) {
+                    if let Err(e) = parsed {
+                        errors.push(e);
+                    }
+                }
+                if !errors.is_empty() {
+                    for e in &errors {
+                        eprintln!("invalid custom rule: {e}");
+                    }
+                    color_eyre::eyre::bail!(
+                        "config INVALID: {} custom rule(s) failed to compile",
+                        errors.len()
+                    );
+                }
                 println!("config OK");
                 println!("  sources:   {}", cfg.sources.len());
                 println!("  actions:   {}", cfg.actions.len());
                 println!("  routes:    {}", cfg.routes.known.len());
                 println!("  packs:     {}", cfg.rules.packs.len());
+                println!("  custom:    {}", cfg.rules.custom.len());
                 println!(
                     "  storage:   {}",
                     if cfg.storage.postgres.url.is_empty() {

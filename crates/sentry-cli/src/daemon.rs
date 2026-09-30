@@ -136,6 +136,13 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         .map(|p| (p.name.clone(), p.mode.clone()))
         .collect();
     let mut rules = build_default_ruleset(&pack_modes);
+    // Static inline rules from `[[rules.custom]]` (config source).
+    for parsed in sentry_core::rules::rules_from_config(&cfg.rules.custom) {
+        match parsed {
+            Ok(rule) => rules.extend(std::iter::once(rule)),
+            Err(e) => warn!(error = %e, "invalid custom rule — skipped"),
+        }
+    }
     // Feeds with an `action` get one synthetic enforcement rule each; feeds
     // without one only enrich (the tor/vpn_proxy packs or user rules match
     // on `reputation = …` themselves).

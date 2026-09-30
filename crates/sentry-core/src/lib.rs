@@ -61,8 +61,8 @@ pub use reputation::{
     TOR_EXIT_NODE_WEIGHT, VPN_PROXY_WEIGHT,
 };
 pub use rules::{
-    dsl, shared, ReputationTier, Rule, RuleAction, RuleId, RuleMatch, RuleSet, RuleSource,
-    SharedRuleSet,
+    dsl, rules_from_config, shared, ReputationTier, Rule, RuleAction, RuleId, RuleMatch, RuleSet,
+    RuleSource, SharedRuleSet,
 };
 pub use scan::ScanTracker;
 pub use source::Source;

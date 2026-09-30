@@ -198,6 +198,71 @@ pub fn shared(ruleset: RuleSet) -> SharedRuleSet {
     Arc::new(RwLock::new(ruleset))
 }
 
+/// Compile `[[rules.custom]]` config entries into [`Rule`]s.
+///
+/// Each entry is compiled independently: an invalid DSL expression or action
+/// yields `Err` (with the rule name) so the daemon can skip just that rule
+/// instead of rejecting the whole config.
+pub fn rules_from_config(defs: &[crate::config::RuleDefConfig]) -> Vec<Result<Rule, String>> {
+    defs.iter()
+        .map(|def| {
+            let match_ =
+                dsl::parse(&def.r#match).map_err(|e| format!("rule '{}': {e}", def.name))?;
+            let action =
+                parse_rule_action(&def.action).map_err(|e| format!("rule '{}': {e}", def.name))?;
+            Ok(Rule {
+                id: rule_slug(&def.name),
+                name: def.name.clone(),
+                priority: def.priority,
+                enabled: true,
+                match_,
+                action,
+                ttl: None,
+                source: RuleSource::Config,
+                tags: def.tags.clone(),
+                created_at: None,
+            })
+        })
+        .collect()
+}
+
+/// Map a `[[rules.custom]]` action string to [`RuleAction`].
+fn parse_rule_action(s: &str) -> Result<RuleAction, String> {
+    match s {
+        "allow" => Ok(RuleAction::Allow),
+        "block" => Ok(RuleAction::Block),
+        "challenge" => Ok(RuleAction::Challenge),
+        "rate_limit" => Ok(RuleAction::RateLimit),
+        "log" => Ok(RuleAction::Log),
+        "tag" => Ok(RuleAction::Tag),
+        other => Err(format!(
+            "unknown action '{other}' (expected allow|block|challenge|rate_limit|log|tag)"
+        )),
+    }
+}
+
+/// ASCII slug for a rule name, used as the stable [`RuleId`].
+fn rule_slug(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        match ch {
+            'a'..='z' | '0'..='9' => out.push(ch),
+            'A'..='Z' => out.push(ch.to_ascii_lowercase()),
+            _ => {
+                if !out.is_empty() && !out.ends_with('_') {
+                    out.push('_');
+                }
+            }
+        }
+    }
+    let slug = out.trim_end_matches('_').to_string();
+    if slug.is_empty() {
+        "custom".to_string()
+    } else {
+        slug
+    }
+}
+
 impl RuleSet {
     /// Build a ruleset from an unsorted collection of rules.
     pub fn new(mut rules: Vec<Rule>) -> Self {
@@ -752,8 +817,57 @@ fn glob_inner(pat: &[u8], mut pi: usize, pth: &[u8], mut si: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RuleDefConfig;
     use crate::event::{HttpData, ProtocolData, SourceKind};
     use std::net::Ipv4Addr;
+
+    fn def(name: &str, priority: i32, expr: &str, action: &str) -> RuleDefConfig {
+        RuleDefConfig {
+            name: name.to_string(),
+            priority,
+            r#match: expr.to_string(),
+            action: action.to_string(),
+            tags: vec!["test".into()],
+        }
+    }
+
+    #[test]
+    fn custom_rules_compile_from_config() {
+        let parsed = rules_from_config(&[def("allow internal", 1, "ip=10.0.0.0/8", "allow")]);
+        let rule = parsed.into_iter().next().unwrap().unwrap();
+        assert_eq!(rule.id, "allow_internal");
+        assert_eq!(rule.priority, 1);
+        assert_eq!(rule.action, RuleAction::Allow);
+        assert_eq!(rule.source, RuleSource::Config);
+        assert_eq!(rule.tags, vec!["test".to_string()]);
+    }
+
+    #[test]
+    fn custom_rules_skip_invalid_dsl_per_rule() {
+        let parsed = rules_from_config(&[
+            def("bad", 1, "nonsense_field=1", "allow"),
+            def("good", 2, "ip=192.168.0.0/16", "log"),
+        ]);
+        assert!(parsed[0].is_err());
+        assert!(parsed[0].as_ref().unwrap_err().contains("bad"));
+        assert!(parsed[1].is_ok());
+    }
+
+    #[test]
+    fn custom_rules_reject_unknown_action() {
+        let parsed = rules_from_config(&[def("x", 1, "ip=127.0.0.0/8", "nuke")]);
+        let err = parsed.into_iter().next().unwrap().unwrap_err();
+        assert!(err.contains("unknown action 'nuke'"));
+    }
+
+    #[test]
+    fn custom_rules_slug_is_ascii_and_stable() {
+        assert_eq!(
+            rule_slug("allow loopback (syslog forwarder)"),
+            "allow_loopback_syslog_forwarder"
+        );
+        assert_eq!(rule_slug("///"), "custom");
+    }
 
     fn http_event(path: &str, ip: &str) -> Event {
         Event::new(
