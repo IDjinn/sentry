@@ -116,6 +116,17 @@ suspicious_success_min_failures = 3
 # login_patterns = ["login", "signin", "auth"]   # empty = built-in list
 # wordlist_paths = ["/admin", "/wp-admin"]       # empty = built-in wordlist
 
+# ── Cross-IP scan→attack correlation (F3.10) ───────────────────────────────
+# Honeypot "shot calling": a scan (404 sweep, masscan/zmap SYN, …) from IP A
+# followed within window_secs by an exploit/brute-force from a *different*
+# IP B in the same /24 (IPv4), /64 (IPv6) or ASN → ScanAttackCorrelation
+# signal on B (weight 20, override via [scorer.weights]
+# scan_attack_correlation). Works across sources: SYN scans captured by the
+# tcp source feed the same window as HTTP 404 sweeps.
+[correlation]
+enabled = true
+window_secs = 900           # 15 min
+
 # ── Local ML threat model (classic ML, ONNX fork) ──────────────────────────
 # Runs beside the hot path: mode = "fork" (default) evaluates asynchronously
 # and feeds signals back via rescore_from (can only raise the score),
@@ -233,12 +244,12 @@ action = "challenge"
 
 # Reputation feeds (F3.7): public IP blocklists fetched periodically and
 # attached to events as enrichment. tier = unknown | clean | suspicious |
-# malicious | datacenter | vpn | tor. An optional `action` generates one
-# enforcement rule per feed; without it the feed only enriches — match it via
-# the `tor` / `vpn_proxy` packs (finally functional with a feed present) or
-# `reputation = …` rules of your own. Feed URLs are untrusted input:
-# http/https only, loopback/private/reserved hosts are rejected.
-# Manage with `sentry feeds list | refresh | check <ip>`.
+# malicious | datacenter | vpn | tor | authorized | promiscuous. An optional
+# `action` generates one enforcement rule per feed; without it the feed only
+# enriches — match it via the `tor` / `vpn_proxy` packs (finally functional
+# with a feed present) or `reputation = …` rules of your own. Feed URLs are
+# untrusted input: http/https only, loopback/private/reserved hosts are
+# rejected. Manage with `sentry feeds list | refresh | check <ip>`.
 #
 # [[rules.feeds]]
 # name = "tor_exit"
@@ -257,6 +268,24 @@ action = "challenge"
 # name = "firehol_level1"   # aggregates Spamhaus DROP/eDROP, DShield, …
 # url  = "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset"
 # tier = "malicious"
+# refresh_hours = 24
+#
+# Scanner taxonomy (F3.10): `promiscuous` marks scanners that publish recon
+# data anyone can query — each hit earns a small `promiscuous_scanner`
+# signal (weight 10) because the data feeds attackers. `authorized` marks
+# contracted scanners (your pentest vendor); it raises no signal — pair it
+# with an `Allow` rule like `reputation = "authorized"` to trust them.
+#
+# [[rules.feeds]]
+# name = "promiscuous_scanners"
+# url  = "https://example.invalid/promiscuous-scanners.txt"
+# tier = "promiscuous"
+# refresh_hours = 24
+#
+# [[rules.feeds]]
+# name = "authorized_scanners"
+# url  = "https://example.invalid/authorized-scanners.txt"
+# tier = "authorized"
 # refresh_hours = 24
 #
 # enabled = true is the default; set enabled = false to pause a feed without

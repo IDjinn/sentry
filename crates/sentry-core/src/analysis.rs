@@ -136,6 +136,9 @@ pub enum SignalKind {
     SensitivePath,
     /// Access from a VPN / proxy / datacenter ASN.
     VpnProxy,
+    /// Client IP sits in a promiscuous-scanner feed (scans everything and
+    /// publishes the recon data for anyone to query — not benign, F3.10).
+    PromiscuousScanner,
     /// Blocked crawler / scanner User-Agent.
     BadCrawler,
     /// Anomaly score from the ONNX model exceeded threshold.
@@ -143,6 +146,9 @@ pub enum SignalKind {
     /// SYN fingerprint matched a known high-rate port scanner
     /// (masscan / zmap / nmap-style, F3.2 passive TCP capture).
     TcpScanner,
+    /// An exploit/brute-force from an IP whose /24, /64 or ASN saw a scan
+    /// from a *different* IP shortly before (F3.10 shot-calling pattern).
+    ScanAttackCorrelation,
     /// LLM classified the payload as malicious.
     LlmMalicious,
     /// A custom rule matched (the rule id is carried in `detail`).

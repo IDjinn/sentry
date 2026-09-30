@@ -15,6 +15,7 @@ use std::time::Instant;
 use crate::analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};
 use crate::behavior::BehaviorTracker;
 use crate::config::{EscalationConfig, RouteDefConfig, ScorerConfig};
+use crate::correlation::{self, CorrelationScope, CorrelationTracker};
 use crate::event::Event;
 use crate::heuristics::HeuristicEngine;
 use crate::offender::OffenderTracker;
@@ -311,6 +312,7 @@ pub struct Pipeline {
     escalation: EscalationConfig,
     scan: Option<Arc<RwLock<ScanTracker>>>,
     behavior: Option<Arc<RwLock<BehaviorTracker>>>,
+    correlation: Option<Arc<RwLock<CorrelationTracker>>>,
 }
 
 /// Output of processing a single event.
@@ -364,6 +366,7 @@ impl Pipeline {
             escalation: EscalationConfig::default(),
             scan: None,
             behavior: None,
+            correlation: None,
         }
     }
 
@@ -394,6 +397,12 @@ impl Pipeline {
     /// stuffing, directory brute-force).
     pub fn with_behavior_tracker(mut self, tracker: Arc<RwLock<BehaviorTracker>>) -> Self {
         self.behavior = Some(tracker);
+        self
+    }
+
+    /// Attach the cross-IP scan→attack correlation tracker (F3.10).
+    pub fn with_correlation_tracker(mut self, tracker: Arc<RwLock<CorrelationTracker>>) -> Self {
+        self.correlation = Some(tracker);
         self
     }
 
@@ -470,6 +479,45 @@ impl Pipeline {
                 ));
             }
         }
+        if let Some(ref corr) = self.correlation {
+            let mut tracker = corr.write().unwrap();
+            for s in &signals {
+                if let Some(label) = correlation::scan_label(s.kind) {
+                    tracker.record_scan(evt.client_ip, evt.asn, label);
+                }
+            }
+            if signals
+                .iter()
+                .any(|s| correlation::is_attack_signal(s.kind))
+            {
+                if let Some(hit) = tracker.correlate(evt.client_ip, evt.asn) {
+                    let scope = match hit.scope {
+                        CorrelationScope::Prefix => match evt.client_ip {
+                            IpAddr::V4(_) => "/24",
+                            IpAddr::V6(_) => "/64",
+                        },
+                        CorrelationScope::Asn => "ASN",
+                    };
+                    let weight = self
+                        .scorer
+                        .weights
+                        .get("scan_attack_correlation")
+                        .copied()
+                        .unwrap_or(correlation::SCAN_ATTACK_CORRELATION_WEIGHT);
+                    signals.push(Signal {
+                        kind: SignalKind::ScanAttackCorrelation,
+                        weight,
+                        detail: Some(format!(
+                            "{} from {} (same {}) {}s ago",
+                            hit.label,
+                            hit.scanner,
+                            scope,
+                            hit.age.as_secs()
+                        )),
+                    });
+                }
+            }
+        }
 
         let bonus = if let Some(ref rep) = self.repetition {
             let mut tracker = rep.write().unwrap();
@@ -542,9 +590,11 @@ impl Pipeline {
             SignalKind::KnownBadIp => "known_bad_ip",
             SignalKind::SensitivePath => "sensitive_path",
             SignalKind::VpnProxy => "vpn_proxy",
+            SignalKind::PromiscuousScanner => "promiscuous_scanner",
             SignalKind::BadCrawler => "bad_crawler",
             SignalKind::AnomalousPayload => "anomalous_payload",
             SignalKind::TcpScanner => "tcp_scanner",
+            SignalKind::ScanAttackCorrelation => "scan_attack_correlation",
             SignalKind::LlmMalicious => "llm_malicious",
             SignalKind::RuleHit => "rule_hit",
             SignalKind::Custom => "custom",
@@ -582,9 +632,11 @@ impl Pipeline {
             SignalKind::KnownBadIp => "known_bad_ip",
             SignalKind::SensitivePath => "sensitive_path",
             SignalKind::VpnProxy => "vpn_proxy",
+            SignalKind::PromiscuousScanner => "promiscuous_scanner",
             SignalKind::BadCrawler => "bad_crawler",
             SignalKind::AnomalousPayload => "anomalous_payload",
             SignalKind::TcpScanner => "tcp_scanner",
+            SignalKind::ScanAttackCorrelation => "scan_attack_correlation",
             SignalKind::LlmMalicious => "llm_malicious",
             SignalKind::RuleHit => "rule_hit",
             SignalKind::Custom => "custom",
@@ -1018,6 +1070,148 @@ mod tests {
             .any(|s| s.kind == SignalKind::RandomScan));
         assert!(r.analysis.risk_score >= 33);
         assert_eq!(r.decision.action, Verdict::RateLimit);
+    }
+
+    fn http_evt_from(ip: IpAddr, path: &str, status: u16) -> Event {
+        Event::new(
+            SourceKind::Synthetic,
+            ip,
+            ProtocolData::Http(HttpData {
+                path: path.to_string(),
+                status: Some(status),
+                method: Some(crate::event::HttpMethod::Get),
+                user_agent: Some("Mozilla/5.0 (X11; Linux x86_64)".into()),
+                ..Default::default()
+            }),
+        )
+    }
+
+    #[test]
+    fn scan_attack_correlation_across_prefix() {
+        let scanner = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let attacker = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 99));
+        let scan = Arc::new(RwLock::new(ScanTracker::new(60, 2, 1000)));
+        let p = Pipeline::new(RuleSet::default(), RouteValidator::default())
+            .with_scan_tracker(Arc::clone(&scan))
+            .with_correlation_tracker(Arc::new(RwLock::new(CorrelationTracker::new(900))));
+
+        p.process(&http_evt_from(scanner, "/a.php", 404));
+        p.process(&http_evt_from(scanner, "/b.php", 404));
+
+        let correlated = p.process(&http_evt_from(attacker, "/login?user='+OR+1=1--", 200));
+        let sig = correlated
+            .analysis
+            .signals
+            .iter()
+            .find(|s| s.kind == SignalKind::ScanAttackCorrelation)
+            .expect("404-burst neighbor must correlate with the SQLi");
+        assert_eq!(sig.weight, 20);
+        let detail = sig.detail.as_deref().unwrap();
+        assert!(detail.contains("http-random-path-scan"), "detail: {detail}");
+        assert!(detail.contains("198.51.100.7"), "detail: {detail}");
+        assert!(detail.contains("same /24"), "detail: {detail}");
+
+        let quiet = Pipeline::new(RuleSet::default(), RouteValidator::default());
+        let base = quiet.process(&http_evt_from(attacker, "/login?user='+OR+1=1--", 200));
+        assert!(correlated.analysis.risk_score > base.analysis.risk_score);
+    }
+
+    #[test]
+    fn same_ip_scan_does_not_correlate() {
+        let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let scan = Arc::new(RwLock::new(ScanTracker::new(60, 2, 1000)));
+        let p = Pipeline::new(RuleSet::default(), RouteValidator::default())
+            .with_scan_tracker(scan)
+            .with_correlation_tracker(Arc::new(RwLock::new(CorrelationTracker::new(900))));
+
+        p.process(&http_evt_from(ip, "/a.php", 404));
+        p.process(&http_evt_from(ip, "/b.php", 404));
+        let r = p.process(&http_evt_from(ip, "/login?user='+OR+1=1--", 200));
+        assert!(r
+            .analysis
+            .signals
+            .iter()
+            .all(|s| s.kind != SignalKind::ScanAttackCorrelation));
+    }
+
+    #[test]
+    fn attack_without_prior_scan_stays_quiet() {
+        let p = Pipeline::new(RuleSet::default(), RouteValidator::default())
+            .with_correlation_tracker(Arc::new(RwLock::new(CorrelationTracker::new(900))));
+        let r = p.process(&http_evt_status("/login?user='+OR+1=1--", 200));
+        assert!(r
+            .analysis
+            .signals
+            .iter()
+            .all(|s| s.kind != SignalKind::ScanAttackCorrelation));
+    }
+
+    #[test]
+    fn tcp_syn_scan_correlates_with_neighbor_attack() {
+        let scanner = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let attacker = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 99));
+        let p = Pipeline::new(RuleSet::default(), RouteValidator::default())
+            .with_correlation_tracker(Arc::new(RwLock::new(CorrelationTracker::new(900))));
+
+        let syn = Event::new(
+            SourceKind::Synthetic,
+            scanner,
+            ProtocolData::Tcp(crate::event::TcpData {
+                fingerprint: Some("65535:::".into()),
+                ..Default::default()
+            }),
+        );
+        let scanned = p.process(&syn);
+        assert!(scanned
+            .analysis
+            .signals
+            .iter()
+            .any(|s| s.kind == SignalKind::TcpScanner));
+
+        let r = p.process(&http_evt_from(attacker, "/login?user='+OR+1=1--", 200));
+        let sig = r
+            .analysis
+            .signals
+            .iter()
+            .find(|s| s.kind == SignalKind::ScanAttackCorrelation)
+            .expect("masscan-style SYN must correlate with the SQLi");
+        assert!(
+            sig.detail.as_deref().unwrap().contains("tcp-syn"),
+            "detail: {}",
+            sig.detail.as_deref().unwrap()
+        );
+    }
+
+    #[test]
+    fn correlation_and_promiscuous_weights_are_configurable() {
+        let scorer = ScorerConfig {
+            weights: [
+                ("scan_attack_correlation".to_string(), 7u8),
+                ("promiscuous_scanner".to_string(), 3u8),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let p = Pipeline::with_config(
+            Arc::new(RwLock::new(RuleSet::default())),
+            RouteValidator::default(),
+            scorer,
+            VerdictPolicy::default(),
+        );
+        let corr = Signal {
+            kind: SignalKind::ScanAttackCorrelation,
+            weight: 20,
+            detail: None,
+        };
+        let prom = Signal {
+            kind: SignalKind::PromiscuousScanner,
+            weight: 10,
+            detail: None,
+        };
+        assert_eq!(p.weight_for_signal(&corr), 7);
+        assert_eq!(p.weight_for_signal(&prom), 3);
+        assert_eq!(p.weight_for(SignalKind::ScanAttackCorrelation, &[corr]), 7);
     }
 
     #[test]

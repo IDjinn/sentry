@@ -27,6 +27,7 @@ pub struct Metrics {
     pub events_processed: prometheus::Counter,
     pub events_blocked: prometheus::Counter,
     pub dedupe_drops: prometheus::Counter,
+    pub correlation_hits: prometheus::Counter,
     pub signals: prometheus::CounterVec,
     pub actions: prometheus::CounterVec,
     pub pipeline_duration: prometheus::Histogram,
@@ -53,6 +54,12 @@ impl Metrics {
         let dedupe_drops = prometheus::Counter::new(
             "sentry_dedupe_drops_total",
             "Events dropped by the deduplication cache.",
+        )
+        .unwrap();
+        let correlation_hits = prometheus::Counter::new(
+            "sentry_correlation_hits_total",
+            "Attacks correlated with a recent scan from a neighboring IP \
+             (same /24, /64 or ASN) — F3.10 shot-calling pattern.",
         )
         .unwrap();
         let signals = prometheus::CounterVec::new(
@@ -112,7 +119,12 @@ impl Metrics {
         )
         .unwrap();
 
-        for m in [&events_processed, &events_blocked, &dedupe_drops] {
+        for m in [
+            &events_processed,
+            &events_blocked,
+            &dedupe_drops,
+            &correlation_hits,
+        ] {
             registry.register(Box::new(m.clone())).ok();
         }
         registry
@@ -139,6 +151,7 @@ impl Metrics {
             events_processed,
             events_blocked,
             dedupe_drops,
+            correlation_hits,
             signals,
             actions,
             pipeline_duration,

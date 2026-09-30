@@ -24,6 +24,9 @@ pub const TOR_EXIT_NODE_WEIGHT: u8 = 15;
 pub const KNOWN_BAD_IP_WEIGHT: u8 = 50;
 /// Default weight of the `VpnProxy` signal.
 pub const VPN_PROXY_WEIGHT: u8 = 20;
+/// Default weight of the `PromiscuousScanner` signal (F3.10 scanner
+/// taxonomy).
+pub const PROMISCUOUS_SCANNER_WEIGHT: u8 = 10;
 
 /// In-memory IP → reputation lookup built from synced feeds.
 ///
@@ -170,10 +173,10 @@ fn parse_net(token: &str) -> Option<IpNet> {
 
 /// Map the reputation enrichment on an event to scored signals.
 ///
-/// `Clean`, `Suspicious` and `Unknown` tiers are informational and produce no
-/// signal; `Tor`, `Malicious` and `VpnProxy`/`Datacenter` map to the catalog
-/// kinds the scorer already knows (weights per the §16 risk table, overridable
-/// via `[scorer].weights`).
+/// `Clean`, `Suspicious`, `Unknown` and `Authorized` tiers are informational
+/// and produce no signal; `Tor`, `Malicious`, `VpnProxy`/`Datacenter` and
+/// `Promiscuous` map to the catalog kinds the scorer already knows (weights
+/// per the §16 risk table, overridable via `[scorer].weights`).
 pub fn reputation_signals(evt: &Event) -> Vec<Signal> {
     let Some(rep) = evt.reputation.as_ref() else {
         return Vec::new();
@@ -184,7 +187,11 @@ pub fn reputation_signals(evt: &Event) -> Vec<Signal> {
         ReputationTier::VpnProxy | ReputationTier::Datacenter => {
             (SignalKind::VpnProxy, VPN_PROXY_WEIGHT)
         }
-        ReputationTier::Unknown | ReputationTier::Clean | ReputationTier::Suspicious => {
+        ReputationTier::Promiscuous => (SignalKind::PromiscuousScanner, PROMISCUOUS_SCANNER_WEIGHT),
+        ReputationTier::Unknown
+        | ReputationTier::Clean
+        | ReputationTier::Suspicious
+        | ReputationTier::Authorized => {
             return Vec::new();
         }
     };
@@ -206,7 +213,7 @@ pub fn feed_rule(feed: &FeedConfig) -> Result<Option<Rule>, String> {
     }
     let tier = ReputationTier::parse(&feed.tier).ok_or_else(|| {
         format!(
-            "unknown reputation tier `{}` (known: unknown | clean | suspicious | malicious | datacenter | vpn | tor)",
+            "unknown reputation tier `{}` (known: unknown | clean | suspicious | malicious | datacenter | vpn | tor | authorized | promiscuous)",
             feed.tier
         )
     })?;
@@ -391,6 +398,44 @@ mod tests {
             source: "allow".into(),
         });
         assert!(reputation_signals(&evt).is_empty());
+    }
+
+    #[test]
+    fn scanner_taxonomy_tiers() {
+        let mut evt = http_evt(v4(1, 2, 3, 4));
+
+        evt.reputation = Some(ReputationInfo {
+            tier: ReputationTier::Promiscuous,
+            source: "promiscuous_scanners".into(),
+        });
+        let sigs = reputation_signals(&evt);
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].kind, SignalKind::PromiscuousScanner);
+        assert_eq!(sigs[0].weight, 10);
+        assert_eq!(sigs[0].detail.as_deref(), Some("feed:promiscuous_scanners"));
+
+        evt.reputation = Some(ReputationInfo {
+            tier: ReputationTier::Authorized,
+            source: "pentest_vendor".into(),
+        });
+        assert!(reputation_signals(&evt).is_empty());
+
+        assert_eq!(
+            ReputationTier::parse("promiscuous"),
+            Some(ReputationTier::Promiscuous)
+        );
+        assert_eq!(
+            ReputationTier::parse("promiscuous_scanner"),
+            Some(ReputationTier::Promiscuous)
+        );
+        assert_eq!(
+            ReputationTier::parse("authorized"),
+            Some(ReputationTier::Authorized)
+        );
+        assert_eq!(
+            ReputationTier::parse("authorized_scanner"),
+            Some(ReputationTier::Authorized)
+        );
     }
 
     #[test]

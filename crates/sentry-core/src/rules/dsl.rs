@@ -313,6 +313,8 @@ impl Parser {
                     "datacenter" => ReputationTier::Datacenter,
                     "vpn" | "proxy" | "vpn_proxy" => ReputationTier::VpnProxy,
                     "tor" => ReputationTier::Tor,
+                    "authorized" => ReputationTier::Authorized,
+                    "promiscuous" => ReputationTier::Promiscuous,
                     _ => return Err(DslError::UnknownKey(val)),
                 };
                 Ok(RuleMatch::Reputation(tier))

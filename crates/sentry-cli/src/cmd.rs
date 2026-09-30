@@ -1015,6 +1015,8 @@ fn tier_label(tier: sentry_core::ReputationTier) -> &'static str {
         sentry_core::ReputationTier::Datacenter => "datacenter",
         sentry_core::ReputationTier::VpnProxy => "vpn/proxy",
         sentry_core::ReputationTier::Tor => "tor",
+        sentry_core::ReputationTier::Authorized => "authorized",
+        sentry_core::ReputationTier::Promiscuous => "promiscuous",
     }
 }
 

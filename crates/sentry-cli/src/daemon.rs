@@ -267,6 +267,13 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         ))
     });
 
+    // Cross-IP scan→attack correlation (F3.10 shot-calling pattern).
+    let correlation_tracker = cfg.correlation.enabled.then(|| {
+        Arc::new(std::sync::RwLock::new(
+            sentry_core::correlation::CorrelationTracker::from_config(&cfg.correlation),
+        ))
+    });
+
     // Repeat-offender memory (strikes → verdict escalation ladder).
     let offender_tracker = cfg.escalation.enabled.then(|| {
         Arc::new(std::sync::RwLock::new(
@@ -287,6 +294,9 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     if let Some(ref t) = behavior_tracker {
         pipeline_builder = pipeline_builder.with_behavior_tracker(Arc::clone(t));
     }
+    if let Some(ref t) = correlation_tracker {
+        pipeline_builder = pipeline_builder.with_correlation_tracker(Arc::clone(t));
+    }
     if let Some(ref t) = offender_tracker {
         pipeline_builder = pipeline_builder.with_offender(Arc::clone(t), cfg.escalation.clone());
     }
@@ -297,6 +307,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         rate_backend = cfg.rate_limit.backend.as_str(),
         scan_detection = cfg.scan.enabled,
         behavior_detection = cfg.behavior.enabled,
+        correlation = cfg.correlation.enabled,
         escalation = cfg.escalation.enabled,
         "pipeline built"
     );
@@ -364,6 +375,17 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         });
     }
     if let Some(ref t) = behavior_tracker {
+        let t = Arc::clone(t);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                t.write().unwrap().prune();
+            }
+        });
+    }
+    if let Some(ref t) = correlation_tracker {
         let t = Arc::clone(t);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -725,6 +747,14 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 }
             }
 
+            if result
+                .analysis
+                .signals
+                .iter()
+                .any(|s| s.kind == sentry_core::SignalKind::ScanAttackCorrelation)
+            {
+                metrics.correlation_hits.inc();
+            }
             metrics.record_event(result.decision.action, result.analysis.risk_level, duration);
 
             // Fork AI mode: evaluate off the hot path; a changed verdict updates

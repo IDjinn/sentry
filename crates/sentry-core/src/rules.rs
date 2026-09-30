@@ -466,6 +466,13 @@ pub enum ReputationTier {
     VpnProxy,
     /// Tor exit node.
     Tor,
+    /// Authorized scanner — contracted by the scanned org (e.g. a pentest
+    /// vendor). Informational; pair with an `Allow` rule on
+    /// `reputation = "authorized"` to trust it explicitly (F3.10).
+    Authorized,
+    /// Promiscuous scanner — scans everything and publishes the recon data
+    /// for anyone to query. Not benign: the data feeds attackers (F3.10).
+    Promiscuous,
 }
 
 impl ReputationTier {
@@ -481,6 +488,8 @@ impl ReputationTier {
             "datacenter" | "hosting" => Some(Self::Datacenter),
             "vpn" | "proxy" | "vpn_proxy" | "vpnproxy" => Some(Self::VpnProxy),
             "tor" => Some(Self::Tor),
+            "authorized" | "authorized_scanner" => Some(Self::Authorized),
+            "promiscuous" | "promiscuous_scanner" => Some(Self::Promiscuous),
             _ => None,
         }
     }

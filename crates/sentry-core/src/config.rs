@@ -46,6 +46,9 @@ pub struct SentryConfig {
     /// directory brute-force).
     #[serde(default)]
     pub behavior: BehaviorConfig,
+    /// Cross-IP scan→attack correlation (F3.10).
+    #[serde(default)]
+    pub correlation: CorrelationConfig,
     /// Local ML threat model (async fork stage).
     #[serde(default)]
     pub ai: AiConfig,
@@ -364,6 +367,35 @@ fn default_scan_distinct_paths() -> u32 {
 }
 fn default_scan_not_found() -> u32 {
     10
+}
+
+/// Cross-IP scan→attack correlation windows (F3.10).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorrelationConfig {
+    /// Enable the correlation tracker.
+    #[serde(default = "default_correlation_enabled")]
+    pub enabled: bool,
+    /// An attack from IP B only correlates with a scan from a *different*
+    /// IP in the same /24 (IPv4), /64 (IPv6) or ASN observed this many
+    /// seconds ago.
+    #[serde(default = "default_correlation_window")]
+    pub window_secs: u64,
+}
+
+impl Default for CorrelationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_correlation_enabled(),
+            window_secs: default_correlation_window(),
+        }
+    }
+}
+
+fn default_correlation_enabled() -> bool {
+    true
+}
+fn default_correlation_window() -> u64 {
+    900 // 15 minutes — the honeypot shot-calling window
 }
 
 /// Behavioral attack detection over per-IP sliding windows (F3.8).
@@ -1105,5 +1137,15 @@ mod tests {
     #[test]
     fn full_config_default_has_sane_storage_pool() {
         assert_eq!(SentryConfig::default().storage.postgres.max_connections, 10);
+    }
+
+    #[test]
+    fn correlation_default_window_is_15min() {
+        let c = CorrelationConfig::default();
+        assert!(c.enabled);
+        assert_eq!(c.window_secs, 900);
+        let parsed: CorrelationConfig = toml::from_str("").unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.window_secs, 900);
     }
 }

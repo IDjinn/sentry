@@ -71,7 +71,7 @@ sentry/
 │   ├── sentry-source-nginx/   # plugin Source: tail de access.log
 │   ├── sentry-source-syslog/  # plugin Source: receptor syslog RFC 5424/3164 (UDP/TCP)
 │   ├── sentry-source-cloudflare/  # plugin Source: polling CF Logs API (NDJSON)
-│   ├── sentry-source-tcp/     # plugin Source: captura TCP (feature pcap) + fingerprint SYN
+│   ├── sentry-source-tcp/     # plugin Source: captura TCP (feature pcap); fingerprint `tcpfp.rs` no sentry-core
 │   ├── sentry-edge/           # edge inline: reverse proxy/middleware axum + edge-tcp
 │   ├── sentry-action-cloudflare/  # plugin Action: block/challenge via API CF
 │   ├── sentry-action-webhook/     # plugin Action: alertas Discord/Slack/etc (HMAC)
@@ -283,7 +283,7 @@ não em runtime.
     Enterprise — parser coberto por fixture)
   - ✅ F3.2 TCP capture + fingerprint (crate `sentry-source-tcp`: capture
     loop atrás da feature `pcap` (pnet/Npcap); módulos puros testados —
-    `tcpfp.rs` fingerprint SYN estilo MuonFP/p0f
+    `tcpfp.rs` fingerprint SYN estilo MuonFP/p0f no **sentry-core**
     (`window:options:MSS:wscale`, assinaturas masscan/zmap/nmap), reassembler
     por flow com stream_id/máquina de estágios; `SignalKind::TcpScanner`
     peso 30 no scorer; `[[source]] type = "tcp"`)
@@ -296,6 +296,20 @@ não em runtime.
     explícito; fan-in `Incoming::{Raw,Processed}` — edge roda o mesmo
     `Arc<Pipeline>` (trackers não duplo-contam) e entrega o resultado pronto;
     `deploy/k8s/edge-sidecar.yaml`; ver `ARCHITECTURE.md` §8.3)
+  - ✅ F3.10 Correlação scan→ataque cross-IP + taxonomia de scanners
+    (`correlation.rs`: `CorrelationTracker` com janelas deslizantes por
+    /24 (v4), /64 (v6) e ASN, cap 64/chave, prune no daemon; o pipeline
+    registra sinais de scan (`RandomScan`/`ScanBehavior`/`TcpScanner` —
+    SYNs do source TCP alimentam a mesma janela que sweeps HTTP) e, num
+    sinal de ataque de **outro** IP no mesmo prefixo (preferido) ou ASN
+    dentro da janela, emite `ScanAttackCorrelation` peso 20 com detail
+    `tcp-syn from 198.51.100.7 (same /24) 42s ago`; `[correlation]`
+    enabled/window_secs=900; métrica `sentry_correlation_hits_total`.
+    Taxonomia como tiers de reputação: `ReputationTier::Authorized` (sem
+    sinal; Allow explícito via `reputation = "authorized"`) e
+    `ReputationTier::Promiscuous` → sinal `PromiscuousScanner` peso 10;
+    parse unificado no DSL (`reputation = "promiscuous"`), feed config
+    (`tier = "promiscuous"`) e `sentry feeds check` — 18 testes)
 - **F4** (concluída): Operação & Dashboard
   - ✅ F4.2 Backend HTTP (`server.rs`: `sentry serve` — processo separado,
     axum; `/api/events?limit&level`, `/api/stats` 24h, `/api/incidents` +
@@ -359,7 +373,7 @@ Backlog detalhado em `ARCHITECTURE.md` §23.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 286 testes passando sem features; 288 com
+# Resultado esperado: 314 testes passando sem features; 316 com
 # --features sentry-cli/onnx (adiciona os 2 testes de inferência ONNX)
 ```
 

@@ -15,6 +15,7 @@ pub mod analysis;
 pub mod behavior;
 pub mod challenge;
 pub mod config;
+pub mod correlation;
 pub mod error;
 pub mod event;
 pub mod heuristics;
@@ -37,12 +38,13 @@ pub use behavior::BehaviorTracker;
 pub use challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
 pub use config::{
     ActionConfig, ActionKind, AiConfig, AuthTokenConfig, AuthUserConfig, BehaviorConfig,
-    CoreConfig, DeploymentConfig, EdgeConfig, EscalationConfig, FeedConfig, GeoConfig, LlmConfig,
-    MetricsConfig, PolicyConfig, PolicyOverrideConfig, PostgresConfig, RateLimitConfig,
-    RouteDefConfig, RouteLearnerConfig, RoutesConfig, RuleDefConfig, RulePackConfig, RulesConfig,
-    ScanConfig, ScorerConfig, SentryConfig, ServerAuthConfig, ServerConfig, SourceConfig,
-    StorageConfig,
+    CoreConfig, CorrelationConfig, DeploymentConfig, EdgeConfig, EscalationConfig, FeedConfig,
+    GeoConfig, LlmConfig, MetricsConfig, PolicyConfig, PolicyOverrideConfig, PostgresConfig,
+    RateLimitConfig, RouteDefConfig, RouteLearnerConfig, RoutesConfig, RuleDefConfig,
+    RulePackConfig, RulesConfig, ScanConfig, ScorerConfig, SentryConfig, ServerAuthConfig,
+    ServerConfig, SourceConfig, StorageConfig,
 };
+pub use correlation::CorrelationTracker;
 pub use error::{CoreError, Result};
 pub use event::{
     Direction, Event, GeoInfo, HttpData, HttpMethod, ProtocolData, ProtocolKind, RawData, RawEvent,

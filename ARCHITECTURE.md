@@ -262,8 +262,8 @@ sequenceDiagram
 O hot path é **síncrono e determinístico**; a IA roda ao lado, como fork:
 
 ```
-rules (fast path) → heurísticas → rotas → scan → scorer → policy → escalation
-                                                                 └→ IA (fork/inline/shadow) → rescore_from
+rules (fast path) → heurísticas → rotas → scan → behavior → correlation → scorer → policy → escalation
+                                                                            └→ IA (fork/inline/shadow) → rescore_from
 ```
 
 - **scan** (`[scan]`): janela deslizante por IP contando apenas respostas 4xx.
@@ -272,6 +272,13 @@ rules (fast path) → heurísticas → rotas → scan → scorer → policy → 
   `ScanBehavior` (peso 35). Paths unknown **nunca** são aprendidos como rota
   (anti-poisoning — aprender silenciaria o próprio sinal); use
   `sentry report --unknown-paths` para promover rotas legítimas à config.
+- **correlation** (`[correlation]`, F3.10): janelas deslizantes por /24 (v4),
+  /64 (v6) e ASN. Sinais de scan (`RandomScan`/`ScanBehavior`/`TcpScanner` —
+  SYNs do source `tcp` alimentam a mesma janela que sweeps HTTP) registram o
+  scanner; um sinal de ataque de **outro** IP no mesmo prefixo (preferido) ou
+  ASN dentro de `window_secs` (default 900 = 15 min) emite
+  `ScanAttackCorrelation` (peso 20) — o padrão "shot calling" de honeypots.
+  Detalhes em §8.5.
 - **escalation** (`[escalation]`): cada verdict não-Allow conta 1 strike por
   IP. `challenge_at` strikes → eleva p/ Challenge; `block_at` → Block (só
   eleva, nunca rebaixa; Allow não conta strike). Strikes decaem após
@@ -518,6 +525,49 @@ operam como um cluster ativo-ativo:
   `[server]` HTTP deve ficar atrás do LB também (F4.4 auth por token é
   stateless; sessões HMAC são válidas em qualquer nó que compartilhe
   `SENTRY_SESSION_SECRET`).
+
+### 8.5 Correlação scan→ataque cross-IP (F3.10)
+
+Honeypots observam o padrão "shot calling": um host varre a internet de um IP
+"limpo" e, minutos depois, exploits/brute-force chegam de um **outro** IP do
+mesmo /24, /64 ou ASN — o scanner acha os alvos, o operador (ou um consumidor
+dos dados de scan publicados) bate. Referência: Ken Webster, *There Is No Such
+Thing as a Benign Internet Scanner*.
+
+- **Tracker** (`crates/sentry-core/src/correlation.rs`):
+  `CorrelationTracker` mantém janelas deslizantes de scans recentes com duas
+  chaves — prefixo de rede (/24 para IPv4, /64 para IPv6) e ASN (`evt.asn`,
+  GeoLite2-ASN; sem MMDB só prefixo correlaciona). História limitada
+  (64 scans/chave, drop-oldest) e `prune()` a cada 60s no daemon, como os
+  demais trackers. Estado em memória, por-node.
+- **Fluxo no pipeline**: em todo evento que passa da fase de regras, sinais
+  de scan (`RandomScan`, `ScanBehavior`, `TcpScanner`) registram o scanner
+  (`record_scan`); se algum sinal de **ataque** dispara (SQLi, XSS,
+  traversal, LFI, Log4Shell, RCE, SensitivePath, AuthBruteForce,
+  SuspiciousLoginSuccess, CredentialStuffing, DirectoryBruteForce,
+  AnomalousPayload, LlmMalicious), `correlate` procura um scan de IP
+  **diferente** no mesmo prefixo (preferido) ou ASN dentro de `window_secs`.
+  Hit → `ScanAttackCorrelation` (peso 20, override
+  `[scorer.weights] scan_attack_correlation`) com detail
+  `tcp-syn from 198.51.100.7 (same /24) 42s ago`.
+- **Cross-source**: SYNs capturados pelo source `tcp` (F3.2) entram pela
+  heurística `TcpScanner` e alimentam a mesma janela — um masscan que nunca
+  gera log HTTP ainda correlaciona com o exploit HTTP vizinho que vem
+  depois. Como o tracker recebe o `&Event` inteiro (não só o tuple HTTP),
+  eventos não-HTTP participam.
+- **Config**: `[correlation] enabled = true, window_secs = 900`.
+  Métrica: `sentry_correlation_hits_total`.
+- **Taxonomia de scanners** (tiers de reputação, F3.10): `ReputationTier`
+  ganha `Authorized` (scanner contratado — sem sinal; confie via regra DSL
+  `reputation = "authorized"` → Allow) e `Promiscuous` (publica recon para
+  qualquer um — sinal `PromiscuousScanner` peso 10; a data alimenta
+  atacantes). Tiers parseam no DSL, em `[[rules.feeds]] tier = "…"` e em
+  `sentry feeds check`.
+- **Limitações**: estado em memória por-node (mesma limitação dos trackers
+  `[scan]`/`[behavior]`, §8.4); eventos que short-circuitam em regras não
+  passam pelos trackers (um scan bloqueado por regra não registra memória de
+  correlação); correlação é **agravador** — nunca gera verdict sozinho, só
+  soma peso ao ataque que a disparou.
 
 ---
 
@@ -1046,6 +1096,8 @@ stateDiagram-v2
 | Tor exit node                                     | 15   | —        |                        |
 | IP em reputation feed                             | 50   | —        | feed com tier `malicious`; `KnownBadIp` |
 | VPN/proxy/datacenter (feed)                       | 20   | —        | `VpnProxy`, tier `vpn`/`datacenter` |
+| Scanner promíscuo (feed tier `promiscuous`)       | 10   | —        | `PromiscuousScanner`; scanner que publica recon p/ qualquer um (F3.10) |
+| Scan→ataque cross-IP (`ScanAttackCorrelation`)    | 20   | sim      | `[correlation]`; scan de outro IP no mesmo /24, /64 ou ASN < `window_secs` (F3.10) |
 | Login bem-sucedido pós-brute-force                | 45   | não      | `SuspiciousLoginSuccess`, `[behavior] suspicious_success_min_failures` |
 | Anomalia ONNX (`AnomalousPayload`, `[ai]`)        | 25   | não      | threshold default 0.70; peso via `[scorer.weights] anomalous_payload` |
 | Acesso a path sensível                            | 30   | sim      |                        |
