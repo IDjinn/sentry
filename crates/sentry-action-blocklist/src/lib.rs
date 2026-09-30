@@ -1,14 +1,13 @@
 //! Local blocklist action.
 //!
-//! Keeps an in-memory set of blocked IPs (with TTL) and, when a storage
-//! backend is available, mirrors the state to the `ip_state` table. Used as
-//! a fallback when Cloudflare isn't configured, and as the source of truth
-//! for the future inline proxy mode.
+//! On a pipeline `Block` verdict, records the source IP in the shared
+//! [`BlockTable`] for the configured TTL. The daemon mirrors the same
+//! verdicts to Postgres (`ip_state`), and the inline edge denies IPs found
+//! in the table before the pipeline runs — so this action is what gives a
+//! `Block` verdict teeth in inline mode.
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,7 +16,7 @@ use sentry_core::action::Action;
 use sentry_core::analysis::Verdict;
 use sentry_core::error::Result;
 use sentry_core::event::Event;
-use tokio::sync::RwLock;
+use sentry_core::BlockTable;
 use tracing::info;
 
 /// Blocklist configuration.
@@ -27,45 +26,16 @@ pub struct BlocklistActionConfig {
     pub ttl: Duration,
 }
 
-/// In-memory blocklist action.
+/// In-memory blocklist action backed by a shared [`BlockTable`].
 pub struct BlocklistAction {
     cfg: BlocklistActionConfig,
-    blocked: Arc<RwLock<HashSet<(IpAddr, Instant)>>>,
+    table: Arc<BlockTable>,
 }
 
 impl BlocklistAction {
-    /// Create a new blocklist action.
-    pub fn new(cfg: BlocklistActionConfig) -> Self {
-        Self {
-            cfg,
-            blocked: Arc::new(RwLock::new(HashSet::new())),
-        }
-    }
-
-    /// Check whether an IP is currently blocked.
-    pub async fn is_blocked(&self, ip: IpAddr) -> bool {
-        let b = self.blocked.read().await;
-        b.iter().any(|(i, exp)| *i == ip && *exp > Instant::now())
-    }
-
-    /// Block an IP for the configured TTL.
-    pub async fn block(&self, ip: IpAddr) {
-        let mut b = self.blocked.write().await;
-        b.insert((ip, Instant::now() + self.cfg.ttl));
-        info!(ip = %ip, ttl = ?self.cfg.ttl, "ip blocked");
-    }
-
-    /// Unblock an IP.
-    pub async fn unblock(&self, ip: IpAddr) {
-        let mut b = self.blocked.write().await;
-        b.retain(|(i, _)| *i != ip);
-    }
-
-    /// Prune expired entries.
-    pub async fn prune(&self) {
-        let mut b = self.blocked.write().await;
-        let now = Instant::now();
-        b.retain(|(_, exp)| *exp > now);
+    /// Create a new blocklist action writing into `table`.
+    pub fn new(cfg: BlocklistActionConfig, table: Arc<BlockTable>) -> Self {
+        Self { cfg, table }
     }
 }
 
@@ -84,8 +54,10 @@ impl Action for BlocklistAction {
         evt: &Event,
         _decision: &sentry_core::analysis::Decision,
     ) -> Result<()> {
-        self.block(evt.client_ip).await;
-        self.prune().await;
+        self.table
+            .block(evt.client_ip, Some(Instant::now() + self.cfg.ttl));
+        self.table.prune();
+        info!(ip = %evt.client_ip, ttl = ?self.cfg.ttl, "ip blocked");
         Ok(())
     }
 }

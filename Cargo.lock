@@ -2983,6 +2983,7 @@ dependencies = [
  "axum-server",
  "futures",
  "http-body-util",
+ "prometheus",
  "reqwest",
  "sentry-core",
  "serde",

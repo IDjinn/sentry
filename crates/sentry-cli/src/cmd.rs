@@ -107,7 +107,7 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                         "Blocked {ip} (expires: {})",
                         expires_at.map(|t| t.to_string()).unwrap_or("never".into())
                     );
-                    notify_rules_changed(&repo).await;
+                    notify_blocks_changed(&repo).await;
                 }
                 Some(IpCmd::Unblock) => {
                     repo.ip_state()
@@ -115,7 +115,7 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                         .await
                         .map_err(|e| color_eyre::eyre::eyre!("unblock failed: {e}"))?;
                     println!("Unblocked {ip}");
-                    notify_rules_changed(&repo).await;
+                    notify_blocks_changed(&repo).await;
                 }
                 Some(IpCmd::Forgive) => {
                     repo.ip_state()
@@ -1051,6 +1051,10 @@ fn build_cf_provider() -> color_eyre::Result<sentry_action_cloudflare::Cloudflar
 
 async fn notify_rules_changed(repo: &sentry_storage::Repo) {
     let _ = repo.pool().notify("sentry_rules_changed").await;
+}
+
+async fn notify_blocks_changed(repo: &sentry_storage::Repo) {
+    let _ = repo.pool().notify("sentry_blocks_changed").await;
 }
 
 /// Tiny deterministic LCG (no `rand` dependency for this offline tool).

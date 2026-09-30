@@ -255,14 +255,16 @@ mod tests {
     }
 
     fn critical_decision(verdict: Verdict) -> sentry_core::analysis::Decision {
-        let mut analysis = AnalysisResult::default();
-        analysis.risk_level = RiskLevel::Critical;
-        analysis.risk_score = 90;
-        analysis.signals = vec![Signal {
-            kind: SignalKind::PathTraversal,
-            weight: 25,
-            detail: None,
-        }];
+        let analysis = AnalysisResult {
+            risk_level: RiskLevel::Critical,
+            risk_score: 90,
+            signals: vec![Signal {
+                kind: SignalKind::PathTraversal,
+                weight: 25,
+                detail: None,
+            }],
+            ..Default::default()
+        };
         sentry_core::analysis::Decision {
             analysis,
             action: verdict,
@@ -328,9 +330,11 @@ mod tests {
                 bytes: vec![],
             }),
         );
-        let mut analysis = AnalysisResult::default();
-        analysis.risk_level = RiskLevel::Low;
-        analysis.risk_score = 4;
+        let analysis = AnalysisResult {
+            risk_level: RiskLevel::Low,
+            risk_score: 4,
+            ..Default::default()
+        };
         let decision = sentry_core::analysis::Decision {
             analysis,
             action: Verdict::Allow,
@@ -365,9 +369,11 @@ mod tests {
             timeout: Duration::from_millis(200),
             secret: Some("topsecret".into()),
         });
-        let mut analysis = sentry_core::AnalysisResult::default();
-        analysis.risk_level = RiskLevel::Critical;
-        analysis.risk_score = 90;
+        let analysis = sentry_core::AnalysisResult {
+            risk_level: RiskLevel::Critical,
+            risk_score: 90,
+            ..Default::default()
+        };
         let decision = sentry_core::Decision {
             analysis,
             action: Verdict::Block,
@@ -388,8 +394,10 @@ mod tests {
             timeout: Duration::from_secs(1),
             secret: None,
         });
-        let mut analysis = sentry_core::AnalysisResult::default();
-        analysis.risk_level = RiskLevel::Critical;
+        let analysis = sentry_core::AnalysisResult {
+            risk_level: RiskLevel::Critical,
+            ..Default::default()
+        };
         let decision = sentry_core::Decision {
             analysis,
             action: Verdict::Block,

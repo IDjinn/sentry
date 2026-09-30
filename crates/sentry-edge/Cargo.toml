@@ -21,6 +21,7 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
+prometheus = { workspace = true }
 axum-server = { version = "0.7", optional = true, default-features = false, features = ["tls-rustls"] }
 
 [dev-dependencies]

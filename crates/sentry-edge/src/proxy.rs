@@ -213,6 +213,11 @@ async fn proxy_handler(
         .collect();
 
     let client_ip = crate::real_client_ip(&parts.headers, peer);
+
+    // Sticky blocks deny before the pipeline runs — no event, no upstream.
+    if runtime.is_hard_blocked(client_ip) {
+        return block_response();
+    }
     let http = sentry_core::event::HttpData {
         method: Some(sentry_core::event::HttpMethod::from_str_lossy(
             parts.method.as_str(),
@@ -312,6 +317,7 @@ async fn proxy_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
 
     #[tokio::test]
     async fn health_check_fails_fast_on_dead_backend() {
@@ -322,5 +328,37 @@ mod tests {
         };
         let err = health_check(&cfg).await.expect_err("dead backend");
         assert!(err.to_string().contains("refusing to start inline"));
+    }
+
+    #[tokio::test]
+    async fn fast_path_denies_blocked_ip_without_upstream() {
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let table = std::sync::Arc::new(sentry_core::BlockTable::new());
+        table.block("127.0.0.1".parse().unwrap(), None);
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0).with_block_table(table);
+        let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new().fallback(any(proxy_handler)).with_state((
+            runtime,
+            reqwest::Client::new(),
+            "http://127.0.0.1:9".to_string(),
+            dec_tx,
+        ));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/anything")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        assert!(
+            dec_rx.try_recv().is_err(),
+            "fast-path denies without a decided event"
+        );
     }
 }

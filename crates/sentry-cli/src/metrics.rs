@@ -28,6 +28,8 @@ pub struct Metrics {
     pub events_blocked: prometheus::Counter,
     pub dedupe_drops: prometheus::Counter,
     pub correlation_hits: prometheus::Counter,
+    pub edge_block_hits: prometheus::Counter,
+    pub block_table_size: prometheus::Gauge,
     pub signals: prometheus::CounterVec,
     pub actions: prometheus::CounterVec,
     pub pipeline_duration: prometheus::Histogram,
@@ -60,6 +62,17 @@ impl Metrics {
             "sentry_correlation_hits_total",
             "Attacks correlated with a recent scan from a neighboring IP \
              (same /24, /64 or ASN) — F3.10 shot-calling pattern.",
+        )
+        .unwrap();
+        let edge_block_hits = prometheus::Counter::new(
+            "sentry_edge_block_hits_total",
+            "Connections denied by the inline edge fast-path for IPs on the \
+             block table (sticky blocks enforced before the pipeline).",
+        )
+        .unwrap();
+        let block_table_size = prometheus::Gauge::new(
+            "sentry_block_table_size",
+            "IPs currently held in the in-memory block table.",
         )
         .unwrap();
         let signals = prometheus::CounterVec::new(
@@ -124,9 +137,11 @@ impl Metrics {
             &events_blocked,
             &dedupe_drops,
             &correlation_hits,
+            &edge_block_hits,
         ] {
             registry.register(Box::new(m.clone())).ok();
         }
+        registry.register(Box::new(block_table_size.clone())).ok();
         registry
             .register(Box::new(signals.clone()))
             .map_err(|e| warn!(error = %e, "register signals"))
@@ -152,6 +167,8 @@ impl Metrics {
             events_blocked,
             dedupe_drops,
             correlation_hits,
+            edge_block_hits,
+            block_table_size,
             signals,
             actions,
             pipeline_duration,

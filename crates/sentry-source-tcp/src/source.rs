@@ -255,8 +255,7 @@ mod tests {
             interface: "eth0".into(),
             ..Default::default()
         })
-        .err()
-        .expect("expected error without the pcap feature");
+        .expect_err("expected error without the pcap feature");
         assert!(err.to_string().contains("pcap"));
     }
 

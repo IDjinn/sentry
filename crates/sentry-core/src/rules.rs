@@ -1129,10 +1129,3 @@ mod tests {
         assert!(m.matches_with(&evt2, Some(&backend)));
     }
 }
-
-// Re-export kept for potential external consumers; the value is unused now but
-// the function preserves the `HashSet` import path for future indexing work.
-#[allow(dead_code)]
-fn _ensure_hashset_used() -> std::collections::HashSet<RuleId> {
-    std::collections::HashSet::new()
-}

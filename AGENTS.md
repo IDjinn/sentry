@@ -310,6 +310,19 @@ não em runtime.
     `ReputationTier::Promiscuous` → sinal `PromiscuousScanner` peso 10;
     parse unificado no DSL (`reputation = "promiscuous"`), feed config
     (`tier = "promiscuous"`) e `sentry feeds check` — 18 testes)
+  - ✅ Inline enforcement de bloqueios (BlockTable) — bloqueios que "grudam"
+    (`blocks.rs`: `BlockTable` `HashMap<IpAddr, Option<Instant>>`
+    compartilhado; fast-path na edge (`sentry_middleware`, `edge-http`,
+    `edge-tcp`) nega o IP **antes** do pipeline — 403/`shutdown()`
+    imediatos, sem evento (sem spam de webhook), contadores
+    `sentry_edge_block_hits_total`/`sentry_block_table_size`; vereditos
+    Block do pipeline são espelhados ao `ip_state` (`expires_at =
+    now + ttl_secs` da blocklist action, guard `is_blocked` anti-regravar) +
+    `NOTIFY sentry_blocks_changed`; dashboard/CLI block/unblock notificam o
+    mesmo canal; pre-warm do `ip_state.blocked()` no startup e
+    `blocks_hot_reload` LISTEN/NOTIFY por nó — bloqueio num nó nega na edge
+    de todos; `BlocklistAction::new(cfg, Arc<BlockTable>)` — 11 testes;
+    ver `ARCHITECTURE.md` §8.6)
 - **F4** (concluída): Operação & Dashboard
   - ✅ F4.2 Backend HTTP (`server.rs`: `sentry serve` — processo separado,
     axum; `/api/events?limit&level`, `/api/stats` 24h, `/api/incidents` +
@@ -373,7 +386,7 @@ Backlog detalhado em `ARCHITECTURE.md` §23.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 314 testes passando sem features; 316 com
+# Resultado esperado: 325 testes passando sem features; 327 com
 # --features sentry-cli/onnx (adiciona os 2 testes de inferência ONNX)
 ```
 

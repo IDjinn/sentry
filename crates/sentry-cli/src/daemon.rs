@@ -191,6 +191,15 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         }
     };
 
+    // Shared block table: the blocklist action, the DB pre-warm/hot-reload
+    // and the block mirror below write it; the inline edge fast-path reads
+    // it to deny blocked IPs before the pipeline runs.
+    let block_table = Arc::new(sentry_core::BlockTable::new());
+    let block_ttl = Duration::from_secs(blocklist_ttl_secs(&cfg));
+
+    let metrics = crate::metrics::Metrics::new();
+    metrics.set_instance(&instance_label(&cfg.deployment.instance_id));
+
     // Optionally connect to Postgres for persistence + hot-reload.
     let repo = if !cfg.storage.postgres.url.is_empty() {
         match sentry_storage::PgPool::connect(&cfg.storage.postgres).await {
@@ -207,6 +216,39 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 tokio::spawn(async move {
                     rules_hot_reload(reload_pool, reload_rules).await;
                 });
+
+                let reload_blocks = Arc::clone(&block_table);
+                let blocks_pool = repo.pool().clone();
+                tokio::spawn(async move {
+                    blocks_hot_reload(blocks_pool, reload_blocks).await;
+                });
+
+                // Pre-warm the block table from persisted blocks so the
+                // inline edge denies them immediately after a restart.
+                match repo.ip_state().blocked(10_000).await {
+                    Ok(rows) => {
+                        let now = chrono::Utc::now();
+                        let seeded = rows
+                            .iter()
+                            .filter_map(|r| {
+                                let ip = r.ip.parse::<IpAddr>().ok()?;
+                                let exp = match r.expires_at {
+                                    None => None,
+                                    Some(ts) => {
+                                        let Ok(remaining) = (ts - now).to_std() else {
+                                            return None;
+                                        };
+                                        Some(std::time::Instant::now() + remaining)
+                                    }
+                                };
+                                block_table.seed(ip, exp);
+                                Some(())
+                            })
+                            .count();
+                        info!(blocked = seeded, "block table pre-warmed from db");
+                    }
+                    Err(e) => warn!(error = %e, "failed to pre-warm block table"),
+                }
 
                 Some(Arc::new(repo))
             }
@@ -396,6 +438,19 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             }
         });
     }
+    {
+        let table = Arc::clone(&block_table);
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                table.prune();
+                metrics.block_table_size.set(table.len() as f64);
+            }
+        });
+    }
 
     // Start the routes LISTEN/NOTIFY hot-reload task (only with storage).
     if let Some(ref repo) = repo {
@@ -417,7 +472,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     }
 
     // Build the plugin registry from config.
-    let (registry, cf_provider) = build_registry(&cfg)?;
+    let (registry, cf_provider) = build_registry(&cfg, Arc::clone(&block_table))?;
 
     // Local ML threat model: runs as a fork off the hot path (or inline /
     // shadow, per [ai] config) and feeds signals back via rescore_from.
@@ -549,7 +604,9 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             Arc::clone(&pipeline),
             enricher.clone(),
             cfg.edge.body_capture_kb.saturating_mul(1024),
-        );
+        )
+        .with_block_table(Arc::clone(&block_table))
+        .with_block_hits(metrics.edge_block_hits.clone());
         let edge_pipeline = cfg.edge.upstream.clone();
         tokio::spawn(async move {
             if let Err(e) = sentry_edge::proxy::serve(runtime, proxy_cfg, dec_tx).await {
@@ -567,7 +624,9 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         if let (Some(tcp_listen), Some(tcp_upstream)) =
             (cfg.edge.tcp_listen.clone(), cfg.edge.tcp_upstream.clone())
         {
-            let tcp_runtime = sentry_edge::EdgeRuntime::new(Arc::clone(&pipeline), enricher, 0);
+            let tcp_runtime = sentry_edge::EdgeRuntime::new(Arc::clone(&pipeline), enricher, 0)
+                .with_block_table(Arc::clone(&block_table))
+                .with_block_hits(metrics.edge_block_hits.clone());
             let (tcp_dec_tx, mut tcp_dec_rx) = mpsc::channel::<sentry_core::ProcessedEvent>(buffer);
             let tcp_cfg = sentry_edge::tcp_listener::TcpEdgeConfig {
                 listen: tcp_listen.clone(),
@@ -610,8 +669,6 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     let mut blocked_count: u64 = 0;
     let mut dropped_dupes: u64 = 0;
 
-    let metrics = crate::metrics::Metrics::new();
-    metrics.set_instance(&instance_label(&cfg.deployment.instance_id));
     if cfg.metrics.enabled {
         let addr: std::net::SocketAddr = format!("{}:{}", cfg.metrics.host, cfg.metrics.port)
             .parse()
@@ -729,6 +786,47 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                         warn!(error = %e, "failed to persist event");
                     }
                 });
+            }
+
+            // Mirror block verdicts into the block table + Postgres so the
+            // inline edge denies the IP before the pipeline, the block
+            // survives restarts and sibling nodes pick it up via NOTIFY.
+            // The is_blocked guard keeps repeat offenders from rewriting the
+            // row on every violating event.
+            if result.decision.action == sentry_core::Verdict::Block
+                && !block_table.is_blocked(result.event.client_ip)
+            {
+                let expires = std::time::Instant::now() + block_ttl;
+                block_table.block(result.event.client_ip, Some(expires));
+                if let Some(ref repo) = repo {
+                    let repo = Arc::clone(repo);
+                    let ip = result.event.client_ip;
+                    let reason = result
+                        .analysis
+                        .signals
+                        .first()
+                        .map(|s| {
+                            serde_json::to_string(&s.kind)
+                                .unwrap_or_default()
+                                .trim_matches('"')
+                                .to_string()
+                        })
+                        .unwrap_or_else(|| "pipeline".to_string());
+                    let expires_db = chrono::Utc::now()
+                        + chrono::Duration::from_std(block_ttl).unwrap_or_default();
+                    tokio::spawn(async move {
+                        if let Err(e) = repo
+                            .ip_state()
+                            .block(ip, Some(&reason), Some(expires_db))
+                            .await
+                        {
+                            warn!(error = %e, "failed to mirror block to db");
+                        }
+                        if let Err(e) = repo.pool().notify("sentry_blocks_changed").await {
+                            warn!(error = %e, "failed to notify block change");
+                        }
+                    });
+                }
             }
 
             for action in registry.actions() {
@@ -1394,6 +1492,61 @@ async fn rules_hot_reload(pool: sentry_storage::PgPool, rules: SharedRuleSet) {
     }
 }
 
+/// Background task: LISTEN for `sentry_blocks_changed` notifications and
+/// hot-reload the block table from `ip_state`.
+///
+/// The dashboard/CLI block endpoints and the daemon's own block mirror emit
+/// the notification; `ip_state` stays the source of truth, the table is its
+/// in-memory cache.
+async fn blocks_hot_reload(pool: sentry_storage::PgPool, table: Arc<sentry_core::BlockTable>) {
+    const CHANNEL: &str = "sentry_blocks_changed";
+    loop {
+        match pool.listen(CHANNEL).await {
+            Ok(mut listener) => {
+                info!(
+                    channel = CHANNEL,
+                    "listening for block change notifications"
+                );
+                while let Ok(_notif) = listener.recv().await {
+                    let repo = sentry_storage::Repo::new(pool.clone());
+                    match repo.ip_state().blocked(10_000).await {
+                        Ok(rows) => {
+                            let now = chrono::Utc::now();
+                            let entries: Vec<(IpAddr, Option<std::time::Instant>)> = rows
+                                .iter()
+                                .filter_map(|r| {
+                                    let ip = r.ip.parse::<IpAddr>().ok()?;
+                                    let exp = match r.expires_at {
+                                        None => None,
+                                        Some(ts) => {
+                                            let Ok(remaining) = (ts - now).to_std() else {
+                                                return None;
+                                            };
+                                            Some(std::time::Instant::now() + remaining)
+                                        }
+                                    };
+                                    Some((ip, exp))
+                                })
+                                .collect();
+                            let count = entries.len();
+                            table.reload(entries);
+                            info!(blocked = count, "block table hot-reloaded from db");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to reload block table from db");
+                        }
+                    }
+                }
+                warn!("LISTEN connection closed, reconnecting in 5s…");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to start LISTEN, retrying in 5s…");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
 /// F3.6 retraining loop endpoint: on `NOTIFY sentry_model_changed`, reload
 /// the ONNX model from disk and swap it into the running fork. A failed load
 /// keeps the previous model running.
@@ -1480,6 +1633,7 @@ fn print_event(evt: &Event, level: &RiskLevel, signals: &[String]) {
 /// background reaper and the CLI status commands).
 fn build_registry(
     cfg: &SentryConfig,
+    block_table: Arc<sentry_core::BlockTable>,
 ) -> color_eyre::Result<(
     sentry_core::registry::Registry,
     Option<Arc<sentry_action_cloudflare::CloudflareProvider>>,
@@ -1617,9 +1771,10 @@ fn build_registry(
         match act.kind {
             ActionKind::Log => log_requested = true,
             ActionKind::Blocklist => {
-                let ttl = Duration::from_secs(parse_ttl_secs(&act.options, 86400));
+                let ttl = Duration::from_secs(blocklist_ttl_secs(cfg));
                 builder.register_action(sentry_action_blocklist::BlocklistAction::new(
                     sentry_action_blocklist::BlocklistActionConfig { ttl },
+                    block_table.clone(),
                 ));
             }
             ActionKind::Webhook => {
@@ -1711,6 +1866,17 @@ fn build_registry(
     }
 
     Ok((builder.build(), cf_provider))
+}
+
+/// Effective blocklist TTL: `ttl_secs` of the first `[[action]]
+/// type = "blocklist"`, else the 24 h default. Shared by the action, the
+/// DB mirror and the pre-warm so all three agree on how long a block lasts.
+fn blocklist_ttl_secs(cfg: &SentryConfig) -> u64 {
+    cfg.actions
+        .iter()
+        .find(|a| a.kind == ActionKind::Blocklist)
+        .map(|a| parse_ttl_secs(&a.options, 86_400))
+        .unwrap_or(86_400)
 }
 
 fn parse_ttl_secs(opts: &HashMap<String, toml::Value>, default_secs: u64) -> u64 {

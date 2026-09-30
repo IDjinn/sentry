@@ -521,7 +521,8 @@ operam como um cluster ativo-ativo:
   de feeds (replace atômico) podem rodar simultaneamente sem corrupção;
   duplicação transitória de trabalho é aceitável.
 - **Edge/HA**: múltiplos `sentry-edge` atrás de um LB — o verdict é
-  stateless por request (rate-limit compartilhado via Redis); o
+  stateless por request (rate-limit compartilhado via Redis; **bloqueios**
+  compartilhados via `ip_state` + NOTIFY `sentry_blocks_changed`, §8.6); o
   `[server]` HTTP deve ficar atrás do LB também (F4.4 auth por token é
   stateless; sessões HMAC são válidas em qualquer nó que compartilhe
   `SENTRY_SESSION_SECRET`).
@@ -568,6 +569,39 @@ Thing as a Benign Internet Scanner*.
   passam pelos trackers (um scan bloqueado por regra não registra memória de
   correlação); correlação é **agravador** — nunca gera verdict sozinho, só
   soma peso ao ataque que a disparou.
+
+### 8.6 Bloqueios persistentes (BlockTable) — enforcement real no inline
+
+Antes do BlockTable, um bloqueio não "grudava": a blocklist action era
+escreva-só (estado inalcançável no registry), o dashboard/CLI gravavam só no
+`ip_state` e nada recarregava — um IP bloqueado voltava a ser proxyado pela
+edge no request seguinte se o pipeline sozinho não re-derivasse Block.
+
+- **`BlockTable`** (`crates/sentry-core/src/blocks.rs`):
+  `HashMap<IpAddr, Option<Instant>>` compartilhado (`Arc`) — `None` =
+  permanente (bloqueio de dashboard/CLI sem TTL), `Some(exp)` = TTL.
+  Writers: blocklist action (verdict Block), pre-warm do DB e hot-reload
+  NOTIFY; readers: o fast-path da edge e o guard do mirror.
+- **Fast-path na edge** (`sentry_middleware`, `edge-http`, `edge-tcp`): o IP
+  do cliente resolvido (§8.1) é checado **antes** do pipeline — bloqueado →
+  403 / `shutdown()` imediatos, sem rodar pipeline nem gerar evento (o
+  incidente já existe de quando o bloco foi decidido; evita spam de webhook
+  por request). Contadores: `sentry_edge_block_hits_total` e
+  `sentry_block_table_size`.
+- **Persistência**: vereditos Block do pipeline são espelhados para
+  `ip_state` (`status='blocked'`, `expires_at = now + ttl_secs` da blocklist
+  action, `reason` = label do primeiro sinal) + `NOTIFY
+  sentry_blocks_changed`; o guard `is_blocked` evita regravar o row a cada
+  evento violador. Restart → pre-warm lê `ip_state.blocked(10_000)` com
+  expirados filtrados no Rust.
+- **Sync multi-node**: dashboard/CLI block/unblock e o próprio daemon emitem
+  `NOTIFY sentry_blocks_changed`; cada nó roda um listener que recarrega a
+  tabela do banco (reload atômico) — um bloqueio decidido num nó passa a
+  negar na edge de todos os nós em tempo real.
+- **Cadeia completa**: pipeline Block → tabela + DB + NOTIFY → edge de
+  qualquer nó nega no fast-path; dashboard block → DB + NOTIFY → efeito
+  imediato; `sentry ip unblock` → delete no DB + NOTIFY → tabela recarrega e
+  o IP volta a passar.
 
 ---
 

@@ -1,49 +1,82 @@
-# F3.10 — Cross-IP scan→attack correlation + scanner taxonomy
+# Inline enforcement — bloqueios que funcionam de verdade (BlockTable)
 
-Verified: F3.1/F3.2/F3.3/F3.6/F3.9 already exist (crates, daemon wiring, config confirmed in code) — out of scope, except ticking their stale BACKLOG.md boxes. Everything below implements F3.10 (BACKLOG.md:75), which has zero existing implementation.
+## Problema (verificado em código)
 
-## A. New correlation tracker — `crates/sentry-core/src/correlation.rs` (new module)
+O modo inline já existe e decide por-request (`proxy.rs:254-261`: Block→403 antes do proxy; `tcp_listener.rs:68-75`: Block→shutdown). Mas um bloqueio não "gruda":
 
-`CorrelationTracker`, modeled exactly on `ScanTracker` (scan.rs:37–110: `from_config`, explicit-arg `new`, `Arc<RwLock<>>` held by Pipeline, `prune()`):
+1. **`BlocklistAction` é escreva-só**: estado `Arc<RwLock<HashSet>>` privado, apagado no registry como `Arc<dyn Action>` sem downcast — `is_blocked()` tem **zero callers** no workspace.
+2. **Dashboard/CLI bloqueiam só no Postgres** (`server.rs:528-560`, `cmd.rs:100-118` → `ip_state` + NOTIFY `sentry_rules_changed`) — e o listener desse canal só recarrega regras (`daemon.rs:1360-1366`). Nada lê `ip_state.blocked()` no startup.
+3. **Edge stateless**: IP bloqueado no dashboard manda requisição benigna → pipeline deriva Allow → **proxied**.
 
-- State: `by_prefix: HashMap<IpAddr, Vec<ScanEntry>>` (v4 masked /24, v6 masked /64 — masking pattern from `mask_v4`/`mask_v6`, reputation.rs:123–137) and `by_asn: HashMap<u32, Vec<ScanEntry>>`. `ScanEntry { scanner: IpAddr, at: Instant, label: String }` (label: "masscan"/"zmap"/"nmap" from `tcpfp::scanner_name`, "http-404-scan" for RandomScan/ScanBehavior).
-- API: `record_scan(scanner, asn, label)` (pushes to both maps; per-key cap 64, drop-oldest like other trackers); `correlate(attacker, asn) -> Option<CorrelationHit>` — most recent entry **from a different IP** within the window; prefix match wins over ASN match; `prune()`.
-- Explicit classification helpers (variants verified against analysis.rs:91–152 at implementation time): `is_scan_signal` → {RandomScan, ScanBehavior, TcpScanner}; `is_attack_signal` → {SQLi, XSS, PathTraversal, LFI, Log4Shell, CmdInjection, SensitivePath, AuthBruteForce, CredentialStuffing, DirectoryBruteForce, SuspiciousLoginSuccess, LlmMalicious}.
+## Design
 
-## B. Config — `crates/sentry-core/src/config.rs` + lib.rs re-export
+**`BlockTable` em memória (sentry-core), DB como source of truth, NOTIFY para sync, fast-path na edge.**
 
-`CorrelationConfig` mirroring `ScanConfig` (config.rs:329–367, same serde/default/impl-Default pattern; `enabled` default mirrors ScanConfig's): `enabled`, `window_secs` (default 900 = 15 min). Field `#[serde(default)] pub correlation` on `SentryConfig` next to `scan`/`behavior`; re-export in lib.rs. Example section in `config/sentry.example.toml` near `[scan]`, plus a commented `[[rules.feeds]]` promiscuous-scanners example (`tier = "promiscuous"`).
+### A. `crates/sentry-core/src/blocks.rs` (novo)
 
-## C. Pipeline — `crates/sentry-core/src/pipeline.rs`
+`BlockTable` seguindo o padrão dos trackers (scan.rs/behavior.rs/correlation.rs):
 
-- New `SignalKind::ScanAttackCorrelation` (analysis.rs) with `pub const SCAN_ATTACK_CORRELATION_WEIGHT: u8 = 20` in correlation.rs; add `"scan_attack_correlation"` arms to **both** `weight_for` (523–559) and `weight_for_signal` (563–593) so `[scorer.weights]` overrides work.
-- Field `correlation: Option<Arc<RwLock<CorrelationTracker>>>` + chained builder `with_correlation_tracker` (pattern of `with_scan_tracker`, 388).
-- In `process()`, after the behavior block (~472) and **before** repetition bonus/scoring: lock tracker, `record_scan` for each scan signal present, and if any attack signal is present call `correlate` → push `Signal { kind: ScanAttackCorrelation, weight from weight_for, detail: "<label> from <scanner_ip> (same /24|/64|ASN) Ns ago" }`. Takes the whole `&Event` (uses `evt.client_ip`, `evt.asn`) so TCP SYN scans correlate too — unlike the HTTP-only trackers.
+```rust
+pub struct BlockTable { inner: RwLock<HashMap<IpAddr, Option<Instant>>> }
+```
+- `None` = permanente (dashboard bloqueia sem TTL), `Some(exp)` = TTL.
+- API: `new()`, `block(ip, expires_at: Option<Instant>)`, `unblock(ip) -> bool`, `is_blocked(ip) -> bool` (lazy: expirado = não bloqueado), `seed(ip, expires_at)` (merge: mantém expiração mais longa; `None` vence), `reload(iter)` (substitui tudo — usado pelo hot-reload), `prune() -> usize`, `len()`.
+- ~7 testes unitários (block/TTL/permanente/expiração/seed-merge/reload/prune). Re-export em `lib.rs`.
 
-## D. Scanner taxonomy — `crates/sentry-core/src/rules.rs` + reputation.rs
+### B. `crates/sentry-action-blocklist` — vira escritor da tabela
 
-- `ReputationTier`: add `Authorized` and `Promiscuous` variants + `parse()` aliases ("authorized", "promiscuous"). Grep ALL `ReputationTier` match/serialization sites and update exhaustively: `parse` (rules.rs:471–487), DSL matcher (rules.rs:612–616), `reputation_signals` (reputation.rs:177–196), siem.rs, serde attrs, any dashboard payload code — compiler + clippy `-D warnings` will police non-wildcard matches.
-- `reputation_signals`: `Promiscuous` → new `SignalKind::PromiscuousScanner` (`PROMISCUOUS_SCANNER_WEIGHT: u8 = 10`, key `"promiscuous_scanner"` in both weight maps — scanner that publishes recon for anyone is not benign); `Authorized` → no signal (trusted; users can write a DSL Allow rule on `reputation = "authorized"`).
+- `BlocklistAction::new(cfg, table: Arc<BlockTable>)` — `execute` faz `table.block(ip, Some(now + ttl))`; delete do `HashSet` privado e dos métodos mortos; doc-comment corrigido (sem a promessa inexistente de "mirror to ip_state" no nível da crate).
 
-## E. Daemon — `crates/sentry-cli/src/daemon.rs`
+### C. `crates/sentry-edge` — fast-path antes do pipeline
 
-Construct `correlation_tracker` gated on `cfg.correlation.enabled` (~256 pattern), `.with_correlation_tracker(...)` in the pipeline chain (~290), prune `tokio::spawn` every 60s (~355 pattern). Small Prometheus counter `sentry_correlation_hits_total` incremented in the main pump when a processed event carries the signal (mirror feed metrics).
+- `EdgeRuntime` (lib.rs:40-45) ganha `block_table: Option<Arc<BlockTable>>` + `block_hits: Option<prometheus::IntCounter>` com builders `with_block_table`/`with_block_hits` e método `is_hard_blocked(ip) -> bool`.
+- Checagem **antes** de construir/processar o evento (logo após resolver o client IP):
+  - `middleware.rs` handler: blocked → `block_response()` (403), sem pipeline.
+  - `proxy.rs` proxy_handler: blocked → `block_response()`, sem pipeline e **sem** enviar ao canal `decided`.
+  - `tcp_listener.rs`: blocked → `inbound.shutdown()`, sem pipeline.
+- Comportamento: **negação silenciosa** + `tracing::debug!` + counter. Não rodar pipeline nem forçar verdict Block (evita spam de webhook/incidente por request de um IP já bloqueado — incidente já existe de quando o bloco foi decidido). Dep `prometheus` adicionada a sentry-edge (workspace dep, handle injetado pelo daemon).
+- Testes: middleware blocked→403 em request benigno; proxy blocked→403 (nunca chega ao upstream); edge-tcp blocked→conexão fechada (bind `127.0.0.1:0`).
 
-## F. Tests (inline `#[cfg(test)]`, house pattern)
+### D. `crates/sentry-cli/src/daemon.rs` — wiring completo
 
-- correlation.rs: /24 and /64 prefix correlation, different-IP requirement, ASN fallback when prefixes differ, window expiry, per-key cap, prune.
-- pipeline.rs tests (helpers `http_evt`/`http_evt_status`): 404-burst from IP A then SQLi from IP B same /24 → signal present and score/verdict reacts; same IP → no signal; TcpScanner TCP event records a scan; weight override via `[scorer.weights]`.
-- reputation.rs: promiscuous → signal, authorized → none, parse aliases round-trip. config.rs: `CorrelationConfig` serde defaults.
+1. `block_table` criado no `run()` antes de `build_registry` (nova parâmetro, espelhando o padrão do handle `cf_provider`).
+2. **Pre-warm do DB** (espelha offender pre-warm, daemon.rs:315-352): `repo.ip_state().blocked(10_000)` → filtra expirados em Rust (`(expires_at - now).to_std()`; `expires_at = NULL` → permanente) → `table.seed(...)`. Log `block table pre-warmed from db (n)`.
+3. Inline block (daemon.rs:548-570): `.with_block_table(table.clone()).with_block_hits(metrics.edge_block_hits.clone())` nos dois `EdgeRuntime`.
+4. **Mirror de vereditos para o DB** (loop principal, junto do mirror de offender, daemon.rs:786-799): `Verdict::Block` **e** `!block_table.is_blocked(ip)` (guard anti-spam) → spawn `repo.ip_state().block(ip, reason = primeiro sinal ou "pipeline", expires_at = now + block_ttl)` + `pool.notify("sentry_blocks_changed")`. `block_ttl` extraído para helper compartilhado com `build_registry` (`ttl_secs` da action, default 86400 — daemon.rs:1716).
+5. **Hot-reload** `blocks_hot_reload(pool, table)` espelhando `rules_hot_reload` (daemon.rs:1365-1395): LISTEN `sentry_blocks_changed` → reload do DB → `table.reload(...)`; retry com backoff 5s. Spawn quando há repo.
+6. Prune task 60s: `block_table.prune()` + `metrics.block_table_size.set(len)`.
 
-## G. Docs
+Fluxo resultante: pipeline Block → blocklist action alimenta a tabela **e** daemon espessa no `ip_state` → NOTIFY → todos os nós recarregam → edge de qualquer nó nega no fast-path. Restart → pre-warm do DB. Dashboard/CLI block → DB + NOTIFY → teeth imediatas. Unblock → DB delete + NOTIFY → reload tira da tabela.
 
-- Main repo: tick stale BACKLOG.md boxes F3.1–F3.9 + F3.10 when done; AGENTS.md gains the F3.10 ✅ entry (+ fix tcpfp.rs location note: lives in sentry-core, not sentry-source-tcp); ARCHITECTURE.md gains F3.10 in the F3 section + a short design subsection (match existing style).
-- Docs submodule (`docs/` → sentry-docs): add the two new signals/weights to the risk-levels weight table and document `[correlation]` + the new tiers in the config reference, in **both** `/pt` and `/en`. Commit **inside the submodule only**; no pushes anywhere (you push/deploy).
+### E. server.rs + cmd.rs — canal correto
 
-## Non-goals
+`block_ip`/`unblock_ip` (server.rs:528-560) e `sentry ip block/unblock` (cmd.rs:100-118) passam a notificar **`sentry_blocks_changed`** (hoje reusam `sentry_rules_changed`, que não faz nada para IPs).
 
-Correlation-state persistence across restarts (in-memory like all trackers, 15-min window makes it moot); DB-backed correlation; new default rule packs.
+### F. metrics.rs
 
-## Validation
+`edge_block_hits: IntCounter` (`sentry_edge_block_hits_total`) + `block_table_size: IntGauge` (`sentry_block_table_size`), criados/registrados no padrão existente.
 
-`cargo fmt --all -- --check` · `cargo clippy --all-targets --all-features -- -D warnings` · `cargo test --all` (baseline 288 passing; expect ~300+).
+### G. Config — zero chaves novas
+
+`config/sentry.example.toml`: só comentários atualizados em `[deployment]`/`[edge]`/ação blocklist descrevendo a enforcement persistente (bloqueios grudam, sobrevivem a restart, sincronizam entre nós).
+
+### H. Docs
+
+- **ARCHITECTURE.md**: §8.3 ganha subseção "Bloqueios persistentes (BlockTable)" (fast-path, mirror, NOTIFY `sentry_blocks_changed`, pre-warm); §8.4 revisa o caveat "verdict é stateless por request" (estado de bloco agora é compartilhado via Postgres+NOTIFY); §16 linhas das 2 métricas novas.
+- **AGENTS.md**: bullet ✅ na seção F3; contagem esperada de testes atualizada.
+- **BACKLOG.md**: item checkado com resumo.
+- **Submodule docs** (pt+en, commit só dentro do submodule): `request-flow.mdx` corrige a linha stale "inline is a future phase"; `plugins/actions.mdx` atualiza a descrição do blocklist ("Local state (for inline proxy)" → agora de fato consultado pela edge).
+
+## Não-goals
+
+- Lookup de DB por request na edge (RTT); bloqueio kernel (iptables/eBPF — F5 avançada); integrações de firewall (F6); challenge page verificável; fast-path para RateLimit/Challenge (permanecem por-request); confiança de headers XFF na edge (preexistente, §8.1).
+
+## Decisões registradas (alternativas rejeitadas)
+
+- Downcast de action via `Any` supertrait — recusado; handle concreto fora do registry segue o precedente `cf_provider`/trackers.
+- Rodar pipeline + forçar Block no hit do fast-path — recusado: auditória por request vira spam de webhook/incident; negação silenciosa + counter cobre ops.
+- Polling periódico do DB além do NOTIFY — recusado (paridade com rules/model/routes que usam só NOTIFY + startup).
+
+## Validação
+
+`cargo fmt --all -- --check` · `cargo clippy --all-targets --all-features -- -D warnings` · `cargo test --all` (baseline 314; espero ~326+ com os novos testes).

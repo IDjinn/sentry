@@ -13,6 +13,7 @@
 pub mod action;
 pub mod analysis;
 pub mod behavior;
+pub mod blocks;
 pub mod challenge;
 pub mod config;
 pub mod correlation;
@@ -35,6 +36,7 @@ pub mod tcpfp;
 pub use action::{Action, ActionContext};
 pub use analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};
 pub use behavior::BehaviorTracker;
+pub use blocks::BlockTable;
 pub use challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
 pub use config::{
     ActionConfig, ActionKind, AiConfig, AuthTokenConfig, AuthUserConfig, BehaviorConfig,

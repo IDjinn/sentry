@@ -391,6 +391,10 @@ mode = "passive"             # passive | inline
 # Chain: client → sentry-edge → nginx → app. The startup health check
 # against the upstream is mandatory; verdicts apply BEFORE proxying
 # (Block→403 · RateLimit→429 · Challenge→challenge page · Allow→proxy).
+# Blocked IPs (blocklist action, dashboard/CLI, pipeline Block verdicts)
+# are denied by a fast-path BEFORE the pipeline runs and stay blocked
+# across restarts (blocks persist in ip_state, synced via NOTIFY
+# sentry_blocks_changed — siblings enforce them too).
 [edge]
 listen = "0.0.0.0:80"
 upstream = "http://127.0.0.1:8080"
@@ -404,6 +408,9 @@ body_capture_kb = 0          # request-body bytes kept for inspection (KiB)
 # tcp_upstream = "127.0.0.1:22"
 
 # ── Actions ──────────────────────────────────────────────────────────────
+# blocklist: feeds the shared block table on Block verdicts; the daemon
+# mirrors the same blocks to ip_state (dashboard-visible, restart-safe).
+# This TTL governs pipeline blocks end to end.
 [[action]]
 type = "blocklist"
 [action.options]

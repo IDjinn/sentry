@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(feature(&evt, "sqli_token_score"), 0.0);
         assert_eq!(feature(&evt, "traversal_token_score"), 0.0);
         assert_eq!(feature(&evt, "ua_bot_token"), 0.0);
-        assert_eq!(feature(&evt, "path_digit_ratio") > 0.0, true);
+        assert!(feature(&evt, "path_digit_ratio") > 0.0);
     }
 
     #[test]

@@ -29,6 +29,7 @@ use std::sync::Arc;
 use axum::http::HeaderMap;
 use sentry_core::event::Event;
 use sentry_core::pipeline::Pipeline;
+use sentry_core::BlockTable;
 
 use crate::middleware::MiddlewareMode;
 
@@ -42,6 +43,8 @@ pub struct EdgeRuntime {
     enrich: Option<Enricher>,
     body_cap: usize,
     mode: MiddlewareMode,
+    block_table: Option<Arc<BlockTable>>,
+    block_hits: Option<prometheus::Counter>,
 }
 
 impl EdgeRuntime {
@@ -55,7 +58,22 @@ impl EdgeRuntime {
             enrich,
             body_cap,
             mode: MiddlewareMode::Inline,
+            block_table: None,
+            block_hits: None,
         }
+    }
+
+    /// Consult `table` before the pipeline runs so a sticky block denies
+    /// traffic even when the current request alone would score as benign.
+    pub fn with_block_table(mut self, table: Arc<BlockTable>) -> Self {
+        self.block_table = Some(table);
+        self
+    }
+
+    /// Counter incremented on every fast-path denial.
+    pub fn with_block_hits(mut self, hits: prometheus::Counter) -> Self {
+        self.block_hits = Some(hits);
+        self
     }
 
     /// Pipeline reference.
@@ -79,6 +97,23 @@ impl EdgeRuntime {
     pub fn process(&self, mut evt: Event) -> sentry_core::ProcessedEvent {
         self.enrich(&mut evt);
         self.pipeline.process(&evt)
+    }
+
+    /// Fast-path check: whether `ip` must be denied before the pipeline runs.
+    /// Returns true only for IPs on the block table; increments the block-hit
+    /// counter and logs when it fires.
+    pub fn is_hard_blocked(&self, ip: IpAddr) -> bool {
+        let Some(table) = &self.block_table else {
+            return false;
+        };
+        if !table.is_blocked(ip) {
+            return false;
+        }
+        if let Some(hits) = &self.block_hits {
+            hits.inc();
+        }
+        tracing::debug!(ip = %ip, "edge fast-path: blocked ip denied before pipeline");
+        true
     }
 }
 

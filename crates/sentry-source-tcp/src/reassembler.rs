@@ -195,10 +195,12 @@ mod tests {
         let mut t = FlowTable::new(16, 8);
         let id = 1;
         t.observe(id, flags(true, false, false, false), &[]);
-        let (_, st) = t.observe(id, flags(false, true, false, false), &vec![b'x'; 100]);
+        let payload = vec![b'x'; 100];
+        let (_, st) = t.observe(id, flags(false, true, false, false), &payload);
         assert_eq!(st.payload.len(), 8);
         // Further data is dropped once the cap is reached.
-        let (_, st) = t.observe(id, flags(false, true, false, false), &vec![b'y'; 10]);
+        let more = vec![b'y'; 10];
+        let (_, st) = t.observe(id, flags(false, true, false, false), &more);
         assert_eq!(st.payload.len(), 8);
     }
 

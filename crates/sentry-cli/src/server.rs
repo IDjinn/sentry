@@ -538,7 +538,7 @@ async fn block_ip(
         .block(ip, Some("dashboard"), None)
         .await
         .map_err(internal_error)?;
-    let _ = state.repo.pool().notify("sentry_rules_changed").await;
+    let _ = state.repo.pool().notify("sentry_blocks_changed").await;
     Ok(Json(json!({"blocked": ip})))
 }
 
@@ -555,7 +555,7 @@ async fn unblock_ip(
         .unblock(ip)
         .await
         .map_err(internal_error)?;
-    let _ = state.repo.pool().notify("sentry_rules_changed").await;
+    let _ = state.repo.pool().notify("sentry_blocks_changed").await;
     Ok(Json(json!({"unblocked": ip})))
 }
 

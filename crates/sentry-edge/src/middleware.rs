@@ -80,6 +80,12 @@ pub async fn handler(State(runtime): State<EdgeRuntime>, req: Request, next: Nex
         .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
     let client_ip = real_client_ip(&parts.headers, peer);
 
+    // Sticky blocks deny before the pipeline runs — a blocked IP stays
+    // blocked even when this request alone would score as benign.
+    if runtime.is_hard_blocked(client_ip) {
+        return block_response();
+    }
+
     let headers: std::collections::HashMap<String, String> = parts
         .headers
         .iter()
@@ -299,6 +305,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn fast_path_denies_blocked_ip_before_pipeline() {
+        let table = std::sync::Arc::new(sentry_core::BlockTable::new());
+        table.block("127.0.0.1".parse().unwrap(), None);
+        let hits = prometheus::Counter::new("edge_block_hits_test", "test").unwrap();
+        let rt = runtime(MiddlewareMode::Inline)
+            .with_block_table(table)
+            .with_block_hits(hits.clone());
+        let app = Router::new()
+            .route("/", get(ok_handler))
+            .route_layer(axum::middleware::from_fn_with_state(rt.clone(), handler))
+            .with_state(rt);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/?health=1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(hits.get(), 1.0);
     }
 
     #[test]
