@@ -1335,3 +1335,82 @@ Limites honestos: números de microbenchmark (cache quente, 1 IP sintético);
 throughput real é dominado por I/O do source e latência do Postgres. Os
 trackers scan/behavior/repetition permanecem por-IP em memória — a escala
 multi-node não muda isso (ver §8.4).
+
+## 23. Roadmap — F5 Performance Engineering (avançada) e F6 Integrações de Firewall/Plataforma
+
+> Performance é critério de design de primeira classe. A F5 prática (§22)
+> entregou o hot-path userspace otimizado; esta seção planeja a próxima
+> escala (kernel-bypass) e as integrações com plataformas de firewall
+> existentes, seguindo o padrão de provider que o projeto já tem
+> (`ChallengeProvider` + `build_challenge_action` — novos providers de edge
+> não mudam regras, `ActionKind` nem o filtro de verdict).
+
+### 23.1 F5 — Performance Engineering (avançada)
+
+Objetivo: sustentar **≥ 100k eventos/s por nó** em Linux, mantendo o
+userspace atual como fallback portável. Pré-requisito: benchmarks da §22
+como baseline de regressão (`cargo bench` no CI, budget por cenário).
+
+- **[ ] F5.1 — Budgets de regressão no CI**: `critest`/comparação de
+  baseline; falha o pipeline se `pipeline/clean` regredir > 20%.
+- **[ ] F5.2 — eBPF/aya (spike Linux)**: observação passiva via kprobe/
+  tracepoint (conexões, SYNs, drops) anexada ao mesmo fan-in como uma
+  `Source`; ring buffer `aya::BpfRingBuf` → `ProtocolData::Tcp`/eventos
+  sintéticos. Sem bloqueio; feature `ebpf` (não-compilável no Windows —
+  CI Linux-only com `bpf-linker`).
+- **[ ] F5.3 — io_uring para sources**: tail de log e sockets TCP via
+  `io-uring` (feature `uring`): menos syscalls por evento no ingest de
+  alta taxa; fallback tokio quando a feature está off.
+- **[ ] F5.4 — AF_XDP kernel-bypass**: captura de pacotes com zero-copy
+  ( feature `xdp`, Linux): UMEM frames → ring buffers de usuário →
+  `sentry-source-tcp` em modo de alta performance. Alvo: linha de 1M pps
+  por nó em EVH. Requer NUMA-aware ring buffers e pinning de cores.
+- **[ ] F5.5 — Ring buffers NUMA-aware no fan-in**: substituir o canal
+  tokio por SPSC/MPSC ring buffer crossbeam sem alocação no produtor,
+  com pinning por NUMA node quando `--enable-numa`.
+- **[ ] F5.6 — Avaliação honesta de kernel module**: protótipo de módulo
+  Linux (C) que marca/drops na hook netfilter com decisão consultando
+  um map compartilhado com o daemon. Critério de go/no-go: o eBPF (F5.2/
+  F5.4) não alcançar o alvo OU necessidade de inspeção que eBPF não
+  permite (estado complexo > 512 bytes por pacote). Trade-offs aceitos:
+  risco de kernel panic, manutenção por versão de kernel, distribuição
+  fora de crates.io — só vale se eBPF comprovar limite.
+- **[ ] F5.7 — SIMD explícito onde o ecossistema não cobre**: ingest de
+  syslog multi-linha e normalização de payload com `std::simd`
+  (nightly-gated atrás de feature) ou crates `memchr`/`aho-corasick`
+  adicionais; sem `unsafe`.
+
+### 23.2 F6 — Integrações de firewall/plataforma
+
+Objetivo: o Sentry decide, a plataforma existente executa — cada provider
+segue o trait `ChallengeProvider` (`apply(ip, verdict, opts)`) e entra no
+`match` de `build_challenge_action` sem tocar em regras/pipeline.
+
+- **[ ] F6.1 — Provider OPNsense/pfSense**: alias tables via REST API do
+  OPNsense (`/api/firewall/alias_util`, prefixo `sentry_`) e via `pfctl
+  -t <table> -T add` para pfSense puro (SSH/exec no host — documentar o
+  requisito de credencial). Verdicts Block/Quarantine → alias com TTL
+  (expiração por reaper como o `note` do Cloudflare); RateLimit/Challenge
+  → 403/429 locais não aplicáveis (a plataforma só sabe drop/reject —
+  documentar). Config: `type = "challenge"`, `provider = "opnsense"`,
+  `api_key_env`/`api_secret_env`/`base_url`.
+- **[ ] F6.2 — Provider nginx**: gerador de include deny-list
+  (`deny <ip>;` em `denylist.conf` incluído do `http`/`server` block) +
+  reload (`nginx -s reload` ou SIGHUP) com debounce (≥ 1 reload/s);
+  valer de `ngx_http_access_module`; TTL por bloco gerado com carimbo de
+  tempo. Modo alternativo: `njs`/map para challenge 429. Requer co-
+  locação (mesmo host ou volume compartilhado) — documentar as 3 topologias.
+- **[ ] F6.3 — HAProxy maps**: `sentry_blocks.map` com `src` como key +
+  `http-request deny` — mesmo ciclo gerador/reload do F6.2.
+- **[ ] F6.4 — Export Suricata/fast.log + EVE**: Espelho de eventos como
+  `fast.log` (formato Snort/Suricata) consumível por ferramentas
+  existentes; complementa o CEF/LEEF da F4.6.
+- **[ ] F6.5 — GUI/empacotamento OPNsense**: plugin oficial (PHP/XML do
+  OPNsense) embutindo `sentry` como serviço — só depois de F6.1 estável.
+
+Critérios de "pronto" da F5/F6:
+- F5: benchmark de regressão no CI verde por 2 semanas; spike eBPF
+  entregando eventos no fan-in em VM Linux; decisão documentada de
+  AF_XDP vs kernel module.
+- F6: um provider de firewall E2E (block → edge real → expira) com
+  testes de contrato + fixture; doc de deploy por plataforma.

@@ -70,10 +70,13 @@ sentry/
 │   ├── sentry-reputation/     # reputation feeds (Tor/Spamhaus/FireHOL) + SSRF-guarded fetcher
 │   ├── sentry-source-nginx/   # plugin Source: tail de access.log
 │   ├── sentry-source-syslog/  # plugin Source: receptor syslog RFC 5424/3164 (UDP/TCP)
+│   ├── sentry-source-cloudflare/  # plugin Source: polling CF Logs API (NDJSON)
+│   ├── sentry-source-tcp/     # plugin Source: captura TCP (feature pcap) + fingerprint SYN
+│   ├── sentry-edge/           # edge inline: reverse proxy/middleware axum + edge-tcp
 │   ├── sentry-action-cloudflare/  # plugin Action: block/challenge via API CF
-│   ├── sentry-action-webhook/     # plugin Action: alertas Discord/Slack/etc
+│   ├── sentry-action-webhook/     # plugin Action: alertas Discord/Slack/etc (HMAC)
 │   ├── sentry-action-blocklist/   # plugin Action: blocklist local em memória
-│   └── sentry-cli/            # binário: clap + ratatui + daemon entrypoint
+│   └── sentry-cli/            # binário: clap + ratatui + daemon + server + auth + siem
 ├── deploy/
 │   ├── docker/               # Dockerfile + docker-compose
 │   └── k8s/                  # manifests Kubernetes
@@ -239,8 +242,8 @@ não em runtime.
     (`SENTRY_CF_ACCOUNT` override); soft-disable + fallback access rules sem
     permissões (Account Filter Lists / Zone Rulesets) com self-heal no reaper
     — 10 testes; ver `ARCHITECTURE.md` §8.2
-- **F3** (exceto F3.1/F3.2/F3.3/F3.6/F3.9): Multi-source (syslog) + LLM
-  (OpenRouter/Ollama) + detecção comportamental + reputation feeds
+- **F3** (concluída): Multi-source (syslog) + LLM (OpenRouter/Ollama)
+  + detecção comportamental + reputation feeds
   - ✅ F3.4 Syslog source (crate `sentry-source-syslog`: parser RFC 5424 com
     fallback RFC 3164, receptor UDP/TCP com framing RFC 6587,
     `ProtocolData::Syslog(SyslogData)`, `RawEvent.transport` distingue UDP;
@@ -270,22 +273,84 @@ não em runtime.
     refresh em background; métricas `sentry_feed_*`; CLI
     `sentry feeds list|refresh|check <ip>`; `[[rules.feeds]]` com
     `tier`/`enabled`) — 15 testes (10 core + 5 crate)
-  - ⏸️ F3.1 (middleware axum), F3.2 (captura TCP/pnet + fingerprint TCP
-    estilo MuonFP/p0f — ver F3.10 no BACKLOG), F3.3 (pull CF logs),
-    F3.6 (retreinamento), F3.9 (modos de borda)
-- **F4** (F4.2/F4.3 entregues): Operação & Dashboard
+  - ✅ F3.6 Retreinamento (`sentry model export --confirmed` — labels de
+    eventos ligados a incidentes; `sentry model reload` via NOTIFY
+    `sentry_model_changed` troca o ONNX a quente com `AiFork` em
+    `Arc<RwLock<>>`; `sentry model status` mostra describe/version)
+  - ✅ F3.3 CF Logs source (crate `sentry-source-cloudflare`: polling
+    `/zones/{id}/logs/received` NDJSON → `HttpData`, dedupe por RayID,
+    checkpoint de cursor, token via `SENTRY_CF_TOKEN`; Logs API exige plan
+    Enterprise — parser coberto por fixture)
+  - ✅ F3.2 TCP capture + fingerprint (crate `sentry-source-tcp`: capture
+    loop atrás da feature `pcap` (pnet/Npcap); módulos puros testados —
+    `tcpfp.rs` fingerprint SYN estilo MuonFP/p0f
+    (`window:options:MSS:wscale`, assinaturas masscan/zmap/nmap), reassembler
+    por flow com stream_id/máquina de estágios; `SignalKind::TcpScanner`
+    peso 30 no scorer; `[[source]] type = "tcp"`)
+  - ✅ F3.1 + F3.9 Edge inline + modos de deployment (crate `sentry-edge`:
+    middleware axum reutilizável Inline/Shadow, reverse proxy `[edge]` com
+    health-check obrigatório do backend no startup, verdict→HTTP
+    (Block→403/RateLimit→429/Challenge→challenge page), `edge-tcp` listener
+    inline para serviços não-HTTP, TLS opcional (feature `edge-tls`), real-IP
+    precedência §8.1; `[deployment] mode = "passive"|"inline"` com opt-in
+    explícito; fan-in `Incoming::{Raw,Processed}` — edge roda o mesmo
+    `Arc<Pipeline>` (trackers não duplo-contam) e entrega o resultado pronto;
+    `deploy/k8s/edge-sidecar.yaml`; ver `ARCHITECTURE.md` §8.3)
+- **F4** (concluída): Operação & Dashboard
   - ✅ F4.2 Backend HTTP (`server.rs`: `sentry serve` — processo separado,
     axum; `/api/events?limit&level`, `/api/stats` 24h, `/api/incidents` +
     resolve, `/api/ips/blocked` + block/unblock/forgive com NOTIFY, health;
-    `[server] host/port`, default loopback — sem auth até F4.4)
+    `[server] host/port`, default loopback)
   - ✅ F4.3 Dashboard web (SPA sem build-step embutida via `include_str!`
     em `assets/dashboard/`: feed de eventos ao vivo com filtro de level,
     stats 24h, incidents com resolve, IPs bloqueados com unblock/forgive,
     block manual; polling 2s, sem CDN)
-  - ⏸️ F4.1 (service mode), F4.4 (auth+RBAC), F4.5 (alertas bidirecionais
-    completos), F4.6 (SIEM export), F4.7 (HA)
+  - ✅ F4.4 Auth + RBAC (`auth.rs`/`server.rs`: login Argon2id + cookie de
+    sessão HMAC-SHA256 (`[server.auth] session_secret_env`, default
+    `SENTRY_SESSION_SECRET`) e/ou API tokens com hash SHA-256 e role
+    admin/viewer (`[[server.auth.tokens]]`); `mode = "none"|"password"|
+    "token"|"both"`; RBAC admin = mutações, viewer = leitura; login limiter
+    10/min com DUMMY_HASH anti-enumeration; login/logout na SPA)
+  - ✅ F4.5 Alertas bidirecionais (daemon auto-cria incidentes em
+    High/Critical com coalescência 1 aberto por IP (`open_incident_for_ip`,
+    idempotente por `event_id`); webhook com `X-Sentry-Signature`
+    (HMAC do body, `SENTRY_WEBHOOK_SECRET`) + `incident_id`/`ack_url` no
+    payload; `POST /api/incidents/{id}/ack` + resolve; dispatch de actions
+    via `execute_with_context(ActionContext)` — backward-compatible)
+  - ✅ F4.6 Export SIEM (`siem.rs`: serializers puras CEF e LEEF 2.0 +
+    syslog RFC5424; `sentry export siem --from <dur> [--format cef|leef|json]
+    [--out] [--follow --to udp|tcp://host:514]`)
+  - ✅ F4.1 Service mode (`sentry service install|uninstall|status`:
+    systemd unit, launchd plist, Windows Service real via `windows-service`
+    (feature `service`, dispatcher `--service`); wrappers de binário fixo +
+    `validate_service_path`/`sanitize_arg` (sem shell))
+  - ✅ F4.7 HA (`events.payload_hash` + índice parcial; insert condicional
+    pula payload já persistido por nó irmão na janela de dedupe (10s) — o
+    LRU local não enxerga outros nós; `[deployment] instance_id` (default
+    hostname) vira gauge `sentry_instance_info{instance}`; docs §8.4:
+    estado compartilhado, rate-limit Redis, trackers por-node (limitação
+    documentada), background tasks idempotentes)
 
-Backlog detalhado em `ARCHITECTURE.md` §15.
+- **F5** (parte prática entregue; avançada em roadmap): Performance
+  - ✅ F5 prática — benchmarks criterion (`crates/sentry-core/benches/
+    perf.rs`), prefilter Aho-Corasick nas heurísticas (1 passada SIMD,
+    zero regex em tráfego limpo; testes de equivalência gated×ungated +
+    proptest de triggers), caches globais de regex/IP-spec em `rules.rs`
+    (era Regex::new por regra por evento — 3,4 ms/evento), decode-once do
+    path (`EvalCtx`/`DecodedHttp`), trackers com história limitada
+    (repetition 128, auth/wordlist 64 por IP), dedupe LRU por `u64` sem
+    alocação no hit com sweep 1×/TTL, ingest em lote `recv_many(64)`.
+    Pipeline end-to-end: 3,49 ms → 4,36 µs/evento (~800×). Números e
+    metodologia em `ARCHITECTURE.md` §22
+  - ⏸️ F5 avançada (roadmap `ARCHITECTURE.md` §23.1): budgets de
+    regressão no CI, eBPF/aya, io_uring, AF_XDP kernel-bypass, ring
+    buffers NUMA, avaliação de kernel module, SIMD explícito
+- **F6** (roadmap `ARCHITECTURE.md` §23.2): Integrações de
+  firewall/plataforma — providers OPNsense/pfSense (alias tables),
+  nginx (deny-list + reload), HAProxy maps, export Suricata/fast.log;
+  todos via trait `ChallengeProvider` (sem mudar regras/pipeline)
+
+Backlog detalhado em `ARCHITECTURE.md` §23.
 
 ### Status atual (verificação contínua)
 
@@ -294,7 +359,7 @@ Backlog detalhado em `ARCHITECTURE.md` §15.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 217 testes passando sem features; 219 com
+# Resultado esperado: 286 testes passando sem features; 288 com
 # --features sentry-cli/onnx (adiciona os 2 testes de inferência ONNX)
 ```
 
