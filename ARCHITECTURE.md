@@ -487,6 +487,38 @@ inline              client → sentry-edge → nginx → app
   ataque chegar na app (RCE/0-day); passive quando a infra não pode mudar
   de path/SSL ou o objetivo é observabilidade. Default = passive.
 
+### 8.4 Multi-node / HA (F4.7)
+
+N daemons (ou N pods do mesmo Deployment) compartilham o mesmo Postgres e
+operam como um cluster ativo-ativo:
+
+- **Dedupe cross-node**: o LRU de dedupe é por-processo — não enxerga
+  eventos processados por outro nó. Cada insert carrega `payload_hash`
+  (mesma chave do dedupe local: IP+método+path para HTTP, IP+hash do raw
+  para os demais). O `INSERT` é condicional: se um nó irmão persistiu o
+  mesmo hash na janela de 10s (igual ao TTL do LRU), o insert é pulado.
+  `events_payload_hash_ts` (índice parcial) mantém o `NOT EXISTS` barato.
+- **Identidade**: `[deployment] instance_id` (default = hostname) vira
+  label do gauge `sentry_instance_info{instance}` para diferenciação em
+  dashboards/alertas.
+- **Estado compartilhado (Postgres/Redis)**: incidentes, offender strikes,
+  rotas aprendidas e rulesets vivem no banco comum — todos os nós enxergam
+  os mesmos incidentes e hot-reload (LISTEN/NOTIFY) é propagado a todos.
+- **Rate-limit**: `backend = "redis"` compartilha a janela entre nós; o
+  backend in-memory é por-node (limite efetivo ≈ N× o configurado).
+- **Limitação documentada**: trackers de scan (`[scan]`) e behavior
+  (`[behavior]`) são por-node — um scanner distribuído entre os nós pode
+  demorar mais para cruzar o limiar em cada nó individual.
+- **Tasks de background idempotentes**: reaper de regras CF (reconcile por
+  `note` com timestamp), learner de rotas (merge determinístico) e refresh
+  de feeds (replace atômico) podem rodar simultaneamente sem corrupção;
+  duplicação transitória de trabalho é aceitável.
+- **Edge/HA**: múltiplos `sentry-edge` atrás de um LB — o verdict é
+  stateless por request (rate-limit compartilhado via Redis); o
+  `[server]` HTTP deve ficar atrás do LB também (F4.4 auth por token é
+  stateless; sessões HMAC são válidas em qualquer nó que compartilhe
+  `SENTRY_SESSION_SECRET`).
+
 ---
 
 ## 9. Detecção de Rotas Válidas

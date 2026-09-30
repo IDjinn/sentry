@@ -33,6 +33,7 @@ pub struct Metrics {
     pub feed_entries: prometheus::GaugeVec,
     pub feed_up: prometheus::GaugeVec,
     pub feed_refresh_ts: prometheus::GaugeVec,
+    instance_info: prometheus::GaugeVec,
 }
 
 impl Metrics {
@@ -102,6 +103,14 @@ impl Metrics {
             &["feed"],
         )
         .unwrap();
+        let instance_info = prometheus::GaugeVec::new(
+            prometheus::Opts::new(
+                "sentry_instance_info",
+                "Always 1; identifies this daemon instance (F4.7 multi-node).",
+            ),
+            &["instance"],
+        )
+        .unwrap();
 
         for m in [&events_processed, &events_blocked, &dedupe_drops] {
             registry.register(Box::new(m.clone())).ok();
@@ -118,7 +127,7 @@ impl Metrics {
             .register(Box::new(pipeline_duration.clone()))
             .map_err(|e| warn!(error = %e, "register histogram"))
             .ok();
-        for m in [&feed_entries, &feed_up, &feed_refresh_ts] {
+        for m in [&feed_entries, &feed_up, &feed_refresh_ts, &instance_info] {
             registry
                 .register(Box::new(m.clone()))
                 .map_err(|e| warn!(error = %e, "register feed metrics"))
@@ -136,7 +145,13 @@ impl Metrics {
             feed_entries,
             feed_up,
             feed_refresh_ts,
+            instance_info,
         }
+    }
+
+    /// Stamp this daemon's instance identity as a metric label (F4.7).
+    pub fn set_instance(&self, instance: &str) {
+        self.instance_info.with_label_values(&[instance]).set(1.0);
     }
 
     /// Record one processed event.

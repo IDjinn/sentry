@@ -121,6 +121,24 @@ impl EventRepo {
         verdict: Verdict,
         signals: &serde_json::Value,
     ) -> Result<()> {
+        self.insert_with_hash(evt, risk_score, risk_level, verdict, signals, None)
+            .await
+    }
+
+    /// Insert with a payload hash for cross-node dedupe (F4.7).
+    ///
+    /// When `payload_hash` is set and a sibling node persisted the same
+    /// payload within the dedupe window (10s), the insert is skipped — the
+    /// per-process dedupe LRU cannot see other nodes' events.
+    pub async fn insert_with_hash(
+        &self,
+        evt: &Event,
+        risk_score: u8,
+        risk_level: RiskLevel,
+        verdict: Verdict,
+        signals: &serde_json::Value,
+        payload_hash: Option<i64>,
+    ) -> Result<()> {
         let protocol_json = serde_json::to_value(&evt.protocol)
             .map_err(|e| StorageError::Query(format!("protocol serialize: {e}")))?;
         let source = evt.source.as_str();
@@ -130,8 +148,14 @@ impl EventRepo {
         sqlx::query(
             r#"INSERT INTO events
                (id, timestamp, source, client_ip, client_port, server_port,
-                asn, country, protocol, risk_score, risk_level, verdict, signals, raw)
-               VALUES ($1, $2, $3, $4::inet, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                asn, country, protocol, risk_score, risk_level, verdict, signals, raw, payload_hash)
+               SELECT $1, $2, $3, $4::inet, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+               WHERE $15::bigint IS NULL
+                  OR NOT EXISTS (
+                      SELECT 1 FROM events
+                      WHERE payload_hash = $15
+                        AND timestamp > now() - interval '10 seconds'
+                  )
                ON CONFLICT (id) DO NOTHING"#,
         )
         .bind(evt.id)
@@ -148,6 +172,7 @@ impl EventRepo {
         .bind(verdict_str)
         .bind(signals)
         .bind(evt.raw.as_deref())
+        .bind(payload_hash)
         .execute(self.pool.inner())
         .await
         .map_err(|e| StorageError::Query(e.to_string()))?;

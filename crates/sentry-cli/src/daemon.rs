@@ -81,6 +81,30 @@ fn dedup_key(evt: &Event) -> String {
     }
 }
 
+/// Resolve the instance identity for metrics (F4.7): the configured
+/// `[deployment] instance_id` when set, otherwise the machine hostname.
+fn instance_label(configured: &str) -> String {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return configured.to_string();
+    }
+    for var in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(name) = std::env::var(var) {
+            let name = name.trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    if let Ok(name) = std::fs::read_to_string("/etc/hostname") {
+        let name = name.trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+    "sentry-0".to_string()
+}
+
 /// Run the daemon.
 pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     info!(
@@ -542,6 +566,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     let mut dropped_dupes: u64 = 0;
 
     let metrics = crate::metrics::Metrics::new();
+    metrics.set_instance(&instance_label(&cfg.deployment.instance_id));
     if cfg.metrics.enabled {
         let addr: std::net::SocketAddr = format!("{}:{}", cfg.metrics.host, cfg.metrics.port)
             .parse()
@@ -634,14 +659,18 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             let repo = Arc::clone(repo);
             let result_clone = result.clone();
             tokio::spawn(async move {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                dedup_key(&result_clone.event).hash(&mut hasher);
                 let events = repo.events();
                 if let Err(e) = events
-                    .insert(
+                    .insert_with_hash(
                         &result_clone.event,
                         result_clone.analysis.risk_score,
                         result_clone.analysis.risk_level,
                         result_clone.decision.action,
                         &signals_json,
+                        Some(hasher.finish() as i64),
                     )
                     .await
                 {
@@ -1921,4 +1950,22 @@ impl sentry_core::Action for LogAction {
 #[allow(dead_code)]
 fn _ensure_ruleset_import() -> RuleSet {
     RuleSet::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::instance_label;
+
+    #[test]
+    fn configured_instance_id_wins() {
+        assert_eq!(instance_label("node-b"), "node-b");
+        assert_eq!(instance_label("  node-c  "), "node-c");
+    }
+
+    #[test]
+    fn falls_back_when_unconfigured() {
+        let label = instance_label("");
+        assert!(!label.is_empty());
+        assert!(!label.contains(char::is_whitespace));
+    }
 }
