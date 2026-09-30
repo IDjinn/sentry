@@ -165,9 +165,12 @@ min_ips = 2               # minimum distinct IPs that hit the shape
 # OpenRouter routes to any model (Claude, GPT, Gemini, Qwen, Llama, …).
 # Set SENTRY_LLM_KEY env var for the API key; never put it here.
 [llm]
-provider = "none"            # none | openrouter | ollama | mock
+provider = "none"            # none | openrouter | openai | ollama | mock
 model = ""                   # default: openai/gpt-4o-mini (openrouter) | llama3.1 (ollama)
 base_url = ""                # override for self-hosted (e.g. http://localhost:11434 for ollama)
+                             # openai = any OpenAI-compatible server: LM Studio (default
+                             # base_url http://localhost:1234/v1), vLLM, llama.cpp; keyless,
+                             # SENTRY_LLM_KEY sent as bearer when set
 mode = "fork"                # fork (async re-score + action re-dispatch) | shadow (log only)
 only_above = 30              # escalate to the LLM above this score (or on quarantine)
 concurrency = 4
@@ -406,6 +409,10 @@ max_failures = 3               # circuit breaker: disable the provider after N c
 [[action]]
 type = "webhook"
 [action.options]
+# Discord/Slack-style URLs are credentials: prefer url_env over a literal.
+# Discord targets get a rich embed payload automatically; others receive the
+# raw JSON payload.
+# url_env = "SENTRY_DISCORD_WEBHOOK_URL"
 url = "https://discord.com/api/webhooks/000000/xxxxx"
 on_levels = ["high", "critical"]
 timeout_secs = 10

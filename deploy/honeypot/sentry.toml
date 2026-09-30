@@ -183,5 +183,30 @@ type = "blocklist"
 [action.options]
 ttl_secs = 86400
 
+# Discord alert on High/Critical incidents. The URL lives in the VPS .env
+# (SENTRY_DISCORD_WEBHOOK_URL) — discord.com targets automatically get a
+# rich embed payload.
+[[action]]
+type = "webhook"
+[action.options]
+url_env = "SENTRY_DISCORD_WEBHOOK_URL"
+on_levels = ["high", "critical"]
+timeout_secs = 10
+
 [[action]]
 type = "log"
+
+# ── LLM (LM Studio on the operator's PC, reached over WireGuard) ───────────
+# provider "openai" = OpenAI-compatible server, keyless. Set base_url to the
+# PC's WireGuard address; model must match a model loaded in LM Studio
+# (`GET /v1/models` lists them). fork = async re-score that can escalate
+# verdicts; events above `only_above` are sent. When the PC/tunnel is down
+# the fork logs warnings and the pipeline proceeds unaffected.
+[llm]
+provider = "openai"
+base_url = "http://10.66.66.2:1234/v1"
+model = "local-model"
+mode = "fork"
+only_above = 30
+concurrency = 2
+cache_ttl_secs = 600
