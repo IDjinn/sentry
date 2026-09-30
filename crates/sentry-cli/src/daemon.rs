@@ -616,7 +616,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                         .set(st.entries as f64);
                     m.feed_up
                         .with_label_values(&[&name])
-                        .set(u8::from(st.last_error.is_some()) as f64);
+                        .set(u8::from(st.last_error.is_none()) as f64);
                     if let Some(ts) = st.last_refresh {
                         m.feed_refresh_ts
                             .with_label_values(&[&name])
