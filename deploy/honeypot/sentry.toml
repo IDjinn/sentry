@@ -51,12 +51,13 @@ backend = "memory"
 # ── Rules engine ───────────────────────────────────────────────────────────
 [rules]
 
-# Loopback hosts the rsyslog forwarder; firehol_level1 treats 127.0.0.0/8 as
-# a bogon, which would block every forwarded auth event. Allow it explicitly.
+# Loopback hosts the rsyslog forwarder and AWS VPC infra (health checks,
+# resolver) shows up on ens5 with private source IPs; firehol_level1 treats
+# all private ranges as bogons, which would block them. Allow explicitly.
 [[rules.custom]]
-name = "allow loopback (syslog forwarder)"
+name = "allow private ranges (rsyslog + VPC infra)"
 priority = 1
-match = 'ip=127.0.0.0/8'
+match = 'ip=127.0.0.0/8 OR ip=10.0.0.0/8 OR ip=172.16.0.0/12 OR ip=192.168.0.0/16 OR ip=169.254.0.0/16'
 action = "allow"
 
 # Enforce packs that map to real actions on this box (blocklist + log).

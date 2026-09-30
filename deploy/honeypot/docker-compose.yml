@@ -80,6 +80,8 @@ services:
       SENTRY_SERVER__HOST: 0.0.0.0
       SENTRY_SESSION_SECRET: ${SENTRY_SESSION_SECRET:?set in .env}
       RUST_LOG: info,sentry=info
+    volumes:
+      - ./sentry.toml:/etc/sentry/sentry.toml:ro
     ports:
       # Loopback for SSH tunneling + the WireGuard host address.
       - "127.0.0.1:8080:8080"
