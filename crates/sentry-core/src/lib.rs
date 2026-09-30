@@ -30,7 +30,7 @@ pub mod rules;
 pub mod scan;
 pub mod source;
 
-pub use action::Action;
+pub use action::{Action, ActionContext};
 pub use analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};
 pub use behavior::BehaviorTracker;
 pub use challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};

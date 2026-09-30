@@ -362,6 +362,10 @@ type = "webhook"
 url = "https://discord.com/api/webhooks/000000/xxxxx"
 on_levels = ["high", "critical"]
 timeout_secs = 10
+# secret_env = "SENTRY_WEBHOOK_SECRET"  # when set, requests are signed with
+# X-Sentry-Signature: sha256=<hmac>; payload carries incident_id so the
+# receiver can call back POST /api/incidents/{id}/ack|resolve — the same
+# secret authenticates those callbacks ([server] webhook_secret_env).
 
 [[action]]
 type = "log"

@@ -564,7 +564,11 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                     .actions
                     .with_label_values(&[action.name(), verdict_str(result.decision.action)])
                     .inc();
-                if let Err(e) = action.execute(&result.event, &result.decision).await {
+                let ctx = incident_context(&repo, &result).await;
+                if let Err(e) = action
+                    .execute_with_context(&result.event, &result.decision, &ctx)
+                    .await
+                {
                     warn!(action = action.name(), error = %e, "action failed");
                 }
             }
@@ -659,6 +663,52 @@ fn verdict_str(v: sentry_core::Verdict) -> &'static str {
         sentry_core::Verdict::Block => "block",
         sentry_core::Verdict::Quarantine => "quarantine",
     }
+}
+
+/// Resolve the incident for a High/Critical event (F4.5).
+///
+/// Reuses an incident already open for the IP so bursts coalesce into one
+/// ticket; otherwise creates one keyed by event id (idempotent on replay).
+/// Returns an empty context for lower levels or without storage.
+async fn incident_context(
+    repo: &Option<Arc<sentry_storage::Repo>>,
+    result: &sentry_core::ProcessedEvent,
+) -> sentry_core::ActionContext {
+    let mut ctx = sentry_core::ActionContext::default();
+    let Some(repo) = repo else {
+        return ctx;
+    };
+    if !matches!(
+        result.analysis.risk_level,
+        sentry_core::RiskLevel::High | sentry_core::RiskLevel::Critical
+    ) {
+        return ctx;
+    }
+    match repo
+        .incidents()
+        .open_incident_for_ip(result.event.client_ip)
+        .await
+    {
+        Ok(Some(id)) => ctx.incident_id = Some(id),
+        Ok(None) => {
+            match repo
+                .incidents()
+                .get_or_create_for_event(
+                    result.event.id,
+                    result.event.client_ip,
+                    result.analysis.risk_level,
+                    result.decision.action,
+                    None,
+                )
+                .await
+            {
+                Ok(id) => ctx.incident_id = Some(id),
+                Err(e) => warn!(error = %e, "failed to create incident"),
+            }
+        }
+        Err(e) => warn!(error = %e, "failed to look up open incident"),
+    }
+    ctx
 }
 
 /// Cached model verdict keyed by payload hash: (inserted_at, signals).
@@ -791,7 +841,11 @@ impl AiFork {
             }
             for action in registry.actions() {
                 if action.applies_to(&updated.decision) {
-                    if let Err(e) = action.execute(&updated.event, &updated.decision).await {
+                    let ctx = incident_context(&repo, &updated).await;
+                    if let Err(e) = action
+                        .execute_with_context(&updated.event, &updated.decision, &ctx)
+                        .await
+                    {
                         warn!(action = action.name(), error = %e, "ai fork action failed");
                     }
                 }
@@ -951,7 +1005,11 @@ impl LlmFork {
             }
             for action in registry.actions() {
                 if action.applies_to(&updated.decision) {
-                    if let Err(e) = action.execute(&updated.event, &updated.decision).await {
+                    let ctx = incident_context(&repo, &updated).await;
+                    if let Err(e) = action
+                        .execute_with_context(&updated.event, &updated.decision, &ctx)
+                        .await
+                    {
                         warn!(action = action.name(), error = %e, "llm fork action failed");
                     }
                 }
@@ -1228,11 +1286,22 @@ fn build_registry(
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_else(|| vec![RiskLevel::High, RiskLevel::Critical]);
+                let secret_env = act
+                    .options
+                    .get("secret_env")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("SENTRY_WEBHOOK_SECRET")
+                    .to_string();
+                let secret = std::env::var(&secret_env)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
                 builder.register_action(sentry_action_webhook::WebhookAction::new(
                     sentry_action_webhook::WebhookActionConfig {
                         url,
                         on_levels,
                         timeout: Duration::from_secs(timeout),
+                        secret,
                     },
                 ));
             }

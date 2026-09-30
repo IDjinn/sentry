@@ -344,12 +344,18 @@ pub struct IncidentRow {
     pub event_id: Option<Uuid>,
     /// Created at.
     pub created_at: DateTime<Utc>,
+    /// Client IP (text form) the incident was raised for.
+    #[serde(default)]
+    pub client_ip: Option<String>,
     /// Risk level.
     pub risk_level: String,
     /// Action taken.
     pub action: String,
     /// Resolved flag.
     pub resolved: bool,
+    /// When the incident was acknowledged (F4.5), if it was.
+    #[serde(default)]
+    pub acknowledged_at: Option<DateTime<Utc>>,
     /// Notes.
     pub notes: Option<String>,
 }
@@ -379,10 +385,66 @@ impl IncidentRepo {
         Ok(id)
     }
 
+    /// Get (or create) the incident tied to an event.
+    ///
+    /// Idempotent per event: the unique index on `event_id` makes a replay a
+    /// no-op that returns the existing incident instead of a duplicate.
+    pub async fn get_or_create_for_event(
+        &self,
+        event_id: Uuid,
+        client_ip: IpAddr,
+        risk_level: RiskLevel,
+        action: Verdict,
+        notes: Option<&str>,
+    ) -> Result<Uuid> {
+        let id = Uuid::new_v4();
+        let inserted = sqlx::query_scalar::<_, Uuid>(
+            r#"INSERT INTO incidents (id, event_id, client_ip, risk_level, action, notes)
+               VALUES ($1, $2, $3::inet, $4, $5, $6)
+               ON CONFLICT (event_id) DO NOTHING
+               RETURNING id"#,
+        )
+        .bind(id)
+        .bind(event_id)
+        .bind(client_ip.to_string())
+        .bind(risk_level_label(risk_level))
+        .bind(verdict_label(action))
+        .bind(notes)
+        .fetch_optional(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        if let Some(existing) = inserted {
+            return Ok(existing);
+        }
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM incidents WHERE event_id = $1")
+            .bind(event_id)
+            .fetch_one(self.pool.inner())
+            .await
+            .map_err(|e| StorageError::Query(e.to_string()))
+    }
+
+    /// Id of an unresolved incident already open for this IP, if any.
+    ///
+    /// Used to coalesce bursts of High/Critical events into a single open
+    /// incident per attacker instead of one row per event.
+    pub async fn open_incident_for_ip(&self, ip: IpAddr) -> Result<Option<Uuid>> {
+        sqlx::query_scalar::<_, Uuid>(
+            r#"SELECT id FROM incidents
+               WHERE client_ip = $1::inet AND resolved = false
+               ORDER BY created_at DESC
+               LIMIT 1"#,
+        )
+        .bind(ip.to_string())
+        .fetch_optional(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))
+    }
+
     /// Fetch unresolved incidents.
     pub async fn unresolved(&self, limit: i64) -> Result<Vec<IncidentRow>> {
         let rows = sqlx::query_as::<_, IncidentRow>(
-            r#"SELECT id, event_id, created_at, risk_level, action, resolved, notes
+            r#"SELECT id, event_id, created_at, client_ip::text AS client_ip,
+                      risk_level, action, resolved, acknowledged_at, notes
                FROM incidents
                WHERE resolved = false
                ORDER BY created_at DESC
@@ -402,6 +464,18 @@ impl IncidentRepo {
             .execute(self.pool.inner())
             .await
             .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Acknowledge an incident (first ack wins; F4.5).
+    pub async fn ack(&self, id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE incidents SET acknowledged_at = now() WHERE id = $1 AND acknowledged_at IS NULL",
+        )
+        .bind(id)
+        .execute(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
         Ok(())
     }
 }

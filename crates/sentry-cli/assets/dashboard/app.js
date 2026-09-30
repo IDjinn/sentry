@@ -205,10 +205,21 @@ async function refreshIncidents() {
       const li = document.createElement("li");
       const meta = document.createElement("div");
       meta.className = "meta";
-      text(meta, "div", (inc.risk_level || "?") + " · " + (inc.action || "?"), "level-" + (inc.risk_level || "info"));
-      text(meta, "small", (inc.created_at || "").replace("T", " ").slice(0, 16) + (inc.notes ? " · " + inc.notes : ""));
+      const acked = inc.acknowledged_at ? " · acked" : "";
+      text(meta, "div", (inc.risk_level || "?") + " · " + (inc.action || "?") + acked,
+        "level-" + (inc.risk_level || "info"));
+      text(meta, "small",
+        (inc.client_ip ? inc.client_ip + " · " : "") +
+        (inc.created_at || "").replace("T", " ").slice(0, 16) +
+        (inc.notes ? " · " + inc.notes : ""));
       li.appendChild(meta);
-      li.appendChild(actionButton("resolve", "/api/incidents/" + inc.id + "/resolve", refreshIncidents));
+      const btns = document.createElement("div");
+      if (!inc.acknowledged_at) {
+        btns.appendChild(actionButton("ack", "/api/incidents/" + inc.id + "/ack", refreshIncidents));
+        btns.appendChild(document.createTextNode(" "));
+      }
+      btns.appendChild(actionButton("resolve", "/api/incidents/" + inc.id + "/resolve", refreshIncidents));
+      li.appendChild(btns);
       ul.appendChild(li);
     }
   } catch (e) {

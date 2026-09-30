@@ -29,7 +29,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::auth::{AuthLayer, Identity};
+use crate::auth::{AuthLayer, Identity, Role};
 
 const INDEX_HTML: &str = include_str!("../assets/dashboard/index.html");
 const APP_JS: &str = include_str!("../assets/dashboard/app.js");
@@ -45,6 +45,9 @@ struct AppState {
     repo: Arc<Repo>,
     auth: Arc<AuthLayer>,
     login_limiter: Arc<LoginLimiter>,
+    /// Shared webhook secret (F4.5): external alert systems presenting
+    /// `X-Sentry-Webhook-Secret` may ack/resolve incidents.
+    webhook_secret: Option<String>,
 }
 
 /// Run the dashboard server until the process is stopped.
@@ -69,6 +72,10 @@ pub async fn run(cfg: &SentryConfig) -> color_eyre::Result<()> {
         repo: Arc::new(Repo::new(pool)),
         auth: Arc::new(auth),
         login_limiter: Arc::new(LoginLimiter::new(LOGIN_MAX_FAILURES, LOGIN_WINDOW)),
+        webhook_secret: std::env::var(&cfg.server.webhook_secret_env)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
     };
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)
         .parse()
@@ -106,6 +113,7 @@ fn router(state: AppState) -> Router {
         .route("/api/stats", get(stats))
         .route("/api/incidents", get(list_incidents))
         .route("/api/incidents/{id}/resolve", post(resolve_incident))
+        .route("/api/incidents/{id}/ack", post(ack_incident))
         .route("/api/ips/blocked", get(list_blocked))
         .route("/api/ips/{ip}/block", post(block_ip))
         .route("/api/ips/{ip}/unblock", post(unblock_ip))
@@ -133,7 +141,11 @@ async fn auth_middleware(
 
     let bearer = bearer_token(req.headers());
     let cookie = cookie_value(req.headers(), state.auth.cookie_name());
-    let identity = state.auth.identify(bearer, cookie);
+    let identity = state.auth.identify(bearer, cookie).or_else(|| {
+        // External alert systems (F4.5 round-trip): a matching webhook
+        // secret grants incident write access only.
+        webhook_secret_identity(&state, req.headers(), path)
+    });
     let is_mutation = !matches!(
         req.method(),
         &Method::GET | &Method::HEAD | &Method::OPTIONS
@@ -162,6 +174,32 @@ fn unauthorized() -> Response {
         Json(json!({"error": "authentication required"})),
     )
         .into_response()
+}
+
+/// Identity granted to callers presenting the shared webhook secret, scoped
+/// to incident ack/resolve (the alert round-trip path). `None` elsewhere.
+fn webhook_secret_identity(state: &AppState, headers: &HeaderMap, path: &str) -> Option<Identity> {
+    let secret = state.webhook_secret.as_deref()?;
+    let presented = headers.get("x-sentry-webhook-secret")?.to_str().ok()?;
+    if !constant_time_eq(secret.as_bytes(), presented.trim().as_bytes()) {
+        return None;
+    }
+    let is_incident_write = (path.ends_with("/ack") || path.ends_with("/resolve"))
+        && path.starts_with("/api/incidents/");
+    is_incident_write.then(|| Identity {
+        username: "webhook".to_string(),
+        role: Role::Admin,
+    })
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -464,6 +502,19 @@ async fn resolve_incident(
     Ok(Json(json!({"resolved": id})))
 }
 
+async fn ack_incident(
+    State(state): State<AppState>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .repo
+        .incidents()
+        .ack(id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(json!({"acked": id})))
+}
+
 async fn list_blocked(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let rows = state
         .repo
@@ -594,6 +645,7 @@ mod tests {
             repo: test_repo(),
             auth: Arc::new(layer),
             login_limiter: Arc::new(LoginLimiter::new(LOGIN_MAX_FAILURES, LOGIN_WINDOW)),
+            webhook_secret: None,
         }
     }
 
@@ -602,7 +654,14 @@ mod tests {
             repo: test_repo(),
             auth: Arc::new(AuthLayer::from_config(&SentryConfig::default()).unwrap()),
             login_limiter: Arc::new(LoginLimiter::new(LOGIN_MAX_FAILURES, LOGIN_WINDOW)),
+            webhook_secret: None,
         }
+    }
+
+    fn webhook_state() -> AppState {
+        let mut st = auth_state("token");
+        st.webhook_secret = Some("wsecret".to_string());
+        st
     }
 
     async fn serve(app: Router, req: Request<Body>) -> Response {
@@ -655,17 +714,17 @@ mod tests {
     #[tokio::test]
     async fn valid_bearer_token_passes_and_viewer_is_read_only() {
         let app = router(auth_state("both"));
-        // Viewer GET passes auth and fails later at the (unreachable) DB.
+        // Viewer GET passes auth; the method router answers 405 (no DB hit).
         let resp = serve(
             app.clone(),
             Request::builder()
-                .uri("/api/events")
+                .uri("/api/incidents/00000000-0000-0000-0000-000000000000/resolve")
                 .header(AUTHORIZATION, "Bearer viewtok")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 
         // Viewer mutation is rejected with 403 before touching the DB.
         let resp = serve(
@@ -729,14 +788,14 @@ mod tests {
         let resp = serve(
             app,
             Request::builder()
-                .uri("/api/events")
+                .uri("/api/incidents/00000000-0000-0000-0000-000000000000/resolve")
                 .header(header::COOKIE, format!("sentry_session={value}"))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await;
-        // Session accepted; request then fails at the unreachable DB.
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Session accepted (middleware passed; method router answers 405).
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]
@@ -817,6 +876,49 @@ mod tests {
         assert!(!limiter.allowed(ip));
         // Different IP is unaffected.
         assert!(limiter.allowed("198.51.100.8".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn webhook_secret_grants_incident_write_only() {
+        let app = router(webhook_state());
+        // Correct secret on the incident path: middleware passes (the route
+        // is POST-only, so a GET answers 405 — no DB involved).
+        let resp = serve(
+            app.clone(),
+            Request::builder()
+                .uri("/api/incidents/00000000-0000-0000-0000-000000000000/ack")
+                .header("x-sentry-webhook-secret", "wsecret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        // Same secret outside the incident scope: rejected.
+        let resp = serve(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/api/ips/203.0.113.9/block")
+                .header("x-sentry-webhook-secret", "wsecret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong secret: rejected.
+        let resp = serve(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/incidents/00000000-0000-0000-0000-000000000000/ack")
+                .header("x-sentry-webhook-secret", "wrong")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

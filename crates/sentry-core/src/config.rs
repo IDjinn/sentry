@@ -583,6 +583,11 @@ pub struct ServerConfig {
     /// Authentication + RBAC for the dashboard and API.
     #[serde(default)]
     pub auth: ServerAuthConfig,
+    /// Env var holding the shared webhook secret (F4.5). When set, requests
+    /// carrying a matching `X-Sentry-Webhook-Secret` header may ack/resolve
+    /// incidents — the callback path for external alert systems.
+    #[serde(default = "default_webhook_secret_env")]
+    pub webhook_secret_env: String,
 }
 
 impl Default for ServerConfig {
@@ -591,6 +596,7 @@ impl Default for ServerConfig {
             host: default_server_host(),
             port: default_server_port(),
             auth: ServerAuthConfig::default(),
+            webhook_secret_env: default_webhook_secret_env(),
         }
     }
 }
@@ -677,6 +683,9 @@ fn default_session_secret_env() -> String {
 }
 fn default_session_ttl() -> u64 {
     43_200
+}
+fn default_webhook_secret_env() -> String {
+    "SENTRY_WEBHOOK_SECRET".to_string()
 }
 
 /// Background route learner config.

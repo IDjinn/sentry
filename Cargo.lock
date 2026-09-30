@@ -2462,12 +2462,15 @@ name = "sentry-action-webhook"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hmac",
  "reqwest",
  "sentry-core",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
