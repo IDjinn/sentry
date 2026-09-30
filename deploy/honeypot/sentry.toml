@@ -16,11 +16,12 @@ max_connections = 5
 # Geo is absent on this box: enrichment is a graceful no-op.
 
 # ── Metrics (Prometheus) — daemon process, host network ────────────────────
-# Reachable from the prometheus container via host-gateway. The Lightsail
-# firewall does NOT open 9100 to the internet.
+# Bound to the docker bridge gateway only: scrapeable by the prometheus
+# container (host-gateway) but not on the WAN interface — defense in depth
+# on top of the Lightsail firewall (9100 is not opened to the internet).
 [metrics]
 enabled = true
-host = "0.0.0.0"
+host = "172.17.0.1"
 port = 9100
 
 [deployment]
