@@ -125,7 +125,10 @@ action = "block"
 type = "nginx"
 [source.options]
 path = "/var/log/nginx/access.log"
-format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"'
+# Trailing x_forwarded_for must match the nginx log_format exactly — the
+# parser validates the whole line and resolves the real client IP from the
+# token (precedence in ARCHITECTURE.md §8.1).
+format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" "$http_x_forwarded_for"'
 
 # 2) Syslog receiver on host loopback: host rsyslog forwards auth failures.
 #    NOTE: syslog events carry no HTTP payload, so only IP reputation applies
@@ -209,7 +212,7 @@ type = "log"
 [llm]
 provider = "openai"
 base_url = "http://10.66.66.2:1234/v1"
-model = "local-model"
+model = "google/gemma-4-e4b"
 mode = "fork"
 only_above = 30
 concurrency = 2
