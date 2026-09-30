@@ -1,0 +1,177 @@
+# sentry.toml — honeypot configuration for the public test VPS.
+#
+# Deployed at /opt/sentry/sentry.toml. The storage URL and session secret are
+# injected via env (SENTRY_STORAGE__POSTGRES__URL / SENTRY_SESSION_SECRET).
+# __ADMIN_PASSWORD_HASH__ is replaced at deploy time with the Argon2id hash of
+# the generated dashboard password (`sentry auth hash-password`).
+
+[core]
+data_dir = "/var/lib/sentry"
+channel_buffer = 4096
+
+[storage.postgres]
+url = ""                # overridden by SENTRY_STORAGE__POSTGRES__URL
+max_connections = 5
+
+# Geo is absent on this box: enrichment is a graceful no-op.
+
+# ── Metrics (Prometheus) — daemon process, host network ────────────────────
+# Reachable from the prometheus container via host-gateway. The Lightsail
+# firewall does NOT open 9100 to the internet.
+[metrics]
+enabled = true
+host = "0.0.0.0"
+port = 9100
+
+[deployment]
+mode = "passive"
+instance_id = "honeypot-lightsail"
+
+# ── Behavioral detectors — all enabled (honeypot: everything is hostile) ───
+[scan]
+enabled = true
+window_secs = 60
+distinct_paths = 8
+not_found = 10
+
+[behavior]
+enabled = true
+window_secs = 300
+
+[escalation]
+enabled = true
+window_secs = 604800
+challenge_at = 3
+block_at = 5
+persist = true
+
+[rate_limit]
+backend = "memory"
+
+# ── Rules engine ───────────────────────────────────────────────────────────
+[rules]
+
+# Enforce packs that map to real actions on this box (blocklist + log).
+[[rules.pack]]
+name = "sensitive_paths"
+mode = "enforce"
+
+[[rules.pack]]
+name = "crawlers_bad"
+mode = "enforce"
+
+[[rules.pack]]
+name = "crawlers_good"
+mode = "enforce"
+
+[[rules.pack]]
+name = "rate_scan"
+mode = "enforce"
+
+[[rules.pack]]
+name = "http_anomaly"
+mode = "enforce"
+
+# Observation-only packs.
+[[rules.pack]]
+name = "empty_ua"
+mode = "shadow"
+
+[[rules.pack]]
+name = "vpn_proxy"
+mode = "shadow"
+
+[[rules.pack]]
+name = "tor"
+mode = "shadow"
+
+[[rules.pack]]
+name = "country_blocklist"
+mode = "off"
+
+# Reputation feeds: exercise sentry-reputation + sentry_feed_* metrics.
+# firehol_level1 gets an enforcement rule (block verdict → blocklist action).
+[[rules.feeds]]
+name = "tor_exit"
+url = "https://check.torproject.org/exit-addresses"
+tier = "tor"
+refresh_hours = 24
+
+[[rules.feeds]]
+name = "firehol_level1"
+url = "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset"
+tier = "malicious"
+refresh_hours = 24
+action = "block"
+
+# ── Sources ────────────────────────────────────────────────────────────────
+# 1) nginx decoy access log (the main detection surface: heuristics, scan and
+#    behavior trackers all run on HTTP events).
+[[source]]
+type = "nginx"
+[source.options]
+path = "/var/log/nginx/access.log"
+format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"'
+
+# 2) Syslog receiver on host loopback: host rsyslog forwards auth failures.
+#    NOTE: syslog events carry no HTTP payload, so only IP reputation applies
+#    (and the peer IP is 127.0.0.1 — documented limitation).
+[[source]]
+type = "syslog"
+[source.options]
+bind = "127.0.0.1:5140"
+transport = "udp"
+
+# 3) Passive TCP capture with SYN fingerprinting (masscan/zmap/nmap).
+#    Requires the `pcap` build feature + NET_RAW (granted in compose) and
+#    host networking to see scans across all ports.
+[[source]]
+type = "tcp"
+[source.options]
+interface = "eth0"
+ports = "21,22,23,25,80,110,135,139,443,445,1433,3306,3389,5432,5900,6379,8080,8443,27017"
+
+# ── Known routes (the decoy site) — everything else is UnknownRoute ────────
+[[routes.known]]
+path = "/"
+methods = ["GET"]
+
+[[routes.known]]
+path = "/robots.txt"
+methods = ["GET"]
+
+[[routes.known]]
+path = "/admin*"
+methods = ["GET", "POST"]
+
+[[routes.known]]
+path = "/login"
+methods = ["GET", "POST"]
+
+[[routes.known]]
+path = "/static/*"
+methods = ["GET"]
+
+# ── Web dashboard (`sentry serve`, separate container) ─────────────────────
+[server]
+host = "127.0.0.1"      # overridden by SENTRY_SERVER__HOST in the container
+port = 8080
+
+[server.auth]
+mode = "password"
+session_secret_env = "SENTRY_SESSION_SECRET"
+session_ttl_secs = 43200
+
+[[server.auth.users]]
+username = "admin"
+password_hash = "__ADMIN_PASSWORD_HASH__"
+role = "admin"
+
+# ── Actions: local only (no Cloudflare on a raw honeypot) ──────────────────
+[[action]]
+type = "blocklist"
+[action.options]
+ttl_secs = 86400
+
+[[action]]
+type = "log"

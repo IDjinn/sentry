@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NimbusCloud — Control Panel</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #f2f5f9; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .card { background: #fff; border-radius: 12px; box-shadow: 0 8px 30px rgba(20, 40, 80, .12); padding: 40px; width: 360px; }
+  .logo { font-size: 20px; font-weight: 700; color: #17325c; margin-bottom: 4px; }
+  .logo span { color: #2f7cf6; }
+  .sub { color: #6b7a90; font-size: 13px; margin-bottom: 24px; }
+  label { display: block; font-size: 12px; font-weight: 600; color: #3c4a5e; margin: 14px 0 6px; }
+  input { width: 100%; padding: 10px 12px; border: 1px solid #cdd7e4; border-radius: 8px; font-size: 14px; }
+  button { width: 100%; margin-top: 22px; padding: 11px; background: #2f7cf6; color: #fff; border: 0; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; }
+  .foot { margin-top: 18px; font-size: 11px; color: #93a3b8; text-align: center; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">Nimbus<span>Cloud</span></div>
+    <div class="sub">Infrastructure control panel — sign in</div>
+    <form action="/login" method="post">
+      <label for="u">Username</label>
+      <input id="u" name="username" autocomplete="username" placeholder="admin">
+      <label for="p">Password</label>
+      <input id="p" name="password" type="password" autocomplete="current-password">
+      <button type="submit">Sign in</button>
+    </form>
+    <div class="foot">© 2026 NimbusCloud Ltd. All rights reserved.</div>
+  </div>
+</body>
+</html>

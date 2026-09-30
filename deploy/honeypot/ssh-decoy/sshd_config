@@ -1,0 +1,27 @@
+# sshd_config — decoy SSH on port 22.
+# The `decoy` user has a LOCKED password ("!"): every password attempt fails,
+# and no valid password exists at all. Host keys are generated on first boot.
+
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+
+PermitRootLogin no
+PasswordAuthentication yes
+PermitEmptyPasswords no
+PubkeyAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+UseDNS no
+
+AllowUsers decoy
+MaxAuthTries 6
+MaxSessions 2
+LoginGraceTime 60
+
+PrintMotd no
+PrintLastLog no
+LogLevel VERBOSE
+StrictModes yes
+
+Subsystem sftp internal-sftp

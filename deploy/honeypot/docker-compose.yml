@@ -1,0 +1,160 @@
+# docker-compose.yml — Sentry honeypot stack for a small public VPS.
+#
+# Target: 1 GB RAM Lightsail/EC2 box with nothing of value on it.
+# Ports published on the HOST loopback / WireGuard IP only — Grafana and the
+# Sentry dashboard are reached via `ssh -L` or the WireGuard interface.
+# See README.md in this directory for the full runbook.
+#
+# The `ssh-decoy` service lives behind the `decoy-ssh` profile: start it only
+# after the real sshd moved to another port (host/sentry-move-ssh.sh), since
+# it binds host port 22.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    # Published on host loopback only: the sentry daemon runs with host
+    # networking and reaches it at 127.0.0.1:5432.
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: sentry
+      POSTGRES_PASSWORD: ${SENTRY_PG_PASSWORD:?set in .env}
+      POSTGRES_DB: sentry
+    command:
+      - postgres
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - max_connections=20
+      - -c
+      - effective_cache_size=128MB
+      - -c
+      - work_mem=2MB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentry"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    mem_limit: 256m
+    restart: unless-stopped
+
+  sentry:
+    image: ghcr.io/idjinn/sentry:latest
+    command: ["run"]
+    # Host networking + NET_RAW: the pcap/tcp source must see host-wide
+    # traffic (SYN scans to any port, including the decoy SSH on 22).
+    network_mode: host
+    cap_add:
+      - NET_RAW
+    user: "0:0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SENTRY_CONFIG: /etc/sentry/sentry.toml
+      SENTRY_STORAGE__POSTGRES__URL: postgres://sentry:${SENTRY_PG_PASSWORD:?set in .env}@127.0.0.1:5432/sentry
+      RUST_LOG: info,sentry=info
+    volumes:
+      - ./sentry.toml:/etc/sentry/sentry.toml:ro
+      - nginxlogs:/var/log/nginx:ro
+      - sentrydata:/var/lib/sentry
+    healthcheck:
+      test: ["CMD", "sentry", "config", "validate"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    mem_limit: 192m
+    restart: unless-stopped
+
+  sentry-dashboard:
+    image: ghcr.io/idjinn/sentry:latest
+    command: ["serve"]
+    depends_on:
+      sentry:
+        condition: service_started
+    environment:
+      SENTRY_CONFIG: /etc/sentry/sentry.toml
+      SENTRY_STORAGE__POSTGRES__URL: postgres://sentry:${SENTRY_PG_PASSWORD:?set in .env}@postgres:5432/sentry
+      SENTRY_SERVER__HOST: 0.0.0.0
+      SENTRY_SESSION_SECRET: ${SENTRY_SESSION_SECRET:?set in .env}
+      RUST_LOG: info,sentry=info
+    ports:
+      # Loopback for SSH tunneling + the WireGuard host address.
+      - "127.0.0.1:8080:8080"
+      - "10.66.66.1:8080:8080"
+    mem_limit: 96m
+    restart: unless-stopped
+
+  nginx-decoy:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx-decoy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx-decoy/html:/usr/share/nginx/html:ro
+      - ./certs:/etc/nginx/certs:ro
+      - nginxlogs:/var/log/nginx
+    mem_limit: 32m
+    restart: unless-stopped
+
+  ssh-decoy:
+    build: ./ssh-decoy
+    profiles: ["decoy-ssh"]
+    ports:
+      - "22:22"
+    mem_limit: 48m
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    command:
+      - --path.rootfs=/host
+      - --web.listen-address=0.0.0.0:9101
+    volumes:
+      - /:/host:ro,rslave
+    mem_limit: 48m
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=3d
+      - --storage.tsdb.retention.size=512MB
+    extra_hosts:
+      # The sentry daemon listens on the host network namespace.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    mem_limit: 256m
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:?set in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "10.66.66.1:3000:3000"
+    mem_limit: 192m
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  sentrydata:
+  nginxlogs:
+  promdata:
+  grafanadata:

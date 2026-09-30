@@ -1,0 +1,76 @@
+# docker-publish.yml — build the Sentry container image for the honeypot VPS
+# and push it to ghcr.io. The 1 GB honeypot box cannot compile Rust itself,
+# so it only ever pulls this image.
+#
+# Image includes the `pcap` feature (passive TCP capture / SYN fingerprinting).
+
+name: docker-publish
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deploy/docker/**"
+      - ".github/workflows/docker-publish.yml"
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            FEATURES=sentry-cli/pcap
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # First push creates the package as PRIVATE; the VPS pulls it
+      # anonymously, so flip it to public. Linked GITHUB_TOKEN should allow
+      # this; if not, do it once in the GitHub UI (Packages → sentry →
+      # Package settings → Danger Zone → Change visibility → Public).
+      - name: Make ghcr package public
+        continue-on-error: true
+        run: |
+          PKG=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]' | cut -d/ -f2)
+          curl -sf -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/user/packages/container/${PKG}/visibility" \
+            -d '{"visibility":"public"}' \
+            || echo "::warning::Could not set package visibility via API — make ghcr.io/${PKG} public in the GitHub UI so the VPS can pull it anonymously."

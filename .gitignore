@@ -7,3 +7,7 @@
 sentry.toml
 config/sentry.toml
 dataset.csv
+
+# Honeypot deploy: local-only files
+!deploy/honeypot/sentry.toml
+deploy/honeypot/certs/

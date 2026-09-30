@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NimbusCloud — Admin Login</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #10151d; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .card { background: #1a2230; border: 1px solid #2a3547; border-radius: 12px; padding: 40px; width: 360px; }
+  .logo { font-size: 20px; font-weight: 700; color: #e8eef7; margin-bottom: 4px; }
+  .logo span { color: #57a0ff; }
+  .sub { color: #8496ad; font-size: 13px; margin-bottom: 24px; }
+  label { display: block; font-size: 12px; font-weight: 600; color: #b9c6d6; margin: 14px 0 6px; }
+  input { width: 100%; padding: 10px 12px; border: 1px solid #2f3d52; background: #0d1117; color: #e8eef7; border-radius: 8px; font-size: 14px; }
+  button { width: 100%; margin-top: 22px; padding: 11px; background: #57a0ff; color: #0d1117; border: 0; border-radius: 8px; font-size: 14px; font-weight: 700; cursor: pointer; }
+  .hint { margin-top: 16px; font-size: 11px; color: #5c6d84; background: #0d1117; border: 1px dashed #2f3d52; border-radius: 6px; padding: 8px; }
+  .foot { margin-top: 18px; font-size: 11px; color: #5c6d84; text-align: center; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">Nimbus<span>Cloud</span> Admin</div>
+    <div class="sub">Restricted area — staff only</div>
+    <form action="/login" method="post">
+      <label for="u">Admin username</label>
+      <input id="u" name="username" autocomplete="username" placeholder="administrator">
+      <label for="p">Admin password</label>
+      <input id="p" name="password" type="password" autocomplete="current-password">
+      <button type="submit">Access panel</button>
+    </form>
+    <!-- FIXME(prod): revert default credentials admin/admin before go-live -->
+    <div class="hint">Default credentials: admin / admin (change after first login)</div>
+    <div class="foot">v3.4.1 — internal build</div>
+  </div>
+</body>
+</html>

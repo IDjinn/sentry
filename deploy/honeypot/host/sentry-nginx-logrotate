@@ -1,0 +1,5 @@
+# /etc/cron.d/sentry-nginx-logrotate — daily copytruncate rotation of the
+# decoy access log. Sentry's tail reopens on truncation, so no signal is
+# lost between the copy and the truncate. Keeps 7 days of gzipped logs.
+SHELL=/bin/bash
+5 0 * * * root docker exec nginx-decoy sh -c 'cd /var/log/nginx && cp access.log access.log.$$(date +\%Y\%m\%d) && truncate -s 0 access.log && gzip -f access.log.20* && find /var/log/nginx -name "access.log.*.gz" -mtime +7 -delete' >/dev/null 2>&1
