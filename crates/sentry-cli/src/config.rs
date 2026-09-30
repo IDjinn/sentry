@@ -133,4 +133,31 @@ mod tests {
         // Sibling keys of [metrics] survive the override.
         assert!(cfg.metrics.enabled);
     }
+
+    #[test]
+    fn env_override_keeps_file_auth_section() {
+        let path = std::env::temp_dir().join("sentry_cfg_env_test.toml");
+        std::fs::write(
+            &path,
+            "[server]\n\
+             host = \"127.0.0.1\"\n\
+             port = 8080\n\
+             \n\
+             [server.auth]\n\
+             mode = \"password\"\n\
+             \n\
+             [[server.auth.users]]\n\
+             username = \"admin\"\n\
+             password_hash = \"argon2-here\"\n\
+             role = \"admin\"\n",
+        )
+        .unwrap();
+        std::env::set_var("SENTRY_SERVER__HOST", "0.0.0.0");
+        let cfg = load(Some(&path)).unwrap();
+        std::env::remove_var("SENTRY_SERVER__HOST");
+        assert_eq!(cfg.server.host, "0.0.0.0");
+        assert_eq!(cfg.server.auth.mode, "password");
+        assert_eq!(cfg.server.auth.users.len(), 1);
+        assert_eq!(cfg.server.auth.users[0].username, "admin");
+    }
 }
