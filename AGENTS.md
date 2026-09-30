@@ -203,6 +203,13 @@ não em runtime.
     daemon wired + prune task; 7 testes
   - ✅ F2.8 Métricas Prometheus + `/metrics` hyper server (`metrics.rs`),
     `report --from/--export json|csv`, aggregations em `repo.rs`; `[metrics]` em config
+  - ✅ Grafana: `/api/events` no mesmo server (`eventlog.rs`: `EventLog`
+    ring buffer de 1024 eventos resumidos — ip/method/path/status/verdict/
+    level/score/country/asn/signals; filtros `limit/level/verdict`),
+    `sentry_signal_kinds_total{kind}` (por SignalKind, chaves do
+    `[scorer.weights]`) e `sentry_signals_total` help corrigido (é events
+    por level); dashboard pronto `deploy/grafana/` (Prometheus + Infinity)
+    — 9 testes
   - ✅ F2.9 Rotas parametrizadas (`template_match`: `{id}`, trailing `/*`,
     `MethodNotAllowed` signal) — 7 testes
   - ✅ F2.10 Route learner (`routes_learn.rs`: shape inference, min_hits/min_ips) +
@@ -386,7 +393,7 @@ Backlog detalhado em `ARCHITECTURE.md` §23.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 325 testes passando sem features; 327 com
+# Resultado esperado: 334 testes passando sem features; 336 com
 # --features sentry-cli/onnx (adiciona os 2 testes de inferência ONNX)
 ```
 

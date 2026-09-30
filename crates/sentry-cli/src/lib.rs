@@ -10,6 +10,7 @@ pub mod cli;
 pub mod cmd;
 pub mod config;
 mod daemon;
+pub mod eventlog;
 pub mod logging;
 pub mod metrics;
 #[cfg(feature = "rate-redis")]

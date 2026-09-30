@@ -199,6 +199,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
 
     let metrics = crate::metrics::Metrics::new();
     metrics.set_instance(&instance_label(&cfg.deployment.instance_id));
+    let event_log = crate::eventlog::EventLog::new();
 
     // Optionally connect to Postgres for persistence + hot-reload.
     let repo = if !cfg.storage.postgres.url.is_empty() {
@@ -674,8 +675,9 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid metrics bind address: {e}"))?;
         let m = metrics.clone();
+        let log = event_log.clone();
         tokio::spawn(async move {
-            serve_metrics(m, addr).await;
+            serve_metrics(m, log, addr).await;
         });
     }
 
@@ -805,12 +807,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                         .analysis
                         .signals
                         .first()
-                        .map(|s| {
-                            serde_json::to_string(&s.kind)
-                                .unwrap_or_default()
-                                .trim_matches('"')
-                                .to_string()
-                        })
+                        .map(|s| crate::eventlog::signal_kind_label(&s.kind))
                         .unwrap_or_else(|| "pipeline".to_string());
                     let expires_db = chrono::Utc::now()
                         + chrono::Duration::from_std(block_ttl).unwrap_or_default();
@@ -853,6 +850,13 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             {
                 metrics.correlation_hits.inc();
             }
+            for signal in &result.analysis.signals {
+                metrics
+                    .signal_kinds
+                    .with_label_values(&[&crate::eventlog::signal_kind_label(&signal.kind)])
+                    .inc();
+            }
+            event_log.push(crate::eventlog::EventSummary::from_processed(&result));
             metrics.record_event(result.decision.action, result.analysis.risk_level, duration);
 
             // Fork AI mode: evaluate off the hot path; a changed verdict updates
@@ -1451,8 +1455,12 @@ fn non_empty_or(value: &str, fallback: &str) -> String {
 
 /// Thin wrapper so the daemon can call the metrics server without importing
 /// the crate-internal module path in every call site.
-async fn serve_metrics(m: crate::metrics::Metrics, addr: std::net::SocketAddr) {
-    crate::metrics::serve(m, addr).await;
+async fn serve_metrics(
+    m: crate::metrics::Metrics,
+    log: crate::eventlog::EventLog,
+    addr: std::net::SocketAddr,
+) {
+    crate::metrics::serve(m, log, addr).await;
 }
 
 /// Background task: LISTEN for `sentry_rules_changed` notifications and hot-reload the ruleset.

@@ -153,8 +153,12 @@ backend = "memory"
 # backend = "redis"
 # redis_url = "redis://127.0.0.1/"
 
-# ── Metrics (Prometheus) ──────────────────────────────────────────────────
-# Exposes /metrics on the configured bind address. Disable with enabled=false.
+# ── Metrics (Prometheus) + event log for Grafana ──────────────────────────
+# /metrics — Prometheus aggregates (also scraped by the bundled Grafana
+#   dashboard, deploy/grafana/).
+# /api/events — recent events as JSON (limit/level/verdict query params)
+#   for dashboard table panels. Unauthenticated like /metrics: keep the
+#   port internal. Disable with enabled=false.
 [metrics]
 enabled = true
 host = "0.0.0.0"

@@ -20,6 +20,8 @@ use sentry_core::Verdict;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+use crate::eventlog::{parse_event_query, EventLog};
+
 /// All Prometheus metrics the daemon updates.
 #[derive(Clone)]
 pub struct Metrics {
@@ -30,6 +32,7 @@ pub struct Metrics {
     pub correlation_hits: prometheus::Counter,
     pub edge_block_hits: prometheus::Counter,
     pub block_table_size: prometheus::Gauge,
+    pub signal_kinds: prometheus::CounterVec,
     pub signals: prometheus::CounterVec,
     pub actions: prometheus::CounterVec,
     pub pipeline_duration: prometheus::Histogram,
@@ -78,7 +81,16 @@ impl Metrics {
         let signals = prometheus::CounterVec::new(
             prometheus::Opts::new(
                 "sentry_signals_total",
-                "Signals emitted by the pipeline, by kind.",
+                "Events processed, by risk level (label `kind`, kept for compatibility).",
+            ),
+            &["kind"],
+        )
+        .unwrap();
+        let signal_kinds = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sentry_signal_kinds_total",
+                "Pipeline signals emitted, by kind (snake_case SignalKind, \
+                 same keys as [scorer.weights]).",
             ),
             &["kind"],
         )
@@ -147,6 +159,10 @@ impl Metrics {
             .map_err(|e| warn!(error = %e, "register signals"))
             .ok();
         registry
+            .register(Box::new(signal_kinds.clone()))
+            .map_err(|e| warn!(error = %e, "register signal kinds"))
+            .ok();
+        registry
             .register(Box::new(actions.clone()))
             .map_err(|e| warn!(error = %e, "register actions"))
             .ok();
@@ -169,6 +185,7 @@ impl Metrics {
             correlation_hits,
             edge_block_hits,
             block_table_size,
+            signal_kinds,
             signals,
             actions,
             pipeline_duration,
@@ -217,8 +234,36 @@ impl Default for Metrics {
     }
 }
 
+type BodyResponse = hyper::Response<Full<Bytes>>;
+
+fn text_response(status: StatusCode, content_type: &str, body: Vec<u8>) -> BodyResponse {
+    Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .body(Full::new(Bytes::from(body)))
+        .unwrap()
+}
+
+/// Resolve one request against the routes (pure, unit-testable).
+fn route(m: &Metrics, log: &EventLog, uri: &hyper::Uri) -> BodyResponse {
+    match uri.path() {
+        "/metrics" => text_response(StatusCode::OK, "text/plain; version=0.0.4", m.gather()),
+        "/api/events" => {
+            let q = parse_event_query(uri.query().unwrap_or(""));
+            let rows = log.query(q.limit, q.level.as_deref(), q.verdict.as_deref());
+            let body = serde_json::to_vec(&rows).unwrap_or_else(|_| b"[]".to_vec());
+            text_response(StatusCode::OK, "application/json", body)
+        }
+        _ => text_response(StatusCode::NOT_FOUND, "text/plain", b"not found\n".to_vec()),
+    }
+}
+
 /// Start the `/metrics` HTTP server on `addr`. Runs until the task is aborted.
-pub async fn serve(metrics: Metrics, addr: SocketAddr) {
+///
+/// Routes: `GET /metrics` (Prometheus text format), `GET /api/events`
+/// (recent events as JSON for external dashboards — `limit`, `level`,
+/// `verdict` query params), anything else → 404.
+pub async fn serve(metrics: Metrics, event_log: EventLog, addr: SocketAddr) {
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => {
             info!(addr = %addr, "metrics server listening on /metrics");
@@ -240,25 +285,14 @@ pub async fn serve(metrics: Metrics, addr: SocketAddr) {
         };
         let io = TokioIo::new(stream);
         let metrics = metrics.clone();
+        let event_log = event_log.clone();
         tokio::spawn(async move {
-            let service = service_fn(move |_req: Request<hyper::body::Incoming>| {
+            let service = service_fn(move |req: Request<hyper::body::Incoming>| {
                 let m = metrics.clone();
+                let log = event_log.clone();
                 async move {
-                    if _req.uri().path() == "/metrics" {
-                        let body = m.gather();
-                        Ok::<_, Infallible>(
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "text/plain; version=0.0.4")
-                                .body(Full::new(Bytes::from(body)))
-                                .unwrap(),
-                        )
-                    } else {
-                        Ok(Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(Full::new(Bytes::from_static(b"not found\n")))
-                            .unwrap())
-                    }
+                    let resp = route(&m, &log, req.uri());
+                    Ok::<_, Infallible>(resp)
                 }
             });
             if let Err(e) = http1::Builder::new()
@@ -269,5 +303,75 @@ pub async fn serve(metrics: Metrics, addr: SocketAddr) {
                 warn!(error = %e, "metrics connection error");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eventlog::EventSummary;
+    use http_body_util::BodyExt;
+    use sentry_core::analysis::{AnalysisResult, Decision, RiskLevel, Verdict};
+    use sentry_core::event::{Event, ProtocolData, RawData, SourceKind};
+
+    fn blocked_summary() -> EventSummary {
+        EventSummary::from_processed(&sentry_core::ProcessedEvent {
+            event: Event::new(
+                SourceKind::Synthetic,
+                "203.0.113.5".parse().unwrap(),
+                ProtocolData::Raw(RawData {
+                    note: "test".into(),
+                    bytes: vec![],
+                }),
+            ),
+            analysis: AnalysisResult {
+                risk_score: 90,
+                risk_level: RiskLevel::Critical,
+                signals: vec![],
+                verdict: Verdict::Block,
+            },
+            decision: Decision {
+                analysis: AnalysisResult::default(),
+                action: Verdict::Block,
+                override_reason: None,
+            },
+            rule_hit: None,
+        })
+    }
+
+    #[test]
+    fn route_serves_metrics_text() {
+        let resp = route(
+            &Metrics::new(),
+            &EventLog::new(),
+            &"/metrics".parse().unwrap(),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn route_serves_events_json_with_filters() {
+        let log = EventLog::new();
+        log.push(blocked_summary());
+        let uri: hyper::Uri = "/api/events?limit=10&level=critical".parse().unwrap();
+        let resp = route(&Metrics::new(), &log, &uri);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(std::str::from_utf8(&body).unwrap().contains("203.0.113.5"));
+
+        let uri: hyper::Uri = "/api/events?verdict=allow".parse().unwrap();
+        let resp = route(&Metrics::new(), &log, &uri);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"[]");
+    }
+
+    #[test]
+    fn route_unknown_path_is_404() {
+        let resp = route(&Metrics::new(), &EventLog::new(), &"/nope".parse().unwrap());
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
