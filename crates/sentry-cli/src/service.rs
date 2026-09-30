@@ -412,9 +412,14 @@ mod tests {
     #[test]
     fn traversal_paths_are_rejected() {
         assert!(validate_service_path(Path::new("/opt/../etc/passwd")).is_err());
-        assert!(validate_service_path(Path::new("C:\\opt\\..\\evil.exe")).is_err());
         assert!(validate_service_path(Path::new("/usr/local/bin/sentry")).is_ok());
-        assert!(validate_service_path(Path::new("C:\\sentry\\sentry.exe")).is_ok());
+        // On unix a backslash is a regular filename byte: "C:\opt\..\evil.exe"
+        // is one relative component with no ParentDir, so these only hold on
+        // Windows where the separator semantics apply.
+        if cfg!(windows) {
+            assert!(validate_service_path(Path::new("C:\\opt\\..\\evil.exe")).is_err());
+            assert!(validate_service_path(Path::new("C:\\sentry\\sentry.exe")).is_ok());
+        }
     }
 
     #[test]
