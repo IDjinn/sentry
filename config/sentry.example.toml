@@ -298,6 +298,18 @@ format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_byt
 # bind = "0.0.0.0:5140"   # ports < 1024 need root; 5140 avoids that
 # transport = "udp"       # udp | tcp
 
+# ── Cloudflare logs pull (F3.3) ────────────────────────────────────────────
+# Polls the zone Logs API (`GET /zones/{id}/logs/received`, NDJSON) and feeds
+# the same pipeline as the nginx tail. Requires an Enterprise entitlement for
+# received logs; token via env (default SENTRY_CF_TOKEN, Logs:Read).
+# [[source]]
+# type = "cloudflare"
+# [source.options]
+# zone_id = "023e105f4ecef8ad9ca31a8372d0c353"
+# poll_secs = 30                  # min 5
+# start = "2026-09-30T00:00:00Z"  # first poll cursor (default: now)
+# api_base = "https://api.cloudflare.com/client/v4"
+
 # ── Web dashboard / JSON API (`sentry serve`) ──────────────────────────────
 # Separate process from the daemon; requires Postgres.
 [server]

@@ -1321,6 +1321,45 @@ fn build_registry(
                 )?;
                 builder.register_source(ss);
             }
+            "cloudflare" => {
+                let zone_id = src
+                    .options
+                    .get("zone_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        color_eyre::eyre::eyre!("source `cloudflare` requires `zone_id`")
+                    })?;
+                let token_env = src
+                    .options
+                    .get("token_env")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("SENTRY_CF_TOKEN")
+                    .to_string();
+                let api_token = std::env::var(&token_env).unwrap_or_default();
+                let poll_secs = parse_ttl_secs(&src.options, 30);
+                let start_at = src
+                    .options
+                    .get("start")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|d| d.with_timezone(&chrono::Utc));
+                let cfs = sentry_source_cloudflare::CloudflareSource::new(
+                    sentry_source_cloudflare::CloudflareSourceConfig {
+                        zone_id,
+                        api_token,
+                        poll_secs,
+                        start_at,
+                        api_base: src
+                            .options
+                            .get("api_base")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("https://api.cloudflare.com/client/v4")
+                            .to_string(),
+                    },
+                )?;
+                builder.register_source(cfs);
+            }
             other => {
                 info!(
                     source = other,

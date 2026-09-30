@@ -8,6 +8,7 @@ members = [
     "crates/sentry-reputation",
     "crates/sentry-source-nginx",
     "crates/sentry-source-syslog",
+    "crates/sentry-source-cloudflare",
     "crates/sentry-action-cloudflare",
     "crates/sentry-action-webhook",
     "crates/sentry-action-blocklist",
@@ -106,6 +107,7 @@ sentry-geo = { path = "crates/sentry-geo" }
 sentry-reputation = { path = "crates/sentry-reputation" }
 sentry-source-nginx = { path = "crates/sentry-source-nginx" }
 sentry-source-syslog = { path = "crates/sentry-source-syslog" }
+sentry-source-cloudflare = { path = "crates/sentry-source-cloudflare" }
 sentry-action-cloudflare = { path = "crates/sentry-action-cloudflare" }
 sentry-action-webhook = { path = "crates/sentry-action-webhook" }
 sentry-action-blocklist = { path = "crates/sentry-action-blocklist" }
