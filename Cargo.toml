@@ -56,6 +56,11 @@ http-body-util = "0.1"
 # Dashboard / JSON API server (F4)
 axum = "0.8"
 
+# Auth (F4.4): password hashing, token/session crypto
+argon2 = "0.5"
+sha2 = "0.10"
+hmac = "0.12"
+
 # Errors
 thiserror = "1"
 anyhow = "1"

@@ -299,11 +299,30 @@ format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_byt
 # transport = "udp"       # udp | tcp
 
 # ── Web dashboard / JSON API (`sentry serve`) ──────────────────────────────
-# Separate process from the daemon; requires Postgres. No auth yet (F4.4) —
-# keep on loopback or front it with an authenticating reverse proxy.
+# Separate process from the daemon; requires Postgres.
 [server]
 host = "127.0.0.1"
 port = 8080
+
+# Auth + RBAC (F4.4). mode: none | password | token | both.
+# Roles: admin = mutations (block/unblock/forgive/resolve/ack); viewer = read-only.
+[server.auth]
+mode = "none"                      # keep "none" only on loopback
+# session_secret_env = "SENTRY_SESSION_SECRET"  # HMAC key for session cookies (32+ random bytes)
+# session_ttl_secs = 43200         # 12h
+#
+# Dashboard login (password mode). Generate the hash:
+#   sentry auth hash-password 'my-password'
+# [[server.auth.users]]
+# username = "admin"
+# password_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."   # output of the command above
+# role = "admin"
+#
+# Static API tokens (token mode). Hash a raw token with:
+#   sentry auth token-hash 'my-raw-token'
+# [[server.auth.tokens]]
+# token_sha256 = "<64 hex chars>"   # or token_env = "SENTRY_DASH_TOKEN" (raw token)
+# role = "viewer"
 
 # ── Actions ──────────────────────────────────────────────────────────────
 [[action]]

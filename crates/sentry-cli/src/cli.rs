@@ -65,6 +65,11 @@ pub enum Command {
         #[command(subcommand)]
         action: FeedsCmd,
     },
+    /// Auth helpers (hash generation for `[server.auth]`).
+    Auth {
+        #[command(subcommand)]
+        action: AuthCmd,
+    },
     /// Generate aggregate reports.
     Report {
         /// Time window (e.g. `24h`, `7d`).
@@ -239,6 +244,20 @@ pub enum FeedsCmd {
     Refresh,
     /// Refresh feeds, then look up an IP against them.
     Check { ip: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCmd {
+    /// Generate an Argon2 password hash for `[[server.auth.users]]`.
+    HashPassword {
+        /// The plain-text password to hash.
+        password: String,
+    },
+    /// Generate the SHA-256 hex hash of an API token for `[[server.auth.tokens]]`.
+    TokenHash {
+        /// The raw API token to hash.
+        token: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

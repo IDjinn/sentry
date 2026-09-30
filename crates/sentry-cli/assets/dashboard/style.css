@@ -137,3 +137,34 @@ footer {
   font-size: 12px;
   border-top: 1px solid var(--border);
 }
+
+.header-right { display: flex; align-items: center; gap: 10px; }
+.identity { color: var(--muted); font-size: 12px; }
+.hidden { display: none !important; }
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(1, 4, 9, 0.82);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.login-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 24px;
+  width: min(360px, 90vw);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.login-card h2 { margin: 0 0 8px; font-size: 16px; }
+.login-card label { color: var(--muted); font-size: 12px; }
+.login-card button { margin-top: 10px; background: #1f6feb; border-color: #1f6feb; color: #fff; }
+.login-card button:hover { background: #388bfd; }
+
+.login-error { color: var(--critical); font-size: 12px; margin: 0; }

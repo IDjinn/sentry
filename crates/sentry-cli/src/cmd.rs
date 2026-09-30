@@ -470,6 +470,15 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 check_feed_ip(cfg, &ip).await?;
             }
         },
+        Command::Auth { action } => match action {
+            AuthCmd::HashPassword { password } => {
+                let hash = crate::auth::hash_password(&password)?;
+                println!("{hash}");
+            }
+            AuthCmd::TokenHash { token } => {
+                println!("{}", crate::auth::token_hash(&token));
+            }
+        },
         Command::Report {
             from,
             export,

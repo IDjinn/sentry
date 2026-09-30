@@ -572,14 +572,17 @@ fn default_metrics_port() -> u16 {
 /// Web dashboard + JSON API server config (F4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
-    /// Bind address. Defaults to loopback because the dashboard has no
-    /// built-in auth yet (F4.4) — front it with an authenticating reverse
+    /// Bind address. Defaults to loopback — with auth disabled (F4.4) only
+    /// loopback is safe; front the server with an authenticating reverse
     /// proxy before binding wider.
     #[serde(default = "default_server_host")]
     pub host: String,
     /// Bind port (default 8080).
     #[serde(default = "default_server_port")]
     pub port: u16,
+    /// Authentication + RBAC for the dashboard and API.
+    #[serde(default)]
+    pub auth: ServerAuthConfig,
 }
 
 impl Default for ServerConfig {
@@ -587,6 +590,7 @@ impl Default for ServerConfig {
         Self {
             host: default_server_host(),
             port: default_server_port(),
+            auth: ServerAuthConfig::default(),
         }
     }
 }
@@ -596,6 +600,83 @@ fn default_server_host() -> String {
 }
 fn default_server_port() -> u16 {
     8080
+}
+
+/// Dashboard user with an Argon2 password hash (F4.4).
+///
+/// Generate the hash with `sentry auth hash-password <password>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthUserConfig {
+    /// Login name.
+    pub username: String,
+    /// Argon2id hash in PHC string format.
+    pub password_hash: String,
+    /// `admin` (mutations allowed) or `viewer` (read-only). Default `viewer`.
+    #[serde(default = "default_auth_role")]
+    pub role: String,
+}
+
+/// API token with a SHA-256 hash (F4.4).
+///
+/// Provide either `token_sha256` (hex of the SHA-256 of the raw token) or
+/// `token_env` (name of an env var holding the raw token, hashed at load).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthTokenConfig {
+    /// Hex-encoded SHA-256 of the raw bearer token.
+    #[serde(default)]
+    pub token_sha256: String,
+    /// Env var holding the raw token (hashed at startup; preferred).
+    #[serde(default)]
+    pub token_env: String,
+    /// `admin` or `viewer`. Default `viewer`.
+    #[serde(default = "default_auth_role")]
+    pub role: String,
+}
+
+/// Auth + RBAC config for the dashboard/API server (F4.4).
+///
+/// `mode` selects which mechanisms are active: `none` (default — loopback
+/// only), `password` (Argon2 login issuing an HMAC-signed session cookie),
+/// `token` (static bearer tokens) or `both`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerAuthConfig {
+    /// `none` | `password` | `token` | `both`.
+    #[serde(default)]
+    pub mode: String,
+    /// Dashboard users (password mode).
+    #[serde(default)]
+    pub users: Vec<AuthUserConfig>,
+    /// Static API tokens (token mode).
+    #[serde(default)]
+    pub tokens: Vec<AuthTokenConfig>,
+    /// Env var holding the HMAC session-signing key (password mode).
+    #[serde(default = "default_session_secret_env")]
+    pub session_secret_env: String,
+    /// Session cookie lifetime in seconds (default 12h).
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_secs: u64,
+}
+
+impl Default for ServerAuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: String::new(),
+            users: Vec::new(),
+            tokens: Vec::new(),
+            session_secret_env: default_session_secret_env(),
+            session_ttl_secs: default_session_ttl(),
+        }
+    }
+}
+
+fn default_auth_role() -> String {
+    "viewer".to_string()
+}
+fn default_session_secret_env() -> String {
+    "SENTRY_SESSION_SECRET".to_string()
+}
+fn default_session_ttl() -> u64 {
+    43_200
 }
 
 /// Background route learner config.

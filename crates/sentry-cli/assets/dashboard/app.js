@@ -4,12 +4,17 @@
 const EVENTS_POLL_MS = 2000;
 const PANELS_POLL_MS = 5000;
 let levelFilter = "";
+let currentRole = null;
 
 const $ = (id) => document.getElementById(id);
 
 async function fetchJson(url, opts) {
   const resp = await fetch(url, opts);
   if (!resp.ok) {
+    if (resp.status === 401) {
+      showLogin();
+      throw new Error("authentication required");
+    }
     const body = await resp.json().catch(() => ({}));
     throw new Error(body.error || resp.status);
   }
@@ -19,6 +24,75 @@ async function fetchJson(url, opts) {
 function setConn(ok) {
   const dot = $("conn");
   dot.className = "dot " + (ok ? "dot-on" : "dot-off");
+}
+
+function showLogin() {
+  $("login-overlay").classList.remove("hidden");
+}
+
+function hideLogin() {
+  $("login-overlay").classList.add("hidden");
+  $("login-error").classList.add("hidden");
+}
+
+function applyIdentity(me) {
+  if (me && me.authenticated) {
+    currentRole = me.role;
+    const label = $("identity");
+    label.textContent = me.username + " · " + me.role;
+    label.classList.remove("hidden");
+    $("logout-btn").classList.remove("hidden");
+    hideLogin();
+  } else {
+    currentRole = null;
+    $("identity").classList.add("hidden");
+    $("logout-btn").classList.add("hidden");
+  }
+  // Viewers can't mutate: hide the manual block form.
+  $("block-form").style.display = currentRole === "admin" || currentRole === null ? "" : "none";
+}
+
+async function bootAuth() {
+  try {
+    const me = await fetchJson("/api/me");
+    applyIdentity(me);
+    if (!me.authenticated) showLogin();
+  } catch (e) {
+    showLogin();
+  }
+}
+
+async function doLogin(ev) {
+  ev.preventDefault();
+  const username = $("login-username").value.trim();
+  const password = $("login-password").value;
+  const token = $("login-token").value.trim();
+  const payload = token ? { token } : { username, password };
+  try {
+    const resp = await fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.error || "login failed");
+    applyIdentity({ authenticated: true, username: body.username, role: body.role });
+    $("login-password").value = "";
+    $("login-token").value = "";
+    refreshAll();
+  } catch (e) {
+    const err = $("login-error");
+    err.textContent = e.message;
+    err.classList.remove("hidden");
+  }
+}
+
+async function doLogout() {
+  try {
+    await fetch("/api/logout", { method: "POST" });
+  } catch (e) { /* ignore */ }
+  applyIdentity(null);
+  showLogin();
 }
 
 function text(parent, tag, value, className) {
@@ -172,6 +246,9 @@ $("level-filter").addEventListener("change", (ev) => {
   refreshEvents();
 });
 
+$("login-form").addEventListener("submit", doLogin);
+$("logout-btn").addEventListener("click", doLogout);
+
 $("block-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const ip = $("block-ip").value.trim();
@@ -185,11 +262,16 @@ $("block-form").addEventListener("submit", async (ev) => {
   }
 });
 
-refreshEvents();
-refreshStats();
-refreshIncidents();
-refreshBlocked();
+function refreshAll() {
+  refreshEvents();
+  refreshStats();
+  refreshIncidents();
+  refreshBlocked();
+}
+
+refreshAll();
 setInterval(refreshEvents, EVENTS_POLL_MS);
 setInterval(refreshStats, PANELS_POLL_MS);
 setInterval(refreshIncidents, PANELS_POLL_MS);
 setInterval(refreshBlocked, PANELS_POLL_MS);
+bootAuth();

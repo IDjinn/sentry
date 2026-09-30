@@ -35,11 +35,11 @@ pub use analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verd
 pub use behavior::BehaviorTracker;
 pub use challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
 pub use config::{
-    ActionConfig, ActionKind, AiConfig, BehaviorConfig, CoreConfig, EscalationConfig, FeedConfig,
-    GeoConfig, LlmConfig, MetricsConfig, PolicyConfig, PolicyOverrideConfig, PostgresConfig,
-    RateLimitConfig, RouteDefConfig, RouteLearnerConfig, RoutesConfig, RuleDefConfig,
-    RulePackConfig, RulesConfig, ScanConfig, ScorerConfig, SentryConfig, ServerConfig,
-    SourceConfig, StorageConfig,
+    ActionConfig, ActionKind, AiConfig, AuthTokenConfig, AuthUserConfig, BehaviorConfig,
+    CoreConfig, EscalationConfig, FeedConfig, GeoConfig, LlmConfig, MetricsConfig, PolicyConfig,
+    PolicyOverrideConfig, PostgresConfig, RateLimitConfig, RouteDefConfig, RouteLearnerConfig,
+    RoutesConfig, RuleDefConfig, RulePackConfig, RulesConfig, ScanConfig, ScorerConfig,
+    SentryConfig, ServerAuthConfig, ServerConfig, SourceConfig, StorageConfig,
 };
 pub use error::{CoreError, Result};
 pub use event::{

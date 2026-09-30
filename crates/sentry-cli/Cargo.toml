@@ -54,6 +54,9 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 redis = { version = "0.27", optional = true, default-features = false, features = ["script"] }
 axum = { workspace = true }
+argon2 = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

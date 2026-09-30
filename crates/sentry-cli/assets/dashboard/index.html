@@ -13,14 +13,18 @@
       <h1>Sentry</h1>
       <span id="conn" class="dot dot-off" title="API status"></span>
     </div>
-    <select id="level-filter">
-      <option value="">all levels</option>
-      <option value="info">info</option>
-      <option value="low">low</option>
-      <option value="medium">medium</option>
-      <option value="high">high</option>
-      <option value="critical">critical</option>
-    </select>
+    <div class="header-right">
+      <select id="level-filter">
+        <option value="">all levels</option>
+        <option value="info">info</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+        <option value="critical">critical</option>
+      </select>
+      <span id="identity" class="identity hidden"></span>
+      <button id="logout-btn" class="hidden">Log out</button>
+    </div>
   </header>
 
   <section id="stats" class="stats">
@@ -65,7 +69,22 @@
     </div>
   </main>
 
-  <footer>Sentry dashboard — read-only polling over the JSON API · no auth (F4.4 pending), keep on loopback</footer>
+  <footer>Sentry dashboard — live polling over the authenticated JSON API · configure access via [server.auth]</footer>
+
+  <div id="login-overlay" class="overlay hidden">
+    <form id="login-form" class="login-card">
+      <h2>Sign in to Sentry</h2>
+      <label for="login-username">Username</label>
+      <input id="login-username" type="text" autocomplete="username" placeholder="admin">
+      <label for="login-password">Password</label>
+      <input id="login-password" type="password" autocomplete="current-password" placeholder="••••••••">
+      <label for="login-token">or API token</label>
+      <input id="login-token" type="password" autocomplete="off" placeholder="paste a bearer token">
+      <p id="login-error" class="login-error hidden"></p>
+      <button type="submit" id="login-submit">Sign in</button>
+    </form>
+  </div>
+
   <script src="/app.js"></script>
 </body>
 </html>
