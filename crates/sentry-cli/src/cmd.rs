@@ -479,6 +479,20 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 println!("{}", crate::auth::token_hash(&token));
             }
         },
+        Command::Service { action } => match action {
+            ServiceCmd::Install { user, workdir } => {
+                crate::service::install(user.as_deref(), workdir.as_deref())?;
+            }
+            ServiceCmd::Uninstall => {
+                crate::service::uninstall()?;
+            }
+            ServiceCmd::Status => {
+                crate::service::status();
+            }
+            ServiceCmd::Run => {
+                crate::service::run_windows_service()?;
+            }
+        },
         Command::Report {
             from,
             export,

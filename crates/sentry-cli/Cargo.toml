@@ -19,6 +19,10 @@ rate-redis = ["dep:redis"]
 onnx = ["sentry-ai/onnx"]
 pcap = ["sentry-source-tcp/pcap"]
 edge-tls = ["sentry-edge/edge-tls"]
+service = ["dep:windows-service"]
+
+[target.'cfg(windows)'.dependencies]
+windows-service = { version = "0.7", optional = true }
 
 [dependencies]
 sentry-core = { workspace = true }

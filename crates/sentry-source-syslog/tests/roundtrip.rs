@@ -8,9 +8,20 @@ use sentry_core::source::Source;
 use sentry_source_syslog::{SyslogSource, SyslogSourceConfig, SyslogTransport};
 
 /// Bind a throwaway socket to discover a free ephemeral port, then drop it.
+///
+/// Windows reserves ranges of ephemeral ports (Hyper-V etc.) and hands them
+/// out from `:0` anyway — binding them afterwards fails with os error 10013.
+/// Retry until the discovered port is actually bindable.
 fn free_port() -> u16 {
-    let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    s.local_addr().unwrap().port()
+    for _ in 0..20 {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = s.local_addr().unwrap().port();
+        drop(s);
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("could not find a bindable ephemeral port (Windows excluded-range flake)");
 }
 
 #[tokio::test]

@@ -70,6 +70,11 @@ pub enum Command {
         #[command(subcommand)]
         action: AuthCmd,
     },
+    /// Manage the OS service (systemd / launchd / Windows Service).
+    Service {
+        #[command(subcommand)]
+        action: ServiceCmd,
+    },
     /// Generate aggregate reports.
     Report {
         /// Time window (e.g. `24h`, `7d`).
@@ -258,6 +263,26 @@ pub enum AuthCmd {
         /// The raw API token to hash.
         token: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceCmd {
+    /// Install and start the system service.
+    Install {
+        /// System user to run the service as (systemd only).
+        #[arg(long)]
+        user: Option<String>,
+        /// Working directory for the service.
+        #[arg(long)]
+        workdir: Option<String>,
+    },
+    /// Stop and remove the system service.
+    Uninstall,
+    /// Show service install paths + best-effort live status.
+    Status,
+    /// Internal entry point: run under the Windows Service Control Manager.
+    #[command(hide = true)]
+    Run,
 }
 
 #[derive(Debug, Subcommand)]

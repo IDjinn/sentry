@@ -16,6 +16,7 @@ pub mod metrics;
 pub mod rate_redis;
 pub mod routes_import;
 pub mod server;
+pub mod service;
 mod tui;
 
 pub use cli::Cli;
