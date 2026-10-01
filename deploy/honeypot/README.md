@@ -11,9 +11,14 @@ Reference deployment: **Lightsail `3.17.156.125` (us-east-2), Ubuntu 24.04,
 ## Architecture
 
 ```
-internet ──► :80/:443  nginx-decoy (fake company login, self-signed TLS)
-             │ writes combined access.log → named volume `nginxlogs`
-             └──► sentry daemon (host net) tails /var/log/nginx/access.log
+internet ──► :80/:443  sentry edge (host net, inline mode)
+             │ 80: plain HTTP — scored and served
+             │ 443: TLS terminated in-app (self-signed cert, F8) — the
+             │      decrypted request goes through rules → heuristics →
+             │      policy BEFORE anything is answered, so payloads like
+             │      /login?test=<script> block on HTTPS exactly like on HTTP
+             └──► 127.0.0.1:8081  nginx-decoy (fake company login, plain HTTP;
+                    combined access.log → named volume `nginxlogs`, humans only)
 internet ──► :22     ssh-decoy (OpenSSH, locked password — everything fails)
 internet ──► :any    sentry tcp source (pcap SYN fingerprint, masscan/zmap/nmap)
 host rsyslog ──► 127.0.0.1:5140/udp  sentry syslog source (reputation-only)
@@ -37,8 +42,8 @@ Networking tab → IPv4 firewall. Required state:
 | Port | Proto | Purpose | Default |
 | --- | --- | --- | --- |
 | 22 | TCP | SSH decoy container | already open |
-| 80 | TCP | nginx decoy | already open |
-| 443 | TCP | nginx decoy (TLS) | open manually |
+| 80 | TCP | sentry edge (decoy behind it) | already open |
+| 443 | TCP | sentry edge (TLS termination, F8) | open manually |
 | 22022 | TCP | real SSHD (after `sentry-move-ssh.sh`) | open manually |
 | 51820 | UDP | WireGuard | open manually |
 
@@ -68,7 +73,8 @@ sudo mkdir -p /opt/sentry && sudo chown ubuntu /opt/sentry
 # copy deploy/honeypot/ → /opt/sentry (scp -r deploy/honeypot/* ubuntu@IP:/opt/sentry/)
 cd /opt/sentry
 
-# self-signed cert for the decoy TLS listener
+# self-signed cert for the edge TLS listener (mounted into the sentry
+# container at /etc/sentry/certs — see [edge] tls_cert/tls_key in sentry.toml)
 mkdir -p certs
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout certs/decoy.key -out certs/decoy.crt -days 3650 -nodes \
@@ -168,11 +174,37 @@ reputation feed health, and host CPU/memory/disk/network.
 ## Updating Sentry
 
 The image is built by the `docker-publish` GitHub Actions workflow
-(builds `linux/amd64` with `FEATURES=sentry-cli/pcap`, pushes
-`ghcr.io/idjinn/sentry:latest`). On the VPS:
+(builds `linux/amd64` with `FEATURES=sentry-cli/pcap,sentry-cli/edge-tls`,
+pushes `ghcr.io/idjinn/sentry:latest` — the `edge` tag pins the same image
+for the VPS). On the VPS:
 
 ```bash
 cd /opt/sentry && docker compose pull && docker compose up -d
+```
+
+### Migrating a deployment that predates edge TLS (443 on nginx-decoy)
+
+Older stacks published `443:443` on nginx-decoy; the edge now binds 443 on
+the host network. If sentry restarts while the old nginx still holds 443,
+the TLS bind fails and takes the whole edge (including port 80) down, so
+stop the decoy first:
+
+```bash
+cd /opt/sentry
+docker compose pull
+docker compose stop nginx-decoy
+docker compose up -d
+# verify both listeners: docker logs -f sentry  →
+#   edge (inline) listening on http  addr=0.0.0.0:80
+#   edge (inline) listening on https addr=0.0.0.0:443
+```
+
+Quick functional check (payload must be blocked with the edge's 403 page on
+both schemes):
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n'  'http://3.17.156.125/login?test=%3Cscript%3Ealert(1)%3C/script%3E'
+curl -sk -o /dev/null -w '%{http_code}\n' 'https://3.17.156.125/login?test=%3Cscript%3Ealert(1)%3C/script%3E'
 ```
 
 ## Limitations (by design or current state)
@@ -184,6 +216,11 @@ cd /opt/sentry && docker compose pull && docker compose up -d
   future Sentry feature.
 - The **tcp source** needs host networking + `NET_RAW` (compose grants it)
   and the image must be built with `sentry-cli/pcap` (the workflow does).
+- The **edge TLS listener** needs the `sentry-cli/edge-tls` build feature
+  (the workflow does). Without it, `[edge]` TLS config makes the whole edge
+  refuse to start — the plain 80 listener dies with it.
+- The nginx decoy is a plain-HTTP upstream on loopback only; it must never
+  republish 80/443 or the edge binds collide and TLS escapes the pipeline.
 - **Geo enrichment is off** (no MaxMind GeoLite2 files). Drop the `.mmdb`
   files into the `sentrydata` volume to enable country/ASN rules.
 - AI (ONNX) is disabled to fit the 1 GB budget. The LLM stage is remote-only

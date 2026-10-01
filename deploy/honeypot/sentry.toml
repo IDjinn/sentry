@@ -25,8 +25,28 @@ host = "172.17.0.1"
 port = 9100
 
 [deployment]
-mode = "passive"
+mode = "inline"
 instance_id = "honeypot-lightsail"
+
+# ── Inline edge (F3.9) + TLS termination (F8) ──────────────────────────────
+# Sentry owns the public listeners: 80 (plain) and 443 (TLS, feature
+# `edge-tls` in the published image). Every request is scored by rules →
+# heuristics → policy BEFORE the decoy answers, so e.g.
+# /login?test=<script>… blocks on HTTPS exactly like on HTTP. What survives
+# is proxied to the decoy nginx on loopback (compose: 127.0.0.1:8081).
+[edge]
+listen = "0.0.0.0:80"
+upstream = "http://127.0.0.1:8081"
+tls_listen = "0.0.0.0:443"
+tls_cert = "/etc/sentry/certs/decoy.crt"
+tls_key = "/etc/sentry/certs/decoy.key"
+# The decoy is reached by raw IP (no SNI). An allowlist here would score
+# every real visit as a TlsSniMismatch probe — keep it empty (disabled).
+# tls_allowed_hosts = []
+# tls_handshake_events defaults to true: one TlsHandshake event (SNI/JA3/
+# JA4) per connection feeds the pipeline. tls_redirect_https stays off so
+# port 80 keeps serving the decoy (honeypot = maximum surface) while still
+# being scored and blocked.
 
 # ── Behavioral detectors — all enabled (honeypot: everything is hostile) ───
 [scan]
@@ -134,18 +154,14 @@ refresh_hours = 24
 action = "block"
 
 # ── Sources ────────────────────────────────────────────────────────────────
-# 1) nginx decoy access log (the main detection surface: heuristics, scan and
-#    behavior trackers all run on HTTP events).
-[[source]]
-type = "nginx"
-[source.options]
-path = "/var/log/nginx/access.log"
-# Trailing x_forwarded_for must match the nginx log_format exactly — the
-# parser validates the whole line and resolves the real client IP from the
-# token (precedence in ARCHITECTURE.md §8.1).
-format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" "$http_x_forwarded_for"'
+# The nginx access log is NOT a source anymore: in inline mode the edge
+# already scores every request with the real client IP before the decoy
+# sees it, while the decoy's log only ever shows the docker-proxy peer
+# (a private IP, allow-listed by the first custom rule — useless as an
+# event source and pure noise). The log stays in the `nginxlogs` volume
+# for manual inspection, still rotated by the host cron.
 
-# 2) Syslog receiver on host loopback: host rsyslog forwards auth failures.
+# 1) Syslog receiver on host loopback: host rsyslog forwards auth failures.
 #    NOTE: syslog events carry no HTTP payload, so only IP reputation applies
 #    (and the peer IP is 127.0.0.1 — documented limitation).
 [[source]]
@@ -154,7 +170,7 @@ type = "syslog"
 bind = "127.0.0.1:5140"
 transport = "udp"
 
-# 3) Passive TCP capture with SYN fingerprinting (masscan/zmap/nmap).
+# 2) Passive TCP capture with SYN fingerprinting (masscan/zmap/nmap).
 #    Requires the `pcap` build feature + NET_RAW (granted in compose) and
 #    host networking to see scans across all ports.
 [[source]]

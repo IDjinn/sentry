@@ -2,7 +2,8 @@
 # and push it to ghcr.io. The 1 GB honeypot box cannot compile Rust itself,
 # so it only ever pulls this image.
 #
-# Image includes the `pcap` feature (passive TCP capture / SYN fingerprinting).
+# Image includes the `pcap` feature (passive TCP capture / SYN
+# fingerprinting) and `edge-tls` (inline TLS termination on 443, F8).
 
 name: docker-publish
 
@@ -57,7 +58,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            FEATURES=sentry-cli/pcap
+            FEATURES=sentry-cli/pcap,sentry-cli/edge-tls
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

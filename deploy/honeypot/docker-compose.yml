@@ -44,7 +44,9 @@ services:
     image: ghcr.io/idjinn/sentry:latest
     command: ["run"]
     # Host networking + NET_RAW: the pcap/tcp source must see host-wide
-    # traffic (SYN scans to any port, including the decoy SSH on 22).
+    # traffic (SYN scans to any port, including the decoy SSH on 22), and
+    # the inline edge binds public 80/443 directly, terminating TLS itself
+    # (needs the edge-tls feature — the publish workflow builds it in).
     network_mode: host
     cap_add:
       - NET_RAW
@@ -60,6 +62,8 @@ services:
       RUST_LOG: info,sentry=info
     volumes:
       - ./sentry.toml:/etc/sentry/sentry.toml:ro
+      # TLS certificate/key for the edge 443 listener (F8).
+      - ./certs:/etc/sentry/certs:ro
       - nginxlogs:/var/log/nginx:ro
       - sentrydata:/var/lib/sentry
     healthcheck:
@@ -93,8 +97,9 @@ services:
 
   nginx-decoy:
     image: nginx:alpine
-    # The stock image symlinks access.log/error.log to /dev/stdout; sentry's
-    # tail needs real, seekable files on the shared volume.
+    # Real, seekable log files on the shared volume (manual inspection +
+    # the host logrotate cron). The sentry edge is the detection surface;
+    # this log is for humans.
     command:
       - sh
       - -c
@@ -103,12 +108,13 @@ services:
         touch /var/log/nginx/access.log /var/log/nginx/error.log
         exec nginx -g 'daemon off;'
     ports:
-      - "80:80"
-      - "443:443"
+      # Loopback upstream only: the sentry edge (host network) owns the
+      # public 80 and 443 listeners — publishing 80/443 here would collide
+      # with the edge binds and put TLS back outside the pipeline.
+      - "127.0.0.1:8081:80"
     volumes:
       - ./nginx-decoy/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx-decoy/html:/usr/share/nginx/html:ro
-      - ./certs:/etc/nginx/certs:ro
       - nginxlogs:/var/log/nginx
     mem_limit: 32m
     restart: unless-stopped
