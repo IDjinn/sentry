@@ -381,6 +381,11 @@ action = "challenge"
 # The nginx-honeypot TRUSTED_IPS concept: clients never to ban, block or
 # report (admins, uptime probes). They short-circuit the pipeline to Allow.
 # trusted_ips = ["203.0.113.7", "2001:db8::1"]
+# Built-in trusted presets (bundled snapshots — no network fetch). Approve
+# by name and they join the never-ban set above: pipeline Allow, edge never
+# 403s, firewall/nginx refuse to ban. Presets: paypal, stripe, googlebot,
+# bingbot (see `sentry trusted list`).
+# trusted_lists = ["paypal", "stripe", "googlebot"]
 # refresh_secs = 86400
 
 # On-demand external IP reputation (F7.5): gray-band IPs — local score

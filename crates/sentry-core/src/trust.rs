@@ -15,6 +15,7 @@ use std::sync::{Arc, RwLock};
 use ipnet::IpNet;
 
 use crate::config::RealIpConfig;
+use crate::trusted_lists;
 
 /// Bundled Cloudflare IPv4 ranges (<https://www.cloudflare.com/ips-v4>),
 /// refreshed at runtime when `[real_ip] cloudflare = true`.
@@ -111,6 +112,20 @@ impl TrustSet {
         for entry in &cfg.trusted_ips {
             ts.never_ban.push(parse_net(entry)?);
         }
+        for name in &cfg.trusted_lists {
+            let nets = trusted_lists::preset_nets(name).ok_or_else(|| {
+                format!(
+                    "unknown trusted list {:?} — available: {}",
+                    name,
+                    trusted_lists::PRESETS
+                        .iter()
+                        .map(|p| p.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            ts.never_ban.extend(nets);
+        }
         Ok(ts)
     }
 
@@ -186,6 +201,7 @@ mod tests {
             trusted_proxies: proxies.iter().map(|s| s.to_string()).collect(),
             cloudflare,
             trusted_ips: never.iter().map(|s| s.to_string()).collect(),
+            trusted_lists: Vec::new(),
             refresh_secs: 0,
         }
     }
@@ -236,6 +252,19 @@ mod tests {
         assert!(ts.is_never_ban("203.0.113.7".parse().unwrap()));
         assert!(ts.is_never_ban("192.168.1.200".parse().unwrap()));
         assert!(!ts.is_never_ban("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_lists_join_never_ban() {
+        let mut c = cfg(&[], &[], false);
+        c.trusted_lists = vec!["paypal".into()];
+        let ts = TrustSet::from_config(&c).unwrap();
+        assert!(ts.is_never_ban("64.4.241.9".parse().unwrap()));
+        assert!(!ts.is_never_ban("8.8.8.8".parse().unwrap()));
+
+        c.trusted_lists = vec!["bogus".into()];
+        let err = TrustSet::from_config(&c).unwrap_err();
+        assert!(err.contains("unknown trusted list"), "{err}");
     }
 
     #[test]

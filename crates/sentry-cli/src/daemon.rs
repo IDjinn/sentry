@@ -391,6 +391,19 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     if cfg.real_ip.cloudflare && cfg.real_ip.refresh_secs > 0 {
         spawn_cloudflare_refresh(cfg.real_ip.clone(), shared_trust.clone());
     }
+    if !cfg.real_ip.trusted_lists.is_empty() {
+        let lists = &cfg.real_ip.trusted_lists;
+        let total: usize = lists
+            .iter()
+            .filter_map(|n| sentry_core::trusted_lists::preset_nets(n))
+            .map(|nets| nets.len())
+            .sum();
+        info!(
+            lists = %lists.join(", "),
+            ranges = total,
+            "trusted IP presets approved (never-ban)"
+        );
+    }
 
     // rDNS bot verification (F7.7): claimed-crawler UAs are checked off the
     // hot path by the background worker; pipeline + edge read the cache.
@@ -1220,9 +1233,15 @@ fn make_enricher(
 /// fill an unset reputation).
 fn mark_trusted(evt: &mut Event, trust: &sentry_core::SharedTrustSet) {
     if evt.reputation.is_none() && trust.is_never_ban(evt.client_ip) {
+        let presets = sentry_core::trusted_lists::matching_presets(evt.client_ip);
+        let source = if presets.is_empty() {
+            "trusted_ips".to_string()
+        } else {
+            format!("trusted_lists:{}", presets.join(","))
+        };
         evt.reputation = Some(sentry_core::ReputationInfo {
             tier: sentry_core::rules::ReputationTier::Authorized,
-            source: "trusted_ips".into(),
+            source,
         });
     }
 }

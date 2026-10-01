@@ -65,6 +65,11 @@ pub enum Command {
         #[command(subcommand)]
         action: FeedsCmd,
     },
+    /// Built-in trusted IP presets (`[real_ip] trusted_lists`).
+    Trusted {
+        #[command(subcommand)]
+        action: TrustedCmd,
+    },
     /// Inspect the local firewall ban backends (nftables/ipset/firewalld).
     Firewall {
         #[command(subcommand)]
@@ -282,6 +287,13 @@ pub enum FeedsCmd {
     Refresh,
     /// Refresh feeds, then look up an IP against them.
     Check { ip: String },
+}
+
+/// Built-in trusted IP preset commands.
+#[derive(Debug, Subcommand)]
+pub enum TrustedCmd {
+    /// List the bundled presets and whether each is approved in config.
+    List,
 }
 
 /// Local firewall ban backend status.

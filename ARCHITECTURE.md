@@ -617,7 +617,11 @@ comportamento legado (quem escreve o log é o edge). Isso fecha o spoof de
 bloqueado ou reportado: short-circuit para `Allow` no `Pipeline::process`,
 guard no fast-path da edge (`is_hard_blocked`), guard final no provider de
 firewall, e reputação `Authorized` no enricher. Estado em
-`TrustSet`/`SharedTrustSet` (`crates/sentry-core/src/trust.rs`).
+`TrustSet`/`SharedTrustSet` (`crates/sentry-core/src/trust.rs`). Presets
+embutidos (`trusted_lists.rs`: paypal, stripe, googlebot, bingbot — snapshots
+das fontes oficiais dos vendors) entram no mesmo never-ban quando aprovados
+por nome em `[real_ip] trusted_lists = ["paypal", ...]`; catálogo via
+`sentry trusted list`.
 
 **Bans de kernel (F7.3)** — crate `sentry-action-firewall`, provider
 `type = "challenge"`, `provider = "firewall"`: herda o filtro

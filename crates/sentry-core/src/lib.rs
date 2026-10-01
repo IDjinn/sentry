@@ -35,6 +35,7 @@ pub mod scan;
 pub mod source;
 pub mod tcpfp;
 pub mod trust;
+pub mod trusted_lists;
 
 pub use action::{Action, ActionContext};
 pub use analysis::{
@@ -81,3 +82,4 @@ pub use rules::{
 pub use scan::ScanTracker;
 pub use source::Source;
 pub use trust::{SharedTrustSet, TrustSet};
+pub use trusted_lists::{matching_presets, preset, PRESETS};

@@ -470,6 +470,12 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 check_feed_ip(cfg, &ip).await?;
             }
         },
+        Command::Trusted { action } => match action {
+            TrustedCmd::List => {
+                let cfg = require_config(&cfg)?;
+                list_trusted_lists(cfg);
+            }
+        },
         Command::Firewall { action } => match action {
             FirewallCmd::Status => {
                 let cfg = require_config(&cfg)?;
@@ -996,6 +1002,31 @@ fn list_feeds(cfg: &SentryConfig) {
     }
 }
 
+/// `sentry trusted list` — bundled trusted IP presets vs. `[real_ip]
+/// trusted_lists` approvals.
+fn list_trusted_lists(cfg: &SentryConfig) {
+    let approved = &cfg.real_ip.trusted_lists;
+    println!(
+        "{:<14} {:<7} {:<40} RANGES",
+        "NAME", "ACTIVE", "DESCRIPTION"
+    );
+    for p in sentry_core::trusted_lists::PRESETS {
+        println!(
+            "{:<14} {:<7} {:<40} {}",
+            p.name,
+            if approved.iter().any(|a| a == p.name) {
+                "yes"
+            } else {
+                "-"
+            },
+            p.description,
+            p.ranges.len()
+        );
+    }
+    println!();
+    println!("approve by name in [real_ip] trusted_lists = [\"paypal\", \"googlebot\", ...]");
+}
+
 /// `sentry firewall status` — probe the local ban backends (F7.3).
 /// One-off rDNS bot verification for an (ip, UA) pair (no daemon needed).
 async fn bots_check(ip: &str, ua: &str) -> color_eyre::Result<()> {
@@ -1114,6 +1145,13 @@ async fn check_feed_ip(cfg: &SentryConfig, ip: &str) -> color_eyre::Result<()> {
     match svc.store().read().unwrap().lookup(ip) {
         Some(rep) => println!("{ip}: {} (feed: {})", tier_label(rep.tier), rep.source),
         None => println!("{ip}: no match in any feed"),
+    }
+    let presets = sentry_core::trusted_lists::matching_presets(ip);
+    if !presets.is_empty() {
+        println!(
+            "{ip}: in trusted preset(s) {} — never-ban when approved in [real_ip] trusted_lists",
+            presets.join(", ")
+        );
     }
     Ok(())
 }

@@ -474,6 +474,11 @@ pub struct RealIpConfig {
     /// `Allow`.
     #[serde(default)]
     pub trusted_ips: Vec<String>,
+    /// Built-in trusted IP presets (see `trusted_lists::PRESETS`) to
+    /// approve by name — e.g. `["paypal", "googlebot"]`. Approved presets
+    /// join the never-ban set with the same guarantees as `trusted_ips`.
+    #[serde(default)]
+    pub trusted_lists: Vec<String>,
     /// Cloudflare ranges refresh interval in seconds (0 disables refresh;
     /// the bundled constants stay in effect).
     #[serde(default = "default_real_ip_refresh")]
@@ -486,6 +491,7 @@ impl Default for RealIpConfig {
             trusted_proxies: Vec::new(),
             cloudflare: default_real_ip_cloudflare(),
             trusted_ips: Vec::new(),
+            trusted_lists: Vec::new(),
             refresh_secs: default_real_ip_refresh(),
         }
     }

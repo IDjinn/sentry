@@ -399,7 +399,6 @@ p{color:#8b949e;margin:.25rem 0}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
     use std::sync::Arc;
     use std::time::Duration;
     use tower::ServiceExt;
