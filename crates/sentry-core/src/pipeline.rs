@@ -314,6 +314,7 @@ pub struct Pipeline {
     behavior: Option<Arc<RwLock<BehaviorTracker>>>,
     correlation: Option<Arc<RwLock<CorrelationTracker>>>,
     trust: Option<crate::trust::SharedTrustSet>,
+    bot: Option<crate::botverify::SharedBotVerifier>,
 }
 
 /// Output of processing a single event.
@@ -369,6 +370,7 @@ impl Pipeline {
             behavior: None,
             correlation: None,
             trust: None,
+            bot: None,
         }
     }
 
@@ -416,6 +418,14 @@ impl Pipeline {
         self
     }
 
+    /// Attach the rDNS bot-verification cache (F7.7). Claimed-crawler UAs
+    /// are annotated with the cached outcome before rule evaluation; misses
+    /// queue a background DNS check and mark the event pending.
+    pub fn with_bot_verifier(mut self, verifier: crate::botverify::SharedBotVerifier) -> Self {
+        self.bot = Some(verifier);
+        self
+    }
+
     /// Process a single event through the full pipeline.
     #[tracing::instrument(skip(self, evt), fields(id = %evt.id, ip = %evt.client_ip))]
     pub fn process(&self, evt: &Event) -> ProcessedEvent {
@@ -445,6 +455,18 @@ impl Pipeline {
                 };
             }
         }
+
+        // Bot verification (F7.7): annotate claimed-crawler UAs before rule
+        // evaluation so `bot_verified` conditions (verified-only allowlists)
+        // see the cached outcome. The event is cloned only when enabled.
+        let mut bot_evt;
+        let evt = if let Some(bot) = &self.bot {
+            bot_evt = evt.clone();
+            bot.annotate(&mut bot_evt);
+            &bot_evt
+        } else {
+            evt
+        };
 
         let ruleset = self.rules.read().unwrap();
 
@@ -498,6 +520,23 @@ impl Pipeline {
 
         let mut signals = self.heuristics.analyze(evt);
         signals.extend(crate::reputation::reputation_signals(evt));
+        if let Some(crate::botverify::BotStatus::Spoofed) = evt.bot {
+            let detail = evt
+                .http()
+                .and_then(|h| h.user_agent.as_deref())
+                .and_then(|ua| crate::botverify::claimed_engine(Some(ua)))
+                .map(|e| {
+                    format!(
+                        "UA claims {} crawler but rDNS verification failed",
+                        e.as_str()
+                    )
+                });
+            signals.push(Signal {
+                kind: SignalKind::SpoofedBot,
+                weight: crate::botverify::SPOOFED_BOT_WEIGHT,
+                detail,
+            });
+        }
         signals.extend(self.routes.read().unwrap().validate(evt));
         if let Some(ref scan) = self.scan {
             if let Some(http) = evt.http() {
@@ -632,6 +671,7 @@ impl Pipeline {
             SignalKind::AnomalousPayload => "anomalous_payload",
             SignalKind::TcpScanner => "tcp_scanner",
             SignalKind::ScanAttackCorrelation => "scan_attack_correlation",
+            SignalKind::SpoofedBot => "spoofed_bot",
             SignalKind::LlmMalicious => "llm_malicious",
             SignalKind::ExternalReputation => "external_reputation",
             SignalKind::RuleHit => "rule_hit",
@@ -675,6 +715,7 @@ impl Pipeline {
             SignalKind::AnomalousPayload => "anomalous_payload",
             SignalKind::TcpScanner => "tcp_scanner",
             SignalKind::ScanAttackCorrelation => "scan_attack_correlation",
+            SignalKind::SpoofedBot => "spoofed_bot",
             SignalKind::LlmMalicious => "llm_malicious",
             SignalKind::ExternalReputation => "external_reputation",
             SignalKind::RuleHit => "rule_hit",
@@ -1306,6 +1347,135 @@ mod tests {
                     && s.kind != SignalKind::DirectoryBruteForce
             }));
         }
+    }
+
+    fn googlebot_evt(ip: IpAddr, ua: &str) -> Event {
+        Event::new(
+            SourceKind::Synthetic,
+            ip,
+            ProtocolData::Http(HttpData {
+                path: "/api/users".into(),
+                method: Some(crate::event::HttpMethod::Get),
+                user_agent: Some(ua.into()),
+                ..Default::default()
+            }),
+        )
+    }
+
+    #[test]
+    fn spoofed_bot_claim_emits_signal() {
+        let verifier = Arc::new(crate::botverify::BotVerifier::new(
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        ));
+        let p = pipeline().with_bot_verifier(verifier.clone());
+        let ip = IpAddr::V4(Ipv4Addr::new(66, 249, 66, 1));
+        let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+
+        // First event: pending, no signal yet.
+        let first = p.process(&googlebot_evt(ip, ua));
+        assert!(first
+            .analysis
+            .signals
+            .iter()
+            .all(|s| s.kind != SignalKind::SpoofedBot));
+
+        // DNS verification fails → next event carries the spoofed signal.
+        verifier.insert(ip, crate::botverify::BotStatus::Spoofed);
+        let second = p.process(&googlebot_evt(ip, ua));
+        let sig = second
+            .analysis
+            .signals
+            .iter()
+            .find(|s| s.kind == SignalKind::SpoofedBot)
+            .expect("spoofed Googlebot claim must be flagged");
+        assert_eq!(sig.weight, 35);
+        assert!(sig.detail.as_deref().unwrap().contains("google"));
+        assert!(second.analysis.risk_score >= 35);
+    }
+
+    #[test]
+    fn verified_bot_claim_never_signals() {
+        let verifier = Arc::new(crate::botverify::BotVerifier::new(
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        ));
+        let p = pipeline().with_bot_verifier(verifier.clone());
+        let ip = IpAddr::V4(Ipv4Addr::new(66, 249, 66, 1));
+        verifier.insert(
+            ip,
+            crate::botverify::BotStatus::Verified(crate::botverify::BotEngine::Google),
+        );
+        let r = p.process(&googlebot_evt(
+            ip,
+            "Mozilla/5.0 (compatible; Googlebot/2.1)",
+        ));
+        assert!(r
+            .analysis
+            .signals
+            .iter()
+            .all(|s| s.kind != SignalKind::SpoofedBot));
+        assert_eq!(r.decision.action, Verdict::Allow);
+    }
+
+    #[test]
+    fn bots_ua_without_verifier_untouched() {
+        let p = pipeline();
+        let r = p.process(&googlebot_evt(
+            IpAddr::V4(Ipv4Addr::new(66, 249, 66, 1)),
+            "Mozilla/5.0 (compatible; Googlebot/2.1)",
+        ));
+        assert!(r.event.bot.is_none());
+    }
+
+    #[test]
+    fn crawlers_good_allow_requires_verification_when_gated() {
+        let mut packs = std::collections::HashMap::new();
+        packs.insert("crawlers_good".to_string(), "enforce".to_string());
+        let gated = crate::packs::build_default_ruleset_with(&packs, true);
+        let ungated = crate::packs::build_default_ruleset_with(&packs, false);
+
+        let ip = IpAddr::V4(Ipv4Addr::new(66, 249, 66, 1));
+        let ua = "Googlebot/2.1 (+http://www.google.com/bot.html)";
+
+        // Ungated: UA alone short-circuits to Allow.
+        let p = Pipeline::new(ungated, RouteValidator::default());
+        let r = p.process(&googlebot_evt(ip, ua));
+        assert_eq!(r.decision.action, Verdict::Allow);
+        assert_eq!(r.rule_hit.as_deref(), Some("crawlers_good"));
+
+        // Gated: claim without verification doesn't earn the rule Allow
+        // (the event flows on to heuristics like any unclaimed client).
+        let verifier = Arc::new(crate::botverify::BotVerifier::new(
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        ));
+        let p = Pipeline::new(gated, RouteValidator::default()).with_bot_verifier(verifier.clone());
+        let res = p.process(&googlebot_evt(ip, ua));
+        assert!(res.rule_hit.is_none());
+
+        // After a verified result the Allow short-circuit applies again.
+        verifier.insert(
+            ip,
+            crate::botverify::BotStatus::Verified(crate::botverify::BotEngine::Google),
+        );
+        let ok = p.process(&googlebot_evt(ip, ua));
+        assert_eq!(ok.decision.action, Verdict::Allow);
+        assert_eq!(
+            ok.rule_hit.as_deref(),
+            Some("crawlers_good_verified"),
+            "rule ids: {:?}",
+            ok.rule_hit
+        );
+    }
+
+    #[test]
+    fn dsl_bot_verified_condition_round_trip() {
+        let m = crate::rules::dsl::parse("bot_verified=true").unwrap();
+        assert!(matches!(m, RuleMatch::BotVerified(v) if v == "true"));
+        let m = crate::rules::dsl::parse("bot_verified=google").unwrap();
+        assert!(matches!(m, RuleMatch::BotVerified(v) if v == "google"));
+        assert!(crate::rules::dsl::parse("bot_verified=bogus").is_err());
     }
 
     #[test]

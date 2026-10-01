@@ -19,22 +19,37 @@
 
 #![forbid(unsafe_code)]
 
+pub mod challenge;
 pub mod middleware;
 pub mod proxy;
 pub mod tcp_listener;
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::http::HeaderMap;
+use axum::response::Response;
 use sentry_core::event::Event;
 use sentry_core::pipeline::Pipeline;
 use sentry_core::BlockTable;
 
+use crate::challenge::{cookie_value, JsChallenge, COOKIE_NAME};
 use crate::middleware::MiddlewareMode;
 
 /// Optional event enrichment hook (geo / reputation) supplied by the host.
 pub type Enricher = Arc<dyn Fn(&mut Event) + Send + Sync>;
+
+/// Gate outcome for a `Challenge` verdict (F7.8).
+#[derive(Debug)]
+pub enum ChallengeGate {
+    /// Let the request through (solved cookie or verified crawler).
+    Pass,
+    /// Serve this PoW interstitial.
+    Page(Response),
+    /// No challenge configured — use the caller's static fallback.
+    Disabled,
+}
 
 /// Shared edge runtime: pipeline + enrichment + capture limits + mode.
 #[derive(Clone)]
@@ -46,6 +61,9 @@ pub struct EdgeRuntime {
     block_table: Option<Arc<BlockTable>>,
     block_hits: Option<prometheus::Counter>,
     trust: Option<sentry_core::SharedTrustSet>,
+    challenge: Option<Arc<JsChallenge>>,
+    bot_verifier: Option<sentry_core::SharedBotVerifier>,
+    challenge_metrics: Option<prometheus::CounterVec>,
 }
 
 impl EdgeRuntime {
@@ -62,6 +80,9 @@ impl EdgeRuntime {
             block_table: None,
             block_hits: None,
             trust: None,
+            challenge: None,
+            bot_verifier: None,
+            challenge_metrics: None,
         }
     }
 
@@ -88,6 +109,74 @@ impl EdgeRuntime {
     pub fn with_block_hits(mut self, hits: prometheus::Counter) -> Self {
         self.block_hits = Some(hits);
         self
+    }
+
+    /// Serve a JavaScript proof-of-work challenge on `Challenge` verdicts
+    /// (F7.8) instead of the static 403 page.
+    pub fn with_challenge(mut self, challenge: Arc<JsChallenge>) -> Self {
+        self.challenge = Some(challenge);
+        self
+    }
+
+    /// Consult the rDNS bot-verification cache so verified crawlers bypass
+    /// the JS challenge (real search bots don't execute JavaScript).
+    pub fn with_bot_verifier(mut self, verifier: sentry_core::SharedBotVerifier) -> Self {
+        self.bot_verifier = Some(verifier);
+        self
+    }
+
+    /// `sentry_edge_challenge_total{result}` counter (served / passed /
+    /// bot_bypass).
+    pub fn with_challenge_metrics(mut self, counter: prometheus::CounterVec) -> Self {
+        self.challenge_metrics = Some(counter);
+        self
+    }
+
+    fn challenge_metric(&self, result: &str) {
+        if let Some(m) = &self.challenge_metrics {
+            m.with_label_values(&[result]).inc();
+        }
+    }
+
+    /// Gate for a `Challenge` verdict (F7.8): browsers solve the proof-of-
+    /// work once per bucket; rDNS-verified crawlers bypass entirely.
+    pub fn challenge_gate(&self, headers: &HeaderMap, client_ip: IpAddr) -> ChallengeGate {
+        let Some(ch) = self.challenge.as_ref() else {
+            return ChallengeGate::Disabled;
+        };
+
+        // Verified crawlers bypass: search bots don't execute JavaScript,
+        // and their identity has been forward-confirmed via rDNS. A spoofed
+        // claim gets no bypass (and, being JS-less, stays stuck on the PoW).
+        if let Some(verifier) = &self.bot_verifier {
+            let claims = sentry_core::botverify::claimed_engine(
+                headers
+                    .get(axum::http::header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok()),
+            )
+            .is_some();
+            if claims
+                && matches!(
+                    verifier.get(client_ip),
+                    Some(sentry_core::botverify::BotStatus::Verified(_))
+                )
+            {
+                self.challenge_metric("bot_bypass");
+                return ChallengeGate::Pass;
+            }
+        }
+
+        // Solved challenge: any request carries the cookie once the browser
+        // reloads after the PoW.
+        if let Some(value) = cookie_value(headers, COOKIE_NAME) {
+            if ch.verify_cookie(client_ip, &value, SystemTime::now()) {
+                self.challenge_metric("passed");
+                return ChallengeGate::Pass;
+            }
+        }
+
+        self.challenge_metric("served");
+        ChallengeGate::Page(ch.page_response(client_ip, headers, SystemTime::now()))
     }
 
     /// Pipeline reference.

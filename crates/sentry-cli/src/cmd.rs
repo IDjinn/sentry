@@ -476,6 +476,11 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 firewall_status(cfg).await;
             }
         },
+        Command::Bots { action } => match action {
+            BotsCmd::Check { ip, ua } => {
+                bots_check(&ip, &ua).await?;
+            }
+        },
         Command::Auth { action } => match action {
             AuthCmd::HashPassword { password } => {
                 let hash = crate::auth::hash_password(&password)?;
@@ -992,6 +997,44 @@ fn list_feeds(cfg: &SentryConfig) {
 }
 
 /// `sentry firewall status` — probe the local ban backends (F7.3).
+/// One-off rDNS bot verification for an (ip, UA) pair (no daemon needed).
+async fn bots_check(ip: &str, ua: &str) -> color_eyre::Result<()> {
+    let ip: std::net::IpAddr = ip.parse()?;
+    let Some(engine) = sentry_core::botverify::claimed_engine(Some(ua)) else {
+        println!("UA does not claim a verifiable crawler:");
+        println!("  {ua}");
+        println!(
+            "verifiable engines: {}",
+            sentry_core::botverify::BotEngine::all()
+                .iter()
+                .map(|e| e.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return Ok(());
+    };
+    println!("claim:      {ua}");
+    println!(
+        "engine:     {} (PTR must end in {})",
+        engine.as_str(),
+        engine.rdns_domains().join(" | ")
+    );
+    let dns = crate::botdns::HickoryDns::new(std::time::Duration::from_secs(3))?;
+    let status = sentry_core::botverify::verify_with(engine, ip, &dns).await;
+    match status {
+        sentry_core::botverify::BotStatus::Verified(e) => {
+            println!("result:     VERIFIED — PTR forward-confirms {ip} as a genuine {e:?} crawler");
+        }
+        sentry_core::botverify::BotStatus::Spoofed => {
+            println!("result:     SPOOFED — {ip} would earn a SpoofedBot signal (weight 35)");
+        }
+        sentry_core::botverify::BotStatus::Unknown => {
+            println!("result:     UNKNOWN — DNS lookup failed (resolver outage? retry later)");
+        }
+    }
+    Ok(())
+}
+
 async fn firewall_status(_cfg: &SentryConfig) {
     if !cfg!(target_os = "linux") {
         println!("firewall ban backends are Linux-only (nftables/ipset/firewalld).");

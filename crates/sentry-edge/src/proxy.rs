@@ -240,7 +240,7 @@ async fn proxy_handler(
         referer: headers.get("referer").cloned(),
         headers,
         body: captured,
-        cookies: None,
+        cookies: Some(crate::challenge::parse_cookies(&parts.headers)),
     };
     let mut evt = sentry_core::event::Event::new(
         sentry_core::event::SourceKind::HttpProxy,
@@ -259,7 +259,13 @@ async fn proxy_handler(
     match processed.decision.action {
         sentry_core::analysis::Verdict::Allow => {}
         sentry_core::analysis::Verdict::RateLimit => return rate_limit_response(),
-        sentry_core::analysis::Verdict::Challenge => return challenge_response(),
+        sentry_core::analysis::Verdict::Challenge => {
+            match runtime.challenge_gate(&parts.headers, client_ip) {
+                crate::ChallengeGate::Pass => {}
+                crate::ChallengeGate::Page(page) => return page,
+                crate::ChallengeGate::Disabled => return challenge_response(),
+            }
+        }
         sentry_core::analysis::Verdict::Block | sentry_core::analysis::Verdict::Quarantine => {
             return block_response()
         }

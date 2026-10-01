@@ -154,6 +154,9 @@ pub enum SignalKind {
     /// External IP-reputation lookup hit (F7.5): the provider's confidence
     /// score (0-100) scales the weight; `detail` carries provider + score.
     ExternalReputation,
+    /// UA claims a verified crawler but rDNS forward-confirmation failed
+    /// (F7.7): spoofed bot identity.
+    SpoofedBot,
     /// A custom rule matched (the rule id is carried in `detail`).
     RuleHit,
     /// Any other signal not yet cataloged.

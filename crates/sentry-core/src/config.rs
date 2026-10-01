@@ -49,6 +49,9 @@ pub struct SentryConfig {
     /// Cross-IP scan→attack correlation (F3.10).
     #[serde(default)]
     pub correlation: CorrelationConfig,
+    /// rDNS bot verification (F7.7).
+    #[serde(default)]
+    pub bot_verification: BotVerificationConfig,
     /// Local ML threat model (async fork stage).
     #[serde(default)]
     pub ai: AiConfig,
@@ -402,6 +405,55 @@ fn default_correlation_enabled() -> bool {
 }
 fn default_correlation_window() -> u64 {
     900 // 15 minutes — the honeypot shot-calling window
+}
+
+/// rDNS forward-confirmed bot verification (F7.7): UA claims of known
+/// crawlers (Googlebot, bingbot, …) are validated via reverse DNS + forward
+/// confirmation; verified bots can bypass edge challenges, spoofed claims
+/// raise the risk score.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BotVerificationConfig {
+    /// Enable verification (off by default; requires DNS resolution).
+    #[serde(default)]
+    pub enabled: bool,
+    /// TTL for verified results (per IP).
+    #[serde(default = "default_bv_cache_ttl")]
+    pub cache_ttl_secs: u64,
+    /// Shorter TTL for failed (spoofed) results so bots recover quickly
+    /// from transient DNS outages.
+    #[serde(default = "default_bv_failed_ttl")]
+    pub failed_ttl_secs: u64,
+    /// Timeout for one PTR+A verification round.
+    #[serde(default = "default_bv_timeout")]
+    pub timeout_ms: u64,
+    /// Maximum claims verified per background drain cycle.
+    #[serde(default = "default_bv_batch")]
+    pub batch_size: usize,
+}
+
+impl Default for BotVerificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cache_ttl_secs: default_bv_cache_ttl(),
+            failed_ttl_secs: default_bv_failed_ttl(),
+            timeout_ms: default_bv_timeout(),
+            batch_size: default_bv_batch(),
+        }
+    }
+}
+
+fn default_bv_cache_ttl() -> u64 {
+    3600
+}
+fn default_bv_failed_ttl() -> u64 {
+    600
+}
+fn default_bv_timeout() -> u64 {
+    2000
+}
+fn default_bv_batch() -> usize {
+    16
 }
 
 /// Real client IP resolution and trusted infrastructure (F7.2).
@@ -898,6 +950,60 @@ pub struct EdgeConfig {
     /// Real backend for the TCP listener (`127.0.0.1:22`).
     #[serde(default)]
     pub tcp_upstream: Option<String>,
+    /// Interactive JavaScript challenge for `Challenge` verdicts (F7.8).
+    #[serde(default)]
+    pub challenge: EdgeChallengeConfig,
+}
+
+/// JavaScript proof-of-work challenge settings (F7.8). When enabled, the
+/// inline edge answers `Challenge` verdicts with a browser PoW interstitial
+/// instead of the static 403 page; solved clients get a cookie valid for the
+/// rest of the bucket. Stateless: share `secret_env` across edge nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeChallengeConfig {
+    /// Enable the interactive challenge (off by default).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Env var holding the shared secret (32+ random bytes recommended:
+    /// `openssl rand -hex 32`). Required when enabled; startup fails without
+    /// it.
+    #[serde(default = "default_edge_challenge_secret_env")]
+    pub secret_env: String,
+    /// Bucket length in seconds — the challenge rotates and cookies expire
+    /// with it (clients re-solve once per bucket).
+    #[serde(default = "default_edge_challenge_bucket")]
+    pub bucket_secs: u64,
+    /// PoW difficulty in leading zero bits (clamped 8..=28 by the edge).
+    #[serde(default = "default_edge_challenge_difficulty")]
+    pub difficulty: u8,
+    /// Interstitial page title.
+    #[serde(default = "default_edge_challenge_title")]
+    pub title: String,
+}
+
+impl Default for EdgeChallengeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            secret_env: default_edge_challenge_secret_env(),
+            bucket_secs: default_edge_challenge_bucket(),
+            difficulty: default_edge_challenge_difficulty(),
+            title: default_edge_challenge_title(),
+        }
+    }
+}
+
+fn default_edge_challenge_secret_env() -> String {
+    "SENTRY_EDGE_CHALLENGE_SECRET".to_string()
+}
+fn default_edge_challenge_bucket() -> u64 {
+    3600
+}
+fn default_edge_challenge_difficulty() -> u8 {
+    16
+}
+fn default_edge_challenge_title() -> String {
+    "Verifying your browser...".to_string()
 }
 
 impl Default for EdgeConfig {
@@ -912,6 +1018,7 @@ impl Default for EdgeConfig {
             tls_key: None,
             tcp_listen: None,
             tcp_upstream: None,
+            challenge: EdgeChallengeConfig::default(),
         }
     }
 }

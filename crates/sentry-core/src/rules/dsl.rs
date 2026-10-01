@@ -319,6 +319,19 @@ impl Parser {
                 };
                 Ok(RuleMatch::Reputation(tier))
             }
+            "bot_verified" => {
+                let val = self.resolve_value(inline_val)?;
+                let lower = val.to_ascii_lowercase();
+                match lower.as_str() {
+                    "true" | "verified" | "false" | "spoofed" => {}
+                    engine => {
+                        if crate::botverify::BotEngine::parse(engine).is_none() {
+                            return Err(DslError::UnknownKey(val));
+                        }
+                    }
+                }
+                Ok(RuleMatch::BotVerified(lower))
+            }
             "time" => {
                 let mode = self.resolve_value(inline_val)?;
                 let mode_lower = mode.to_ascii_lowercase();

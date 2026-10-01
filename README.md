@@ -3,7 +3,9 @@
 Real-time access monitor for internet-exposed services. Detects threats via
 deterministic heuristics + AI (local ONNX / optional LLM), computes a risk
 level per request/IP, and acts automatically: block, edge challenge
-(Cloudflare), rate-limit, or webhook alert.
+(Cloudflare, self-hosted JS proof-of-work, or nginx includes), rate-limit,
+or webhook alert. Search-engine crawlers are verified via reverse DNS —
+real Googlebot passes, spoofers don't.
 
 ## Why it exists
 

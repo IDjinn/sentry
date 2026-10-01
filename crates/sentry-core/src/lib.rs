@@ -14,6 +14,7 @@ pub mod action;
 pub mod analysis;
 pub mod behavior;
 pub mod blocks;
+pub mod botverify;
 pub mod challenge;
 pub mod config;
 pub mod correlation;
@@ -39,14 +40,19 @@ pub use action::{Action, ActionContext};
 pub use analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};
 pub use behavior::BehaviorTracker;
 pub use blocks::BlockTable;
+pub use botverify::{
+    claimed_engine, forward_confirms, hostname_matches, verify_with, BotDnsResolver, BotEngine,
+    BotStatus, BotVerifier, SharedBotVerifier, SPOOFED_BOT_WEIGHT,
+};
 pub use challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
 pub use config::{
     ActionConfig, ActionKind, AiConfig, AuthTokenConfig, AuthUserConfig, BehaviorConfig,
-    CoreConfig, CorrelationConfig, DeploymentConfig, EdgeConfig, EscalationConfig, FeedConfig,
-    FeedKind, GeoConfig, IpLookupConfig, LlmConfig, MetricsConfig, PolicyConfig,
-    PolicyOverrideConfig, PostgresConfig, RateLimitConfig, RealIpConfig, RouteDefConfig,
-    RouteLearnerConfig, RoutesConfig, RuleDefConfig, RulePackConfig, RulesConfig, ScanConfig,
-    ScorerConfig, SentryConfig, ServerAuthConfig, ServerConfig, SourceConfig, StorageConfig,
+    BotVerificationConfig, CoreConfig, CorrelationConfig, DeploymentConfig, EdgeChallengeConfig,
+    EdgeConfig, EscalationConfig, FeedConfig, FeedKind, GeoConfig, IpLookupConfig, LlmConfig,
+    MetricsConfig, PolicyConfig, PolicyOverrideConfig, PostgresConfig, RateLimitConfig,
+    RealIpConfig, RouteDefConfig, RouteLearnerConfig, RoutesConfig, RuleDefConfig, RulePackConfig,
+    RulesConfig, ScanConfig, ScorerConfig, SentryConfig, ServerAuthConfig, ServerConfig,
+    SourceConfig, StorageConfig,
 };
 pub use correlation::CorrelationTracker;
 pub use error::{CoreError, Result};

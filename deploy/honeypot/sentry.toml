@@ -218,6 +218,21 @@ backend = "auto"
 ttl_secs = 86400
 rate_limit_ttl_secs = 600
 
+# nginx includes (F7.8): alternative to (or beside) the firewall bans when
+# the decoy nginx should serve the getpagespeed JS challenge to Challenge
+# verdicts and deny Block verdicts in-config. Writes includes under the
+# compose-mounted nginx conf dir and reloads with `nginx -t` gating; add
+# `include /etc/nginx/conf.d/sentry/sentry-challenge-if.conf;` to the decoy
+# server block.
+# [[action]]
+# type = "challenge"
+# provider = "nginx"
+# [action.options]
+# conf_dir = "/etc/nginx/conf.d/sentry"
+# reload_cmd = "nginx -s reload"
+# validate = true
+# ttl_secs = 86400
+
 # Report the honeypot's catch to the community (F7.4): anything that earned
 # a Block here gets reported to AbuseIPDB (key in the stack .env). One
 # report per IP per day keeps the free tier's 1k/day quota safe. Categories

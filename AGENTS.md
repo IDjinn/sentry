@@ -76,6 +76,7 @@ sentry/
 │   ├── sentry-action-cloudflare/  # plugin Action: block/challenge via API CF
 │   ├── sentry-action-webhook/     # plugin Action: alertas Discord/Slack/etc (HMAC)
 │   ├── sentry-action-blocklist/   # plugin Action: blocklist local em memória
+│   ├── sentry-action-nginx/       # plugin Action: includes deny/challenge p/ nginx + reload (F7.8)
 │   └── sentry-cli/            # binário: clap + ratatui + daemon + server + auth + siem
 ├── deploy/
 │   ├── docker/               # Dockerfile + docker-compose
@@ -427,6 +428,35 @@ não em runtime.
     core; exemplo bad-bot-blocker no `sentry.example.toml`. Params de
     packs agora são achatados (`<pack>__<param>`) no daemon — corrigindo
     `country_blocklist__countries`, que nunca chegava ao builder
+  - ✅ F7.10 Verificação de bots via rDNS (`botverify.rs` no core +
+    `botdns.rs` no CLI, `[bot_verification]` opt-in): UA alega crawler
+    (Googlebot/bingbot/Slurp/Baiduspider/YandexBot) → PTR termina nos
+    domínios do engine **e** forward-resolve de volta ao IP (mata spoof);
+    DNS injetado via trait `BotDnsResolver` (hickory no daemon), fora do
+    hot path — pipeline/edge leem o cache `BotVerifier` (TTL 1h/10min;
+    miss = `Unknown` + fila pro worker; erro de DNS ≠ PTR vazio, outage
+    não marca bot verdadeiro). Verificado → bypass do JS challenge na
+    edge; falsificado → sinal `SpoofedBot` (35); pack `crawlers_good`
+    divide-se em `crawlers_good_verified` (condição DSL
+    `bot_verified = "true"|"false"|engine`) + `crawlers_good_unverified_ok`
+    — `sentry bots check <ip> --ua "Googlebot/2.1"`; métrica
+    `sentry_bot_verifications_total{result}`
+  - ✅ F7.11 JS challenge (F6.2 entregue de quebra): (a) **edge inline**
+    (`[edge.challenge]` opt-in, `sentry-edge/src/challenge.rs`): PoW
+    SHA-256 stateless (`challenge_id = SHA-256(secret||ip||bucket)`,
+    cookie `sentry_ch=<bucket>:<nonce>`, graça de 1 bucket, 503 +
+    retry-after, `EdgeRuntime::challenge_gate` compartilhado por
+    middleware/proxy, página embutida sem CDN, secret
+    `SENTRY_EDGE_CHALLENGE_SECRET` obrigatório quando enabled, PoW nunca
+    destrava Block; cookies agora populam `HttpData.cookies`); (b)
+    **provider nginx** (crate `sentry-action-nginx`,
+    `provider = "nginx"`): gera includes atômicos em `conf_dir`
+    (`sentry-deny.conf` / `sentry-challenge.conf` geo map /
+    `sentry-challenge-if.conf` p/ módulo getpagespeed js_challenge +
+    `sentry-bots.conf` bot_verifier opt-in) com stamps
+    `# sentry:<ts>:<ttl>`, worker com debounce ≥1/s + `nginx -t` antes do
+    reload, IPv6 CIDR (`ipv6_prefix`), deny reconcile com `ip_state` 60s,
+    guard never-ban
   - ⏸️ F7.7-F7.9 (roadmap `ARCHITECTURE.md` §23.3): datasets DB-backed
     com import CLI + prefilter dinâmico, ReportedIP check, feeds CLI p/
     datasets
@@ -440,7 +470,7 @@ Backlog detalhado em `ARCHITECTURE.md` §23.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 381 testes passando sem features; 383 com
+# Resultado esperado: 420 testes passando sem features; 422 com
 # --features sentry-cli/onnx (adiciona os 2 testes de inferência ONNX)
 ```
 

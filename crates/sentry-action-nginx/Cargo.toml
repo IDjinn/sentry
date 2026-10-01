@@ -1,0 +1,15 @@
+[package]
+name = "sentry-action-nginx"
+description = "nginx edge provider for Sentry (F7.8): deny-list + JS-challenge includes with reload"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+sentry-core = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

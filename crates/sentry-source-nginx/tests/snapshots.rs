@@ -120,6 +120,7 @@ fn signal_label(k: sentry_core::SignalKind) -> &'static str {
         AnomalousPayload => "anomalous_payload",
         TcpScanner => "tcp_scanner",
         ScanAttackCorrelation => "scan_attack_correlation",
+        SpoofedBot => "spoofed_bot",
         LlmMalicious => "llm_malicious",
         ExternalReputation => "external_reputation",
         RuleHit => "rule_hit",

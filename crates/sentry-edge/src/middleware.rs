@@ -119,7 +119,7 @@ pub async fn handler(State(runtime): State<EdgeRuntime>, req: Request, next: Nex
         referer: headers.get("referer").cloned(),
         headers,
         body: captured,
-        cookies: None,
+        cookies: Some(crate::challenge::parse_cookies(&parts.headers)),
     };
 
     let mut evt = Event::new(SourceKind::HttpProxy, client_ip, ProtocolData::Http(http));
@@ -144,7 +144,15 @@ pub async fn handler(State(runtime): State<EdgeRuntime>, req: Request, next: Nex
             next.run(req).await
         }
         Verdict::RateLimit => rate_limit_response(),
-        Verdict::Challenge => challenge_response(),
+        Verdict::Challenge => match runtime.challenge_gate(&parts.headers, client_ip) {
+            crate::ChallengeGate::Pass => {
+                parts.extensions.insert(processed);
+                let req = Request::from_parts(parts, body);
+                next.run(req).await
+            }
+            crate::ChallengeGate::Page(page) => page,
+            crate::ChallengeGate::Disabled => challenge_response(),
+        },
         Verdict::Block | Verdict::Quarantine => block_response(),
     }
 }
@@ -171,11 +179,8 @@ pub fn rate_limit_response() -> Response {
     resp
 }
 
-/// 403 challenge page for `Challenge` verdicts.
-///
-/// Edge challenges are static pages (unlike Cloudflare-managed challenges,
-/// there is no verification backend here); use `mode = "block"` semantics or
-/// front Sentry with Cloudflare for interactive challenges.
+/// 403 challenge page for `Challenge` verdicts without an interactive
+/// challenge configured (see `[edge.challenge]`, F7.8).
 pub fn challenge_response() -> Response {
     verdict_page(
         StatusCode::FORBIDDEN,

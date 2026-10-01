@@ -379,6 +379,10 @@ pub enum RuleMatch {
     },
     /// Match a reputation tier assigned to the client IP.
     Reputation(ReputationTier),
+    /// Match the rDNS bot-verification outcome (F7.7). The value accepts
+    /// `true`/`verified`, `false`/`spoofed`, or an engine name (`google`).
+    /// Only true fires for `Verified`; pending/unknown never grants access.
+    BotVerified(String),
     /// Match the HTTP response status code.
     Status(u16),
     /// Match a rate condition (count over window).
@@ -622,6 +626,11 @@ impl RuleMatch {
                 .reputation
                 .as_ref()
                 .map(|r| r.tier == *tier)
+                .unwrap_or(false),
+            Self::BotVerified(want) => evt
+                .bot
+                .as_ref()
+                .map(|status| status.matches_condition(want))
                 .unwrap_or(false),
             Self::Status(code) => evt
                 .http()

@@ -70,6 +70,11 @@ pub enum Command {
         #[command(subcommand)]
         action: FirewallCmd,
     },
+    /// rDNS bot verification (F7.7): check a claimed crawler IP.
+    Bots {
+        #[command(subcommand)]
+        action: BotsCmd,
+    },
     /// Auth helpers (hash generation for `[server.auth]`).
     Auth {
         #[command(subcommand)]
@@ -285,6 +290,20 @@ pub enum FirewallCmd {
     /// Detect available backends (nftables / ipset / firewalld) and their
     /// privileges; shows live set sizes when a backend responds.
     Status,
+}
+
+/// rDNS bot verification commands (F7.7).
+#[derive(Debug, Subcommand)]
+pub enum BotsCmd {
+    /// Verify one IP as a claimed crawler via reverse DNS + forward
+    /// confirmation (no daemon needed; uses the system resolver).
+    Check {
+        /// Client IP to verify.
+        ip: String,
+        /// User-Agent claiming the bot identity (e.g. "Googlebot/2.1").
+        #[arg(long)]
+        ua: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

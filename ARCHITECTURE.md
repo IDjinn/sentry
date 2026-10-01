@@ -669,6 +669,73 @@ internamente); `action` default `log`. Params de packs são achatados para
 próprios countries). Roadmap F7.7: datasets DB-backed com import CLI e
 prefilter dinâmico (§23.3).
 
+**Verificação de bots via rDNS (F7.10)** — `[bot_verification]`
+(opt-in, `enabled = false`): UAs que alegam ser crawler verificado
+(Googlebot, bingbot, Slurp, Baiduspider, YandexBot) passam pelo método
+oficial dos engines — o PTR do IP tem de terminar nos domínios do engine
+(`googlebot.com`/`google.com`, `search.msn.com`, `yahoo.com`,
+`crawl.baidu.com`, `yandex.com|net|ru`) **e** a resolução direta do
+hostname tem de conter o IP de origem (mata spoof de PTR). DNS entra
+injetado via trait `BotDnsResolver` (`crates/sentry-cli/src/botdns.rs`
+com hickory-resolver; mock nos testes) e roda **fora do hot path**: o
+pipeline só lê o cache `BotVerifier` (`crates/sentry-core/src/
+botverify.rs`; TTL 1h verificado / 10 min falha; miss marca `Unknown` no
+evento e enfileira `(ip, engine)` para o worker em background — pendente
+não concede bypass nem sinal). Claim verificado → bypass do JS challenge
+na edge; claim falsificado → sinal `SpoofedBot` (peso 35, override em
+`[scorer.weights] spoofed_bot`; no LevelMap default vira Challenge);
+outage de DNS → `Unknown` (nunca marca bot verdadeiro como spoof — erro
+é distinto de resposta vazia via `DnsOutcome`). Com a verificação ligada,
+o pack `crawlers_good` divide-se em `crawlers_good_verified`
+(exige a condição DSL `bot_verified = "true"` — allowlist verified-only;
+a condição também aceita `false`/`spoofed` e engine: `bot_verified =
+google`) e `crawlers_good_unverified_ok` (UAs sem verificação possível
+mantêm o allow por UA). Diagnóstico: `sentry bots check <ip> --ua
+"Googlebot/2.1"`. Métrica `sentry_bot_verifications_total{result=
+verified|spoofed|error}`.
+
+**JS challenge nativo na edge + provider nginx (F7.11)** — duas
+topologias para o verdict `Challenge` (`EdgeMode::JsChallenge` já
+existia no vocabulário; agora tem execução):
+(1) **Edge inline** (`[edge.challenge]`, opt-in; ativa em
+`[deployment] mode = "inline"`): interstitial proof-of-work SHA-256 sem
+estado, no estilo do módulo nginx js_challenge —
+`challenge_id = SHA-256(secret || ip || bucket)`; o browser procura um
+nonce com `SHA-256(challenge_id || ":" || nonce)` com `difficulty` bits
+zero à esquerda (default 16, clamp 8..=28; WebCrypto, resolve em <1 s),
+seta o cookie `sentry_ch=<bucket>:<nonce>` e dá reload. A edge valida
+recomputando o PoW — stateless, multi-node com o mesmo
+`secret_env` (`SENTRY_EDGE_CHALLENGE_SECRET`, obrigatório quando
+`enabled`, mínimo 16 bytes); bucket default 3600 s com graça do bucket
+anterior; resposta 503 + `retry-after: 3` + `cache-control: no-store`,
+`Secure` no cookie quando há HTTPS (`X-Forwarded-Proto`). Clientes sem
+JS (curl, bots burros) ficam presos no 503; bots verificados (F7.10)
+passam direto (`ChallengeGate::Pass`, métrica `bot_bypass`);
+`Block`/`RateLimit` continuam 403/429 — PoW nunca destrava block hard.
+Página embutida (`CHALLENGE_HTML`), tema escuro, zero CDN. Middleware e
+reverse proxy compartilham `EdgeRuntime::challenge_gate`; cookies agora
+populam `HttpData.cookies`. Métrica
+`sentry_edge_challenge_total{result=served|passed|bot_bypass}`.
+(2) **Provider nginx** (crate `sentry-action-nginx`,
+`type = "challenge"`, `provider = "nginx"`; entrega o F6.2): gera
+includes com escrita atômica (tmp+rename) em `conf_dir` —
+`sentry-deny.conf` (`deny <ip>;` para Block; `rate_limit_deny` opt-in
+para RateLimit), `sentry-challenge.conf` (geo map
+`$sentry_challenge_ip` para Challenge) e `sentry-challenge-if.conf`
+(snippet de server: `if ($sentry_challenge_ip) { js_challenge on; }` +
+`sentry-bots.conf` opcional com `bot_verifier on;`) — para os módulos
+getpagespeed (`nginx-module-js-challenge`, `nginx-module-bot-verifier`
++ Redis) no host. Stamps `# sentry:<ts>:<ttl>` (mesma convenção do note
+do Cloudflare), worker com reload com debounce ≥1/s e `nginx -t` antes
+(`validate = true`, reload quebrado é pulado, nunca aplicado), IPv6 por
+CIDR (`ipv6_prefix`, host bits mascarados), deny entries reconciliadas
+com o `ip_state` no startup e a cada 60 s (entries de challenge são
+efêmeras), guard never-ban (`[real_ip] trusted_ips` nunca entra em
+include). Topologias suportadas: passivo + provider nginx
+(co-localizado, honeypot), edge inline nativa (F7.11.1) ou Cloudflare —
+as três compartilham o mesmo verdict/pipeline e o bypass de bot
+verificado.
+
 ---
 
 ## 9. Detecção de Rotas Válidas
@@ -1561,12 +1628,14 @@ segue o trait `ChallengeProvider` (`apply(ip, verdict, opts)`) e entra no
   → 403/429 locais não aplicáveis (a plataforma só sabe drop/reject —
   documentar). Config: `type = "challenge"`, `provider = "opnsense"`,
   `api_key_env`/`api_secret_env`/`base_url`.
-- **[ ] F6.2 — Provider nginx**: gerador de include deny-list
-  (`deny <ip>;` em `denylist.conf` incluído do `http`/`server` block) +
-  reload (`nginx -s reload` ou SIGHUP) com debounce (≥ 1 reload/s);
-  valer de `ngx_http_access_module`; TTL por bloco gerado com carimbo de
-  tempo. Modo alternativo: `njs`/map para challenge 429. Requer co-
-  locação (mesmo host ou volume compartilhado) — documentar as 3 topologias.
+- **[x] F6.2 — Provider nginx** (entregue pelo F7.11, §8.7): gerador de
+  include deny-list (`deny <ip>;` em `sentry-deny.conf` incluído do
+  `http`/`server` block) + reload (`nginx -s reload`) com debounce
+  (≥ 1 reload/s) e `nginx -t` antes (`validate = true`); TTL por bloco
+  gerado com carimbo de tempo (`# sentry:<ts>:<ttl>`). Modo desafio: geo
+  map `$sentry_challenge_ip` + `if` → `js_challenge on` (módulo
+  getpagespeed no host) em vez de njs. Requer co-locação — topologias
+  documentadas em §8.7 (F7.11).
 - **[ ] F6.3 — HAProxy maps**: `sentry_blocks.map` com `src` como key +
   `http-request deny` — mesmo ciclo gerador/reload do F6.2.
 - **[ ] F6.4 — Export Suricata/fast.log + EVE**: Espelho de eventos como
@@ -1584,7 +1653,8 @@ Critérios de "pronto" da F5/F6:
 
 ### 23.3 F7 — Roadmap restante (datasets completos)
 
-F7.1–F7.6 estão entregues (§8.7). Restante:
+F7.1–F7.6 estão entregues (§8.7), assim como F7.10 (verificação de bots
+via rDNS) e F7.11 (JS challenge na edge inline + provider nginx). Restante:
 
 - **[ ] F7.7 — Datasets DB-backed**: tabelas `datasets` +
   `dataset_entries` + `DatasetRepo`; `sentry datasets import <file|url>`

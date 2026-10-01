@@ -31,6 +31,8 @@ pub struct Metrics {
     pub dedupe_drops: prometheus::Counter,
     pub correlation_hits: prometheus::Counter,
     pub edge_block_hits: prometheus::Counter,
+    pub bot_verifications: prometheus::CounterVec,
+    pub edge_challenge: prometheus::CounterVec,
     pub block_table_size: prometheus::Gauge,
     pub signal_kinds: prometheus::CounterVec,
     pub signals: prometheus::CounterVec,
@@ -71,6 +73,24 @@ impl Metrics {
             "sentry_edge_block_hits_total",
             "Connections denied by the inline edge fast-path for IPs on the \
              block table (sticky blocks enforced before the pipeline).",
+        )
+        .unwrap();
+        let bot_verifications = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sentry_bot_verifications_total",
+                "rDNS bot verifications performed, by result (verified | \
+                 spoofed | error) — F7.7.",
+            ),
+            &["result"],
+        )
+        .unwrap();
+        let edge_challenge = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sentry_edge_challenge_total",
+                "Inline-edge JS challenges, by result (served | passed | \
+                 bot_bypass) — F7.8.",
+            ),
+            &["result"],
         )
         .unwrap();
         let block_table_size = prometheus::Gauge::new(
@@ -155,6 +175,14 @@ impl Metrics {
         }
         registry.register(Box::new(block_table_size.clone())).ok();
         registry
+            .register(Box::new(bot_verifications.clone()))
+            .map_err(|e| warn!(error = %e, "register bot verifications"))
+            .ok();
+        registry
+            .register(Box::new(edge_challenge.clone()))
+            .map_err(|e| warn!(error = %e, "register edge challenge"))
+            .ok();
+        registry
             .register(Box::new(signals.clone()))
             .map_err(|e| warn!(error = %e, "register signals"))
             .ok();
@@ -184,6 +212,8 @@ impl Metrics {
             dedupe_drops,
             correlation_hits,
             edge_block_hits,
+            bot_verifications,
+            edge_challenge,
             block_table_size,
             signal_kinds,
             signals,

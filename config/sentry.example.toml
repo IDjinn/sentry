@@ -127,6 +127,24 @@ suspicious_success_min_failures = 3
 enabled = true
 window_secs = 900           # 15 min
 
+# ── rDNS bot verification (F7.10) ─────────────────────────────────────────
+# UAs claiming to be a verifiable crawler (Googlebot, bingbot, Slurp,
+# Baiduspider, YandexBot) are validated the way the engines recommend:
+# reverse DNS must land on the engine's domains AND forward-resolve back to
+# the client IP. Verified bots bypass the edge JS challenge; spoofed claims
+# earn the SpoofedBot signal (weight 35 — override via
+# [scorer.weights] spoofed_bot). DNS runs off the hot path (cache TTL per
+# IP); a resolver outage never flags a genuine bot.
+# With this enabled, the crawlers_good pack (enforce) requires a verified
+# result for the engines it can verify (DSL: bot_verified = "true"|"false"|
+# "google"|...). Inspect one IP: `sentry bots check <ip> --ua "Googlebot/2.1"`.
+[bot_verification]
+enabled = false
+cache_ttl_secs = 3600       # verified result TTL per IP
+failed_ttl_secs = 600       # spoofed result TTL (short: bots recover)
+timeout_ms = 2000           # per-verification DNS round timeout
+batch_size = 16             # max queued claims verified per drain cycle
+
 # ── Local ML threat model (classic ML, ONNX fork) ──────────────────────────
 # Runs beside the hot path: mode = "fork" (default) evaluates asynchronously
 # and feeds signals back via rescore_from (can only raise the score),
@@ -492,6 +510,18 @@ body_capture_kb = 0          # request-body bytes kept for inspection (KiB)
 # tcp_listen = "0.0.0.0:2222"
 # tcp_upstream = "127.0.0.1:22"
 
+# Interactive JavaScript challenge for `Challenge` verdicts (F7.8) — the
+# self-hosted "checking your browser": a SHA-256 proof-of-work page browsers
+# solve in <1s; JS-less clients (curl, dumb bots) stay stuck on 503. rDNS-
+# verified crawlers ([bot_verification]) bypass entirely. Stateless: share
+# the secret across edge nodes. PoW never unlocks a hard Block.
+[edge.challenge]
+enabled = false
+secret_env = "SENTRY_EDGE_CHALLENGE_SECRET"   # required when enabled (`openssl rand -hex 32`)
+bucket_secs = 3600           # challenge/cookie rotation window
+difficulty = 16              # PoW leading zero bits (clamped 8..=28)
+title = "Verifying your browser..."
+
 # ── Actions ──────────────────────────────────────────────────────────────
 # blocklist: feeds the shared block table on Block verdicts; the daemon
 # mirrors the same blocks to ip_state (dashboard-visible, restart-safe).
@@ -544,6 +574,32 @@ max_failures = 3               # circuit breaker: disable the provider after N c
 # rate_limit_ttl_secs = 600    # shorter TTL for RateLimit verdicts
 # table = "sentry"             # nftables table name
 # set_prefix = "sentry_blocks" # sets sentry_blocks_v4 / sentry_blocks_v6
+
+# nginx config-generation provider (F7.8/F6.2): enforces verdicts on a
+# co-located nginx by writing includes + reloading it. Works with Sentry in
+# passive mode (the honeypot topology). Generates, under conf_dir:
+#   sentry-deny.conf        deny <ip>; lines (Block verdicts)
+#   sentry-challenge.conf   geo map $sentry_challenge_ip (Challenge verdicts)
+#   sentry-challenge-if.conf include inside your server {} block — turns on
+#                           the getpagespeed js_challenge module for mapped
+#                           IPs (install nginx-module-js-challenge)
+#   sentry-bots.conf        optional `bot_verifier on;` snippet (install
+#                           nginx-module-bot-verifier + Redis)
+# Denies reconcile with ip_state every 60s; reloads are debounced (≥1/s)
+# and gated on `nginx -t`. The daemon needs write access to conf_dir and
+# reload permission.
+# [[action]]
+# type = "challenge"
+# provider = "nginx"
+# [action.options]
+# conf_dir = "/etc/nginx/conf.d/sentry"
+# reload_cmd = "nginx -s reload"
+# validate = true              # nginx -t before every reload
+# ttl_secs = 86400
+# rate_limit_deny = false      # also deny RateLimit verdicts
+# provision_bots = true        # emit the bot_verifier snippet
+# geo_var = "$sentry_challenge_ip"
+# ipv6_prefix = 64             # IPv6 entries as CIDR (exact when absent)
 
 # Community abuse reporting (F7.4): reports IPs that earn an enforcing
 # verdict to AbuseIPDB or ReportedIP, with signal→category mapping and a

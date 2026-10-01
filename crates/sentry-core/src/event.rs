@@ -215,6 +215,10 @@ pub struct Event {
     /// Reputation enrichment from synced feeds (populated by ingestor).
     #[serde(default)]
     pub reputation: Option<ReputationInfo>,
+    /// rDNS bot-verification outcome (F7.7, set by the pipeline when
+    /// `[bot_verification]` is enabled and the UA claims a known crawler).
+    #[serde(default)]
+    pub bot: Option<crate::botverify::BotStatus>,
     /// Bytes received from the client.
     pub bytes_in: Option<u64>,
     /// Bytes sent back to the client.
@@ -243,6 +247,7 @@ impl Event {
             geo: None,
             asn: None,
             reputation: None,
+            bot: None,
             bytes_in: None,
             bytes_out: None,
             duration_ms: None,
@@ -355,6 +360,7 @@ impl RawEvent {
             geo: None,
             asn: None,
             reputation: None,
+            bot: None,
             bytes_in: self.bytes_in,
             bytes_out: self.bytes_out,
             duration_ms: self.duration_ms,

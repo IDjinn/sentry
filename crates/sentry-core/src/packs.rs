@@ -51,6 +51,17 @@ impl PackMode {
 
 /// Build the default ruleset from configured pack modes.
 pub fn build_default_ruleset(pack_modes: &std::collections::HashMap<String, String>) -> RuleSet {
+    build_default_ruleset_with(pack_modes, false)
+}
+
+/// Build the default ruleset with bot-verification gating (F7.7): when
+/// enabled, `crawlers_good` only allowlists verifiable engines
+/// (Googlebot/bingbot/…) whose rDNS forward-confirmation passed; the
+/// remaining UA-allowlisted clients keep the ungated rule.
+pub fn build_default_ruleset_with(
+    pack_modes: &std::collections::HashMap<String, String>,
+    bot_verify_enabled: bool,
+) -> RuleSet {
     let mut rules = Vec::new();
 
     let sp_mode = pack_modes
@@ -74,7 +85,7 @@ pub fn build_default_ruleset(pack_modes: &std::collections::HashMap<String, Stri
         .map(|s| PackMode::parse(s))
         .unwrap_or(PackMode::Off);
     if cg_mode != PackMode::Off {
-        rules.extend(good_crawler_rules(cg_mode.is_enforce()));
+        rules.extend(good_crawler_rules(cg_mode.is_enforce(), bot_verify_enabled));
     }
 
     let eu_mode = pack_modes
@@ -420,21 +431,55 @@ fn tor_rules(enforce: bool) -> Vec<Rule> {
 /// Good crawler rules — allow known legitimate bots (Googlebot, Bingbot, etc.).
 /// Verification via reverse-DNS is the app's responsibility; this just
 /// allowlists by User-Agent so known-good bots bypass the pipeline.
-fn good_crawler_rules(_enforce: bool) -> Vec<Rule> {
-    vec![Rule {
-        id: "crawlers_good".into(),
-        name: "allow legitimate crawlers/bots".into(),
-        priority: 2,
+///
+/// With `bot_verify` (F7.7) the verifiable engines additionally require a
+/// passing `bot_verified` condition (rDNS forward-confirmation), and the
+/// unverifiable remainder keeps a plain UA rule so enabling verification
+/// doesn't silently revoke their allow.
+fn good_crawler_rules(_enforce: bool, bot_verify: bool) -> Vec<Rule> {
+    const VERIFIABLE: &str = r"(?i)^(Googlebot|Bingbot|Slurp|Baiduspider|YandexBot)";
+    const UNVERIFIABLE: &str = r"(?i)^(DuckDuckBot|facebookexternalhit|Twitterbot|LinkedInBot|Applebot|Puppeteer|WhatsApp|TelegramBot|Discordbot|SkypeUriPreview|W3C_Validator|curl/8|Go-http-client/1\.1)";
+    let ua_rule = |id: &str, pattern: &str, priority: i32, gate: Option<RuleMatch>| Rule {
+        id: id.into(),
+        name: format!("allow legitimate crawlers/bots ({id})"),
+        priority,
         enabled: true,
-        match_: RuleMatch::UserAgent(crate::rules::StrOp::Regex {
-            pattern: r"(?i)^(Googlebot|Bingbot|Slurp|DuckDuckBot|Baiduspider|YandexBot|facebookexternalhit|Twitterbot|LinkedInBot|Applebot|Puppeteer|WhatsApp|TelegramBot|Discordbot|SkypeUriPreview|W3C_Validator|curl/8|Go-http-client/1\.1)".into(),
-        }),
+        match_: match gate {
+            Some(extra) => RuleMatch::All(vec![
+                RuleMatch::UserAgent(crate::rules::StrOp::Regex {
+                    pattern: pattern.into(),
+                }),
+                extra,
+            ]),
+            None => RuleMatch::UserAgent(crate::rules::StrOp::Regex {
+                pattern: pattern.into(),
+            }),
+        },
         action: RuleAction::Allow,
         ttl: None,
         source: RuleSource::DefaultPack,
         tags: vec!["crawlers_good".into()],
         created_at: None,
-    }]
+    };
+
+    if bot_verify {
+        vec![
+            ua_rule(
+                "crawlers_good_verified",
+                VERIFIABLE,
+                2,
+                Some(RuleMatch::BotVerified("true".into())),
+            ),
+            ua_rule("crawlers_good_unverified_ok", UNVERIFIABLE, 3, None),
+        ]
+    } else {
+        vec![ua_rule(
+            "crawlers_good",
+            r"(?i)^(Googlebot|Bingbot|Slurp|DuckDuckBot|Baiduspider|YandexBot|facebookexternalhit|Twitterbot|LinkedInBot|Applebot|Puppeteer|WhatsApp|TelegramBot|Discordbot|SkypeUriPreview|W3C_Validator|curl/8|Go-http-client/1\.1)",
+            2,
+            None,
+        )]
+    }
 }
 
 /// Rate scan rules — rate-limit IPs with many 404s in a short window

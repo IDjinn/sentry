@@ -19,7 +19,7 @@ use sentry_ai::ThreatModel;
 use sentry_core::challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
 use sentry_core::config::{ActionKind, SentryConfig};
 use sentry_core::event::Event;
-use sentry_core::packs::build_default_ruleset;
+use sentry_core::packs::build_default_ruleset_with;
 use sentry_core::pipeline::{Pipeline, RouteValidator};
 use sentry_core::ratelimit::{InMemoryRateLimiter, RateLimitBackend};
 use sentry_core::registry::RegistryBuilder;
@@ -29,11 +29,13 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 /// A challenge action paired with its concrete provider handles (when the
-/// providers are built locally — Cloudflare edge rules, local firewall).
+/// providers are built locally — Cloudflare edge rules, local firewall,
+/// nginx includes).
 struct ChallengeActionWithProvider {
     action: ChallengeAction,
     provider: Option<Arc<sentry_action_cloudflare::CloudflareProvider>>,
     firewall: Option<Arc<sentry_action_firewall::FirewallProvider>>,
+    nginx: Option<Arc<sentry_action_nginx::NginxProvider>>,
 }
 
 /// Deduplication cache: prevents processing the same event (by hash) within
@@ -174,7 +176,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         None
     };
 
-    let mut rules = build_default_ruleset(&pack_modes);
+    let mut rules = build_default_ruleset_with(&pack_modes, cfg.bot_verification.enabled);
     // Static inline rules from `[[rules.custom]]` (config source).
     for parsed in sentry_core::rules::rules_from_config(&cfg.rules.custom) {
         match parsed {
@@ -390,6 +392,34 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         spawn_cloudflare_refresh(cfg.real_ip.clone(), shared_trust.clone());
     }
 
+    // rDNS bot verification (F7.7): claimed-crawler UAs are checked off the
+    // hot path by the background worker; pipeline + edge read the cache.
+    let bot_verifier = if cfg.bot_verification.enabled {
+        match crate::botdns::HickoryDns::new(Duration::from_millis(cfg.bot_verification.timeout_ms))
+        {
+            Ok(dns) => {
+                let verifier = Arc::new(sentry_core::botverify::BotVerifier::from_config(
+                    &cfg.bot_verification,
+                ));
+                tokio::spawn(crate::botdns::bot_verify_worker(
+                    verifier.clone(),
+                    Arc::new(dns),
+                    Duration::from_millis(cfg.bot_verification.timeout_ms),
+                    cfg.bot_verification.batch_size,
+                    metrics.clone(),
+                ));
+                info!("bot verification enabled (rDNS forward-confirm)");
+                Some(verifier)
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to build bot-verification resolver — disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut pipeline_builder = Pipeline::with_config(
         Arc::clone(&shared_rules),
         route_validator,
@@ -398,6 +428,9 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     )
     .with_rate_limiter(build_rate_limiter(&cfg)?)
     .with_trust(shared_trust.clone());
+    if let Some(ref v) = bot_verifier {
+        pipeline_builder = pipeline_builder.with_bot_verifier(Arc::clone(v));
+    }
     if let Some(ref t) = scan_tracker {
         pipeline_builder = pipeline_builder.with_scan_tracker(Arc::clone(t));
     }
@@ -419,6 +452,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         behavior_detection = cfg.behavior.enabled,
         correlation = cfg.correlation.enabled,
         escalation = cfg.escalation.enabled,
+        bot_verification = cfg.bot_verification.enabled,
         "pipeline built"
     );
 
@@ -544,7 +578,37 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         registry,
         cf_provider,
         fw_provider,
+        nginx_provider,
     } = build_registry(&cfg, Arc::clone(&block_table), &shared_trust)?;
+
+    // nginx include reconcile (F7.8): `ip_state` is the source of truth for
+    // deny entries — re-seed them after a restart and keep converging with
+    // manual unblocks from other nodes. Challenge-map entries are ephemeral.
+    if let (Some(ref ng), Some(ref repo)) = (&nginx_provider, &repo) {
+        let rows = repo.ip_state().blocked(10_000).await.unwrap_or_default();
+        let expected = expected_firewall_entries(&rows);
+        let (added, removed) = ng.sync_denies(&expected).await;
+        info!(added, removed, "nginx denies synced with ip_state");
+        let ng_task = Arc::clone(ng);
+        let repo_task = Arc::clone(repo);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await; // skip the immediate tick (startup sync above)
+            loop {
+                interval.tick().await;
+                let rows = repo_task
+                    .ip_state()
+                    .blocked(10_000)
+                    .await
+                    .unwrap_or_default();
+                let expected = expected_firewall_entries(&rows);
+                let (added, removed) = ng_task.sync_denies(&expected).await;
+                if added > 0 || removed > 0 {
+                    info!(added, removed, "nginx deny reconcile applied changes");
+                }
+            }
+        });
+    }
 
     // Firewall reconcile (F7.3): the DB (`ip_state`) is the source of
     // truth — provision the sets, re-seed persisted bans after a restart,
@@ -722,7 +786,42 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         )
         .with_trust(shared_trust.clone())
         .with_block_table(Arc::clone(&block_table))
-        .with_block_hits(metrics.edge_block_hits.clone());
+        .with_block_hits(metrics.edge_block_hits.clone())
+        .with_challenge_metrics(metrics.edge_challenge.clone());
+        let runtime = if let Some(ref v) = bot_verifier {
+            runtime.with_bot_verifier(Arc::clone(v))
+        } else {
+            runtime
+        };
+        let runtime = if cfg.edge.challenge.enabled {
+            let secret = std::env::var(&cfg.edge.challenge.secret_env)
+                .map_err(|_| {
+                    color_eyre::eyre::eyre!(
+                        "[edge.challenge] enabled but env `{}` is not set (generate one with `openssl rand -hex 32`)",
+                        cfg.edge.challenge.secret_env
+                    )
+                })?;
+            if secret.len() < 16 {
+                return Err(color_eyre::eyre::eyre!(
+                    "[edge.challenge] secret in `{}` is too short (use 32+ random bytes)",
+                    cfg.edge.challenge.secret_env
+                ));
+            }
+            let ch = Arc::new(sentry_edge::challenge::JsChallenge::new(
+                secret.into_bytes(),
+                cfg.edge.challenge.bucket_secs,
+                cfg.edge.challenge.difficulty,
+                cfg.edge.challenge.title.clone(),
+            ));
+            info!(
+                bucket_secs = cfg.edge.challenge.bucket_secs,
+                difficulty = cfg.edge.challenge.difficulty,
+                "edge JS challenge enabled (F7.8)"
+            );
+            runtime.with_challenge(ch)
+        } else {
+            runtime
+        };
         let edge_pipeline = cfg.edge.upstream.clone();
         tokio::spawn(async move {
             if let Err(e) = sentry_edge::proxy::serve(runtime, proxy_cfg, dec_tx).await {
@@ -2065,6 +2164,7 @@ fn build_registry(
     let mut builder = RegistryBuilder::new();
     let mut cf_provider: Option<Arc<sentry_action_cloudflare::CloudflareProvider>> = None;
     let mut fw_provider: Option<Arc<sentry_action_firewall::FirewallProvider>> = None;
+    let mut nginx_provider: Option<Arc<sentry_action_nginx::NginxProvider>> = None;
 
     for src in &cfg.sources {
         match src.kind.as_str() {
@@ -2339,6 +2439,9 @@ fn build_registry(
                     if fw_provider.is_none() {
                         fw_provider = built.firewall;
                     }
+                    if nginx_provider.is_none() {
+                        nginx_provider = built.nginx;
+                    }
                     builder.register_action(built.action);
                 }
             }
@@ -2353,6 +2456,7 @@ fn build_registry(
         registry: builder.build(),
         cf_provider,
         fw_provider,
+        nginx_provider,
     })
 }
 
@@ -2437,12 +2541,14 @@ struct RegistryBundle {
     registry: sentry_core::registry::Registry,
     cf_provider: Option<Arc<sentry_action_cloudflare::CloudflareProvider>>,
     fw_provider: Option<Arc<sentry_action_firewall::FirewallProvider>>,
+    nginx_provider: Option<Arc<sentry_action_nginx::NginxProvider>>,
 }
 
 type ProviderHandles = (
     Arc<dyn ChallengeProvider>,
     Option<Arc<sentry_action_cloudflare::CloudflareProvider>>,
     Option<Arc<sentry_action_firewall::FirewallProvider>>,
+    Option<Arc<sentry_action_nginx::NginxProvider>>,
 );
 
 fn build_challenge_action(
@@ -2454,7 +2560,8 @@ fn build_challenge_action(
     let mode = parse_edge_mode(options);
     let opts = EdgeOptions { ttl, mode };
 
-    let (provider, cf_concrete, fw_concrete): ProviderHandles = match provider_name {
+    let (provider, cf_concrete, fw_concrete, nginx_concrete): ProviderHandles = match provider_name
+    {
         "cloudflare" => {
             let token = std::env::var("SENTRY_CF_TOKEN").unwrap_or_default();
             let zone = std::env::var("SENTRY_CF_ZONE").unwrap_or_default();
@@ -2485,7 +2592,7 @@ fn build_challenge_action(
                     account,
                 },
             ));
-            (cf.clone(), Some(cf), None)
+            (cf.clone(), Some(cf), None, None)
         }
         "firewall" => {
             // Local kernel-level enforcement (F7.3): nftables/ipset/
@@ -2522,11 +2629,61 @@ fn build_challenge_action(
                 },
                 Some(trust.clone()),
             ));
-            (fw.clone(), None, Some(fw))
+            (fw.clone(), None, Some(fw), None)
+        }
+        "nginx" => {
+            // Config-generation provider (F7.8): deny-list + JS-challenge
+            // geo map includes for a co-located nginx (getpagespeed
+            // modules on the host), with a debounced validate/reload.
+            let conf_dir = options
+                .get("conf_dir")
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/etc/nginx/conf.d/sentry"));
+            let reload_cmd = options
+                .get("reload_cmd")
+                .and_then(|v| v.as_str())
+                .unwrap_or("nginx -s reload")
+                .to_string();
+            let validate = options
+                .get("validate")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let rate_limit_deny = options
+                .get("rate_limit_deny")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let provision_bots = options
+                .get("provision_bots")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let geo_var = options
+                .get("geo_var")
+                .and_then(|v| v.as_str())
+                .unwrap_or("$sentry_challenge_ip")
+                .to_string();
+            let ng = sentry_action_nginx::NginxProvider::new(
+                sentry_action_nginx::NginxConfig {
+                    conf_dir,
+                    reload_cmd,
+                    validate,
+                    ttl,
+                    rate_limit_deny,
+                    ipv6_prefix: parse_ipv6_prefix(options),
+                    geo_var,
+                    provision_bots,
+                },
+                Some(trust.clone()),
+            );
+            info!(
+                conf_dir = %ng.config().conf_dir.display(),
+                "nginx provider enabled (deny + challenge includes)"
+            );
+            (ng.clone(), None, None, Some(ng))
         }
         other => {
             return Err(color_eyre::eyre::eyre!(
-                "unknown challenge provider `{other}` — known: cloudflare, firewall"
+                "unknown challenge provider `{other}` — known: cloudflare, firewall, nginx"
             ));
         }
     };
@@ -2535,6 +2692,7 @@ fn build_challenge_action(
         action: ChallengeAction::new(provider, opts),
         provider: cf_concrete,
         firewall: fw_concrete,
+        nginx: nginx_concrete,
     }))
 }
 
