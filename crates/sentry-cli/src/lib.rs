@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod bench_llm;
 pub mod cli;
 pub mod cmd;
 pub mod config;

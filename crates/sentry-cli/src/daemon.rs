@@ -1369,60 +1369,88 @@ fn llm_signals(resp: &sentry_ai::ClassifyResponse) -> Vec<sentry_core::Signal> {
     }]
 }
 
-/// Build the LLM fork from `[llm]` config when `provider != "none"`.
-fn build_llm_fork(cfg: &SentryConfig) -> Option<Arc<LlmFork>> {
-    if cfg.llm.provider.is_empty() || cfg.llm.provider == "none" {
-        return None;
-    }
-    let provider: Arc<dyn sentry_ai::LlmProvider> = match cfg.llm.provider.as_str() {
+/// Construct a provider by name from `[llm]` config. Returns `None` (with a
+/// warning) when the name is unknown or a required env key is missing —
+/// shared by the daemon and `sentry bench llm`.
+pub(crate) fn make_llm_provider(
+    provider: &str,
+    llm: &sentry_core::config::LlmConfig,
+) -> Option<Arc<dyn sentry_ai::LlmProvider>> {
+    match provider {
         "openrouter" => {
             let key = std::env::var("SENTRY_LLM_KEY").unwrap_or_default();
             if key.is_empty() {
                 warn!("llm.provider = \"openrouter\" but SENTRY_LLM_KEY env unset — llm stage disabled for this run");
                 return None;
             }
-            Arc::new(sentry_ai::OpenRouterProvider::new(
+            Some(Arc::new(sentry_ai::OpenRouterProvider::new(
                 sentry_ai::llm::openrouter::OpenRouterConfig {
                     api_key: key,
-                    model: non_empty_or(&cfg.llm.model, "openai/gpt-4o-mini"),
+                    model: non_empty_or(&llm.model, "openai/gpt-4o-mini"),
                     base_url: non_empty_or(
-                        cfg.llm.base_url.as_deref().unwrap_or(""),
+                        llm.base_url.as_deref().unwrap_or(""),
                         sentry_ai::llm::openrouter::DEFAULT_BASE_URL,
                     ),
                 },
-            ))
+            )))
         }
-        "openai" => Arc::new(sentry_ai::OpenRouterProvider::new(
+        "openai" => Some(Arc::new(sentry_ai::OpenRouterProvider::new(
             sentry_ai::llm::openrouter::OpenRouterConfig {
                 // OpenAI-compatible local servers (LM Studio, vLLM,
                 // llama.cpp server…) need no key; SENTRY_LLM_KEY is sent as
                 // bearer when set, and base_url points at the server.
                 api_key: std::env::var("SENTRY_LLM_KEY").unwrap_or_default(),
-                model: non_empty_or(&cfg.llm.model, "local-model"),
+                model: non_empty_or(&llm.model, "local-model"),
                 base_url: non_empty_or(
-                    cfg.llm.base_url.as_deref().unwrap_or(""),
+                    llm.base_url.as_deref().unwrap_or(""),
                     "http://localhost:1234/v1",
                 ),
             },
-        )),
-        "ollama" => Arc::new(sentry_ai::OllamaProvider::new(
+        ))),
+        "ollama" => Some(Arc::new(sentry_ai::OllamaProvider::new(
             sentry_ai::llm::ollama::OllamaConfig {
-                model: non_empty_or(&cfg.llm.model, "llama3.1"),
+                model: non_empty_or(&llm.model, "llama3.1"),
                 base_url: non_empty_or(
-                    cfg.llm.base_url.as_deref().unwrap_or(""),
+                    llm.base_url.as_deref().unwrap_or(""),
                     sentry_ai::llm::ollama::DEFAULT_BASE_URL,
                 ),
             },
-        )),
-        "mock" => Arc::new(sentry_ai::MockLlmProvider::default()),
+        ))),
+        "jev" => {
+            let Some(key) = sentry_ai::llm::jev::resolve_api_key() else {
+                warn!(
+                    "llm.provider = \"jev\" but no API key (SENTRY_JEV_KEY / TYPESAFE_API_KEY / JEV_API_KEY / ~/.config/typesafe/key) — llm stage disabled for this run"
+                );
+                return None;
+            };
+            Some(Arc::new(sentry_ai::JevProvider::new(
+                sentry_ai::llm::jev::JevConfig {
+                    api_key: key,
+                    model: non_empty_or(&llm.model, sentry_ai::llm::jev::DEFAULT_MODEL),
+                    base_url: non_empty_or(
+                        llm.base_url.as_deref().unwrap_or(""),
+                        sentry_ai::llm::jev::DEFAULT_BASE_URL,
+                    ),
+                },
+            )))
+        }
+        "mock" => Some(Arc::new(sentry_ai::MockLlmProvider::default())),
         other => {
             warn!(
                 provider = other,
-                "unknown llm.provider — known: openrouter | openai | ollama | mock"
+                "unknown llm.provider — known: openrouter | openai | ollama | jev | mock"
             );
-            return None;
+            None
         }
-    };
+    }
+}
+
+/// Build the LLM fork from `[llm]` config when `provider != "none"`.
+fn build_llm_fork(cfg: &SentryConfig) -> Option<Arc<LlmFork>> {
+    if cfg.llm.provider.is_empty() || cfg.llm.provider == "none" {
+        return None;
+    }
+    let provider = make_llm_provider(&cfg.llm.provider, &cfg.llm)?;
     let mode = match cfg.llm.mode.as_str() {
         "shadow" => "shadow",
         _ => "fork",

@@ -139,6 +139,7 @@ pub fn parse_classify(raw: &str) -> anyhow::Result<ClassifyResponse> {
         signals: parsed.signals.unwrap_or_default(),
         confidence: parsed.confidence.unwrap_or(1.0).clamp(0.0, 1.0) as f32,
         explanation: parsed.explanation.filter(|s| !s.is_empty()),
+        usage: None,
     })
 }
 
@@ -163,7 +164,8 @@ fn extract_json_object(raw: &str) -> anyhow::Result<&str> {
     Ok(&raw[start..end])
 }
 
-fn parse_verdict(s: &str) -> Option<Verdict> {
+/// Normalize a verdict token (`deny`, `Rate-Limit`, …) to the enum.
+pub(crate) fn parse_verdict(s: &str) -> Option<Verdict> {
     match normalize_token(s).as_str() {
         "allow" => Some(Verdict::Allow),
         "ratelimit" | "rate_limit" | "rate_limit_violation" => Some(Verdict::RateLimit),

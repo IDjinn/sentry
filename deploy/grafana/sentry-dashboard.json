@@ -208,36 +208,106 @@
           "source": "url",
           "url": "http://localhost:9100/api/events?limit=100",
           "format": "table",
-          "refId": "events"
+          "refId": "events",
+          "url_options": { "method": "GET" },
+          "null_value": ""
+        }
+      ],
+      "transformations": [
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              { "targetField": "ts", "destinationType": "time" }
+            ]
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "asn": true,
+              "country": true,
+              "host": true,
+              "signals": true,
+              "source": true,
+              "user_agent": true
+            },
+            "indexByName": {
+              "ts": 0,
+              "ip": 1,
+              "method": 2,
+              "path": 3,
+              "status": 4,
+              "protocol": 5,
+              "risk_level": 6,
+              "score": 7,
+              "rule_hit": 8,
+              "verdict": 9
+            },
+            "renameByName": {
+              "ts": "Time",
+              "ip": "IP",
+              "method": "Method",
+              "path": "Path",
+              "status": "Status",
+              "protocol": "Proto",
+              "risk_level": "Level",
+              "score": "Score",
+              "rule_hit": "Rule / Signal",
+              "verdict": "Verdict"
+            }
+          }
         }
       ],
       "fieldConfig": {
         "defaults": {
           "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "inspect": false },
           "color": { "mode": "thresholds" },
+          "mappings": [
+            { "type": "special", "options": { "match": "null", "result": { "text": "", "index": 0 } } },
+            { "type": "special", "options": { "match": "empty", "result": { "text": "", "index": 1 } } },
+            { "type": "regex", "options": { "pattern": "^null$", "result": { "text": "" } } }
+          ],
           "thresholds": { "mode": "absolute", "steps": [ { "color": "text", "value": null }, { "color": "orange", "value": 50 }, { "color": "red", "value": 75 } ] }
         },
         "overrides": [
+          { "matcher": { "id": "byName", "options": "Time" }, "properties": [ { "id": "custom.width", "value": 165 } ] },
+          { "matcher": { "id": "byName", "options": "IP" }, "properties": [ { "id": "custom.width", "value": 135 } ] },
+          { "matcher": { "id": "byName", "options": "Method" }, "properties": [ { "id": "custom.width", "value": 70 } ] },
+          { "matcher": { "id": "byName", "options": "Status" }, "properties": [ { "id": "custom.width", "value": 65 } ] },
+          { "matcher": { "id": "byName", "options": "Proto" }, "properties": [ { "id": "custom.width", "value": 60 } ] },
           {
-            "matcher": { "id": "byName", "options": "verdict" },
+            "matcher": { "id": "byName", "options": "Level" },
             "properties": [
+              { "id": "custom.width", "value": 80 },
               {
                 "id": "mappings",
                 "value": [
-                  { "type": "value", "options": { "block": { "color": "red", "index": 0 }, "challenge": { "color": "orange", "index": 1 }, "rate_limit": { "color": "yellow", "index": 2 }, "quarantine": { "color": "dark-red", "index": 3 } } }
+                  { "type": "value", "options": { "critical": { "color": "red", "index": 0 }, "high": { "color": "orange", "index": 1 }, "medium": { "color": "yellow", "index": 2 }, "low": { "color": "blue", "index": 3 } } }
                 ]
               }
             ]
           },
-          { "matcher": { "id": "byName", "options": "host" }, "properties": [ { "id": "custom.hidden", "value": true } ] },
-          { "matcher": { "id": "byName", "options": "user_agent" }, "properties": [ { "id": "custom.hidden", "value": true } ] },
-          { "matcher": { "id": "byName", "options": "ip" }, "properties": [ { "id": "custom.width", "value": 130 } ] },
-          { "matcher": { "id": "byName", "options": "ts" }, "properties": [ { "id": "custom.width", "value": 180 } ] }
+          { "matcher": { "id": "byName", "options": "Score" }, "properties": [ { "id": "custom.width", "value": 60 } ] },
+          {
+            "matcher": { "id": "byName", "options": "Verdict" },
+            "properties": [
+              { "id": "custom.width", "value": 90 },
+              {
+                "id": "mappings",
+                "value": [
+                  { "type": "value", "options": { "block": { "color": "red", "index": 0 }, "challenge": { "color": "orange", "index": 1 }, "rate_limit": { "color": "yellow", "index": 2 }, "quarantine": { "color": "dark-red", "index": 3 }, "allow": { "color": "green", "index": 4 } } }
+                ]
+              }
+            ]
+          }
         ]
       },
       "options": {
         "showHeader": true,
         "cellHeight": "sm",
+        "sortBy": [ { "displayName": "Time", "desc": true } ],
         "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" }
       }
     }
