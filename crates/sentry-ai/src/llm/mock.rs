@@ -47,6 +47,7 @@ impl LlmProvider for MockLlmProvider {
             signals: vec!["mock".to_string()],
             confidence: self.confidence,
             explanation: Some("deterministic mock verdict".to_string()),
+            usage: None,
         })
     }
 

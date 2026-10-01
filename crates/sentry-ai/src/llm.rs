@@ -16,11 +16,13 @@ use serde::{Deserialize, Serialize};
 use sentry_core::analysis::{RiskLevel, Signal, Verdict};
 use sentry_core::event::ProtocolData;
 
+pub mod jev;
 pub mod mock;
 pub mod ollama;
 pub mod openrouter;
 pub mod prompt;
 
+pub use jev::JevProvider;
 pub use mock::MockLlmProvider;
 pub use ollama::OllamaProvider;
 pub use openrouter::OpenRouterProvider;
@@ -35,6 +37,18 @@ pub struct ClassifyRequest {
     pub context: String,
     /// JSON schema the model MUST follow in its response.
     pub schema: serde_json::Value,
+}
+
+/// Token/cost usage a provider reports for a single call.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct LlmUsage {
+    /// Tokens consumed by the request (prompt/context).
+    pub input_tokens: u64,
+    /// Tokens produced by the response.
+    pub output_tokens: u64,
+    /// Provider-reported monetary cost, when it exposes one.
+    #[serde(default)]
+    pub cost: Option<f64>,
 }
 
 /// Structured classification response from the LLM.
@@ -53,6 +67,9 @@ pub struct ClassifyResponse {
     pub confidence: f32,
     /// Optional short explanation (1–2 sentences).
     pub explanation: Option<String>,
+    /// Token/cost usage when the provider reports it.
+    #[serde(default)]
+    pub usage: Option<LlmUsage>,
 }
 
 /// Request for a free-form explanation of an already-classified event.
