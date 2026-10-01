@@ -203,16 +203,14 @@ timeout_secs = 10
 [[action]]
 type = "log"
 
-# ── LLM (LM Studio on the operator's PC, reached over WireGuard) ───────────
-# provider "openai" = OpenAI-compatible server, keyless. Set base_url to the
-# PC's WireGuard address; model must match a model loaded in LM Studio
-# (`GET /v1/models` lists them). fork = async re-score that can escalate
-# verdicts; events above `only_above` are sent. When the PC/tunnel is down
+# ── LLM (TypeSafe jev — calibrated judgment API, no local compute) ─────────
+# provider "jev" = structured probabilistic classification (see
+# JEV_EVALUATION.md). The API key never lives in this file: it comes from
+# SENTRY_JEV_KEY in the stack .env. fork = async re-score that can escalate
+# verdicts; events above `only_above` are sent. When the API is unreachable
 # the fork logs warnings and the pipeline proceeds unaffected.
 [llm]
-provider = "openai"
-base_url = "http://10.66.66.2:1234/v1"
-model = "google/gemma-4-e4b"
+provider = "jev"
 mode = "fork"
 only_above = 30
 concurrency = 2
