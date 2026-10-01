@@ -47,6 +47,8 @@ pub enum ChallengeGate {
     Pass,
     /// Serve this PoW interstitial.
     Page(Response),
+    /// Presented cookie failed verification — terminal 403, no retry loop.
+    Blocked(Response),
     /// No challenge configured — use the caller's static fallback.
     Disabled,
 }
@@ -167,11 +169,19 @@ impl EdgeRuntime {
         }
 
         // Solved challenge: any request carries the cookie once the browser
-        // reloads after the PoW.
+        // reloads after the PoW. A present-but-invalid cookie is a failed
+        // attempt (terminal 403); an expired one just re-challenges.
         if let Some(value) = cookie_value(headers, COOKIE_NAME) {
-            if ch.verify_cookie(client_ip, &value, SystemTime::now()) {
-                self.challenge_metric("passed");
-                return ChallengeGate::Pass;
+            match ch.classify_cookie(client_ip, &value, SystemTime::now()) {
+                crate::challenge::CookieCheck::Valid => {
+                    self.challenge_metric("passed");
+                    return ChallengeGate::Pass;
+                }
+                crate::challenge::CookieCheck::Failed => {
+                    self.challenge_metric("failed");
+                    return ChallengeGate::Blocked(ch.failed_response());
+                }
+                crate::challenge::CookieCheck::Stale => {}
             }
         }
 

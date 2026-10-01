@@ -979,6 +979,11 @@ pub struct EdgeChallengeConfig {
     /// Interstitial page title.
     #[serde(default = "default_edge_challenge_title")]
     pub title: String,
+    /// Optional file overriding the challenge page HTML. Re-read on every
+    /// render (edits go live without a restart); falls back to the built-in
+    /// page when unreadable or missing the required `{{…}}` markers.
+    #[serde(default)]
+    pub template_path: Option<std::path::PathBuf>,
 }
 
 impl Default for EdgeChallengeConfig {
@@ -989,6 +994,7 @@ impl Default for EdgeChallengeConfig {
             bucket_secs: default_edge_challenge_bucket(),
             difficulty: default_edge_challenge_difficulty(),
             title: default_edge_challenge_title(),
+            template_path: None,
         }
     }
 }

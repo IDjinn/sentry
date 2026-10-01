@@ -521,6 +521,14 @@ secret_env = "SENTRY_EDGE_CHALLENGE_SECRET"   # required when enabled (`openssl 
 bucket_secs = 3600           # challenge/cookie rotation window
 difficulty = 16              # PoW leading zero bits (clamped 8..=28)
 title = "Verifying your browser..."
+# Optional HTML override for the interstitial — re-read on every render, so
+# edits go live without a restart. Must keep the markers {{CHALLENGE}},
+# {{DIFFICULTY}}, {{BUCKET}}, {{MAX_AGE}} and {{SECURE}} (the page breaks
+# without them and Sentry falls back to the built-in page); {{TITLE}} and
+# {{ICON}} (embedded logo data URI) are optional.
+# template_path = "/etc/sentry/challenge.html"
+# A presented cookie that fails verification gets a terminal 403 (no retry
+# loop); no cookie or an expired one re-serves the 503 interstitial.
 
 # ── Actions ──────────────────────────────────────────────────────────────
 # blocklist: feeds the shared block table on Block verdicts; the daemon

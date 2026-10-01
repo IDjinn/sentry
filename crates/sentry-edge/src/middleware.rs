@@ -151,6 +151,7 @@ pub async fn handler(State(runtime): State<EdgeRuntime>, req: Request, next: Nex
                 next.run(req).await
             }
             crate::ChallengeGate::Page(page) => page,
+            crate::ChallengeGate::Blocked(page) => page,
             crate::ChallengeGate::Disabled => challenge_response(),
         },
         Verdict::Block | Verdict::Quarantine => block_response(),

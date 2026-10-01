@@ -18,13 +18,14 @@ use std::time::{Duration, Instant};
 use sentry_ai::ThreatModel;
 use sentry_core::challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
 use sentry_core::config::{ActionKind, SentryConfig};
-use sentry_core::event::Event;
+use sentry_core::event::{Event, ProtocolData};
 use sentry_core::packs::build_default_ruleset_with;
 use sentry_core::pipeline::{Pipeline, RouteValidator};
 use sentry_core::ratelimit::{InMemoryRateLimiter, RateLimitBackend};
 use sentry_core::registry::RegistryBuilder;
 use sentry_core::rules::{shared, RuleSet, SharedRuleSet};
 use sentry_core::RiskLevel;
+use sentry_core::Signal;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -812,10 +813,12 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 cfg.edge.challenge.bucket_secs,
                 cfg.edge.challenge.difficulty,
                 cfg.edge.challenge.title.clone(),
+                cfg.edge.challenge.template_path.clone(),
             ));
             info!(
                 bucket_secs = cfg.edge.challenge.bucket_secs,
                 difficulty = cfg.edge.challenge.difficulty,
+                template = ?cfg.edge.challenge.template_path,
                 "edge JS challenge enabled (F7.8)"
             );
             runtime.with_challenge(ch)
@@ -974,12 +977,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             print_event(
                 &result.event,
                 &result.analysis.risk_level,
-                &result
-                    .analysis
-                    .signals
-                    .iter()
-                    .map(|s| format!("{:?}", s.kind))
-                    .collect::<Vec<_>>(),
+                &result.analysis.signals,
             );
 
             if let Some(ref repo) = repo {
@@ -2123,32 +2121,113 @@ async fn model_hot_reload(
     }
 }
 
+/// Well-known port → service name, for non-HTTP event lines.
+fn port_service(port: u16) -> &'static str {
+    match port {
+        22 => "ssh",
+        25 => "smtp",
+        53 => "dns",
+        80 => "http",
+        110 => "pop3",
+        143 => "imap",
+        443 => "https",
+        445 => "smb",
+        465 | 587 => "smtps",
+        993 => "imaps",
+        995 => "pop3s",
+        1433 => "mssql",
+        3306 => "mysql",
+        3389 => "rdp",
+        5432 => "postgres",
+        6379 => "redis",
+        8080 => "http-alt",
+        8443 => "https-alt",
+        _ => "",
+    }
+}
+
+/// Human summary of the protocol payload for non-HTTP events:
+/// service/port when known (e.g. `tcp/ssh`), app-name for syslog,
+/// SNI for TLS, otherwise the protocol name.
+fn protocol_summary(evt: &Event) -> String {
+    match &evt.protocol {
+        ProtocolData::Http(_) => String::new(),
+        ProtocolData::Tcp(_) => match evt.server_port {
+            Some(p) => {
+                let svc = port_service(p);
+                if svc.is_empty() {
+                    format!("tcp/{p}")
+                } else {
+                    format!("tcp/{svc}")
+                }
+            }
+            None => "tcp".into(),
+        },
+        ProtocolData::Udp(d) => match (&d.dns_query, evt.server_port) {
+            (Some(q), _) => format!("udp/dns {q}"),
+            (None, Some(p)) => format!("udp/{p}"),
+            (None, None) => "udp".into(),
+        },
+        ProtocolData::TlsHandshake(d) => match &d.sni {
+            Some(sni) => format!("tls {sni}"),
+            None => "tls".into(),
+        },
+        ProtocolData::Syslog(d) => match &d.app_name {
+            Some(app) => format!("syslog {app}"),
+            None => "syslog".into(),
+        },
+        ProtocolData::Raw(d) if !d.note.is_empty() => format!("raw {}", d.note),
+        ProtocolData::Raw(_) => "raw".into(),
+    }
+}
+
+/// Format a signal for the event line: `RuleHit(rule_id)` when there is a
+/// detail, bare kind name otherwise.
+fn format_signal(s: &Signal) -> String {
+    match &s.detail {
+        Some(d) if !d.is_empty() => format!("{:?}({d})", s.kind),
+        _ => format!("{:?}", s.kind),
+    }
+}
+
 /// Print a colored event line to stdout.
-fn print_event(evt: &Event, level: &RiskLevel, signals: &[String]) {
+fn print_event(evt: &Event, level: &RiskLevel, signals: &[Signal]) {
     let color = level.ansi_color();
     let reset = "\x1b[0m";
     let label = level.label();
 
-    let method = evt
-        .http()
-        .and_then(|h| h.method)
-        .map(|m| format!("{m:?}"))
-        .unwrap_or_else(|| "???".into());
-    let path = evt.http().map(|h| h.path.as_str()).unwrap_or("(non-http)");
+    let source = evt.source.as_str();
+    let (method, path, status) = if let Some(h) = evt.http() {
+        (
+            h.method
+                .map(|m| format!("{m:?}"))
+                .unwrap_or_else(|| "???".into()),
+            h.path.clone(),
+            h.status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".into()),
+        )
+    } else {
+        (String::new(), protocol_summary(evt), "-".into())
+    };
     let ip = evt.client_ip;
-    let status = evt
-        .http()
-        .and_then(|h| h.status)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| " -".into());
 
     let signal_str = if signals.is_empty() {
         String::new()
     } else {
-        format!(" [{}]", signals.join(","))
+        format!(
+            " [{}]",
+            signals
+                .iter()
+                .map(format_signal)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
     };
 
-    println!("{color}{label:4}{reset} {ip:15} {method:6} {path:40} {status:3}{signal_str}");
+    println!(
+        "{color}{label:4}{reset} {ip:15} [{source:8}] {method:6} {path:40} {status:3}{signal_str}"
+    );
 }
 
 /// Build the plugin registry from config.

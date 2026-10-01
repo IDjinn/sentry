@@ -263,6 +263,7 @@ async fn proxy_handler(
             match runtime.challenge_gate(&parts.headers, client_ip) {
                 crate::ChallengeGate::Pass => {}
                 crate::ChallengeGate::Page(page) => return page,
+                crate::ChallengeGate::Blocked(page) => return page,
                 crate::ChallengeGate::Disabled => return challenge_response(),
             }
         }

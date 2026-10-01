@@ -227,7 +227,7 @@ impl App {
 
 fn row_spans(row: &EventRow) -> Vec<Span<'_>> {
     let level_color = level_color(&row.risk_level);
-    let (method, path, status) = protocol_summary(&row.protocol);
+    let (method, path, status) = protocol_summary(row);
     let time = row.timestamp.format("%H:%M:%S").to_string();
     vec![
         Span::raw(format!("{time} ")),
@@ -237,6 +237,7 @@ fn row_spans(row: &EventRow) -> Vec<Span<'_>> {
         ),
         Span::raw(format!(" {:>3}", row.risk_score)),
         Span::raw(format!(" {:<15}", row.client_ip)),
+        Span::raw(format!(" [{:<8}]", row.source)),
         Span::raw(format!(" {:<6}", method)),
         Span::raw(format!(" {:<40}", truncate(&path, 40))),
         Span::raw(format!(" {:>3}", status)),
@@ -257,8 +258,39 @@ fn level_color(s: &str) -> Color {
     }
 }
 
-fn protocol_summary(v: &serde_json::Value) -> (String, String, String) {
-    match serde_json::from_value::<ProtocolData>(v.clone()) {
+fn port_service(port: u16) -> &'static str {
+    match port {
+        22 => "ssh",
+        25 => "smtp",
+        53 => "dns",
+        80 => "http",
+        443 => "https",
+        445 => "smb",
+        3306 => "mysql",
+        3389 => "rdp",
+        5432 => "postgres",
+        6379 => "redis",
+        8080 => "http-alt",
+        8443 => "https-alt",
+        _ => "",
+    }
+}
+
+fn port_label(port: Option<i32>) -> String {
+    port.and_then(|p| u16::try_from(p).ok())
+        .map(|p| {
+            let svc = port_service(p);
+            if svc.is_empty() {
+                p.to_string()
+            } else {
+                svc.to_string()
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn protocol_summary(row: &EventRow) -> (String, String, String) {
+    match serde_json::from_value::<ProtocolData>(row.protocol.clone()) {
         Ok(ProtocolData::Http(h)) => (
             h.method
                 .map(|m| format!("{m:?}"))
@@ -268,7 +300,42 @@ fn protocol_summary(v: &serde_json::Value) -> (String, String, String) {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "-".into()),
         ),
-        _ => ("?".into(), "(non-http)".into(), "-".into()),
+        Ok(ProtocolData::Tcp(_)) => {
+            let port = port_label(row.server_port);
+            let label = if port.is_empty() {
+                "tcp".to_string()
+            } else {
+                format!("tcp/{port}")
+            };
+            ("-".into(), format!("({label})"), "-".into())
+        }
+        Ok(ProtocolData::Udp(d)) => {
+            let label = match &d.dns_query {
+                Some(q) => format!("udp/dns {q}"),
+                None => match port_label(row.server_port) {
+                    p if p.is_empty() => "udp".to_string(),
+                    p => format!("udp/{p}"),
+                },
+            };
+            ("-".into(), format!("({label})"), "-".into())
+        }
+        Ok(ProtocolData::TlsHandshake(d)) => (
+            "-".into(),
+            match &d.sni {
+                Some(sni) => format!("(tls {sni})"),
+                None => "(tls)".into(),
+            },
+            "-".into(),
+        ),
+        Ok(ProtocolData::Syslog(d)) => (
+            "-".into(),
+            match &d.app_name {
+                Some(app) => format!("(syslog {app})"),
+                None => "(syslog)".into(),
+            },
+            "-".into(),
+        ),
+        _ => ("-".into(), "(non-http)".into(), "-".into()),
     }
 }
 

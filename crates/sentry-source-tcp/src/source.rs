@@ -66,9 +66,9 @@ impl TcpCaptureSource {
         #[cfg(not(feature = "pcap"))]
         {
             let _ = &cfg;
-            return Err(sentry_core::error::CoreError::Config(
+            Err(sentry_core::error::CoreError::Config(
                 "sentry-source-tcp was built without the `pcap` feature — rebuild sentry-cli with --features sentry-cli/pcap (requires Npcap on Windows / CAP_NET_RAW on Linux)".into(),
-            ));
+            ))
         }
         #[cfg(feature = "pcap")]
         {
