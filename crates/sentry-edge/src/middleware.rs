@@ -17,6 +17,8 @@
 //! handler runs; `Shadow` only records the decision in the request
 //! extensions (key [`DECISION`]) and never interferes.
 
+use std::time::Instant;
+
 use axum::extract::Request;
 use axum::extract::State;
 use axum::http::{header, StatusCode};
@@ -57,6 +59,15 @@ impl EdgeRuntime {
 /// The axum middleware handler — use with
 /// `middleware::from_fn_with_state(runtime, sentry_edge::middleware::handler)`.
 pub async fn handler(State(runtime): State<EdgeRuntime>, req: Request, next: Next) -> Response {
+    let start = Instant::now();
+    let resp = handler_inner(State(runtime.clone()), req, next).await;
+    if let Some(h) = runtime.request_duration.as_ref() {
+        h.observe(start.elapsed().as_secs_f64());
+    }
+    resp
+}
+
+async fn handler_inner(State(runtime): State<EdgeRuntime>, req: Request, next: Next) -> Response {
     let (mut parts, body) = req.into_parts();
 
     // Capture the body up to the configured cap (0 = don't buffer).
@@ -126,6 +137,7 @@ pub async fn handler(State(runtime): State<EdgeRuntime>, req: Request, next: Nex
         headers,
         body: captured,
         cookies: Some(crate::challenge::parse_cookies(&parts.headers)),
+        upstream_time_ms: None,
     };
 
     let mut evt = Event::new(SourceKind::HttpProxy, client_ip, ProtocolData::Http(http));

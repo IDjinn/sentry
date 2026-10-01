@@ -271,6 +271,14 @@ impl Event {
         }
     }
 
+    /// Mutable variant of [`Self::http`].
+    pub fn http_mut(&mut self) -> Option<&mut HttpData> {
+        match &mut self.protocol {
+            ProtocolData::Http(d) => Some(d),
+            _ => None,
+        }
+    }
+
     /// Returns the TCP payload if this is a TCP event, else `None`.
     pub fn tcp(&self) -> Option<&TcpData> {
         match &self.protocol {
@@ -420,6 +428,10 @@ pub struct HttpData {
     pub body: Option<Vec<u8>>,
     /// Parsed cookies, when available.
     pub cookies: Option<HashMap<String, String>>,
+    /// Upstream response time in milliseconds (`$upstream_response_time`,
+    /// first value when nginx reports a comma-separated list).
+    #[serde(default)]
+    pub upstream_time_ms: Option<u64>,
 }
 
 /// TCP-specific observation (packet capture path).

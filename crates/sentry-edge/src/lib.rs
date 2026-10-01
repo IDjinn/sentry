@@ -93,6 +93,7 @@ pub struct EdgeRuntime {
     challenge_metrics: Option<prometheus::CounterVec>,
     challenge_backend: ChallengeBackend,
     tls_metrics: Option<TlsMetrics>,
+    request_duration: Option<prometheus::Histogram>,
 }
 
 impl EdgeRuntime {
@@ -114,6 +115,7 @@ impl EdgeRuntime {
             challenge_metrics: None,
             challenge_backend: ChallengeBackend::default(),
             tls_metrics: None,
+            request_duration: None,
         }
     }
 
@@ -139,6 +141,13 @@ impl EdgeRuntime {
     /// Counter incremented on every fast-path denial.
     pub fn with_block_hits(mut self, hits: prometheus::Counter) -> Self {
         self.block_hits = Some(hits);
+        self
+    }
+
+    /// Histogram observed with the wall-clock time spent handling each
+    /// request (middleware and reverse proxy), for latency panels.
+    pub fn with_request_duration(mut self, histogram: prometheus::Histogram) -> Self {
+        self.request_duration = Some(histogram);
         self
     }
 

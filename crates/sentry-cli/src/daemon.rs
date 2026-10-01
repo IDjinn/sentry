@@ -684,7 +684,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
 
     // Local ML threat model: runs as a fork off the hot path (or inline /
     // shadow, per [ai] config) and feeds signals back via rescore_from.
-    let ai_fork = build_ai_fork(&cfg);
+    let ai_fork = build_ai_fork(&cfg, &metrics);
     if let Some(ref ai) = ai_fork {
         info!(
             model = ai.model().name(),
@@ -705,8 +705,8 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
 
     // Remote LLM classifier (Layer 2): escalates suspicious or quarantined
     // events off the hot path, bounded by a semaphore and a verdict cache.
-    let llm_fork = build_llm_fork(&cfg);
-    let ip_lookup_fork = build_ip_lookup_fork(&cfg);
+    let llm_fork = build_llm_fork(&cfg, &metrics);
+    let ip_lookup_fork = build_ip_lookup_fork(&cfg, &metrics);
 
     if registry.source_count() == 0 {
         warn!("no sources configured — daemon will idle. Add [[source]] entries in sentry.toml");
@@ -839,6 +839,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         .with_trust(shared_trust.clone())
         .with_block_table(Arc::clone(&block_table))
         .with_block_hits(metrics.edge_block_hits.clone())
+        .with_request_duration(metrics.edge_request_duration.clone())
         .with_challenge_metrics(metrics.edge_challenge.clone())
         .with_tls_metrics(sentry_edge::TlsMetrics {
             handshakes: metrics.edge_tls_handshakes.clone(),
@@ -1053,6 +1054,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         }
         for incoming in batch.drain(..) {
             let start = Instant::now();
+            let from_edge = matches!(incoming, Incoming::Processed(_));
             let mut result = match incoming {
                 Incoming::Raw(evt) => {
                     let evt = *evt;
@@ -1068,6 +1070,10 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 Incoming::Processed(pe) => *pe,
             };
             let duration = start.elapsed();
+            // The pipeline only runs for raw sources; edge-decided events
+            // arrive with the verdict already applied (process_us stays None
+            // and the edge latency lives in sentry_edge_request_duration_seconds).
+            let process_us = (!from_edge).then_some(duration.as_micros() as u64);
 
             // Inline AI mode: block before persistence/actions so the stored
             // verdict and the dispatched actions already include the model's say.
@@ -1100,6 +1106,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 &result.analysis.risk_level,
                 &result.analysis.signals,
                 result.decision.log_level,
+                (!from_edge).then_some(duration),
             );
 
             if let Some(ref repo) = repo {
@@ -1117,6 +1124,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                             result_clone.decision.action,
                             &signals_json,
                             Some(dedup_hash(&result_clone.event) as i64),
+                            process_us,
                         )
                         .await
                     {
@@ -1168,10 +1176,12 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                         .with_label_values(&[action.name(), verdict_str(result.decision.action)])
                         .inc();
                     let ctx = incident_context(&repo, &result).await;
-                    if let Err(e) = action
+                    let action_start = Instant::now();
+                    let executed = action
                         .execute_with_context(&result.event, &result.decision, &ctx)
-                        .await
-                    {
+                        .await;
+                    metrics.record_action_dispatch(action.name(), action_start.elapsed());
+                    if let Err(e) = executed {
                         warn!(action = action.name(), error = %e, "action failed");
                     }
                 }
@@ -1191,8 +1201,12 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                     .with_label_values(&[&crate::eventlog::signal_kind_label(&signal.kind)])
                     .inc();
             }
-            event_log.push(crate::eventlog::EventSummary::from_processed(&result));
+            event_log.push(crate::eventlog::EventSummary::from_processed_with_timing(
+                &result,
+                (!from_edge).then_some(duration),
+            ));
             metrics.record_event(result.decision.action, result.analysis.risk_level, duration);
+            metrics.record_ingest(start.elapsed());
 
             // Fork AI mode: evaluate off the hot path; a changed verdict updates
             // the persisted event and re-dispatches actions.
@@ -1493,6 +1507,7 @@ struct AiFork {
     cache_ttl: Duration,
     semaphore: Arc<tokio::sync::Semaphore>,
     cache: AiCache,
+    metrics: crate::metrics::Metrics,
 }
 
 impl AiFork {
@@ -1556,7 +1571,9 @@ impl AiFork {
     ) {
         let fork = Arc::clone(self);
         tokio::spawn(async move {
+            let started = Instant::now();
             let signals = fork.evaluate(&base.event).await;
+            fork.metrics.record_fork("ai", started.elapsed());
             if signals.is_empty() {
                 return;
             }
@@ -1611,7 +1628,7 @@ impl AiFork {
 }
 
 /// Build the AI fork from config when `[ai] enabled = true`.
-fn build_ai_fork(cfg: &SentryConfig) -> Option<Arc<AiFork>> {
+fn build_ai_fork(cfg: &SentryConfig, metrics: &crate::metrics::Metrics) -> Option<Arc<AiFork>> {
     if !cfg.ai.enabled {
         return None;
     }
@@ -1647,6 +1664,7 @@ fn build_ai_fork(cfg: &SentryConfig) -> Option<Arc<AiFork>> {
             cache_ttl: Duration::from_secs(cfg.ai.cache_ttl_secs),
             semaphore: Arc::new(tokio::sync::Semaphore::new(cfg.ai.concurrency.max(1))),
             cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            metrics: metrics.clone(),
         }))
     }
     #[cfg(not(feature = "onnx"))]
@@ -1670,6 +1688,7 @@ struct LlmFork {
     cache_ttl: Duration,
     semaphore: Arc<tokio::sync::Semaphore>,
     cache: AiCache,
+    metrics: crate::metrics::Metrics,
 }
 
 impl LlmFork {
@@ -1722,7 +1741,9 @@ impl LlmFork {
     ) {
         let fork = Arc::clone(self);
         tokio::spawn(async move {
+            let started = Instant::now();
             let signals = fork.evaluate(&base.event).await;
+            fork.metrics.record_fork("llm", started.elapsed());
             if signals.is_empty() {
                 return;
             }
@@ -1885,7 +1906,7 @@ pub(crate) fn make_llm_provider(
 }
 
 /// Build the LLM fork from `[llm]` config when `provider != "none"`.
-fn build_llm_fork(cfg: &SentryConfig) -> Option<Arc<LlmFork>> {
+fn build_llm_fork(cfg: &SentryConfig, metrics: &crate::metrics::Metrics) -> Option<Arc<LlmFork>> {
     if cfg.llm.provider.is_empty() || cfg.llm.provider == "none" {
         return None;
     }
@@ -1909,6 +1930,7 @@ fn build_llm_fork(cfg: &SentryConfig) -> Option<Arc<LlmFork>> {
         cache_ttl: Duration::from_secs(cfg.llm.cache_ttl_secs),
         semaphore: Arc::new(tokio::sync::Semaphore::new(cfg.llm.concurrency.max(1))),
         cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        metrics: metrics.clone(),
     }))
 }
 
@@ -1936,6 +1958,7 @@ struct IpLookupFork {
     cache: std::sync::Mutex<HashMap<IpAddr, (Instant, u8)>>,
     quota: std::sync::Mutex<(Instant, u32)>,
     on_signals: Vec<sentry_core::analysis::SignalKind>,
+    metrics: crate::metrics::Metrics,
 }
 
 impl IpLookupFork {
@@ -2002,9 +2025,11 @@ impl IpLookupFork {
     ) {
         let fork = Arc::clone(self);
         tokio::spawn(async move {
+            let started = Instant::now();
             let Some(score) = fork.evaluate(base.event.client_ip).await else {
                 return;
             };
+            fork.metrics.record_fork("ip_lookup", started.elapsed());
             // Provider confidence scales the weight: 25% ≈ +10, 100% ≈ +40.
             let weight = ((u16::from(score) * 40) / 100).min(40) as u8;
             if weight == 0 {
@@ -2056,7 +2081,10 @@ impl IpLookupFork {
 }
 
 /// Build the IP lookup fork from `[ip_lookup]` config when enabled.
-fn build_ip_lookup_fork(cfg: &SentryConfig) -> Option<Arc<IpLookupFork>> {
+fn build_ip_lookup_fork(
+    cfg: &SentryConfig,
+    metrics: &crate::metrics::Metrics,
+) -> Option<Arc<IpLookupFork>> {
     let ilc = &cfg.ip_lookup;
     if !ilc.enabled {
         return None;
@@ -2099,6 +2127,7 @@ fn build_ip_lookup_fork(cfg: &SentryConfig) -> Option<Arc<IpLookupFork>> {
         cache: std::sync::Mutex::new(HashMap::new()),
         quota: std::sync::Mutex::new((Instant::now(), 0)),
         on_signals,
+        metrics: metrics.clone(),
     }))
 }
 
@@ -2428,6 +2457,7 @@ fn print_event(
     level: &RiskLevel,
     signals: &[Signal],
     log_level: Option<RuleLogLevel>,
+    process: Option<Duration>,
 ) {
     if matches!(log_level, Some(RuleLogLevel::Silent)) {
         return;
@@ -2463,8 +2493,17 @@ fn print_event(
         )
     };
 
-    let line =
-        format!("{label:4} {ip:15} [{source:8}] {method:6} {path:40} {status:3}{signal_str}");
+    let mut timing = String::new();
+    if let Some(ms) = evt.duration_ms {
+        timing.push_str(&format!(" {ms}ms"));
+    }
+    if let Some(d) = process {
+        timing.push_str(&format!(" ({})", fmt_duration(d)));
+    }
+
+    let line = format!(
+        "{label:4} {ip:15} [{source:8}] {method:6} {path:40} {status:3}{timing}{signal_str}"
+    );
     match log_level {
         Some(RuleLogLevel::Warn) => warn!("{line}"),
         Some(RuleLogLevel::Error) => error!("{line}"),
@@ -2472,6 +2511,18 @@ fn print_event(
             let color = level.ansi_color();
             println!("{color}{line}\x1b[0m");
         }
+    }
+}
+
+/// Human-friendly duration for the console line (`823µs`, `1.2ms`, `3.4s`).
+fn fmt_duration(d: Duration) -> String {
+    let micros = d.as_micros();
+    if micros < 1_000 {
+        format!("{micros}µs")
+    } else if micros < 1_000_000 {
+        format!("{:.1}ms", micros as f64 / 1_000.0)
+    } else {
+        format!("{:.1}s", d.as_secs_f64())
     }
 }
 
@@ -3340,6 +3391,7 @@ mod tests {
             cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             quota: std::sync::Mutex::new((std::time::Instant::now(), 0)),
             on_signals,
+            metrics: crate::metrics::Metrics::new(),
         }
     }
 

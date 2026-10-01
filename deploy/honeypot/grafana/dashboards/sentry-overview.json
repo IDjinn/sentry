@@ -245,7 +245,7 @@
       "id": 6,
       "type": "timeseries",
       "title": "Top signal kinds",
-      "description": "Pipeline signals by kind \u2014 same keys as [scorer.weights].",
+      "description": "Pipeline signals by kind — same keys as [scorer.weights].",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -380,6 +380,196 @@
       }
     },
     {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Ingest latency (p99/p50)",
+      "description": "End-to-end time per ingested event: dedupe, pipeline, inline AI and action dispatch.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sentry_ingest_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sentry_ingest_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 5,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Edge request latency (p99/p50)",
+      "description": "Time spent handling each request in the inline edge, from receipt to response.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sentry_edge_request_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sentry_edge_request_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 5,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Fork rescore latency (p99)",
+      "description": "Async fork rescoring duration by fork (ai | llm | ip_lookup).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 30
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, fork) (rate(sentry_fork_rescore_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{fork}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 5,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Action dispatch latency (p99)",
+      "description": "Time spent dispatching each action execution, by action name.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 30
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, action) (rate(sentry_action_dispatch_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{action}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 5,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
       "id": 9,
       "type": "table",
       "title": "Recent events (live log)",
@@ -392,7 +582,7 @@
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 22
+        "y": 38
       },
       "targets": [
         {
@@ -401,7 +591,9 @@
           "url": "http://host.docker.internal:9100/api/events?limit=100",
           "format": "table",
           "refId": "events",
-          "url_options": { "method": "GET" },
+          "url_options": {
+            "method": "GET"
+          },
           "null_value": ""
         }
       ],
@@ -410,7 +602,10 @@
           "id": "convertFieldType",
           "options": {
             "conversions": [
-              { "targetField": "ts", "destinationType": "time" }
+              {
+                "targetField": "ts",
+                "destinationType": "time"
+              }
             ]
           }
         },
@@ -431,11 +626,14 @@
               "method": 2,
               "path": 3,
               "status": 4,
-              "protocol": 5,
-              "risk_level": 6,
-              "score": 7,
-              "rule_hit": 8,
-              "verdict": 9
+              "duration_ms": 5,
+              "upstream_ms": 6,
+              "process_us": 7,
+              "protocol": 8,
+              "risk_level": 9,
+              "score": 10,
+              "rule_hit": 11,
+              "verdict": 12
             },
             "renameByName": {
               "ts": "Time",
@@ -447,7 +645,10 @@
               "risk_level": "Level",
               "score": "Score",
               "rule_hit": "Rule / Signal",
-              "verdict": "Verdict"
+              "verdict": "Verdict",
+              "duration_ms": "Req ms",
+              "upstream_ms": "Upstream ms",
+              "process_us": "Proc µs"
             }
           }
         }
@@ -467,15 +668,32 @@
           "mappings": [
             {
               "type": "special",
-              "options": { "match": "null", "result": { "text": "", "index": 0 } }
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "",
+                  "index": 0
+                }
+              }
             },
             {
               "type": "special",
-              "options": { "match": "empty", "result": { "text": "", "index": 1 } }
+              "options": {
+                "match": "empty",
+                "result": {
+                  "text": "",
+                  "index": 1
+                }
+              }
             },
             {
               "type": "regex",
-              "options": { "pattern": "^null$", "result": { "text": "" } }
+              "options": {
+                "pattern": "^null$",
+                "result": {
+                  "text": ""
+                }
+              }
             }
           ],
           "thresholds": {
@@ -542,6 +760,42 @@
               {
                 "id": "custom.width",
                 "value": 65
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Req ms"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 75
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Upstream ms"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Proc µs"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 75
               }
             ]
           },
@@ -655,7 +909,10 @@
         "showHeader": true,
         "cellHeight": "sm",
         "sortBy": [
-          { "displayName": "Time", "desc": true }
+          {
+            "displayName": "Time",
+            "desc": true
+          }
         ],
         "footer": {
           "show": false,
@@ -684,7 +941,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Sentry \u2014 events & signals",
+  "title": "Sentry — events & signals",
   "uid": "sentry-overview",
   "version": 1,
   "weekStart": ""

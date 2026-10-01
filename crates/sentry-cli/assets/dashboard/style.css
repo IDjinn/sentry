@@ -105,7 +105,8 @@ table.events th, table.events td {
 }
 table.events th { color: var(--muted); font-weight: 500; font-size: 12px; }
 table.events td:nth-child(4) { direction: rtl; text-align: left; } /* keep path tail visible */
-table.events td:nth-child(8) { color: var(--muted); font-size: 12px; }
+table.events td:nth-child(5) { color: var(--muted); font-size: 12px; } /* timing: req ms / +process */
+table.events td:nth-child(9) { color: var(--muted); font-size: 12px; }
 
 .level-info, .verdict-allow { color: var(--info); }
 .level-low { color: var(--low); }

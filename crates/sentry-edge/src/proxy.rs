@@ -9,7 +9,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
 use axum::http::header;
@@ -196,6 +196,16 @@ struct ProxyState {
 }
 
 async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Response {
+    let start = Instant::now();
+    let runtime = state.runtime.clone();
+    let resp = proxy_handler_inner(State(state), req).await;
+    if let Some(h) = runtime.request_duration.as_ref() {
+        h.observe(start.elapsed().as_secs_f64());
+    }
+    resp
+}
+
+async fn proxy_handler_inner(State(state): State<ProxyState>, req: Request) -> Response {
     let ProxyState {
         runtime,
         client,
@@ -281,6 +291,7 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
         headers,
         body: captured,
         cookies: Some(crate::challenge::parse_cookies(&parts.headers)),
+        upstream_time_ms: None,
     };
     let mut evt = sentry_core::event::Event::new(
         sentry_core::event::SourceKind::HttpProxy,

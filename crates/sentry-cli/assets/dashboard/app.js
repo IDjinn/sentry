@@ -134,6 +134,21 @@ function signalNames(evt) {
   return signals.map((s) => (typeof s === "string" ? s : s.kind)).join(",");
 }
 
+function fmtMicros(us) {
+  if (us == null) return null;
+  if (us < 1000) return us + "µs";
+  if (us < 1e6) return (us / 1000).toFixed(1) + "ms";
+  return (us / 1e6).toFixed(2) + "s";
+}
+
+function fmtTiming(evt) {
+  const parts = [];
+  if (evt.duration_ms != null) parts.push(evt.duration_ms + "ms");
+  const proc = fmtMicros(evt.process_us);
+  if (proc) parts.push("+" + proc);
+  return parts.length ? parts.join(" / ") : "–";
+}
+
 async function refreshEvents() {
   const params = new URLSearchParams({ limit: "50" });
   if (levelFilter) params.set("level", levelFilter);
@@ -151,6 +166,7 @@ async function refreshEvents() {
       text(tr, "td", p.method);
       text(tr, "td", p.target);
       text(tr, "td", String(p.status));
+      text(tr, "td", fmtTiming(evt));
       text(tr, "td", evt.risk_level || "info", "level-" + (evt.risk_level || "info"));
       text(tr, "td", evt.verdict || "allow", "verdict-" + (evt.verdict || "allow"));
       text(tr, "td", p.signals);

@@ -42,6 +42,10 @@ pub struct Metrics {
     pub signals: prometheus::CounterVec,
     pub actions: prometheus::CounterVec,
     pub pipeline_duration: prometheus::Histogram,
+    pub ingest_duration: prometheus::Histogram,
+    pub fork_rescore_duration: prometheus::HistogramVec,
+    pub action_dispatch_duration: prometheus::HistogramVec,
+    pub edge_request_duration: prometheus::Histogram,
     pub feed_entries: prometheus::GaugeVec,
     pub feed_up: prometheus::GaugeVec,
     pub feed_refresh_ts: prometheus::GaugeVec,
@@ -162,6 +166,47 @@ impl Metrics {
             .buckets(vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]),
         )
         .unwrap();
+        let ingest_duration = prometheus::Histogram::with_opts(
+            prometheus::HistogramOpts::new(
+                "sentry_ingest_duration_seconds",
+                "End-to-end time per ingested event: dedupe, pipeline, \
+                 inline AI rescoring and action dispatch.",
+            )
+            .buckets(vec![
+                0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,
+            ]),
+        )
+        .unwrap();
+        let fork_rescore_duration = prometheus::HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "sentry_fork_rescore_duration_seconds",
+                "Duration of async fork rescoring passes, by fork \
+                 (ai | llm | ip_lookup).",
+            )
+            .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
+            &["fork"],
+        )
+        .unwrap();
+        let action_dispatch_duration = prometheus::HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "sentry_action_dispatch_duration_seconds",
+                "Time spent dispatching one action execution, by action name.",
+            )
+            .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]),
+            &["action"],
+        )
+        .unwrap();
+        let edge_request_duration = prometheus::Histogram::with_opts(
+            prometheus::HistogramOpts::new(
+                "sentry_edge_request_duration_seconds",
+                "Time spent handling one request in the inline edge, from \
+                 receipt to response (fast-path denials included).",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+        )
+        .unwrap();
         let feed_entries = prometheus::GaugeVec::new(
             prometheus::Opts::new(
                 "sentry_feed_entries",
@@ -239,6 +284,21 @@ impl Metrics {
             .register(Box::new(pipeline_duration.clone()))
             .map_err(|e| warn!(error = %e, "register histogram"))
             .ok();
+        for m in [&ingest_duration, &edge_request_duration] {
+            registry
+                .register(Box::new(m.clone()))
+                .map_err(|e| warn!(error = %e, "register duration histogram"))
+                .ok();
+        }
+        for (m, name) in [
+            (&fork_rescore_duration, "fork rescore"),
+            (&action_dispatch_duration, "action dispatch"),
+        ] {
+            registry
+                .register(Box::new(m.clone()))
+                .map_err(|e| warn!(error = %e, "register {name} histogram"))
+                .ok();
+        }
         for m in [&feed_entries, &feed_up, &feed_refresh_ts, &instance_info] {
             registry
                 .register(Box::new(m.clone()))
@@ -264,6 +324,10 @@ impl Metrics {
             signals,
             actions,
             pipeline_duration,
+            ingest_duration,
+            fork_rescore_duration,
+            action_dispatch_duration,
+            edge_request_duration,
             feed_entries,
             feed_up,
             feed_refresh_ts,
@@ -291,6 +355,27 @@ impl Metrics {
         };
         self.signals.with_label_values(&[level_str]).inc();
         self.pipeline_duration.observe(duration.as_secs_f64());
+    }
+
+    /// Record the end-to-end ingest time for one event (dedupe → pipeline →
+    /// inline AI → action dispatch).
+    pub fn record_ingest(&self, duration: std::time::Duration) {
+        self.ingest_duration.observe(duration.as_secs_f64());
+    }
+
+    /// Record how long an async fork took to rescore an event
+    /// (`ai` | `llm` | `ip_lookup`).
+    pub fn record_fork(&self, fork: &str, duration: std::time::Duration) {
+        self.fork_rescore_duration
+            .with_label_values(&[fork])
+            .observe(duration.as_secs_f64());
+    }
+
+    /// Record how long one action dispatch took.
+    pub fn record_action_dispatch(&self, action: &str, duration: std::time::Duration) {
+        self.action_dispatch_duration
+            .with_label_values(&[action])
+            .observe(duration.as_secs_f64());
     }
 
     /// Render the full registry in Prometheus text exposition format.
@@ -449,5 +534,36 @@ mod tests {
     fn route_unknown_path_is_404() {
         let resp = route(&Metrics::new(), &EventLog::new(), &"/nope".parse().unwrap());
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn timing_histograms_are_exposed() {
+        let m = Metrics::new();
+        m.record_event(
+            Verdict::Block,
+            RiskLevel::High,
+            std::time::Duration::from_micros(420),
+        );
+        m.record_ingest(std::time::Duration::from_micros(900));
+        m.record_fork("llm", std::time::Duration::from_millis(1500));
+        m.record_action_dispatch("webhook", std::time::Duration::from_millis(30));
+        m.edge_request_duration.observe(0.042);
+        let text = String::from_utf8(m.gather()).unwrap();
+        for name in [
+            "sentry_pipeline_duration_seconds_bucket",
+            "sentry_ingest_duration_seconds_bucket",
+            "sentry_fork_rescore_duration_seconds_bucket{fork=\"llm\",le=",
+            "sentry_action_dispatch_duration_seconds_bucket{action=\"webhook\",le=",
+            "sentry_edge_request_duration_seconds_bucket",
+        ] {
+            assert!(
+                text.contains(name),
+                "missing {name} in exposition:\n{}",
+                text.lines()
+                    .filter(|l| l.contains(name.split('{').next().unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
     }
 }

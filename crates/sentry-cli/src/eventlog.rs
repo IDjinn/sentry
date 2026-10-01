@@ -8,6 +8,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use sentry_core::analysis::SignalKind;
 use sentry_core::event::ProtocolKind;
@@ -76,11 +77,23 @@ pub struct EventSummary {
     pub asn: Option<u32>,
     pub rule_hit: Option<String>,
     pub signals: Vec<SignalSummary>,
+    /// Observed request duration in ms from the source log (`$request_time`).
+    pub duration_ms: Option<u64>,
+    /// Upstream response time in ms (`$upstream_response_time`).
+    pub upstream_ms: Option<u64>,
+    /// Wall-clock pipeline processing time in microseconds; `None` when the
+    /// event arrived already decided (edge fast paths skip the pipeline).
+    pub process_us: Option<u64>,
 }
 
 impl EventSummary {
-    /// Condense a processed event for the log.
+    /// Condense a processed event for the log (no pipeline timing).
     pub fn from_processed(pe: &ProcessedEvent) -> Self {
+        Self::from_processed_with_timing(pe, None)
+    }
+
+    /// Like [`Self::from_processed`], but records how long the pipeline took.
+    pub fn from_processed_with_timing(pe: &ProcessedEvent, process: Option<Duration>) -> Self {
         let evt = &pe.event;
         let http = evt.http();
         let signals = pe
@@ -132,6 +145,9 @@ impl EventSummary {
             asn: evt.asn,
             rule_hit: pe.rule_hit.clone(),
             signals,
+            duration_ms: evt.duration_ms,
+            upstream_ms: http.and_then(|h| h.upstream_time_ms),
+            process_us: process.map(|d| d.as_micros() as u64),
         }
     }
 }
@@ -388,9 +404,35 @@ mod tests {
             "asn",
             "rule_hit",
             "signals",
+            "duration_ms",
+            "upstream_ms",
+            "process_us",
         ] {
             assert!(v.get(k).is_some(), "missing key {k}");
         }
+    }
+
+    #[test]
+    fn summary_carries_request_and_process_timings() {
+        let mut pe = http_evt("203.0.113.9", "/slow", Some(200));
+        pe.event.duration_ms = Some(1234);
+        if let Some(h) = pe.event.http_mut() {
+            h.upstream_time_ms = Some(1180);
+        }
+        let s = EventSummary::from_processed_with_timing(&pe, Some(Duration::from_micros(823)));
+        assert_eq!(s.duration_ms, Some(1234));
+        assert_eq!(s.upstream_ms, Some(1180));
+        assert_eq!(s.process_us, Some(823));
+
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["duration_ms"], 1234);
+        assert_eq!(json["upstream_ms"], 1180);
+        assert_eq!(json["process_us"], 823);
+
+        let plain = EventSummary::from_processed(&http_evt("10.0.0.1", "/a", None));
+        assert_eq!(plain.duration_ms, None);
+        assert_eq!(plain.upstream_ms, None);
+        assert_eq!(plain.process_us, None);
     }
 
     #[test]

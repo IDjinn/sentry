@@ -116,6 +116,7 @@ impl LogFormat {
         let mut referer: Option<String> = None;
         let mut bytes_out: Option<u64> = None;
         let mut duration_ms: Option<u64> = None;
+        let mut upstream_time_ms: Option<u64> = None;
         let mut timestamp = Utc::now();
 
         for name in &self.fields {
@@ -167,6 +168,18 @@ impl LogFormat {
                     // nginx emits seconds as a float (e.g. "0.123").
                     duration_ms = val.parse::<f64>().ok().map(|f| (f * 1000.0) as u64);
                 }
+                "upstream_response_time" => {
+                    // Comma-separated when the request hit multiple upstreams
+                    // ("0.005, 0.003"); the first value is the upstreammost.
+                    upstream_time_ms = val
+                        .split(',')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .map(|f| (f * 1000.0) as u64);
+                }
                 "time_local" | "time_iso8601" | "t" => {
                     if let Ok(dt) = parse_nginx_time(val) {
                         timestamp = dt;
@@ -215,6 +228,7 @@ impl LogFormat {
             headers,
             body: None,
             cookies: None,
+            upstream_time_ms,
         });
 
         Ok(RawEvent {
@@ -259,6 +273,9 @@ fn make_capture(name: &str) -> String {
         "status" | "body_bytes_sent" | "bytes_sent" | "request_time" | "b" | "s" => {
             r"\d+(?:\.\d+)?".to_string()
         }
+        // Upstream times: comma-separated list ("0.005, 0.003") when the
+        // request traversed multiple upstreams; `-` when not proxied.
+        "upstream_response_time" => r"(?:[\d., ]+|-)".to_string(),
         // The request line: METHOD PATH PROTO (no spaces inside).
         "request" => r"\S+\s+\S+\s+\S+".to_string(),
         // Quoted strings: the format wraps UA/referer in double quotes, so the
@@ -312,6 +329,48 @@ mod tests {
         let line = r#"5.6.7.8 "POST /login HTTP/1.1" 500 0.456"#;
         let evt = fmt.parse_line(line).unwrap();
         assert_eq!(evt.duration_ms, Some(456));
+    }
+
+    #[test]
+    fn parse_upstream_response_time_single_value() {
+        let fmt = LogFormat::compile(
+            r#"$remote_addr "$request" $status $request_time $upstream_response_time"#,
+        )
+        .unwrap();
+        let line = r#"5.6.7.8 "GET /api HTTP/1.1" 200 0.123 0.118"#;
+        let evt = fmt.parse_line(line).unwrap();
+        assert_eq!(evt.duration_ms, Some(123));
+        match evt.protocol {
+            ProtocolData::Http(ref h) => assert_eq!(h.upstream_time_ms, Some(118)),
+            _ => panic!("expected http"),
+        }
+    }
+
+    #[test]
+    fn parse_upstream_response_time_comma_list_takes_first() {
+        let fmt =
+            LogFormat::compile(r#"$remote_addr "$request" $status "$upstream_response_time""#)
+                .unwrap();
+        let line = r#"5.6.7.8 "GET /api HTTP/1.1" 200 "0.005, 0.003""#;
+        let evt = fmt.parse_line(line).unwrap();
+        match evt.protocol {
+            ProtocolData::Http(ref h) => assert_eq!(h.upstream_time_ms, Some(5)),
+            _ => panic!("expected http"),
+        }
+    }
+
+    #[test]
+    fn parse_upstream_response_time_dash_is_none() {
+        let fmt = LogFormat::compile(
+            r#"$remote_addr "$request" $status $body_bytes_sent $upstream_response_time"#,
+        )
+        .unwrap();
+        let line = r#"5.6.7.8 "GET / HTTP/1.1" 304 0 -"#;
+        let evt = fmt.parse_line(line).unwrap();
+        match evt.protocol {
+            ProtocolData::Http(ref h) => assert_eq!(h.upstream_time_ms, None),
+            _ => panic!("expected http"),
+        }
     }
 
     #[test]

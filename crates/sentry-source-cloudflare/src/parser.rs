@@ -86,6 +86,7 @@ impl CfLogLine {
             headers: Default::default(),
             body: None,
             cookies: None,
+            upstream_time_ms: None,
         };
         let evt = RawEvent {
             source: SourceKind::CloudflareLogs,
