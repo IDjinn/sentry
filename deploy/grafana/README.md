@@ -47,9 +47,19 @@ Served by the daemon's metrics server, alongside `/metrics`.
 | `level` | Filter by risk level: `info` `low` `medium` `high` `critical` |
 | `verdict` | Filter by verdict: `allow` `rate_limit` `challenge` `block` `quarantine` |
 
+> The dashboard's Infinity panel uses plain JSON auto-detect — no
+> `root_selector` / explicit `columns` in the query. Infinity ≥ 4 dropped
+> JSONPath root selectors and ignores explicit column lists on `json`
+> queries; auto-detect plus the stable row schema below is version-proof.
+
 Each row: `ts` (RFC 3339), `ip`, `source`, `protocol`, `method`, `path`,
 `host`, `status`, `user_agent`, `verdict`, `risk_level`, `score`,
 `country`, `asn`, `rule_hit`, `signals[]` (`kind`, `weight`, `detail`).
+Every key is always present (`null` when not applicable — the schema is
+stable across protocols, so consumers that infer columns from the first
+row, like the Grafana Infinity datasource, see all 16 fields). Fields
+absent for the queried protocol are `null` (e.g. `path`/`status` on TCP
+SYN events).
 The buffer holds the **last 1024 events in memory** — for full history use
 the `events` table in Postgres (Grafana Postgres datasource) or `sentry
 export siem`.
