@@ -677,6 +677,7 @@ impl Pipeline {
             SignalKind::SpoofedBot => "spoofed_bot",
             SignalKind::LlmMalicious => "llm_malicious",
             SignalKind::ExternalReputation => "external_reputation",
+            SignalKind::TlsSniMismatch => "tls_sni_mismatch",
             SignalKind::RuleHit => "rule_hit",
             SignalKind::Custom => "custom",
         };
@@ -721,6 +722,7 @@ impl Pipeline {
             SignalKind::SpoofedBot => "spoofed_bot",
             SignalKind::LlmMalicious => "llm_malicious",
             SignalKind::ExternalReputation => "external_reputation",
+            SignalKind::TlsSniMismatch => "tls_sni_mismatch",
             SignalKind::RuleHit => "rule_hit",
             SignalKind::Custom => "custom",
         };

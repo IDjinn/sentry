@@ -40,6 +40,7 @@ sentry-action-webhook = { workspace = true }
 sentry-action-blocklist = { workspace = true }
 sentry-action-report = { workspace = true }
 sentry-action-firewall = { workspace = true }
+sentry-action-opnsense = { workspace = true }
 sentry-action-nginx = { workspace = true }
 
 hickory-resolver = { workspace = true }

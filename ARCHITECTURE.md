@@ -487,6 +487,25 @@ inline              client → sentry-edge → nginx → app
   promíscuo via `sentry-source-tcp` em capture mode (feature `pcap`).
 - **`edge-sidecar` (F3.9c)**: mesmo binário em container sidecar/DaemonSet
   (`deploy/k8s/edge-sidecar.yaml`).
+- **Páginas de verdict (`sentry-edge/src/pages.rs`)**: os bloqueios e
+  fallbacks de challenge servem uma página HTML única (tema dark do PoW,
+  logo do Sentry embutido como data URI, copy estilo Cloudflare —
+  "403 - Forbidden" / "You are unable to access this website." — e um
+  **Trace ID** rastreável: nas decisões do pipeline é o `event.id`
+  persistido; no fast-path (BlockTable, sem evento) um UUID novo é gerado,
+  exibido na página, logado em `tracing::info!` e devolvido no header
+  `x-sentry-trace-id`). Status codes CF-like: Block/Quarantine,
+  fast-path, challenge falhado e challenge sem PoW → **403**;
+  RateLimit → **429** (`retry-after: 60`); o interstitial PoW também é
+  **403** (CF serve o managed challenge assim; `cache-control: no-store`
+  evita caches), não mais 503.
+- **`challenge_backend` (`[edge]`)**: quem executa o `Challenge` verdict —
+  `sentry` (default) roda o PoW local (F7.8); `cloudflare` delega ao
+  provider CF: o verdict vira regra no Cloudflare via API
+  (`[[action]]` com `provider = "cloudflare"`) e a edge só segura a
+  requisição atual com 403 + `retry-after` até a regra assumir no hop
+  seguinte. As páginas continuam sendo do Sentry — nada do Cloudflare é
+  imitado. Warning no startup se `cloudflare` sem action CF configurada.
 - **Regra de cadeia**: `client → sentry-edge → nginx → app` — o Sentry é a
   camada de decisão de ameaça; rate-limit/WAF de app do nginx continuam
   sendo do nginx (complementares, não substitutos).
@@ -711,15 +730,21 @@ seta o cookie `sentry_ch=<bucket>:<nonce>` e dá reload. A edge valida
 recomputando o PoW — stateless, multi-node com o mesmo
 `secret_env` (`SENTRY_EDGE_CHALLENGE_SECRET`, obrigatório quando
 `enabled`, mínimo 16 bytes); bucket default 3600 s com graça do bucket
-anterior; resposta 503 + `retry-after: 3` + `cache-control: no-store`,
+anterior; resposta 403 + `retry-after: 3` + `cache-control: no-store`
+(status Cloudflare; era 503 até F8.1),
 `Secure` no cookie quando há HTTPS (`X-Forwarded-Proto`). Clientes sem
-JS (curl, bots burros) ficam presos no 503; bots verificados (F7.10)
+JS (curl, bots burros) ficam presos no interstitial (403); bots
+verificados (F7.10)
 passam direto (`ChallengeGate::Pass`, métrica `bot_bypass`);
 `Block`/`RateLimit` continuam 403/429 — PoW nunca destrava block hard.
 Página embutida (`CHALLENGE_HTML`), tema escuro, zero CDN. Middleware e
 reverse proxy compartilham `EdgeRuntime::challenge_gate`; cookies agora
 populam `HttpData.cookies`. Métrica
-`sentry_edge_challenge_total{result=served|passed|bot_bypass}`.
+`sentry_edge_challenge_total{result=served|passed|bot_bypass|delegated|
+failed}`. Com `[edge] challenge_backend = "cloudflare"` o gate não roda
+PoW local: o verdict vira regra CF via API e a edge responde a página
+de espera 403 (`pages::delegated_challenge_page`); cookie inválido
+continua terminal 403 (`pages::challenge_failed_page`, com Trace ID).
 (2) **Provider nginx** (crate `sentry-action-nginx`,
 `type = "challenge"`, `provider = "nginx"`; entrega o F6.2): gera
 includes com escrita atômica (tmp+rename) em `conf_dir` —
@@ -741,6 +766,58 @@ as três compartilham o mesmo verdict/pipeline e o bypass de bot
 verificado.
 
 ---
+
+### 8.8 Edge TLS — monitoramento SSL/443 inline (F8)
+
+No modo `inline` a edge passa a manter **dois listeners** no mesmo processo
+e pipeline: o HTTP plain (`[edge] listen`, default `0.0.0.0:80`) e o HTTPS
+(`[edge] tls_listen`, default `0.0.0.0:443`), habilitado quando
+`tls_cert`+`tls_key` estão configurados e o binário foi compilado com
+`--features sentry-cli/edge-tls`. Ambos os portos são **monitorados e
+enforçados**: block table nega IP em qualquer um deles; a block table é
+consultada *antes* do handshake TLS (o IP bloqueado só vê a conexão cair,
+sem handshake, sem evento).
+
+**Terminação + telemetria (F8.1)** — o acceptor TLS (`sentry-edge/src/tls.rs`)
+faz peek do ClientHello *antes* do handshake rustls (os bytes lidos são
+realimentados via `PrefixedStream`, o handshake vê os mesmos octetos),
+extrai SNI/JA3/JA4 e só então roda o handshake (tokio-rustls, provider
+ring, ALPN `http/1.1`, timeout 5s anti-slowloris). Após o handshake os
+requests decryptados entram no **mesmo router** do proxy plain
+(hyper-util auto-builder), com `ConnectInfo<SocketAddr>` e
+`x-forwarded-proto: https` injetados por conexão — o handler de proxy e o
+cookie do challenge ( atributo `Secure`) veem o IP real e o scheme correto.
+Cert/config inválidos sem a feature = erro de startup (nunca mais "caiu
+silenciosamente para HTTP plain"). `tls_redirect_https = true` responde 301
+no listener plain **depois** do pipeline — tráfego na porta 80 continua
+sendo pontuado e bloqueado. `listen = ""` desliga o listener plain
+(HTTPS-only).
+
+**Monitoramento da camada SSL (F8.2)** — cada handshake emitido gera um
+evento `TlsHandshake` (`SourceKind::EdgeTls`) com
+`TlsData { sni, ja3, ja4, cipher, version, alpn }` no mesmo pipeline
+(regras → reputação → scorer → policy; heurísticas HTTP devolvem vazio
+para variante TLS). `ja3` é o MD5 canônico (ordem de wire); `ja4` segue a
+especificação pública FoxIO (versão ofertada mais alta, marcador SNI
+`d/i/n`, contagens de ciphers/extensions — SNI e ALPN excluídos, ALPN
+tag, SHA-256 truncado das listas ordenadas). O parser vive em
+`sentry-edge/src/clienthello.rs` (puro, sem I/O, testado contra ClientHellos
+sintetizados de Chrome/curl/OpenSSL e hellos fragmentados em múltiplos
+records). Condições DSL novas: `tls_ja3 = "…"`, `tls_ja4 = "…"`,
+`tls_sni = "…"`. Com `[edge] tls_allowed_hosts` configurado, handshake com
+SNI ausente/desconhecido ganha o sinal `TlsSniMismatch` (peso 20, via
+`rescore_from` — nunca rebaixa, never-ban respeitado): assinatura de
+scanner sondando a porta 443 por IP (comportamento honeypot). Veredito
+Block/Quarantine pós-handshake derruba a conexão inteira.
+
+**Observabilidade** — `sentry_edge_tls_handshakes_total{version}`,
+`sentry_edge_tls_handshake_failures_total` (records malformados, hellos
+truncados, handshakes falhos/expirados),
+`sentry_edge_tls_sni_mismatch_total`,
+`sentry_edge_tls_cert_not_after` (gauge unix-ts do notAfter do PEM,
+recomputado diariamente, warn < 14 dias). O `/api/events` (eventlog)
+carrega `tls: {sni, ja3, ja4, version, cipher, alpn}` com key-set estável
+(null quando não-TLS) e `host = sni`.
 
 ## 9. Detecção de Rotas Válidas
 
@@ -1624,14 +1701,15 @@ Objetivo: o Sentry decide, a plataforma existente executa — cada provider
 segue o trait `ChallengeProvider` (`apply(ip, verdict, opts)`) e entra no
 `match` de `build_challenge_action` sem tocar em regras/pipeline.
 
-- **[ ] F6.1 — Provider OPNsense/pfSense**: alias tables via REST API do
-  OPNsense (`/api/firewall/alias_util`, prefixo `sentry_`) e via `pfctl
-  -t <table> -T add` para pfSense puro (SSH/exec no host — documentar o
-  requisito de credencial). Verdicts Block/Quarantine → alias com TTL
-  (expiração por reaper como o `note` do Cloudflare); RateLimit/Challenge
-  → 403/429 locais não aplicáveis (a plataforma só sabe drop/reject —
-  documentar). Config: `type = "challenge"`, `provider = "opnsense"`,
-  `api_key_env`/`api_secret_env`/`base_url`.
+- **[x] F6.1 — Provider OPNsense/pfSense** (entregue pela F8, §8.8): crate
+  `sentry-action-opnsense` (`provider = "opnsense" | "pfsense"`). OPNsense:
+  REST `/api/firewall/alias_util/add|delete/<table>` com key/secret via env
+  (`api_key_env`/`api_secret_env`); pfSense: `pfctl -t <table> -T add` no
+  host (sem shell, args posicionais). TTL em mapa de expiração em memória +
+  reaper 30s (a plataforma não tem TTL por entrada); guard never-ban antes
+  de qualquer chamada; `Challenge`/`RateLimit` são logados como unenforced
+  (a plataforma só conhece drop/reject). Wire no
+  `build_challenge_action` sem reconcile daemon-side.
 - **[x] F6.2 — Provider nginx** (entregue pelo F7.11, §8.7): gerador de
   include deny-list (`deny <ip>;` em `sentry-deny.conf` incluído do
   `http`/`server` block) + reload (`nginx -s reload`) com debounce
@@ -1660,18 +1738,28 @@ Critérios de "pronto" da F5/F6:
 F7.1–F7.6 estão entregues (§8.7), assim como F7.10 (verificação de bots
 via rDNS) e F7.11 (JS challenge na edge inline + provider nginx). Restante:
 
-- **[ ] F7.7 — Datasets DB-backed**: tabelas `datasets` +
-  `dataset_entries` + `DatasetRepo`; `sentry datasets import <file|url>`
-  seguindo o padrão `routes_import` (dedup, dry-run, NOTIFY
-  `sentry_datasets_changed`); enable/disable por dataset via CLI/dashboard;
-  prefilter Aho-Corasick dinâmico (hoje `PREFILTER` é estático em
-  `LazyLock` — converter para instância do engine com arc-swap) para que
-  UAs/paths importados acelerem heurísticas e não apenas regras; refresh de
-  dataset reconstruindo a regra sintética a quente (hoje o snapshot é do
-  startup). Status/resumo por dataset em `sentry datasets list`.
+- **[x] F7.7 — Datasets DB-backed** (entregue pela F8; fecha o F7.9 na
+  prática): tabelas `datasets`/`dataset_entries` + `DatasetRepo` (upsert/
+  list/entries/set_enabled/delete, cada mutação emite NOTIFY
+  `sentry_datasets_changed`); `FeedKind::Ja3` + `RuleMatch::Ja3In`
+  (HashSet, case-insensitive) para listas de fingerprint TLS; CLI
+  `sentry datasets list|import|enable|disable|delete|fetch` (import aceita
+  arquivo ou URL, dedup + cap `MAX_DATASET_ENTRIES`, `--dry-run`); prefilter
+  dinâmico — `PREFILTER`/`SENSITIVE_PATH_RE`/`BAD_CRAWLER_RE` são
+  `ArcSwap` e `heuristics::reload_dataset_lists` reconstrói os três com os
+  literais de datasets `user_agent`/`path` habilitados (UA → gate CRAWLER,
+  path → gate SENSITIVE); o daemon aplica no startup e hot-reloada na
+  NOTIFY (regras sintéticas `dataset:<name>` trocadas atomicamente via
+  `RuleSet::replace_by_prefix`, nunca tocando nas demais); regra:
+  `FeedConfig.action` do dataset vira o veredito (`log` default).
+  Limitação documentada: datasets só alimentam regras + prefilter — os
+  detectores de heurística continuam com os literais builtin (a equivalência
+  gated×ungated e os proptests de cobertura dependem deles).
 - **[ ] F7.8 — ReportedIP check/lookup**: estender `IpLookupProvider` com
   o ReportedIP (hoje só AbuseIPDB `/check`); mapear severity 1-10 das 63
   categorias para o peso do sinal.
-- **[ ] F7.9 — `sentry feeds` para datasets**: `refresh` mostra contagens
-  de UAs/paths por dataset; `check` aceita `--user-agent`/`--path` para
-  testar o match de uma regra de dataset.
+- **[x] F7.9 — CLI de datasets** (entregue junto com o F7.7):
+  `sentry datasets list` mostra kind/entries/enabled/source_url;
+  `import --kind user_agent|path|ja3 --name <n> [--action <a>] [--dry-run]`
+  aceita arquivo ou URL; `enable/disable/delete` notificam o mesmo canal;
+  `fetch` re-busca os datasets com `source_url` e re-publica contagens.

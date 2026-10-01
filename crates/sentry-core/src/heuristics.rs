@@ -85,6 +85,10 @@ struct FamilyPrefilter {
 
 impl FamilyPrefilter {
     fn build() -> Self {
+        Self::compile(Self::base_patterns())
+    }
+
+    fn base_patterns() -> Vec<(String, u8)> {
         const P: &[(&str, u8)] = &[
             // sqli — branch 1 needs a quote; the others their keyword.
             ("'", gate::SQLI),
@@ -182,16 +186,12 @@ impl FamilyPrefilter {
             ("webbandit", gate::CRAWLER),
             ("emailcollector", gate::CRAWLER),
         ];
-        let mut patterns: Vec<(&str, u8)> = P.to_vec();
-        patterns.extend(crate::lists::sensitive_path_literals().map(|lit| (lit, gate::SENSITIVE)));
-        let ac = aho_corasick::AhoCorasickBuilder::new()
-            .ascii_case_insensitive(true)
-            .build(patterns.iter().map(|(p, _)| *p))
-            .expect("static patterns compile");
-        Self {
-            ac,
-            bits: patterns.iter().map(|(_, b)| *b).collect(),
-        }
+        let mut patterns: Vec<(String, u8)> =
+            P.iter().map(|(p, g)| ((*p).to_string(), *g)).collect();
+        patterns.extend(
+            crate::lists::sensitive_path_literals().map(|lit| (lit.to_string(), gate::SENSITIVE)),
+        );
+        patterns
     }
 
     /// Scan one text field, setting bits for families whose triggers appear.
@@ -212,9 +212,102 @@ impl FamilyPrefilter {
             .find_overlapping_iter(text)
             .any(|m| self.bits[m.pattern().as_usize()] & bit != 0)
     }
+
+    fn compile(patterns: Vec<(String, u8)>) -> Self {
+        let ac = aho_corasick::AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(patterns.iter().map(|(p, _)| p.as_str()))
+            .expect("static patterns compile");
+        Self {
+            ac,
+            bits: patterns.iter().map(|(_, b)| *b).collect(),
+        }
+    }
+
+    /// Prefilter with dataset literals merged in (F7.7): UA substrings gate
+    /// CRAWLER, path fragments gate SENSITIVE.
+    fn build_with_datasets(user_agents: &[String], paths: &[String]) -> Self {
+        let mut patterns = Self::base_patterns();
+        patterns.extend(
+            user_agents
+                .iter()
+                .filter(|u| u.len() >= 4)
+                .map(|u| (u.clone(), gate::CRAWLER)),
+        );
+        patterns.extend(
+            paths
+                .iter()
+                .filter(|p| p.len() >= 3)
+                .map(|p| (p.clone(), gate::SENSITIVE)),
+        );
+        Self::compile(patterns)
+    }
 }
 
-static PREFILTER: LazyLock<FamilyPrefilter> = LazyLock::new(FamilyPrefilter::build);
+static PREFILTER: LazyLock<arc_swap::ArcSwap<FamilyPrefilter>> =
+    LazyLock::new(|| arc_swap::ArcSwap::from_pointee(FamilyPrefilter::build()));
+
+/// Hot-reload dataset-driven literals (F7.7): the prefilter gains the
+/// imported UA/path triggers and the sensitive-path / bad-crawler regexes
+/// gain the imported alternatives. Called by the daemon at startup and on
+/// `sentry_datasets_changed`; subsequent scans see the new sets atomically.
+pub fn reload_dataset_lists(user_agents: &[String], paths: &[String]) {
+    let uas: Vec<String> = user_agents
+        .iter()
+        .map(|u| u.trim().to_ascii_lowercase())
+        .filter(|u| u.len() >= 4)
+        .collect();
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| p.len() >= 3)
+        .collect();
+    PREFILTER.store(std::sync::Arc::new(FamilyPrefilter::build_with_datasets(
+        &uas, &paths,
+    )));
+    SENSITIVE_PATH_RE.store(std::sync::Arc::new(build_sensitive_path_re(&paths)));
+    BAD_CRAWLER_RE.store(std::sync::Arc::new(build_bad_crawler_re(&uas)));
+}
+
+fn build_sensitive_path_re(extra: &[String]) -> Regex {
+    let base = crate::lists::sensitive_paths_regex();
+    if extra.is_empty() {
+        return Regex::new(&base).expect("sensitive path patterns compile");
+    }
+    let extras = extra
+        .iter()
+        .map(|p| regex::escape(p))
+        .collect::<Vec<_>>()
+        .join("|");
+    // The base is "(?i)(?:a|b|…)": splice the extras into the same group so
+    // the semantics match the built-in paths exactly.
+    let mut src = base.trim_end().to_string();
+    if src.ends_with(')') {
+        src.truncate(src.len() - 1);
+        src.push('|');
+        src.push_str(&extras);
+        src.push(')');
+    }
+    Regex::new(&src).unwrap_or_else(|_| Regex::new(&base).expect("base patterns compile"))
+}
+
+fn build_bad_crawler_re(extra: &[String]) -> Regex {
+    if extra.is_empty() {
+        return Regex::new(BAD_CRAWLER_PATTERN).expect("bad crawler pattern compiles");
+    }
+    let extras = extra
+        .iter()
+        .map(|u| regex::escape(u))
+        .collect::<Vec<_>>()
+        .join("|");
+    Regex::new(&format!("(?i)(?:{}|{})", BAD_CRAWLER_INNER, extras))
+        .expect("bad crawler + dataset pattern compiles")
+}
+
+/// Built-in bad-crawler alternatives (kept verbatim from the original
+/// literal list; dataset entries are appended by the daemon, F7.7).
+const BAD_CRAWLER_INNER: &str = "sqlmap|nikto|nmap|masscan|zgrab|zmap|rustscan|unicornscan|nessus|acunetix|dirbuster|dirsearch|gobuster|feroxbuster|ffuf|wfuzz|wpscan|hydra|metasploit|burp|httrack|libwww|python-requests|curl/[0-9]|go-http-client|scrapy|crawler4j|semrush|ahrefs|nuclei|arachni|openvas|havij|commix|xsser|dalfox|gospider|hakrawler|webbandit|emailcollector";
+const BAD_CRAWLER_PATTERN: &str = "(?i)(?:sqlmap|nikto|nmap|masscan|zgrab|zmap|rustscan|unicornscan|nessus|acunetix|dirbuster|dirsearch|gobuster|feroxbuster|ffuf|wfuzz|wpscan|hydra|metasploit|burp|httrack|libwww|python-requests|curl/[0-9]|go-http-client|scrapy|crawler4j|semrush|ahrefs|nuclei|arachni|openvas|havij|commix|xsser|dalfox|gospider|hakrawler|webbandit|emailcollector)";
 
 /// Composite heuristic that runs all registered detectors.
 pub struct HeuristicEngine {
@@ -247,17 +340,18 @@ impl HeuristicEngine {
     pub fn analyze(&self, evt: &Event) -> Vec<Signal> {
         let decoded = evt.http().map(DecodedHttp::of);
         let mut gates = 0u8;
+        let prefilter = PREFILTER.load();
         if let (Some(http), Some(text)) = (evt.http(), decoded.as_ref()) {
-            PREFILTER.scan_into(&text.path, &mut gates);
-            PREFILTER.scan_into(&text.query, &mut gates);
+            prefilter.scan_into(&text.path, &mut gates);
+            prefilter.scan_into(&text.query, &mut gates);
             if let Some(ua) = &http.user_agent {
-                PREFILTER.scan_into(ua, &mut gates);
+                prefilter.scan_into(ua, &mut gates);
             }
-            if let Some(referer) = &http.referer {
-                PREFILTER.scan_into(referer, &mut gates);
+            if let Some(referrer) = &http.referer {
+                prefilter.scan_into(referrer, &mut gates);
             }
             for v in http.headers.values() {
-                PREFILTER.scan_into(v, &mut gates);
+                prefilter.scan_into(v, &mut gates);
             }
         }
         let empty = DecodedHttp::default();
@@ -370,13 +464,11 @@ static CMD_INJECTION_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:;\s*(?:cat|ls|id|whoami|uname|wget|curl|bash|sh|nc|ncat)\b)|(?:\|\s*(?:cat|ls|id|whoami|uname|wget|curl|bash|sh|nc|ncat)\b)|(?:`[^`]+`)|(?:\$\([^)]+\))|(?:&&\s*(?:cat|ls|id|whoami))").unwrap()
 });
 
-static SENSITIVE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&crate::lists::sensitive_paths_regex()).expect("sensitive path patterns compile")
-});
+static SENSITIVE_PATH_RE: LazyLock<arc_swap::ArcSwap<Regex>> =
+    LazyLock::new(|| arc_swap::ArcSwap::from_pointee(build_sensitive_path_re(&[])));
 
-static BAD_CRAWLER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:sqlmap|nikto|nmap|masscan|zgrab|zmap|rustscan|unicornscan|nessus|acunetix|dirbuster|dirsearch|gobuster|feroxbuster|ffuf|wfuzz|wpscan|hydra|metasploit|burp|httrack|libwww|python-requests|curl/[0-9]|go-http-client|scrapy|crawler4j|semrush|ahrefs|nuclei|arachni|openvas|havij|commix|xsser|dalfox|gospider|hakrawler|webbandit|emailcollector)").unwrap()
-});
+static BAD_CRAWLER_RE: LazyLock<arc_swap::ArcSwap<Regex>> =
+    LazyLock::new(|| arc_swap::ArcSwap::from_pointee(build_bad_crawler_re(&[])));
 
 // ── Detectors ────────────────────────────────────────────────────────────
 
@@ -549,7 +641,10 @@ impl Heuristic for SensitivePath {
             Some(h) => h,
             None => return vec![],
         };
-        if SENSITIVE_PATH_RE.is_match(&http.path.to_ascii_lowercase()) {
+        if SENSITIVE_PATH_RE
+            .load()
+            .is_match(&http.path.to_ascii_lowercase())
+        {
             return vec![Signal {
                 kind: SignalKind::SensitivePath,
                 weight: 30,
@@ -578,7 +673,7 @@ impl Heuristic for BadCrawler {
             Some(u) => u.to_ascii_lowercase(),
             None => return vec![],
         };
-        if BAD_CRAWLER_RE.is_match(&ua) {
+        if BAD_CRAWLER_RE.load().is_match(&ua) {
             return vec![Signal {
                 kind: SignalKind::BadCrawler,
                 weight: 40,
@@ -953,7 +1048,7 @@ mod proptests {
             "feroxbuster/2.10",
             "dirsearch/v0.4.3",
         ];
-        let pf = &*PREFILTER;
+        let pf = PREFILTER.load();
         for t in samples {
             let check = |bit: u8, hit: bool, family: &str| {
                 assert!(
@@ -969,12 +1064,12 @@ mod proptests {
             check(gate::CMD, CMD_INJECTION_RE.is_match(t), "cmd");
             check(
                 gate::SENSITIVE,
-                SENSITIVE_PATH_RE.is_match(&t.to_ascii_lowercase()),
+                SENSITIVE_PATH_RE.load().is_match(&t.to_ascii_lowercase()),
                 "sensitive",
             );
             check(
                 gate::CRAWLER,
-                BAD_CRAWLER_RE.is_match(&t.to_ascii_lowercase()),
+                BAD_CRAWLER_RE.load().is_match(&t.to_ascii_lowercase()),
                 "crawler",
             );
         }

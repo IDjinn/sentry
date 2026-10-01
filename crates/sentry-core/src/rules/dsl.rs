@@ -284,6 +284,21 @@ impl Parser {
                 };
                 Ok(RuleMatch::Protocol(p))
             }
+            "tls_ja3" => {
+                let val = self.resolve_value(inline_val)?;
+                Ok(RuleMatch::TlsFingerprint {
+                    ja3: Some(val),
+                    ja4: None,
+                })
+            }
+            "tls_ja4" => {
+                let val = self.resolve_value(inline_val)?;
+                Ok(RuleMatch::TlsFingerprint {
+                    ja3: None,
+                    ja4: Some(val),
+                })
+            }
+            "tls_sni" => self.parse_str_op_atom(inline_val, RuleMatch::TlsSni),
             "status" => {
                 let val = self.resolve_value(inline_val)?;
                 let n = val

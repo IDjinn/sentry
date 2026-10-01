@@ -470,6 +470,120 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 check_feed_ip(cfg, &ip).await?;
             }
         },
+        Command::Datasets { action } => match action {
+            DatasetsCmd::List => {
+                let cfg = require_config(&cfg)?;
+                let repo = connect_storage(cfg).await?;
+                let rows = repo
+                    .datasets()
+                    .list()
+                    .await
+                    .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
+                crate::datasets::print_list(&rows);
+            }
+            DatasetsCmd::Import {
+                path,
+                kind,
+                name,
+                action: rule_action,
+                dry_run,
+            } => {
+                let cfg = require_config(&cfg)?;
+                let repo = connect_storage(cfg).await?;
+                let body = crate::datasets::read_source(&path).await?;
+                let entries = crate::datasets::parse_entries(&body);
+                if entries.is_empty() {
+                    color_eyre::eyre::bail!("no usable entries found in {path}");
+                }
+                println!(
+                    "dataset `{name}` ({}): {} entries parsed",
+                    kind.as_str(),
+                    entries.len()
+                );
+                if dry_run {
+                    for entry in entries.iter().take(10) {
+                        println!("  {entry}");
+                    }
+                    if entries.len() > 10 {
+                        println!("  … and {} more", entries.len() - 10);
+                    }
+                    println!("dry-run: nothing persisted");
+                } else {
+                    repo.datasets()
+                        .upsert(&name, kind.as_str(), Some(&path), &rule_action, &entries)
+                        .await
+                        .map_err(|e| color_eyre::eyre::eyre!("upsert failed: {e}"))?;
+                    println!("saved; running daemons hot-reload via NOTIFY");
+                }
+            }
+            DatasetsCmd::Enable { name } => {
+                let cfg = require_config(&cfg)?;
+                let repo = connect_storage(cfg).await?;
+                repo.datasets()
+                    .set_enabled(&name, true)
+                    .await
+                    .map_err(|e| color_eyre::eyre::eyre!("update failed: {e}"))?;
+                println!("dataset `{name}` enabled");
+            }
+            DatasetsCmd::Disable { name } => {
+                let cfg = require_config(&cfg)?;
+                let repo = connect_storage(cfg).await?;
+                repo.datasets()
+                    .set_enabled(&name, false)
+                    .await
+                    .map_err(|e| color_eyre::eyre::eyre!("update failed: {e}"))?;
+                println!("dataset `{name}` disabled");
+            }
+            DatasetsCmd::Delete { name } => {
+                let cfg = require_config(&cfg)?;
+                let repo = connect_storage(cfg).await?;
+                repo.datasets()
+                    .delete(&name)
+                    .await
+                    .map_err(|e| color_eyre::eyre::eyre!("delete failed: {e}"))?;
+                println!("dataset `{name}` deleted");
+            }
+            DatasetsCmd::Fetch => {
+                let cfg = require_config(&cfg)?;
+                let repo = connect_storage(cfg).await?;
+                let rows = repo
+                    .datasets()
+                    .list()
+                    .await
+                    .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
+                let with_url: Vec<&sentry_storage::DatasetRow> = rows
+                    .iter()
+                    .filter(|r| r.enabled && r.source_url.is_some())
+                    .collect();
+                if with_url.is_empty() {
+                    println!("no enabled datasets with a source URL");
+                    return Ok(());
+                }
+                for ds in with_url {
+                    let url = ds.source_url.as_deref().unwrap_or_default();
+                    match crate::datasets::read_source(url).await {
+                        Ok(body) => {
+                            let entries = crate::datasets::parse_entries(&body);
+                            match repo
+                                .datasets()
+                                .upsert(&ds.name, &ds.kind, Some(url), &ds.action, &entries)
+                                .await
+                            {
+                                Ok(()) => {
+                                    println!(
+                                        "{:<24} refetched ({} entries)",
+                                        ds.name,
+                                        entries.len()
+                                    )
+                                }
+                                Err(e) => eprintln!("{:<24} save failed: {e}", ds.name),
+                            }
+                        }
+                        Err(e) => eprintln!("{:<24} fetch failed: {e}", ds.name),
+                    }
+                }
+            }
+        },
         Command::Trusted { action } => match action {
             TrustedCmd::List => {
                 let cfg = require_config(&cfg)?;

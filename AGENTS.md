@@ -47,6 +47,11 @@ cargo test -p sentry-core   # crate específica
 ./target/debug/sentry config validate
 ./target/debug/sentry run
 
+# TLS inline (F8): terminação HTTPS + telemetria ClientHello (JA3/JA4)
+cargo build --release --features sentry-cli/edge-tls
+# Datasets DB-backed (F7.7) — requer storage.postgres
+./target/debug/sentry datasets --help
+
 # Docker
 docker build -t sentry .
 docker compose -f deploy/docker/docker-compose.yml up
@@ -72,10 +77,12 @@ sentry/
 │   ├── sentry-source-syslog/  # plugin Source: receptor syslog RFC 5424/3164 (UDP/TCP)
 │   ├── sentry-source-cloudflare/  # plugin Source: polling CF Logs API (NDJSON)
 │   ├── sentry-source-tcp/     # plugin Source: captura TCP (feature pcap); fingerprint `tcpfp.rs` no sentry-core
-│   ├── sentry-edge/           # edge inline: reverse proxy/middleware axum + edge-tcp
+│   ├── sentry-edge/           # edge inline: reverse proxy axum + edge-tcp + TLS 443 (F8)
 │   ├── sentry-action-cloudflare/  # plugin Action: block/challenge via API CF
 │   ├── sentry-action-webhook/     # plugin Action: alertas Discord/Slack/etc (HMAC)
 │   ├── sentry-action-blocklist/   # plugin Action: blocklist local em memória
+│   ├── sentry-action-firewall/    # plugin Action: bans de kernel nftables/ipset/firewalld (F7.3)
+│   ├── sentry-action-opnsense/    # plugin Action: bans OPNsense/pfSense (F6.1)
 │   ├── sentry-action-nginx/       # plugin Action: includes deny/challenge p/ nginx + reload (F7.8)
 │   └── sentry-cli/            # binário: clap + ratatui + daemon + server + auth + siem
 ├── deploy/
@@ -457,9 +464,67 @@ não em runtime.
     `# sentry:<ts>:<ttl>`, worker com debounce ≥1/s + `nginx -t` antes do
     reload, IPv6 CIDR (`ipv6_prefix`), deny reconcile com `ip_state` 60s,
     guard never-ban
-  - ⏸️ F7.7-F7.9 (roadmap `ARCHITECTURE.md` §23.3): datasets DB-backed
-    com import CLI + prefilter dinâmico, ReportedIP check, feeds CLI p/
-    datasets
+  - ✅ F7.7 Datasets DB-backed (F7.9 entregue de quebra): migration
+    `datasets`/`dataset_entries` + `DatasetRepo` (sentry-storage; NOTIFY
+    `sentry_datasets_changed`); `FeedKind::Ja3` + `RuleMatch::Ja3In`
+    (HashSet, case-insensitive) no core; **prefilter dinâmico** —
+    `PREFILTER`/`SENSITIVE_PATH_RE`/`BAD_CRAWLER_RE` viram `ArcSwap`
+    (arc-swap), `heuristics::reload_dataset_lists` mescla literais de
+    datasets `user_agent`/`path` habilitados (UA → gate CRAWLER, path →
+    gate SENSITIVE); daemon aplica no startup e hot-reloada na NOTIFY
+    (regras `dataset:<name>` substituídas via `RuleSet::replace_by_prefix`);
+    CLI `sentry datasets list|import|enable|disable|delete|fetch` (import
+    aceita arquivo ou URL; fetch re-busca os `source_url`; `--dry-run`)
+  - ⏸️ F7.8 ReportedIP check (roadmap `ARCHITECTURE.md` §23.3)
+
+## F8 (concluída): Monitoramento SSL/443 inline — terminação TLS +
+telemetria de handshake + provider de appliance
+  - ✅ F8.1 Listener duplo 80+443 (`sentry-edge/src/tls.rs`, feature
+    `edge-tls`): `serve_tls` peeka o ClientHello *antes* do handshake
+    rustls (bytes realimentados via `PrefixedStream`), handshake
+    tokio-rustls (provider ring, ALPN http/1.1), HTTP servido pelo mesmo
+    Router do proxy (hyper-util auto-builder) com `ConnectInfo` +
+    `x-forwarded-proto: https` injetados por conexão. Config
+    `[edge] tls_cert/tls_key/tls_listen/tls_redirect_https` — redirect 301
+    roda **depois** do pipeline (porta 80 continua monitorada/bloqueada);
+    `listen = ""` desliga o listener plain (HTTPS-only). Fix: o branch TLS
+    antigo perdia `ConnectInfo` (IP virava 127.0.0.1); cookie do challenge
+    agora recebe `Secure` quando a própria edge termina TLS. Certs
+    configurados sem a feature = erro de startup (não cai mais em HTTP
+    plain silenciosamente). Deps opcionais: tokio-rustls, rustls (ring),
+    rustls-pemfile, hyper, hyper-util, tower-service, x509-parser;
+    `md-5`/`sha2` não-opcionais (JA3/JA4). axum-server removido
+  - ✅ F8.2 Telemetria ClientHello (`sentry-edge/src/clienthello.rs`):
+    parser puro (SNI, ciphers, extensions, supported_versions, ALPN,
+    groups, ec_point_formats) + **JA3** (md5 da string canônica, ordem de
+    wire) + **JA4** (FoxIO: t13d1516h2_... com sha256 truncado de
+    ciphers/extensions ordenados, SNI/ALPN excluídos da contagem);
+    `SourceKind::EdgeTls` + evento `TlsHandshake` por conexão
+    (`tls_handshake_events`, default true) no **mesmo pipeline** da edge
+    (fast-path de block table nega antes do handshake); sinal
+    `TlsSniMismatch` (peso 20; SNI ausente/fora de
+    `[edge] tls_allowed_hosts` → honeypot 443) via `rescore_from` (nunca
+    rebaixa, never-ban respeitado); Block/Quarantine pós-handshake derruba
+    a conexão. DSL: `tls_ja3`/`tls_ja4` (→ `RuleMatch::TlsFingerprint`,
+    match case-insensitive já existente) + `tls_sni` (→ novo
+    `RuleMatch::TlsSni`); métricas `sentry_edge_tls_handshakes_total{version}`,
+    `..._failures_total`, `..._sni_mismatch_total`,
+    `sentry_edge_tls_cert_not_after` (gauge notAfter, refresh diário, warn
+    < 14 dias); eventlog ganha `TlsSummary {sni, ja3, ja4, version, cipher,
+    alpn}` (key-set estável; host = SNI p/ dashboard). Testes: vetores
+    sintetizados de ClientHello (JA3/JA4 dourados, SNI ausente/IP, TLS 1.2
+    legacy, records fragmentados, lixo non-TLS), integração TLS com cert
+    rcgen self-signed (garbage → failure counter), redirect 301 monitorado
+  - ✅ F6.1 Provider OPNsense/pfSense (crate `sentry-action-opnsense`,
+    `provider = "opnsense"|"pfsense"`): OPNsense via REST alias_util
+    (`/api/firewall/alias_util/add|delete/<table>`, key/secret via env,
+    provisionamento na startup), pfSense via `pfctl -t <table> -T add`
+    (sem shell); TTL em mapa de expiração + reaper 30s (plataforma não tem
+    TTL por entrada); guard never-ban antes de qualquer chamada; vereditos
+    Challenge/RateLimit logam "unenforced" (plataforma só conhece drop);
+    `base_url` obrigatório p/ opnsense; 5 testes (body/URL/args puros +
+    never-ban). Wire no `build_challenge_action` (braço opnsense/pfsense,
+    sem reconcile daemon-side)
 
 Backlog detalhado em `ARCHITECTURE.md` §23.
 
@@ -470,8 +535,8 @@ Backlog detalhado em `ARCHITECTURE.md` §23.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 420 testes passando sem features; 422 com
-# --features sentry-cli/onnx (adiciona os 2 testes de inferência ONNX)
+# Resultado esperado: 453 testes passando sem features (455 com
+# --features sentry-cli/onnx — os 2 testes de inferência ONNX)
 ```
 
 ## 8. Convenões de código

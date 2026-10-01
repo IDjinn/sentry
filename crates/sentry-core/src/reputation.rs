@@ -307,6 +307,16 @@ pub fn dataset_rule(feed: &FeedConfig, entries: &[String]) -> Result<Option<Rule
             },
         ),
         FeedKind::Ip => return Err("dataset_rule called with kind = ip".into()),
+        FeedKind::Ja3 => (
+            "ja3 dataset",
+            RuleMatch::Ja3In(
+                entries
+                    .iter()
+                    .take(MAX_DATASET_ENTRIES)
+                    .map(|e| e.trim().to_ascii_lowercase())
+                    .collect(),
+            ),
+        ),
     };
     Ok(Some(Rule {
         id: format!("feed:{}", feed.name),

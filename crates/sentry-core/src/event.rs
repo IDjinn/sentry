@@ -27,6 +27,9 @@ pub enum SourceKind {
     CloudflareLogs,
     /// `sentry-source-syslog` — RFC 5424 receiver.
     Syslog,
+    /// `sentry-edge` TLS acceptor (F8): handshake telemetry from the inline
+    /// HTTPS front (SNI / JA3 / JA4).
+    EdgeTls,
     /// Synthetic / test source.
     Synthetic,
 }
@@ -40,6 +43,7 @@ impl SourceKind {
             Self::Tcp => "tcp",
             Self::CloudflareLogs => "cloudflare_logs",
             Self::Syslog => "syslog",
+            Self::EdgeTls => "edge_tls",
             Self::Synthetic => "synthetic",
         }
     }
@@ -492,6 +496,9 @@ pub struct TlsData {
     pub cipher: Option<String>,
     /// TLS version.
     pub version: Option<String>,
+    /// First ALPN protocol the client offered (F8, edge TLS telemetry).
+    #[serde(default)]
+    pub alpn: Option<String>,
 }
 
 /// Fallback payload for protocols without a dedicated variant.

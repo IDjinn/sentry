@@ -2,8 +2,9 @@
 //!
 //! A `Challenge` verdict normally means "hand the client to a CDN" — but an
 //! inline edge has no CDN behind it, so it runs the check itself, the way
-//! the nginx `js_challenge` module does: first-time visitors get a 503 page
-//! whose JavaScript must find a nonce such that
+//! the nginx `js_challenge` module does: first-time visitors get a 403 page
+//! (Cloudflare serves its managed challenge the same way) whose JavaScript
+//! must find a nonce such that
 //! `SHA-256(challenge_id || ":" || nonce)` has `difficulty` leading zero
 //! bits, set it as a cookie and reload. Browsers solve this in well under a
 //! second; clients without JS (curl, most bots) never do.
@@ -15,10 +16,10 @@
 //! expires cookies; the previous bucket is honored for boundary grace.
 //!
 //! Cookie states are classified, Cloudflare-style: no cookie or an expired
-//! one re-serves the interstitial (503); a cookie that is present but fails
+//! one re-serves the interstitial; a cookie that is present but fails
 //! verification (bad nonce, tampered) is a completed, failed attempt and
-//! gets a plain 403 — a client without JavaScript loops on the interstitial,
-//! a client that *tried and failed* does not.
+//! gets a terminal 403 — a client without JavaScript loops on the
+//! interstitial, a client that *tried and failed* does not.
 //!
 //! The page HTML is a template with `{{TITLE}}`, `{{ICON}}`, `{{CHALLENGE}}`,
 //! `{{DIFFICULTY}}`, `{{BUCKET}}`, `{{MAX_AGE}}` and `{{SECURE}}` markers.
@@ -28,7 +29,6 @@
 
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::{header, HeaderMap, StatusCode};
@@ -37,13 +37,10 @@ use sha2::{Digest, Sha256};
 
 /// Cookie carrying the proof-of-work solution.
 pub const COOKIE_NAME: &str = "sentry_ch";
-/// Status used for the challenge interstitial (matches the nginx module:
-/// 503 so caches don't pin the page as the real content).
-pub const CHALLENGE_STATUS: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
-/// Status served when a presented cookie fails verification (the "you
-/// tried and failed" terminal state, the way a CDN blocks after a
-/// challenge is not solved).
-pub const FAILED_STATUS: StatusCode = StatusCode::FORBIDDEN;
+/// Status used for the challenge interstitial — Cloudflare serves its
+/// managed challenge with 403, so the inline edge does too (`Cache-Control:
+/// no-store` keeps caches from pinning the page as the real content).
+pub const CHALLENGE_STATUS: StatusCode = StatusCode::FORBIDDEN;
 
 /// Placeholders a custom template must carry for the challenge to work at
 /// all — the JS builds and validates the cookie from these.
@@ -54,15 +51,6 @@ const REQUIRED_PLACEHOLDERS: [&str; 5] = [
     "{{MAX_AGE}}",
     "{{SECURE}}",
 ];
-
-/// Project logo, embedded once as a `data:` URI so pages stay
-/// self-contained (no CDN, no extra requests).
-static ICON_DATA_URI: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "data:image/png;base64,{}",
-        base64(include_bytes!("../assets/sentry-icon.png"))
-    )
-});
 
 /// Outcome of checking a presented `sentry_ch` cookie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +163,7 @@ impl JsChallenge {
         let html = self
             .load_template()
             .replace("{{TITLE}}", &self.title)
-            .replace("{{ICON}}", &ICON_DATA_URI)
+            .replace("{{ICON}}", crate::pages::sentry_icon())
             .replace("{{CHALLENGE}}", &self.challenge_id(ip, bucket))
             .replace("{{DIFFICULTY}}", &self.difficulty.to_string())
             .replace("{{BUCKET}}", &bucket.to_string())
@@ -186,22 +174,6 @@ impl JsChallenge {
             [
                 (header::CONTENT_TYPE, "text/html; charset=utf-8"),
                 (header::RETRY_AFTER, "3"),
-                (header::CACHE_CONTROL, "no-store, max-age=0"),
-            ],
-            html,
-        )
-            .into_response()
-    }
-
-    /// Terminal 403 page for a cookie that failed verification.
-    pub fn failed_response(&self) -> Response {
-        let html = FAILED_HTML
-            .replace("{{TITLE}}", &self.title)
-            .replace("{{ICON}}", &ICON_DATA_URI);
-        (
-            FAILED_STATUS,
-            [
-                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
                 (header::CACHE_CONTROL, "no-store, max-age=0"),
             ],
             html,
@@ -251,32 +223,6 @@ pub fn leading_zero_bits(hash: &[u8]) -> u8 {
         }
     }
     bits
-}
-
-/// Standard-alphabet base64 (with padding) — used only for the embedded
-/// icon data URI, so a hand-rolled encoder beats a new dependency.
-fn base64(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 /// Extract a cookie value from a `Cookie` header (first match wins).
@@ -369,33 +315,6 @@ p{color:#8b949e;margin:.25rem 0}
 </html>
 "#;
 
-/// Terminal page for a cookie that failed verification (no retry loop —
-/// the client proved it cannot or will not solve the challenge).
-const FAILED_HTML: &str = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>403 — verification failed</title>
-<style>
-body{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#e6edf3;display:grid;place-items:center;height:100vh;margin:0}
-.box{text-align:center}
-.icon{width:56px;height:56px;margin-bottom:.75rem}
-h1{font-size:1.4rem;margin:0 0 .5rem}
-p{color:#8b949e;margin:.25rem 0}
-</style>
-</head>
-<body>
-<div class="box">
-<img class="icon" src="{{ICON}}" alt="">
-<h1>403 — verification failed</h1>
-<p>Your browser did not pass the security check.</p>
-<p>If you believe this is an error, contact the administrator.</p>
-</div>
-</body>
-</html>
-"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,17 +351,6 @@ mod tests {
         assert_eq!(leading_zero_bits(&[0b1000_0000, 0xff]), 0);
         assert_eq!(leading_zero_bits(&[0b0100_0000, 0xff]), 1);
         assert_eq!(leading_zero_bits(&[0b0000_1111, 0xff]), 4);
-    }
-
-    #[test]
-    fn base64_matches_known_vectors() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foob"), "Zm9vYg==");
-        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
     }
 
     #[test]
@@ -516,17 +424,17 @@ mod tests {
     }
 
     #[test]
-    fn page_response_embeds_challenge_icon_and_sets_503() {
+    fn page_response_embeds_challenge_icon_and_sets_403() {
         let ch = challenge();
         let now = fixed_now();
         let ip: IpAddr = "203.0.113.7".parse().unwrap();
         let mut headers = HeaderMap::new();
         let resp = ch.page_response(ip, &headers, now);
-        assert_eq!(resp.status(), CHALLENGE_STATUS);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         let resp = ch.page_response(ip, &headers, now);
-        assert_eq!(resp.status(), CHALLENGE_STATUS);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -538,13 +446,6 @@ mod tests {
         assert!(page.contains("data:image/png;base64,"), "page: {page}");
         assert!(page.contains("Verifying…"), "page: {page}");
         assert!(!page.contains("{{CHALLENGE}}"), "page: {page}");
-    }
-
-    #[test]
-    fn failed_response_is_a_plain_403_page() {
-        let ch = challenge();
-        let resp = ch.failed_response();
-        assert_eq!(resp.status(), FAILED_STATUS);
     }
 
     #[tokio::test]
@@ -727,7 +628,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_and_stale_cookies_split_403_from_fresh_interstitial() {
+    async fn failed_and_stale_cookies_split_terminal_403_from_interstitial() {
         let ch = challenge();
         let rt = crate::EdgeRuntime::new(challenge_pipeline(), None, 0)
             .with_challenge(Arc::new(ch.clone()));
@@ -741,7 +642,8 @@ mod tests {
                 .unwrap()
         };
 
-        // Present but wrong nonce: terminal failure → 403, not a loop.
+        // Present but wrong nonce: terminal failure — a static 403 with no
+        // PoW loop, not another interstitial.
         let bucket = ch.current_bucket(SystemTime::now());
         let resp = app
             .clone()
@@ -750,9 +652,11 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
         let page = body_bytes(resp).await;
-        assert!(page.contains("verification failed"), "page: {page}");
+        assert!(page.contains("did not pass the security check"), "{page}");
+        assert!(!page.contains("crypto.subtle"), "{page}");
 
-        // Expired bucket: fresh interstitial (503), the client may retry.
+        // Expired bucket: fresh interstitial (403 as well, but with the
+        // PoW script), the client may retry.
         let stale_bucket = bucket.saturating_sub(10);
         let resp = app
             .clone()
@@ -760,10 +664,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), CHALLENGE_STATUS);
+        let page = body_bytes(resp).await;
+        assert!(page.contains("crypto.subtle"), "{page}");
 
         // Garbage cookie: tamper, terminal 403.
         let resp = app.oneshot(req("garbage".into())).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        let page = body_bytes(resp).await;
+        assert!(page.contains("did not pass the security check"), "{page}");
     }
 
     #[tokio::test]
@@ -823,5 +731,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        let page = body_bytes(resp).await;
+        assert!(page.contains("403 - Forbidden"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn cloudflare_backend_delegates_challenge_to_cf_rule() {
+        let rt = crate::EdgeRuntime::new(challenge_pipeline(), None, 0)
+            .with_challenge(Arc::new(challenge()))
+            .with_challenge_backend(sentry_core::config::ChallengeBackend::Cloudflare);
+        let app = challenge_app(rt);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/locked")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Hold page while the CF provider turns the verdict into a rule —
+        // no local PoW, no solved-cookie shortcut.
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "3");
+        let page = body_bytes(resp).await;
+        assert!(page.contains("Verifying your browser..."), "{page}");
+        assert!(!page.contains("crypto.subtle"), "{page}");
     }
 }

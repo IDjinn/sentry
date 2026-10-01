@@ -33,6 +33,10 @@ pub struct Metrics {
     pub edge_block_hits: prometheus::Counter,
     pub bot_verifications: prometheus::CounterVec,
     pub edge_challenge: prometheus::CounterVec,
+    pub edge_tls_handshakes: prometheus::CounterVec,
+    pub edge_tls_failures: prometheus::Counter,
+    pub edge_tls_sni_mismatches: prometheus::Counter,
+    pub edge_tls_cert_not_after: prometheus::Gauge,
     pub block_table_size: prometheus::Gauge,
     pub signal_kinds: prometheus::CounterVec,
     pub signals: prometheus::CounterVec,
@@ -91,6 +95,33 @@ impl Metrics {
                  bot_bypass) — F7.8.",
             ),
             &["result"],
+        )
+        .unwrap();
+        let edge_tls_handshakes = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sentry_edge_tls_handshakes_total",
+                "Completed TLS handshakes on the inline edge, by negotiated \
+                 version (F8).",
+            ),
+            &["version"],
+        )
+        .unwrap();
+        let edge_tls_failures = prometheus::Counter::new(
+            "sentry_edge_tls_handshake_failures_total",
+            "TLS acceptor failures: malformed records, truncated ClientHellos, \
+             failed or timed-out handshakes (F8).",
+        )
+        .unwrap();
+        let edge_tls_sni_mismatches = prometheus::Counter::new(
+            "sentry_edge_tls_sni_mismatch_total",
+            "Handshakes whose SNI is missing or not in [edge] \
+             tls_allowed_hosts (F8).",
+        )
+        .unwrap();
+        let edge_tls_cert_not_after = prometheus::Gauge::new(
+            "sentry_edge_tls_cert_not_after",
+            "Unix timestamp of the edge TLS certificate's notAfter, \
+             refreshed daily (F8).",
         )
         .unwrap();
         let block_table_size = prometheus::Gauge::new(
@@ -183,6 +214,16 @@ impl Metrics {
             .map_err(|e| warn!(error = %e, "register edge challenge"))
             .ok();
         registry
+            .register(Box::new(edge_tls_handshakes.clone()))
+            .map_err(|e| warn!(error = %e, "register edge tls handshakes"))
+            .ok();
+        for m in [&edge_tls_failures, &edge_tls_sni_mismatches] {
+            registry.register(Box::new(m.clone())).ok();
+        }
+        registry
+            .register(Box::new(edge_tls_cert_not_after.clone()))
+            .ok();
+        registry
             .register(Box::new(signals.clone()))
             .map_err(|e| warn!(error = %e, "register signals"))
             .ok();
@@ -214,6 +255,10 @@ impl Metrics {
             edge_block_hits,
             bot_verifications,
             edge_challenge,
+            edge_tls_handshakes,
+            edge_tls_failures,
+            edge_tls_sni_mismatches,
+            edge_tls_cert_not_after,
             block_table_size,
             signal_kinds,
             signals,

@@ -20,9 +20,32 @@
 #![forbid(unsafe_code)]
 
 pub mod challenge;
+pub mod clienthello;
 pub mod middleware;
+pub mod pages;
 pub mod proxy;
 pub mod tcp_listener;
+#[cfg(feature = "edge-tls")]
+pub mod tls;
+
+/// Marker request extension: the edge itself terminated TLS on this
+/// connection (F8). Distinguishes a real HTTPS connection from a spoofable
+/// `x-forwarded-proto` header — the HTTP→HTTPS redirect decision uses it,
+/// never the header alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsTerminated;
+
+/// Prometheus handles for the TLS acceptor (F8), wired by the daemon.
+#[derive(Clone)]
+pub struct TlsMetrics {
+    /// `sentry_edge_tls_handshakes_total{version}`.
+    pub handshakes: prometheus::CounterVec,
+    /// `sentry_edge_tls_handshake_failures_total` — truncated hellos,
+    /// malformed records, failed or timed-out handshakes.
+    pub failures: prometheus::Counter,
+    /// `sentry_edge_tls_sni_mismatch_total` — missing or unknown SNI.
+    pub sni_mismatches: prometheus::Counter,
+}
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -30,9 +53,11 @@ use std::time::SystemTime;
 
 use axum::http::HeaderMap;
 use axum::response::Response;
+use sentry_core::config::ChallengeBackend;
 use sentry_core::event::Event;
 use sentry_core::pipeline::Pipeline;
 use sentry_core::BlockTable;
+use uuid::Uuid;
 
 use crate::challenge::{cookie_value, JsChallenge, COOKIE_NAME};
 use crate::middleware::MiddlewareMode;
@@ -66,6 +91,8 @@ pub struct EdgeRuntime {
     challenge: Option<Arc<JsChallenge>>,
     bot_verifier: Option<sentry_core::SharedBotVerifier>,
     challenge_metrics: Option<prometheus::CounterVec>,
+    challenge_backend: ChallengeBackend,
+    tls_metrics: Option<TlsMetrics>,
 }
 
 impl EdgeRuntime {
@@ -85,6 +112,8 @@ impl EdgeRuntime {
             challenge: None,
             bot_verifier: None,
             challenge_metrics: None,
+            challenge_backend: ChallengeBackend::default(),
+            tls_metrics: None,
         }
     }
 
@@ -128,10 +157,35 @@ impl EdgeRuntime {
     }
 
     /// `sentry_edge_challenge_total{result}` counter (served / passed /
-    /// bot_bypass).
+    /// bot_bypass / delegated).
     pub fn with_challenge_metrics(mut self, counter: prometheus::CounterVec) -> Self {
         self.challenge_metrics = Some(counter);
         self
+    }
+
+    /// Set who executes `Challenge` verdicts (`[edge] challenge_backend`):
+    /// `Sentry` runs the built-in PoW; `Cloudflare` delegates to the CF
+    /// provider — the verdict becomes a Cloudflare rule via its API.
+    pub fn with_challenge_backend(mut self, backend: ChallengeBackend) -> Self {
+        self.challenge_backend = backend;
+        self
+    }
+
+    /// Challenge enforcement backend.
+    pub fn challenge_backend(&self) -> ChallengeBackend {
+        self.challenge_backend
+    }
+
+    /// TLS acceptor counters (F8): handshakes by version, failures, SNI
+    /// mismatches.
+    pub fn with_tls_metrics(mut self, metrics: TlsMetrics) -> Self {
+        self.tls_metrics = Some(metrics);
+        self
+    }
+
+    /// TLS acceptor counters, when attached.
+    pub fn tls_metrics(&self) -> Option<&TlsMetrics> {
+        self.tls_metrics.as_ref()
     }
 
     fn challenge_metric(&self, result: &str) {
@@ -141,8 +195,21 @@ impl EdgeRuntime {
     }
 
     /// Gate for a `Challenge` verdict (F7.8): browsers solve the proof-of-
-    /// work once per bucket; rDNS-verified crawlers bypass entirely.
-    pub fn challenge_gate(&self, headers: &HeaderMap, client_ip: IpAddr) -> ChallengeGate {
+    /// work once per bucket; rDNS-verified crawlers bypass entirely. With
+    /// `challenge_backend = "cloudflare"` the challenge is delegated to the
+    /// Cloudflare provider (the verdict becomes a CF rule via its API) and
+    /// this gate only serves a hold page — no local PoW.
+    pub fn challenge_gate(
+        &self,
+        headers: &HeaderMap,
+        client_ip: IpAddr,
+        trace: Option<Uuid>,
+    ) -> ChallengeGate {
+        if self.challenge_backend == ChallengeBackend::Cloudflare {
+            self.challenge_metric("delegated");
+            return ChallengeGate::Page(pages::delegated_challenge_page(trace));
+        }
+
         let Some(ch) = self.challenge.as_ref() else {
             return ChallengeGate::Disabled;
         };
@@ -179,7 +246,7 @@ impl EdgeRuntime {
                 }
                 crate::challenge::CookieCheck::Failed => {
                     self.challenge_metric("failed");
-                    return ChallengeGate::Blocked(ch.failed_response());
+                    return ChallengeGate::Blocked(pages::challenge_failed_page(trace));
                 }
                 crate::challenge::CookieCheck::Stale => {}
             }

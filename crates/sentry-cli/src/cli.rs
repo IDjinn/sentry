@@ -65,6 +65,12 @@ pub enum Command {
         #[command(subcommand)]
         action: FeedsCmd,
     },
+    /// Manage DB-backed datasets (F7.7): UA/path/JA3 lists that become
+    /// synthetic rules and feed the dynamic prefilter.
+    Datasets {
+        #[command(subcommand)]
+        action: DatasetsCmd,
+    },
     /// Built-in trusted IP presets (`[real_ip] trusted_lists`).
     Trusted {
         #[command(subcommand)]
@@ -294,6 +300,71 @@ pub enum FeedsCmd {
 pub enum TrustedCmd {
     /// List the bundled presets and whether each is approved in config.
     List,
+}
+
+/// DB-backed dataset commands (F7.7).
+#[derive(Debug, Subcommand)]
+pub enum DatasetsCmd {
+    /// List datasets with kind, entry count and enabled state.
+    List,
+    /// Import a one-entry-per-line list (file path or http(s) URL) as a
+    /// named dataset, replacing any previous version of that name.
+    Import {
+        /// File path or URL.
+        path: String,
+        /// What the entries match: user_agent, path or ja3.
+        #[arg(long, value_enum)]
+        kind: DatasetKindArg,
+        /// Unique dataset name (the synthetic rule id becomes `dataset:<name>`).
+        #[arg(long)]
+        name: String,
+        /// Action when the synthetic rule matches (allow | block | challenge |
+        /// rate_limit | log | tag; default log).
+        #[arg(long, default_value = "log")]
+        action: String,
+        /// Parse and validate only, don't persist.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Enable a dataset (running daemons hot-reload on the next notification).
+    Enable {
+        /// Dataset name.
+        name: String,
+    },
+    /// Disable a dataset without deleting it.
+    Disable {
+        /// Dataset name.
+        name: String,
+    },
+    /// Delete a dataset.
+    Delete {
+        /// Dataset name.
+        name: String,
+    },
+    /// Re-fetch every dataset that has a source URL and show the new counts.
+    Fetch,
+}
+
+/// Entry kind accepted by `sentry datasets import`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum DatasetKindArg {
+    /// User-Agent substrings.
+    UserAgent,
+    /// Path fragments.
+    Path,
+    /// JA3 fingerprints (lowercase hex).
+    Ja3,
+}
+
+impl DatasetKindArg {
+    /// Storage string for the dataset kind column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserAgent => "user_agent",
+            Self::Path => "path",
+            Self::Ja3 => "ja3",
+        }
+    }
 }
 
 /// Local firewall ban backend status.

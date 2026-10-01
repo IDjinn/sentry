@@ -19,24 +19,42 @@ use axum::Router;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::middleware::{block_response, challenge_response, rate_limit_response};
+use crate::pages;
 use crate::EdgeRuntime;
+use uuid::Uuid;
 
 /// Inline proxy configuration.
 #[derive(Debug, Clone)]
 pub struct EdgeProxyConfig {
-    /// Listen address (`0.0.0.0:80`).
+    /// Listen address (`0.0.0.0:80`). An empty string disables the plain
+    /// listener (HTTPS-only edge).
     pub listen: String,
     /// Protected upstream base URL (`http://127.0.0.1:8080`).
     pub upstream: String,
-    /// Path used for the startup health check (default `/`).
+    /// Path used for the mandatory startup health check (default `/`).
     pub health_path: String,
     /// Health check timeout in seconds (default 5).
     pub health_timeout_secs: u64,
-    /// TLS certificate (feature `edge-tls`); both must be set to enable.
-    pub tls_cert: Option<PathBuf>,
-    /// TLS private key (feature `edge-tls`).
-    pub tls_key: Option<PathBuf>,
+    /// HTTPS front (F8): `None` serves plain HTTP only.
+    pub tls: Option<TlsEdgeConfig>,
+}
+
+/// HTTPS front settings (F8) — built by the daemon from `[edge] tls_*`.
+#[derive(Debug, Clone, Default)]
+pub struct TlsEdgeConfig {
+    /// HTTPS listen address (`0.0.0.0:443`).
+    pub listen: String,
+    /// Certificate PEM file.
+    pub cert: PathBuf,
+    /// Private key PEM file.
+    pub key: PathBuf,
+    /// Answer plain-HTTP with a 301 to HTTPS. The redirect runs after the
+    /// pipeline, so port-80 traffic keeps being monitored and enforced.
+    pub redirect_https: bool,
+    /// ClientHello SNI allowlist; empty disables the mismatch check.
+    pub allowed_hosts: Vec<String>,
+    /// Emit one `TlsHandshake` event per completed handshake.
+    pub handshake_events: bool,
 }
 
 impl Default for EdgeProxyConfig {
@@ -46,8 +64,7 @@ impl Default for EdgeProxyConfig {
             upstream: "http://127.0.0.1:8080".to_string(),
             health_path: "/".to_string(),
             health_timeout_secs: 5,
-            tls_cert: None,
-            tls_key: None,
+            tls: None,
         }
     }
 }
@@ -94,63 +111,69 @@ pub async fn health_check(cfg: &EdgeProxyConfig) -> sentry_core::error::Result<(
 }
 
 /// Serve the inline edge until the process stops.
+///
+/// With a TLS front (F8) the plain and HTTPS listeners run concurrently
+/// on the same pipeline: port 80 and port 443 are both monitored, blocked
+/// IPs are denied on both, and the SNI/JA3 telemetry flows from the TLS
+/// acceptor.
 pub async fn serve(
     runtime: EdgeRuntime,
     cfg: EdgeProxyConfig,
     decided: mpsc::Sender<sentry_core::ProcessedEvent>,
 ) -> sentry_core::error::Result<()> {
     health_check(&cfg).await?;
-    let addr: SocketAddr = cfg.listen.parse().map_err(|e| {
-        sentry_core::error::CoreError::Config(format!("invalid edge listen address: {e}"))
-    })?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
         .build()
         .map_err(|e| sentry_core::error::CoreError::Config(format!("edge http client: {e}")))?;
 
-    let app = Router::new().fallback(any(proxy_handler)).with_state((
-        runtime,
-        client,
-        cfg.upstream.clone(),
-        decided,
-    ));
+    let redirect_https = cfg.tls.as_ref().is_some_and(|t| t.redirect_https);
+    let app = Router::new()
+        .fallback(any(proxy_handler))
+        .with_state(ProxyState {
+            runtime: runtime.clone(),
+            client,
+            upstream: cfg.upstream.clone(),
+            decided: decided.clone(),
+            redirect_https,
+        });
 
-    match (&cfg.tls_cert, &cfg.tls_key) {
-        (Some(cert), Some(key)) => {
+    match cfg.tls {
+        None => serve_plain(app, cfg.listen).await,
+        Some(tls_cfg) => {
             #[cfg(feature = "edge-tls")]
             {
-                let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
-                    .await
-                    .map_err(|e| {
-                        sentry_core::error::CoreError::Config(format!("edge tls config: {e}"))
-                    })?;
-                info!(%addr, cert = %cert.display(), "edge (inline) listening on https");
-                axum_server::bind_rustls(addr, tls)
-                    .serve(app.into_make_service())
-                    .await
-                    .map_err(|e| {
-                        sentry_core::error::CoreError::Config(format!("edge server error: {e}"))
-                    })?;
+                tokio::try_join!(
+                    serve_plain(app.clone(), cfg.listen),
+                    crate::tls::serve_tls(runtime, tls_cfg, app, decided)
+                )?;
                 Ok(())
             }
             #[cfg(not(feature = "edge-tls"))]
             {
-                let _ = (cert, key);
-                warn!("edge tls configured but sentry was built without the `edge-tls` feature — serving plain HTTP");
-                serve_plain(app, addr).await
+                let _ = (tls_cfg, runtime, app, decided);
+                Err(sentry_core::error::CoreError::Config(
+                    "edge tls configured but sentry was built without the `edge-tls` \
+                     feature — rebuild with --features sentry-cli/edge-tls"
+                        .to_string(),
+                ))
             }
-        }
-        _ => {
-            info!(%addr, "edge (inline) listening on http");
-            serve_plain(app, addr).await
         }
     }
 }
 
-async fn serve_plain(app: Router, addr: SocketAddr) -> sentry_core::error::Result<()> {
+/// Plain-HTTP listener. An empty `listen` disables it (HTTPS-only edge).
+async fn serve_plain(app: Router, listen: String) -> sentry_core::error::Result<()> {
+    if listen.is_empty() {
+        return Ok(());
+    }
+    let addr: SocketAddr = listen.parse().map_err(|e| {
+        sentry_core::error::CoreError::Config(format!("invalid edge listen address: {e}"))
+    })?;
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
         sentry_core::error::CoreError::Config(format!("edge bind on {addr} failed: {e}"))
     })?;
+    info!(addr = %addr, "edge (inline) listening on http");
     // `into_make_service` + ready loop keeps ConnectInfo available for the
     // real-IP precedence chain.
     axum::serve(
@@ -161,16 +184,29 @@ async fn serve_plain(app: Router, addr: SocketAddr) -> sentry_core::error::Resul
     .map_err(|e| sentry_core::error::CoreError::Config(format!("edge server error: {e}")))
 }
 
-async fn proxy_handler(
-    State((runtime, client, upstream, decided)): State<(
-        EdgeRuntime,
-        reqwest::Client,
-        String,
-        mpsc::Sender<sentry_core::ProcessedEvent>,
-    )>,
-    req: Request,
-) -> Response {
+/// Shared handler state (single struct — the state tuple got unwieldy).
+#[derive(Clone)]
+struct ProxyState {
+    runtime: EdgeRuntime,
+    client: reqwest::Client,
+    upstream: String,
+    decided: mpsc::Sender<sentry_core::ProcessedEvent>,
+    /// 301 plain-HTTP requests to HTTPS (F8, TLS front only).
+    redirect_https: bool,
+}
+
+async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Response {
+    let ProxyState {
+        runtime,
+        client,
+        upstream,
+        decided,
+        redirect_https,
+    } = state;
     let (parts, body) = req.into_parts();
+    // Set by the TLS acceptor (F8) — a real HTTPS connection, not a
+    // spoofable header.
+    let is_tls = parts.extensions.get::<crate::TlsTerminated>().is_some();
     let peer = parts
         .extensions
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
@@ -215,8 +251,12 @@ async fn proxy_handler(
     let client_ip = crate::real_client_ip_with(&parts.headers, peer, runtime.trust());
 
     // Sticky blocks deny before the pipeline runs — no event, no upstream.
+    // No event is persisted here, so the trace id only lives in the page
+    // and the log line.
     if runtime.is_hard_blocked(client_ip) {
-        return block_response();
+        let trace = Uuid::new_v4();
+        tracing::info!(ip = %client_ip, trace_id = %trace, "edge fast-path: blocked ip denied before pipeline (no event persisted)");
+        return pages::block_page(Some(trace));
     }
     let http = sentry_core::event::HttpData {
         method: Some(sentry_core::event::HttpMethod::from_str_lossy(
@@ -258,17 +298,46 @@ async fn proxy_handler(
 
     match processed.decision.action {
         sentry_core::analysis::Verdict::Allow => {}
-        sentry_core::analysis::Verdict::RateLimit => return rate_limit_response(),
+        sentry_core::analysis::Verdict::RateLimit => {
+            return pages::rate_limit_page(Some(processed.event.id))
+        }
         sentry_core::analysis::Verdict::Challenge => {
-            match runtime.challenge_gate(&parts.headers, client_ip) {
+            match runtime.challenge_gate(&parts.headers, client_ip, Some(processed.event.id)) {
                 crate::ChallengeGate::Pass => {}
                 crate::ChallengeGate::Page(page) => return page,
                 crate::ChallengeGate::Blocked(page) => return page,
-                crate::ChallengeGate::Disabled => return challenge_response(),
+                crate::ChallengeGate::Disabled => {
+                    return pages::challenge_required_page(Some(processed.event.id))
+                }
             }
         }
         sentry_core::analysis::Verdict::Block | sentry_core::analysis::Verdict::Quarantine => {
-            return block_response()
+            return pages::block_page(Some(processed.event.id))
+        }
+    }
+
+    // Plain-HTTP → HTTPS redirect (F8): verdicts above already applied, so
+    // port-80 traffic stays monitored and enforced; benign requests get the
+    // 301 instead of double-hitting the upstream.
+    if redirect_https && !is_tls {
+        if let Some(host) = parts
+            .headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+        {
+            let query = match parts.uri.query() {
+                Some(q) => format!("?{q}"),
+                None => String::new(),
+            };
+            return Response::builder()
+                .status(axum::http::StatusCode::MOVED_PERMANENTLY)
+                .header(
+                    header::LOCATION,
+                    format!("https://{host}{}{query}", parts.uri.path()),
+                )
+                .body(axum::body::Body::empty())
+                .unwrap_or_else(|_| axum::http::StatusCode::BAD_GATEWAY.into_response());
         }
     }
 
@@ -347,12 +416,15 @@ mod tests {
         table.block("127.0.0.1".parse().unwrap(), None);
         let runtime = crate::EdgeRuntime::new(pipeline, None, 0).with_block_table(table);
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
-        let app = Router::new().fallback(any(proxy_handler)).with_state((
-            runtime,
-            reqwest::Client::new(),
-            "http://127.0.0.1:9".to_string(),
-            dec_tx,
-        ));
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: "http://127.0.0.1:9".to_string(),
+                decided: dec_tx,
+                redirect_https: false,
+            });
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -366,6 +438,46 @@ mod tests {
         assert!(
             dec_rx.try_recv().is_err(),
             "fast-path denies without a decided event"
+        );
+    }
+
+    #[tokio::test]
+    async fn https_redirect_answers_301_and_keeps_monitoring() {
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: "http://127.0.0.1:9".to_string(),
+                decided: dec_tx,
+                redirect_https: true,
+            });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/some/path?q=1")
+                    .header("host", "example.com")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("https://example.com/some/path?q=1")
+        );
+        // The redirect runs after the pipeline: port-80 traffic keeps
+        // producing decided events (monitoring is preserved).
+        assert!(
+            dec_rx.try_recv().is_ok(),
+            "redirected request was monitored"
         );
     }
 }

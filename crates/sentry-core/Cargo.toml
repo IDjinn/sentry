@@ -30,6 +30,7 @@ http = { workspace = true }
 ipnet = { workspace = true }
 regex = { workspace = true }
 aho-corasick = { workspace = true }
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

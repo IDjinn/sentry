@@ -302,6 +302,14 @@ impl RuleSet {
         self.rules.iter()
     }
 
+    /// Remove every rule whose id starts with `prefix` and append `fresh`
+    /// (F7.7 dataset hot-reload). Returns the resulting rule count.
+    pub fn replace_by_prefix(&mut self, prefix: &str, fresh: Vec<Rule>) -> usize {
+        self.rules.retain(|r| !r.id.starts_with(prefix));
+        self.rules.extend(fresh);
+        self.rules.len()
+    }
+
     /// Evaluate the ruleset against an event.
     ///
     /// Returns the first matching rule's action (short-circuit) along with
@@ -388,6 +396,14 @@ pub enum RuleMatch {
         /// JA4 hash.
         ja4: Option<String>,
     },
+    /// Match the TLS ClientHello SNI (F8). Only fires when an SNI was
+    /// presented; a missing SNI never matches (the edge surfaces that as
+    /// a `TlsSniMismatch` signal instead).
+    TlsSni(StrOp),
+    /// JA3 set membership (F7.7): DB-backed datasets become one rule with
+    /// the whole fingerprint list. Entries are stored lowercase; the event
+    /// hash is lowercased before the lookup.
+    Ja3In(std::collections::HashSet<String>),
     /// Match a reputation tier assigned to the client IP.
     Reputation(ReputationTier),
     /// Match the rDNS bot-verification outcome (F7.7). The value accepts
@@ -624,14 +640,24 @@ impl RuleMatch {
                 .map(|t| {
                     ja3.as_ref()
                         .zip(t.ja3.as_ref())
-                        .map(|(a, b)| a == b)
+                        .map(|(a, b)| a.eq_ignore_ascii_case(b))
                         .unwrap_or(false)
                         || ja4
                             .as_ref()
                             .zip(t.ja4.as_ref())
-                            .map(|(a, b)| a == b)
+                            .map(|(a, b)| a.eq_ignore_ascii_case(b))
                             .unwrap_or(false)
                 })
+                .unwrap_or(false),
+            Self::TlsSni(op) => evt
+                .tls()
+                .and_then(|t| t.sni.as_deref())
+                .map(|sni| match_str_op(op, sni))
+                .unwrap_or(false),
+            Self::Ja3In(list) => evt
+                .tls()
+                .and_then(|t| t.ja3.as_deref())
+                .map(|ja3| list.contains(&ja3.to_ascii_lowercase()))
                 .unwrap_or(false),
             Self::Reputation(tier) => evt
                 .reputation

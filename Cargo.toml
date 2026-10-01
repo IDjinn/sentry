@@ -16,6 +16,7 @@ members = [
     "crates/sentry-action-blocklist",
     "crates/sentry-action-report",
     "crates/sentry-action-firewall",
+    "crates/sentry-action-opnsense",
     "crates/sentry-action-nginx",
     "crates/sentry-cli",
 ]
@@ -70,6 +71,9 @@ hmac = "0.12"
 # Performance (F5): SIMD-accelerated multi-pattern matching, benchmarks
 aho-corasick = "1.1"
 criterion = "0.5"
+
+# Dynamic heuristic lists (F7.7): lock-free swap of prefilter/regex sets
+arc-swap = "1"
 
 # Bot verification (F7.7): async DNS (PTR + forward-confirm)
 hickory-resolver = "0.24"
@@ -127,6 +131,7 @@ sentry-action-webhook = { path = "crates/sentry-action-webhook" }
 sentry-action-blocklist = { path = "crates/sentry-action-blocklist" }
 sentry-action-report = { path = "crates/sentry-action-report" }
 sentry-action-firewall = { path = "crates/sentry-action-firewall" }
+sentry-action-opnsense = { path = "crates/sentry-action-opnsense" }
 sentry-action-nginx = { path = "crates/sentry-action-nginx" }
 
 [profile.release]

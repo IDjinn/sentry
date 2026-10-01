@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "onnx")]
 use sentry_ai::ThreatModel;
 use sentry_core::challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
-use sentry_core::config::{ActionKind, SentryConfig};
+use sentry_core::config::{ActionKind, ChallengeBackend, SentryConfig};
 use sentry_core::event::{Event, ProtocolData};
 use sentry_core::packs::build_default_ruleset_with;
 use sentry_core::pipeline::{Pipeline, RouteValidator};
@@ -279,6 +279,25 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 let blocks_pool = repo.pool().clone();
                 tokio::spawn(async move {
                     blocks_hot_reload(blocks_pool, reload_blocks).await;
+                });
+
+                // DB datasets (F7.7): synthetic rules + dynamic prefilter
+                // literals, applied at startup and hot-reloaded on NOTIFY.
+                match db_dataset_rules(&repo).await {
+                    Ok((fresh, uas, paths)) => {
+                        let n = {
+                            let mut guard = shared_rules.write().unwrap();
+                            guard.replace_by_prefix("dataset:", fresh)
+                        };
+                        sentry_core::heuristics::reload_dataset_lists(&uas, &paths);
+                        info!(rule_count = n, "db datasets applied");
+                    }
+                    Err(e) => warn!(error = %e, "failed to load db datasets"),
+                }
+                let reload_datasets_pool = repo.pool().clone();
+                let reload_datasets_rules = Arc::clone(&shared_rules);
+                tokio::spawn(async move {
+                    datasets_hot_reload(reload_datasets_pool, reload_datasets_rules).await;
                 });
 
                 // Pre-warm the block table from persisted blocks so the
@@ -784,29 +803,56 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         }
         let enricher = make_enricher(&geo, &reputation, &shared_trust);
         let (dec_tx, mut dec_rx) = mpsc::channel::<sentry_core::ProcessedEvent>(buffer);
+        let tls_cfg = match (&cfg.edge.tls_cert, &cfg.edge.tls_key) {
+            (Some(cert), Some(key)) => Some(sentry_edge::proxy::TlsEdgeConfig {
+                listen: cfg
+                    .edge
+                    .tls_listen
+                    .clone()
+                    .unwrap_or_else(|| "0.0.0.0:443".to_string()),
+                cert: cert.clone(),
+                key: key.clone(),
+                redirect_https: cfg.edge.tls_redirect_https,
+                allowed_hosts: cfg.edge.tls_allowed_hosts.clone(),
+                handshake_events: cfg.edge.tls_handshake_events,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(color_eyre::eyre::eyre!(
+                    "[edge] tls_cert and tls_key must be configured together"
+                ));
+            }
+        };
         let proxy_cfg = sentry_edge::proxy::EdgeProxyConfig {
             listen: cfg.edge.listen.clone(),
             upstream: cfg.edge.upstream.clone(),
             health_path: cfg.edge.health_path.clone(),
             health_timeout_secs: cfg.edge.health_timeout_secs,
-            tls_cert: cfg.edge.tls_cert.clone(),
-            tls_key: cfg.edge.tls_key.clone(),
+            tls: tls_cfg.clone(),
         };
         let runtime = sentry_edge::EdgeRuntime::new(
             Arc::clone(&pipeline),
             enricher.clone(),
             cfg.edge.body_capture_kb.saturating_mul(1024),
         )
+        .with_challenge_backend(cfg.edge.challenge_backend)
         .with_trust(shared_trust.clone())
         .with_block_table(Arc::clone(&block_table))
         .with_block_hits(metrics.edge_block_hits.clone())
-        .with_challenge_metrics(metrics.edge_challenge.clone());
+        .with_challenge_metrics(metrics.edge_challenge.clone())
+        .with_tls_metrics(sentry_edge::TlsMetrics {
+            handshakes: metrics.edge_tls_handshakes.clone(),
+            failures: metrics.edge_tls_failures.clone(),
+            sni_mismatches: metrics.edge_tls_sni_mismatches.clone(),
+        });
         let runtime = if let Some(ref v) = bot_verifier {
             runtime.with_bot_verifier(Arc::clone(v))
         } else {
             runtime
         };
-        let runtime = if cfg.edge.challenge.enabled {
+        let runtime = if cfg.edge.challenge.enabled
+            && cfg.edge.challenge_backend == ChallengeBackend::Sentry
+        {
             let secret = std::env::var(&cfg.edge.challenge.secret_env)
                 .map_err(|_| {
                     color_eyre::eyre::eyre!(
@@ -837,6 +883,21 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         } else {
             runtime
         };
+        if cfg.edge.challenge_backend == ChallengeBackend::Cloudflare {
+            if cf_provider.is_some() {
+                info!(
+                    backend = "cloudflare",
+                    "edge challenges delegated to the Cloudflare provider — \
+                     verdicts become CF rules via the CF API"
+                );
+            } else {
+                warn!(
+                    "[edge] challenge_backend = \"cloudflare\" but no [[action]] with provider \
+                     = \"cloudflare\" is configured — Challenge verdicts will be held with a \
+                     403 retry page instead of becoming Cloudflare rules"
+                );
+            }
+        }
         let edge_pipeline = cfg.edge.upstream.clone();
         tokio::spawn(async move {
             if let Err(e) = sentry_edge::proxy::serve(runtime, proxy_cfg, dec_tx).await {
@@ -851,10 +912,53 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 }
             }
         });
+        // Certificate expiry gauge + daily refresh (F8): operators see the
+        // runway in `/metrics` long before browsers start warning.
+        #[cfg(feature = "edge-tls")]
+        if let Some(ref tls_cfg) = tls_cfg {
+            let gauge = metrics.edge_tls_cert_not_after.clone();
+            let cert_path = tls_cfg.cert.clone();
+            if let Some(not_after) = sentry_edge::tls::cert_not_after(&cert_path) {
+                let ts = not_after
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                gauge.set(ts as f64);
+                let days_left = not_after
+                    .duration_since(std::time::SystemTime::now())
+                    .map(|d| d.as_secs() / 86_400)
+                    .unwrap_or(0);
+                if days_left < 14 {
+                    warn!(
+                        days_left,
+                        cert = %cert_path.display(),
+                        "edge tls certificate expires soon"
+                    );
+                }
+            } else {
+                warn!(
+                    cert = %cert_path.display(),
+                    "edge tls certificate expiry could not be parsed"
+                );
+            }
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+                    if let Some(not_after) = sentry_edge::tls::cert_not_after(&cert_path) {
+                        let ts = not_after
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        gauge.set(ts as f64);
+                    }
+                }
+            });
+        }
         if let (Some(tcp_listen), Some(tcp_upstream)) =
             (cfg.edge.tcp_listen.clone(), cfg.edge.tcp_upstream.clone())
         {
             let tcp_runtime = sentry_edge::EdgeRuntime::new(Arc::clone(&pipeline), enricher, 0)
+                .with_challenge_backend(cfg.edge.challenge_backend)
                 .with_trust(shared_trust.clone())
                 .with_block_table(Arc::clone(&block_table))
                 .with_block_hits(metrics.edge_block_hits.clone());
@@ -2045,6 +2149,91 @@ async fn rules_hot_reload(pool: sentry_storage::PgPool, rules: SharedRuleSet) {
     }
 }
 
+/// Load every enabled DB dataset (F7.7) and build its synthetic rule.
+///
+/// Returns the rules plus the user-agent/path literals that feed the
+/// dynamic prefilter.
+async fn db_dataset_rules(
+    repo: &sentry_storage::Repo,
+) -> color_eyre::Result<(Vec<sentry_core::rules::Rule>, Vec<String>, Vec<String>)> {
+    let rows = repo.datasets().list().await?;
+    let mut out = Vec::new();
+    let mut user_agents = Vec::new();
+    let mut paths = Vec::new();
+    for ds in rows.iter().filter(|d| d.enabled) {
+        let entries = repo.datasets().entries(&ds.name).await.unwrap_or_default();
+        let kind = match ds.kind.as_str() {
+            "user_agent" => sentry_core::config::FeedKind::UserAgent,
+            "ja3" => sentry_core::config::FeedKind::Ja3,
+            _ => sentry_core::config::FeedKind::Path,
+        };
+        let feed = sentry_core::config::FeedConfig {
+            name: ds.name.clone(),
+            kind,
+            action: ds.action.clone(),
+            ..Default::default()
+        };
+        match sentry_core::reputation::dataset_rule(&feed, &entries) {
+            Ok(Some(mut rule)) => {
+                rule.id = format!("dataset:{}", ds.name);
+                rule.name = format!("dataset `{}` ({} entries)", ds.name, entries.len());
+                match kind {
+                    sentry_core::config::FeedKind::UserAgent => {
+                        user_agents.extend(entries.iter().cloned())
+                    }
+                    sentry_core::config::FeedKind::Path => paths.extend(entries.iter().cloned()),
+                    _ => {}
+                }
+                out.push(rule);
+            }
+            Ok(None) => {}
+            Err(e) => warn!(dataset = %ds.name, error = %e, "invalid dataset rule — skipped"),
+        }
+    }
+    Ok((out, user_agents, paths))
+}
+
+/// Background task: LISTEN for `sentry_datasets_changed` notifications (F7.7)
+/// and hot-reload the synthetic dataset rules + prefilter literals.
+///
+/// The CLI `sentry datasets …` commands and the nightly re-fetch emit the
+/// notification; the shared ruleset is updated in place (rules with the
+/// `dataset:` id prefix are replaced atomically).
+async fn datasets_hot_reload(pool: sentry_storage::PgPool, rules: SharedRuleSet) {
+    const CHANNEL: &str = "sentry_datasets_changed";
+    loop {
+        match pool.listen(CHANNEL).await {
+            Ok(mut listener) => {
+                info!(
+                    channel = CHANNEL,
+                    "listening for dataset change notifications"
+                );
+                while listener.recv().await.is_ok() {
+                    let repo = sentry_storage::Repo::new(pool.clone());
+                    match db_dataset_rules(&repo).await {
+                        Ok((fresh, uas, paths)) => {
+                            let n = {
+                                let mut guard = rules.write().unwrap();
+                                guard.replace_by_prefix("dataset:", fresh)
+                            };
+                            sentry_core::heuristics::reload_dataset_lists(&uas, &paths);
+                            info!(rule_count = n, "dataset rules + prefilter hot-reloaded");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to reload datasets from db");
+                        }
+                    }
+                }
+                warn!("LISTEN connection closed, reconnecting in 5s…");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to start LISTEN, retrying in 5s…");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
 /// Background task: LISTEN for `sentry_blocks_changed` notifications and
 /// hot-reload the block table from `ip_state`.
 ///
@@ -2816,9 +3005,49 @@ fn build_challenge_action(
             );
             (ng.clone(), None, None, Some(ng))
         }
+        "opnsense" | "pfsense" => {
+            // Firewall-appliance enforcement (F6.1): OPNsense alias_util
+            // REST or pfSense pfctl table. Drop-only platform: Challenge/
+            // RateLimit verdicts are logged as unenforced.
+            let platform = if provider_name == "opnsense" {
+                sentry_action_opnsense::Platform::Opnsense
+            } else {
+                sentry_action_opnsense::Platform::Pfsense
+            };
+            let opt_str = |key: &str, default: &str| {
+                options
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(default)
+                    .to_string()
+            };
+            let opn = sentry_action_opnsense::OpnsenseProvider::new(
+                sentry_action_opnsense::OpnsenseConfig {
+                    platform,
+                    base_url: opt_str("base_url", ""),
+                    api_key_env: opt_str("api_key_env", "SENTRY_OPN_API_KEY"),
+                    api_secret_env: opt_str("api_secret_env", "SENTRY_OPN_API_SECRET"),
+                    table: opt_str("table", "sentry_blocks"),
+                    pfctl_path: opt_str("pfctl_path", "pfctl"),
+                    accept_invalid_certs: options
+                        .get("accept_invalid_certs")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                },
+                Some(trust.clone()),
+            );
+            if platform == sentry_action_opnsense::Platform::Opnsense
+                && opn.config().base_url.is_empty()
+            {
+                return Err(color_eyre::eyre::eyre!(
+                    "opnsense action requires [action.options] base_url (e.g. \"https://192.0.2.10\")"
+                ));
+            }
+            (opn, None, None, None)
+        }
         other => {
             return Err(color_eyre::eyre::eyre!(
-                "unknown challenge provider `{other}` — known: cloudflare, firewall, nginx"
+                "unknown challenge provider `{other}` — known: cloudflare, firewall, opnsense, pfsense, nginx"
             ));
         }
     };

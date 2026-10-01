@@ -19,12 +19,14 @@
 
 use axum::extract::Request;
 use axum::extract::State;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use sentry_core::analysis::Verdict;
 use sentry_core::event::{Event, HttpData, ProtocolData, SourceKind, Transport};
+use uuid::Uuid;
 
+use crate::pages;
 use crate::EdgeRuntime;
 
 /// How the middleware treats decisions.
@@ -81,9 +83,13 @@ pub async fn handler(State(runtime): State<EdgeRuntime>, req: Request, next: Nex
     let client_ip = crate::real_client_ip_with(&parts.headers, peer, runtime.trust());
 
     // Sticky blocks deny before the pipeline runs — a blocked IP stays
-    // blocked even when this request alone would score as benign.
+    // blocked even when this request alone would score as benign. No event
+    // is persisted here, so the trace id only lives in the page and the
+    // log line.
     if runtime.is_hard_blocked(client_ip) {
-        return block_response();
+        let trace = Uuid::new_v4();
+        tracing::info!(ip = %client_ip, trace_id = %trace, "edge fast-path: blocked ip denied before pipeline (no event persisted)");
+        return pages::block_page(Some(trace));
     }
 
     let headers: std::collections::HashMap<String, String> = parts
@@ -143,63 +149,23 @@ pub async fn handler(State(runtime): State<EdgeRuntime>, req: Request, next: Nex
             let req = Request::from_parts(parts, body);
             next.run(req).await
         }
-        Verdict::RateLimit => rate_limit_response(),
-        Verdict::Challenge => match runtime.challenge_gate(&parts.headers, client_ip) {
-            crate::ChallengeGate::Pass => {
-                parts.extensions.insert(processed);
-                let req = Request::from_parts(parts, body);
-                next.run(req).await
+        Verdict::RateLimit => pages::rate_limit_page(Some(processed.event.id)),
+        Verdict::Challenge => {
+            match runtime.challenge_gate(&parts.headers, client_ip, Some(processed.event.id)) {
+                crate::ChallengeGate::Pass => {
+                    parts.extensions.insert(processed);
+                    let req = Request::from_parts(parts, body);
+                    next.run(req).await
+                }
+                crate::ChallengeGate::Page(page) => page,
+                crate::ChallengeGate::Blocked(page) => page,
+                crate::ChallengeGate::Disabled => {
+                    pages::challenge_required_page(Some(processed.event.id))
+                }
             }
-            crate::ChallengeGate::Page(page) => page,
-            crate::ChallengeGate::Blocked(page) => page,
-            crate::ChallengeGate::Disabled => challenge_response(),
-        },
-        Verdict::Block | Verdict::Quarantine => block_response(),
+        }
+        Verdict::Block | Verdict::Quarantine => pages::block_page(Some(processed.event.id)),
     }
-}
-
-/// 403 page for `Block` / `Quarantine` verdicts.
-pub fn block_response() -> Response {
-    verdict_page(
-        StatusCode::FORBIDDEN,
-        "403 — blocked",
-        "Your request was blocked by Sentry.",
-    )
-}
-
-/// 429 for `RateLimit` verdicts.
-pub fn rate_limit_response() -> Response {
-    let mut resp = verdict_page(
-        StatusCode::TOO_MANY_REQUESTS,
-        "429 — too many requests",
-        "Slow down and retry shortly.",
-    );
-    if let Ok(v) = HeaderValue::from_str("60") {
-        resp.headers_mut().insert("retry-after", v);
-    }
-    resp
-}
-
-/// 403 challenge page for `Challenge` verdicts without an interactive
-/// challenge configured (see `[edge.challenge]`, F7.8).
-pub fn challenge_response() -> Response {
-    verdict_page(
-        StatusCode::FORBIDDEN,
-        "403 — verification required",
-        "This resource requires verification. If you believe this is an error, contact the administrator.",
-    )
-}
-
-fn verdict_page(status: StatusCode, title: &str, message: &str) -> Response {
-    let html = format!(
-        "<!DOCTYPE html><html><head><title>{title}</title></head><body style=\"font-family:sans-serif;background:#0d1117;color:#e6edf3;display:grid;place-items:center;height:100vh;margin:0\"><div style=\"text-align:center\"><h1>{title}</h1><p>{message}</p></div></body></html>"
-    );
-    (
-        status,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        html,
-    )
-        .into_response()
 }
 
 /// Minimal percent-decode so heuristics see the attacker's intent (the same
@@ -311,6 +277,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.headers().get(pages::TRACE_HEADER).is_some());
+        let page = body_bytes(resp).await;
+        assert!(page.contains("403 - Forbidden"), "{page}");
+        assert!(
+            page.contains("You are unable to access this website."),
+            "{page}"
+        );
+        assert!(page.contains("Trace ID:"), "{page}");
     }
 
     #[tokio::test]
@@ -336,6 +310,16 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(hits.get(), 1.0);
+        let page = body_bytes(resp).await;
+        assert!(page.contains("403 - Forbidden"), "{page}");
+        assert!(page.contains("Trace ID:"), "{page}");
+    }
+
+    async fn body_bytes(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     #[test]

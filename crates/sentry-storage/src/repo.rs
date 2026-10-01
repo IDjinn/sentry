@@ -68,6 +68,13 @@ impl Repo {
             pool: self.pool.clone(),
         }
     }
+
+    /// Borrow the datasets repo (F7.7).
+    pub fn datasets(&self) -> DatasetRepo {
+        DatasetRepo {
+            pool: self.pool.clone(),
+        }
+    }
 }
 
 // ─── EventRepo ──────────────────────────────────────────────────────────────
@@ -968,5 +975,158 @@ fn parse_rule_action(s: &str) -> Option<RuleAction> {
         "log" => Some(RuleAction::Log),
         "tag" => Some(RuleAction::Tag),
         _ => None,
+    }
+}
+
+// ─── DatasetRepo ────────────────────────────────────────────────────────────
+
+/// Repository for DB-backed datasets (F7.7): curated user-agent / path /
+/// JA3 lists that become synthetic `feed:<name>` rules and feed the dynamic
+/// prefilter. Every mutation notifies `sentry_datasets_changed` so all
+/// nodes hot-reload without a restart.
+#[derive(Clone)]
+pub struct DatasetRepo {
+    pool: PgPool,
+}
+
+/// One dataset with its metadata and entry count.
+#[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
+pub struct DatasetRow {
+    /// Unique name (the synthetic rule id becomes `feed:<name>`).
+    pub name: String,
+    /// `user_agent` | `path` | `ja3`.
+    pub kind: String,
+    /// Optional URL the list was imported from (enables re-fetch).
+    pub source_url: Option<String>,
+    /// Pipeline action when the synthetic rule matches (`log` default).
+    pub action: String,
+    /// Whether the dataset feeds the pipeline.
+    pub enabled: bool,
+    /// Number of stored entries.
+    pub entry_count: i64,
+}
+
+const NOTIFY_DATASETS: &str = "sentry_datasets_changed";
+
+impl DatasetRepo {
+    /// Replace a dataset wholesale: upsert metadata, swap the entry set and
+    /// notify listeners.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert(
+        &self,
+        name: &str,
+        kind: &str,
+        source_url: Option<&str>,
+        action: &str,
+        entries: &[String],
+    ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .inner()
+            .begin()
+            .await
+            .map_err(|e| StorageError::Query(e.to_string()))?;
+        sqlx::query(
+            r#"INSERT INTO datasets (name, kind, source_url, action)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (name) DO UPDATE
+                 SET kind = EXCLUDED.kind,
+                     source_url = EXCLUDED.source_url,
+                     action = EXCLUDED.action,
+                     updated_at = now()"#,
+        )
+        .bind(name)
+        .bind(kind)
+        .bind(source_url)
+        .bind(action)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        sqlx::query("DELETE FROM dataset_entries WHERE dataset_id = (SELECT id FROM datasets WHERE name = $1)")
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Query(e.to_string()))?;
+        if !entries.is_empty() {
+            sqlx::query(
+                r#"INSERT INTO dataset_entries (dataset_id, value)
+                   SELECT id, v FROM datasets, UNNEST($2::text[]) AS t(v)
+                   WHERE datasets.name = $1
+                   ON CONFLICT (dataset_id, value) DO NOTHING"#,
+            )
+            .bind(name)
+            .bind(entries.to_vec())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Query(e.to_string()))?;
+        }
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(NOTIFY_DATASETS)
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Query(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Query(e.to_string()))
+    }
+
+    /// List all datasets (metadata + entry counts), by name.
+    pub async fn list(&self) -> Result<Vec<DatasetRow>> {
+        sqlx::query_as::<_, DatasetRow>(
+            r#"SELECT d.name, d.kind, d.source_url, d.action, d.enabled, count(e.value) AS entry_count
+               FROM datasets d
+               LEFT JOIN dataset_entries e ON e.dataset_id = d.id
+               GROUP BY d.id, d.name, d.kind, d.source_url, d.action, d.enabled
+               ORDER BY d.name ASC"#,
+        )
+        .fetch_all(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))
+    }
+
+    /// Fetch every entry of one dataset (empty when absent).
+    pub async fn entries(&self, name: &str) -> Result<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT e.value FROM dataset_entries e \
+             JOIN datasets d ON d.id = e.dataset_id WHERE d.name = $1",
+        )
+        .bind(name)
+        .fetch_all(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))
+    }
+
+    /// Enable or disable a dataset and notify listeners.
+    pub async fn set_enabled(&self, name: &str, enabled: bool) -> Result<()> {
+        sqlx::query("UPDATE datasets SET enabled = $2, updated_at = now() WHERE name = $1")
+            .bind(name)
+            .bind(enabled)
+            .execute(self.pool.inner())
+            .await
+            .map_err(|e| StorageError::Query(e.to_string()))?;
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(NOTIFY_DATASETS)
+            .bind(name)
+            .execute(self.pool.inner())
+            .await
+            .map(|_| ())
+            .map_err(|e| StorageError::Query(e.to_string()))
+    }
+
+    /// Delete a dataset (entries cascade) and notify listeners.
+    pub async fn delete(&self, name: &str) -> Result<()> {
+        sqlx::query("DELETE FROM datasets WHERE name = $1")
+            .bind(name)
+            .execute(self.pool.inner())
+            .await
+            .map_err(|e| StorageError::Query(e.to_string()))?;
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(NOTIFY_DATASETS)
+            .bind(name)
+            .execute(self.pool.inner())
+            .await
+            .map(|_| ())
+            .map_err(|e| StorageError::Query(e.to_string()))
     }
 }

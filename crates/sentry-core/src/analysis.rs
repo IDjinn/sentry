@@ -157,11 +157,17 @@ pub enum SignalKind {
     /// UA claims a verified crawler but rDNS forward-confirmation failed
     /// (F7.7): spoofed bot identity.
     SpoofedBot,
+    /// TLS ClientHello with a missing or unknown SNI on the inline HTTPS
+    /// front (F8): scanners probing by IP against the 443 honeypot.
+    TlsSniMismatch,
     /// A custom rule matched (the rule id is carried in `detail`).
     RuleHit,
     /// Any other signal not yet cataloged.
     Custom,
 }
+
+/// Default weight for [`SignalKind::TlsSniMismatch`] (F8).
+pub const TLS_SNI_MISMATCH_WEIGHT: u8 = 20;
 
 /// What the pipeline decided to do with the event.
 ///

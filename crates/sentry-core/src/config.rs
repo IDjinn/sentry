@@ -925,6 +925,33 @@ impl DeploymentConfig {
     }
 }
 
+/// Who executes a `Challenge` verdict at the inline edge. Purely about
+/// enforcement — the verdict pages themselves are always Sentry's.
+/// Type-safe like [`ActionKind`]: typos fail at config-load time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChallengeBackend {
+    /// Built-in proof-of-work interstitial (F7.8) — or the static 403
+    /// fallback when `[edge.challenge]` is disabled.
+    #[default]
+    Sentry,
+    /// Delegate to the Cloudflare provider: the verdict becomes a
+    /// Cloudflare rule via the CF API (`provider = "cloudflare"` action)
+    /// and visitors are challenged by Cloudflare itself. Requires an
+    /// action with `provider = "cloudflare"`.
+    Cloudflare,
+}
+
+impl ChallengeBackend {
+    /// Lowercase stable name used in logs and config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sentry => "sentry",
+            Self::Cloudflare => "cloudflare",
+        }
+    }
+}
+
 /// Inline edge settings (F3.1/F3.9) — required when
 /// `[deployment] mode = "inline"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -950,6 +977,27 @@ pub struct EdgeConfig {
     /// TLS private key path (feature `edge-tls`).
     #[serde(default)]
     pub tls_key: Option<PathBuf>,
+    /// HTTPS listen address used together with `tls_cert`/`tls_key`
+    /// (default `0.0.0.0:443`). The plain `listen` stays up at the same
+    /// time, so both 80 and 443 are monitored in inline mode.
+    #[serde(default)]
+    pub tls_listen: Option<String>,
+    /// Answer plain-HTTP requests with a 301 to the HTTPS listener
+    /// (host + path preserved). Only meaningful with TLS enabled; the
+    /// redirect runs after the pipeline, so port-80 traffic keeps being
+    /// monitored and blocked normally.
+    #[serde(default)]
+    pub tls_redirect_https: bool,
+    /// Hostnames accepted in the TLS ClientHello SNI (F8). Empty disables
+    /// the check. When set, a handshake whose SNI is missing or unknown
+    /// scores as a scanner probe through the `TlsSniMismatch` signal.
+    #[serde(default)]
+    pub tls_allowed_hosts: Vec<String>,
+    /// Emit one `TlsHandshake` event per completed handshake (SNI + JA3 +
+    /// JA4 telemetry) into the pipeline. SNI mismatches are always emitted
+    /// regardless of this flag.
+    #[serde(default = "default_tls_handshake_events")]
+    pub tls_handshake_events: bool,
     /// Optional inline TCP listener for non-HTTP services (`0.0.0.0:2222`).
     #[serde(default)]
     pub tcp_listen: Option<String>,
@@ -959,6 +1007,12 @@ pub struct EdgeConfig {
     /// Interactive JavaScript challenge for `Challenge` verdicts (F7.8).
     #[serde(default)]
     pub challenge: EdgeChallengeConfig,
+    /// Who executes `Challenge` verdicts — `sentry` (built-in PoW) or
+    /// `cloudflare` (the verdict becomes a Cloudflare rule via the CF
+    /// provider; requires an action with `provider = "cloudflare"`).
+    /// Default `sentry`.
+    #[serde(default)]
+    pub challenge_backend: ChallengeBackend,
 }
 
 /// JavaScript proof-of-work challenge settings (F7.8). When enabled, the
@@ -1028,9 +1082,14 @@ impl Default for EdgeConfig {
             body_capture_kb: 0,
             tls_cert: None,
             tls_key: None,
+            tls_listen: None,
+            tls_redirect_https: false,
+            tls_allowed_hosts: Vec::new(),
+            tls_handshake_events: default_tls_handshake_events(),
             tcp_listen: None,
             tcp_upstream: None,
             challenge: EdgeChallengeConfig::default(),
+            challenge_backend: ChallengeBackend::default(),
         }
     }
 }
@@ -1043,6 +1102,9 @@ fn default_edge_health_path() -> String {
 }
 fn default_edge_health_timeout() -> u64 {
     5
+}
+fn default_tls_handshake_events() -> bool {
+    true
 }
 
 /// Background route learner config.
@@ -1262,6 +1324,10 @@ pub enum FeedKind {
     UserAgent,
     /// Path fragments, one per line → synthetic path rule.
     Path,
+    /// JA3 fingerprints (lowercase hex), one per line → synthetic TLS
+    /// fingerprint rule (F7.7). Only evaluated against `TlsHandshake`
+    /// events from the inline edge.
+    Ja3,
 }
 
 impl FeedKind {
@@ -1271,6 +1337,7 @@ impl FeedKind {
             Self::Ip => "ip",
             Self::UserAgent => "user_agent",
             Self::Path => "path",
+            Self::Ja3 => "ja3",
         }
     }
 }
@@ -1431,5 +1498,22 @@ mod tests {
         let parsed: CorrelationConfig = toml::from_str("").unwrap();
         assert!(parsed.enabled);
         assert_eq!(parsed.window_secs, 900);
+    }
+
+    #[test]
+    fn edge_challenge_backend_defaults_to_sentry_and_parses_variants() {
+        assert_eq!(
+            EdgeConfig::default().challenge_backend,
+            ChallengeBackend::Sentry
+        );
+
+        let parsed: EdgeConfig = toml::from_str("challenge_backend = \"cloudflare\"").unwrap();
+        assert_eq!(parsed.challenge_backend, ChallengeBackend::Cloudflare);
+
+        let parsed: EdgeConfig = toml::from_str("challenge_backend = \"sentry\"").unwrap();
+        assert_eq!(parsed.challenge_backend, ChallengeBackend::Sentry);
+
+        let err = toml::from_str::<EdgeConfig>("challenge_backend = \"bunny\"");
+        assert!(err.is_err(), "typos must fail at config-load time");
     }
 }

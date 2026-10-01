@@ -151,7 +151,9 @@ impl ReputationService {
                     .replace_feed(&feed.name, tier, nets);
                 count
             }
-            sentry_core::config::FeedKind::UserAgent | sentry_core::config::FeedKind::Path => {
+            sentry_core::config::FeedKind::UserAgent
+            | sentry_core::config::FeedKind::Path
+            | sentry_core::config::FeedKind::Ja3 => {
                 let list = sentry_core::parse_string_list(&body);
                 let count = list.len();
                 self.datasets.lock().await.insert(feed.name.clone(), list);

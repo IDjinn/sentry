@@ -39,6 +39,19 @@ pub struct SignalSummary {
     pub detail: Option<String>,
 }
 
+/// TLS handshake telemetry condensed for the event log (F8). Populated for
+/// `edge_tls` events; `null` (never omitted) for every other protocol so the
+/// summary key set stays stable for consumers.
+#[derive(Debug, Clone, Serialize)]
+pub struct TlsSummary {
+    pub sni: Option<String>,
+    pub ja3: Option<String>,
+    pub ja4: Option<String>,
+    pub version: Option<String>,
+    pub cipher: Option<String>,
+    pub alpn: Option<String>,
+}
+
 /// Flat per-event summary (Grafana-friendly: no nested protocol payloads).
 ///
 /// Every field is always serialized (`null` instead of omitted): consumers
@@ -55,6 +68,7 @@ pub struct EventSummary {
     pub host: Option<String>,
     pub status: Option<u16>,
     pub user_agent: Option<String>,
+    pub tls: Option<TlsSummary>,
     pub verdict: String,
     pub risk_level: String,
     pub score: u8,
@@ -92,9 +106,19 @@ impl EventSummary {
                     .to_string()
             }),
             path: http.map(|h| truncate(&h.path, 256)),
-            host: http.and_then(|h| h.host.clone()),
+            host: http
+                .and_then(|h| h.host.clone())
+                .or_else(|| evt.tls().and_then(|t| t.sni.clone())),
             status: http.and_then(|h| h.status),
             user_agent: http.and_then(|h| h.user_agent.as_deref().map(|u| truncate(u, 128))),
+            tls: evt.tls().map(|t| TlsSummary {
+                sni: t.sni.clone(),
+                ja3: t.ja3.clone(),
+                ja4: t.ja4.clone(),
+                version: t.version.clone(),
+                cipher: t.cipher.clone(),
+                alpn: t.alpn.clone(),
+            }),
             verdict: serde_json::to_string(&pe.decision.action)
                 .unwrap_or_default()
                 .trim_matches('"')
@@ -356,6 +380,7 @@ mod tests {
             "host",
             "status",
             "user_agent",
+            "tls",
             "verdict",
             "risk_level",
             "score",
@@ -366,6 +391,42 @@ mod tests {
         ] {
             assert!(v.get(k).is_some(), "missing key {k}");
         }
+    }
+
+    #[test]
+    fn tls_events_expose_the_handshake_summary() {
+        let pe = ProcessedEvent {
+            event: Event::new(
+                SourceKind::EdgeTls,
+                "203.0.113.7".parse().unwrap(),
+                ProtocolData::TlsHandshake(sentry_core::event::TlsData {
+                    sni: Some("example.com".into()),
+                    ja3: Some("a".repeat(32)),
+                    ja4: Some("t13d1516h2_8daaf6152771_b0da82dd1658".into()),
+                    cipher: Some("TLS13_AES_128_GCM_SHA256".into()),
+                    version: Some("TLS1.3".into()),
+                    alpn: Some("h2".into()),
+                }),
+            ),
+            analysis: AnalysisResult::default(),
+            decision: Decision {
+                analysis: AnalysisResult::default(),
+                action: Verdict::Allow,
+                override_reason: None,
+                log_level: None,
+            },
+            rule_hit: None,
+        };
+        let s = EventSummary::from_processed(&pe);
+        assert_eq!(s.protocol, "tls");
+        assert_eq!(s.host.as_deref(), Some("example.com"));
+        let tls = s.tls.as_ref().unwrap();
+        assert_eq!(tls.sni.as_deref(), Some("example.com"));
+        assert_eq!(tls.version.as_deref(), Some("TLS1.3"));
+        assert_eq!(
+            tls.ja4.as_deref(),
+            Some("t13d1516h2_8daaf6152771_b0da82dd1658")
+        );
     }
 
     #[test]

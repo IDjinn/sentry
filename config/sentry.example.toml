@@ -333,6 +333,16 @@ action = "challenge"
 # tier = "authorized"
 # refresh_hours = 24
 #
+# DB-backed datasets (F7.7) are the Postgres equivalent of the UA/path
+# feeds above — no TOML entry needed. Import, list and toggle them from the
+# CLI; every change is hot-reloaded by running daemons (rules + prefilter):
+#
+#   sentry datasets import https://example.invalid/scanners.txt \
+#        --kind user_agent --name bad-scanners --action block
+#   sentry datasets import honeypot-paths.txt --kind path --name honeypot-paths
+#   sentry datasets import scanner-ja3.txt    --kind ja3   --name scan-tools
+#   sentry datasets list | enable | disable | delete | fetch
+#
 # Datasets (F7.6): `kind = "user_agent" | "path"` compiles a plain one-per-
 # line list (https, SSRF-guarded) into one synthetic rule — entries are
 # matched as case-insensitive literals. Unlike IP feeds there is no
@@ -512,17 +522,40 @@ upstream = "http://127.0.0.1:8080"
 health_path = "/"
 health_timeout_secs = 5
 body_capture_kb = 0          # request-body bytes kept for inspection (KiB)
-# tls_cert = "/etc/sentry/edge.crt"   # requires build feature `edge-tls`
+# Who executes `Challenge` verdicts (the verdict pages are always Sentry's,
+# with icon + Trace ID for tracing):
+#   sentry     — built-in proof-of-work interstitial (see [edge.challenge])
+#   cloudflare — the verdict becomes a Cloudflare rule via the CF API
+#                (`[[action]]` with provider = "cloudflare"); visitors are
+#                challenged by Cloudflare itself, the edge only serves a
+#                403 hold page until the rule takes effect
+challenge_backend = "sentry"
+# TLS front (F8): terminate HTTPS on 443 and monitor it inline. Both paths
+# together enable TLS and require the build feature `edge-tls`:
+#   cargo build --release --features sentry-cli/edge-tls
+# The plain `listen` above stays up at the same time, so both 80 and 443 are
+# monitored; blocked IPs are denied on both.
+# tls_cert = "/etc/sentry/edge.crt"
 # tls_key = "/etc/sentry/edge.key"
+# tls_listen = "0.0.0.0:443"        # HTTPS bind address (default when TLS is on)
+# tls_redirect_https = false        # 301 plain HTTP → HTTPS (after the pipeline,
+#                                   # so port-80 traffic stays monitored/blocked)
+# tls_handshake_events = true       # one TlsHandshake event per handshake
+#                                   # (SNI + JA3 + JA4 telemetry) in the pipeline
+# Hostname allowlist for the ClientHello SNI. When set, a handshake with a
+# missing or unknown SNI scores as a scanner probe (TlsSniMismatch signal,
+# honeypot behavior):
+# tls_allowed_hosts = ["api.example.com", "example.com"]
 # Inline TCP front for non-HTTP services (verdict on connect):
 # tcp_listen = "0.0.0.0:2222"
 # tcp_upstream = "127.0.0.1:22"
 
 # Interactive JavaScript challenge for `Challenge` verdicts (F7.8) — the
 # self-hosted "checking your browser": a SHA-256 proof-of-work page browsers
-# solve in <1s; JS-less clients (curl, dumb bots) stay stuck on 503. rDNS-
-# verified crawlers ([bot_verification]) bypass entirely. Stateless: share
-# the secret across edge nodes. PoW never unlocks a hard Block.
+# solve in <1s; JS-less clients (curl, dumb bots) stay stuck on 403
+# (Cloudflare-style status). rDNS-verified crawlers ([bot_verification])
+# bypass entirely. Stateless: share the secret across edge nodes. PoW never
+# unlocks a hard Block. Only used with challenge_backend = "sentry".
 [edge.challenge]
 enabled = false
 secret_env = "SENTRY_EDGE_CHALLENGE_SECRET"   # required when enabled (`openssl rand -hex 32`)
@@ -615,6 +648,23 @@ max_failures = 3               # circuit breaker: disable the provider after N c
 # rate_limit_deny = false      # also deny RateLimit verdicts
 # provision_bots = true        # emit the bot_verifier snippet
 # geo_var = "$sentry_challenge_ip"
+
+# OPNsense/pfSense ban provider (F6.1): drops at the firewall appliance
+# itself. OPNsense uses the alias_util REST API (key + secret via env,
+# `openssl rand -hex 32`-style credentials); pfSense shells out to `pfctl`
+# on the daemon host. Drop-only platform: Challenge/RateLimit verdicts are
+# logged as unenforced (the appliance knows nothing else), Block verdicts
+# land in the `sentry_blocks` alias/table with the TTL tracked in memory.
+# [[action]]
+# type = "challenge"
+# provider = "opnsense"        # opnsense (REST) | pfsense (pfctl)
+# [action.options]
+# base_url = "https://192.0.2.10"           # OPNsense only, required
+# api_key_env = "SENTRY_OPN_API_KEY"        # env holding the API key
+# api_secret_env = "SENTRY_OPN_API_SECRET"  # env holding the API secret
+# table = "sentry_blocks"                   # alias / pfctl table name
+# pfctl_path = "pfctl"                      # pfSense backend only
+# accept_invalid_certs = true               # appliance self-signed cert
 # ipv6_prefix = 64             # IPv6 entries as CIDR (exact when absent)
 
 # Community abuse reporting (F7.4): reports IPs that earn an enforcing
