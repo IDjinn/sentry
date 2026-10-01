@@ -209,7 +209,12 @@ fn make_capture(name: &str) -> String {
         // IPs: a sequence of hex digits, dots and colons.
         "remote_addr" | "remote_addr_v6" => r"[0-9a-fA-F:.]+".to_string(),
         // XFF carries a comma-separated chain: "client, proxy1, proxy2".
-        "proxy_add_x_forwarded_for" | "http_x_forwarded_for" => r"[0-9a-fA-F:., ]+".to_string(),
+        // `-` (nginx's empty marker) must also match: a direct (non-proxied)
+        // request logs `"$http_x_forwarded_for" "-"` and would otherwise be
+        // rejected wholesale instead of falling back to remote_addr.
+        "proxy_add_x_forwarded_for" | "http_x_forwarded_for" => {
+            r"(?:[0-9a-fA-F:., ]+|-)".to_string()
+        }
         // Numeric tokens.
         "status" | "body_bytes_sent" | "bytes_sent" | "request_time" | "b" | "s" => {
             r"\d+(?:\.\d+)?".to_string()
@@ -340,6 +345,30 @@ mod tests {
             evt.client_ip,
             Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)))
         );
+    }
+
+    #[test]
+    fn empty_xff_marker_parses_and_falls_back_to_remote_addr() {
+        let fmt = LogFormat::compile(
+            r#"$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" "$http_x_forwarded_for""#,
+        )
+        .unwrap();
+
+        // Direct (non-proxied) request: nginx logs XFF as `-`, which must not
+        // reject the whole line.
+        let line = r#"177.171.45.43 - - [01/Oct/2026:03:28:03 +0000] "GET /admin HTTP/1.1" 200 2166 "-" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0" "-""#;
+        let evt = fmt.parse_line(line).expect("empty XFF marker must match");
+        assert_eq!(
+            evt.client_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(177, 171, 45, 43)))
+        );
+        let http = match evt.protocol {
+            ProtocolData::Http(ref h) => h,
+            _ => panic!("expected http"),
+        };
+        assert_eq!(http.method, Some(HttpMethod::Get));
+        assert_eq!(http.path, "/admin");
+        assert_eq!(http.status, Some(200));
     }
 
     #[test]

@@ -366,7 +366,8 @@ pub enum BenchCmd {
         /// instead of the built-in labeled synthetic kit.
         #[arg(long)]
         events: Option<String>,
-        /// nginx log_format string for `--events` (default: combined format).
+        /// nginx log_format string for `--events` (default: the first
+        /// `[source] type = "nginx"` format from config, else combined).
         #[arg(long)]
         format: Option<String>,
         /// Max events per provider (0 = all).

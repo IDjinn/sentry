@@ -186,7 +186,8 @@ cd /opt/sentry && docker compose pull && docker compose up -d
   and the image must be built with `sentry-cli/pcap` (the workflow does).
 - **Geo enrichment is off** (no MaxMind GeoLite2 files). Drop the `.mmdb`
   files into the `sentrydata` volume to enable country/ASN rules.
-- AI (ONNX) and LLM are disabled to fit the 1 GB budget.
+- AI (ONNX) is disabled to fit the 1 GB budget. The LLM stage is remote-only
+  (TypeSafe jev, key in `.env` as `SENTRY_JEV_KEY`) — zero local compute.
 - The nginx decoy is static HTML with no backend; POSTs to `/login` return
   405/404, which still feeds the behavioral detectors.
 

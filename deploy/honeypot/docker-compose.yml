@@ -56,6 +56,7 @@ services:
       SENTRY_CONFIG: /etc/sentry/sentry.toml
       SENTRY_STORAGE__POSTGRES__URL: postgres://sentry:${SENTRY_PG_PASSWORD:?set in .env}@127.0.0.1:5432/sentry
       SENTRY_DISCORD_WEBHOOK_URL: ${SENTRY_DISCORD_WEBHOOK_URL:-}
+      SENTRY_JEV_KEY: ${SENTRY_JEV_KEY:-}
       RUST_LOG: info,sentry=info
     volumes:
       - ./sentry.toml:/etc/sentry/sentry.toml:ro
