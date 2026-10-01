@@ -272,11 +272,14 @@ mode  = "off"
 # domains = ["example.com", "www.example.com"]
 
 # Static inline rules (in addition to the DB-managed ones).
+# `log_level` controls the console line: silent (no line; event is still
+# stored and dispatched), info (default), warn or error.
 [[rules.custom]]
 name = "allow internal monitoring"
 priority = 1
 match = 'ip=10.0.0.0/8'
 action = "allow"
+log_level = "silent"
 
 [[rules.custom]]
 name = "challenge datacenter ASN outside business hours"

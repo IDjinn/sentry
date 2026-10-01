@@ -37,7 +37,9 @@ pub mod tcpfp;
 pub mod trust;
 
 pub use action::{Action, ActionContext};
-pub use analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};
+pub use analysis::{
+    AnalysisResult, Decision, RiskLevel, RuleLogLevel, Signal, SignalKind, Verdict,
+};
 pub use behavior::BehaviorTracker;
 pub use blocks::BlockTable;
 pub use botverify::{

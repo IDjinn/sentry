@@ -215,7 +215,7 @@ fn sensitive_path_rules(enforce: bool) -> Vec<Rule> {
             source: RuleSource::DefaultPack,
             tags: vec!["sensitive_paths".into()],
             created_at: None,
-        log_level: None,
+            log_level: None,
         })
         .collect();
 
@@ -264,7 +264,7 @@ fn honeypot_path_rules(enforce: bool) -> Vec<Rule> {
             source: RuleSource::DefaultPack,
             tags: vec!["honeypot_paths".into()],
             created_at: None,
-        log_level: None,
+            log_level: None,
         })
         .collect()
 }
@@ -376,7 +376,7 @@ fn http_anomaly_rules(enforce: bool) -> Vec<Rule> {
             source: RuleSource::DefaultPack,
             tags: vec!["http_anomaly".into()],
             created_at: None,
-        log_level: None,
+            log_level: None,
         },
         Rule {
             id: "http_anomaly_connect".into(),
@@ -389,7 +389,7 @@ fn http_anomaly_rules(enforce: bool) -> Vec<Rule> {
             source: RuleSource::DefaultPack,
             tags: vec!["http_anomaly".into()],
             created_at: None,
-        log_level: None,
+            log_level: None,
         },
     ]
 }

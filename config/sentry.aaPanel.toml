@@ -63,18 +63,21 @@ name = "country_blocklist"
 mode  = "off"
 # countries = ["RU", "CN"]
 
-# Allow internal monitoring / health checks.
+# Allow internal monitoring / health checks — silent: rsyslog + VPC infra
+# traffic is expected noise; still stored, just not printed per event.
 [[rules.custom]]
 name = "allow localhost"
 priority = 1
 match = 'ip=127.0.0.0/8'
 action = "allow"
+log_level = "silent"
 
 [[rules.custom]]
 name = "allow private networks"
 priority = 2
 match = 'ip=10.0.0.0/8 OR ip=172.16.0.0/12 OR ip=192.168.0.0/16'
 action = "allow"
+log_level = "silent"
 
 # ── Sources — aaPanel nginx logs (combined format is the nginx default) ──
 [[source]]

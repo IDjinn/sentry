@@ -24,8 +24,7 @@ use sentry_core::pipeline::{Pipeline, RouteValidator};
 use sentry_core::ratelimit::{InMemoryRateLimiter, RateLimitBackend};
 use sentry_core::registry::RegistryBuilder;
 use sentry_core::rules::{shared, RuleSet, SharedRuleSet};
-use sentry_core::RiskLevel;
-use sentry_core::Signal;
+use sentry_core::{RiskLevel, RuleLogLevel, Signal};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -958,6 +957,10 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             if let Some(ref ai) = ai_fork {
                 if ai.is_inline() && ai.should_run(&result) {
                     let signals = ai.evaluate(&result.event).await;
+                    let reason = signals
+                        .iter()
+                        .find_map(|s| s.detail.clone())
+                        .unwrap_or_else(|| "-".into());
                     if !signals.is_empty() {
                         let updated = pipeline.rescore_from(&result, signals);
                         if updated.decision.action != result.decision.action {
@@ -966,6 +969,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                                 from = ?result.decision.action,
                                 to = ?updated.decision.action,
                                 score = updated.analysis.risk_score,
+                                reason = %reason,
                                 "ai (inline) changed verdict"
                             );
                         }
@@ -978,6 +982,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 &result.event,
                 &result.analysis.risk_level,
                 &result.analysis.signals,
+                result.decision.log_level,
             );
 
             if let Some(ref repo) = repo {
@@ -1598,6 +1603,10 @@ impl LlmFork {
             if signals.is_empty() {
                 return;
             }
+            let reason = signals
+                .iter()
+                .find(|s| s.kind == sentry_core::SignalKind::LlmMalicious)
+                .and_then(|s| s.detail.clone());
             let updated = pipeline.rescore_from(&base, signals);
             if updated.decision.action == base.decision.action {
                 return;
@@ -1608,6 +1617,7 @@ impl LlmFork {
                     ip = %ip,
                     would = ?updated.decision.action,
                     score = updated.analysis.risk_score,
+                    reason = reason.as_deref().unwrap_or("-"),
                     "llm (shadow) would change verdict"
                 );
                 return;
@@ -1617,6 +1627,7 @@ impl LlmFork {
                 from = ?base.decision.action,
                 to = ?updated.decision.action,
                 score = updated.analysis.risk_score,
+                reason = reason.as_deref().unwrap_or("-"),
                 "llm fork changed verdict"
             );
             if let Some(ref repo) = repo {
@@ -2182,18 +2193,37 @@ fn protocol_summary(evt: &Event) -> String {
 }
 
 /// Format a signal for the event line: `RuleHit(rule_id)` when there is a
-/// detail, bare kind name otherwise.
+/// detail, bare kind name otherwise. Details are truncated to keep the
+/// console line readable.
 fn format_signal(s: &Signal) -> String {
+    const MAX_DETAIL: usize = 48;
     match &s.detail {
-        Some(d) if !d.is_empty() => format!("{:?}({d})", s.kind),
+        Some(d) if !d.is_empty() => {
+            let short: String = d.chars().take(MAX_DETAIL).collect();
+            let ellipsis = if d.chars().count() > MAX_DETAIL {
+                "…"
+            } else {
+                ""
+            };
+            format!("{:?}({short}{ellipsis})", s.kind)
+        }
         _ => format!("{:?}", s.kind),
     }
 }
 
-/// Print a colored event line to stdout.
-fn print_event(evt: &Event, level: &RiskLevel, signals: &[Signal]) {
-    let color = level.ansi_color();
-    let reset = "\x1b[0m";
+/// Print (or suppress) the event console line according to the matching
+/// rule's `log_level`: `silent` drops the line entirely (the event is still
+/// persisted and dispatched to actions), `warn`/`error` route the line
+/// through tracing at that level, `info`/absent prints the colored line.
+fn print_event(
+    evt: &Event,
+    level: &RiskLevel,
+    signals: &[Signal],
+    log_level: Option<RuleLogLevel>,
+) {
+    if matches!(log_level, Some(RuleLogLevel::Silent)) {
+        return;
+    }
     let label = level.label();
 
     let source = evt.source.as_str();
@@ -2225,9 +2255,16 @@ fn print_event(evt: &Event, level: &RiskLevel, signals: &[Signal]) {
         )
     };
 
-    println!(
-        "{color}{label:4}{reset} {ip:15} [{source:8}] {method:6} {path:40} {status:3}{signal_str}"
-    );
+    let line =
+        format!("{label:4} {ip:15} [{source:8}] {method:6} {path:40} {status:3}{signal_str}");
+    match log_level {
+        Some(RuleLogLevel::Warn) => warn!("{line}"),
+        Some(RuleLogLevel::Error) => error!("{line}"),
+        _ => {
+            let color = level.ansi_color();
+            println!("{color}{line}\x1b[0m");
+        }
+    }
 }
 
 /// Build the plugin registry from config.
@@ -3075,6 +3112,7 @@ mod tests {
                 analysis: analysis.clone(),
                 action: Verdict::Allow,
                 override_reason: None,
+                log_level: None,
             },
             analysis,
             rule_hit: None,
@@ -3094,6 +3132,7 @@ mod tests {
                 analysis: blocked.analysis.clone(),
                 action: Verdict::Block,
                 override_reason: None,
+                log_level: None,
             },
             ..blocked
         }));
