@@ -32,7 +32,18 @@ pub(crate) struct BenchArgs<'a> {
 
 /// Run the benchmark and print (and optionally persist) the results.
 pub(crate) async fn run(args: BenchArgs<'_>, cfg: Option<SentryConfig>) -> color_eyre::Result<()> {
-    let llm_cfg = cfg.map(|c| c.llm).unwrap_or_default();
+    let (llm_cfg, config_nginx_format) = match cfg {
+        Some(c) => (
+            c.llm.clone(),
+            c.sources
+                .iter()
+                .find(|s| s.kind == "nginx")
+                .and_then(|s| s.options.get("format"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_string),
+        ),
+        None => (sentry_core::config::LlmConfig::default(), None),
+    };
 
     let mut providers: Vec<(String, Arc<dyn LlmProvider>)> = Vec::new();
     for name in args
@@ -53,7 +64,11 @@ pub(crate) async fn run(args: BenchArgs<'_>, cfg: Option<SentryConfig>) -> color
         color_eyre::eyre::bail!("no usable providers in `{}`", args.providers);
     }
 
-    let events = load_events(args.events, args.format, args.n)?;
+    let events = load_events(
+        args.events,
+        args.format.or(config_nginx_format.as_deref()),
+        args.n,
+    )?;
     let labeled = events.iter().all(|(_, m)| m.is_some());
     println!(
         "events: {} (labeled: {}) | providers: {} | concurrency: {}",

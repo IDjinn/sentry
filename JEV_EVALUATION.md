@@ -81,6 +81,27 @@ answer, not a score answer.
 On the real-log replay (7 mixed lines): malicious-vs-benign agreement **100%**,
 unparseable lines skipped gracefully.
 
+### Live validation on the honeypot VPS (2026-10-01)
+
+After deploying this branch to the honeypot (image `sha-d211b0b`, `[llm] provider = "jev"`,
+fork mode, key via `SENTRY_JEV_KEY` in the stack `.env`), the bench ran **inside
+the production container** against the decoy's real `access.log` (25 most
+recent events, scanner traffic included):
+
+| Metric | Value |
+| --- | ---: |
+| Calls / errors | 25 / 0 |
+| p50 / p95 latency (from us-east-2) | **132 ms** / 176 ms |
+| Throughput | 27.4 ok-calls/s @ concurrency 4 |
+| Agreement with heuristic pipeline | 92.0% |
+| Verdicts | Allow=21, Block=4 |
+| Tokens | 18160 in / 1725 out (~727 in / 69 out per event) |
+
+The daemon itself logged `llm provider loaded provider="jev" mode="fork"` and
+processed rule-short-circuited Block events through the fork with **zero
+`llm classify failed` warnings** (the fork logs nothing when jev confirms an
+existing Block — it can only raise verdicts).
+
 Verdict distribution on the kit: `Allow=25, Block=30` — jev **never chose
 rate_limit/challenge/quarantine** on these events. If finer escalation matters
 (slowloris-style volume abuse), the score question still carries it (mid-band
