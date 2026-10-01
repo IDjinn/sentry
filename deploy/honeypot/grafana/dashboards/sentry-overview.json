@@ -400,7 +400,8 @@
           "source": "url",
           "url": "http://host.docker.internal:9100/api/events?limit=100",
           "format": "table",
-          "refId": "events"
+          "refId": "events",
+          "url_options": { "method": "GET" }
         }
       ],
       "fieldConfig": {
