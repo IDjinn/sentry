@@ -131,6 +131,11 @@ pub enum Command {
         #[arg(long, default_value = "GET")]
         method: String,
     },
+    /// Benchmarks (provider evaluation harnesses).
+    Bench {
+        #[command(subcommand)]
+        action: BenchCmd,
+    },
     /// Auto-detect framework and generate rules/routes (zero-config).
     Auto {
         /// Project root (default: current directory).
@@ -347,4 +352,31 @@ pub enum CloudflareCmd {
     Test,
     /// Pull existing logs (best-effort Logpull / GraphQL).
     Pull,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BenchCmd {
+    /// Compare risk-classification providers (LLM / jev / mock) on latency,
+    /// agreement with the heuristic pipeline, output quality and cost.
+    Llm {
+        /// Comma-separated providers: jev | openrouter | openai | ollama | mock.
+        #[arg(long, default_value = "jev,mock")]
+        providers: String,
+        /// Replay events from an nginx access.log (or .jsonl of events)
+        /// instead of the built-in labeled synthetic kit.
+        #[arg(long)]
+        events: Option<String>,
+        /// nginx log_format string for `--events` (default: combined format).
+        #[arg(long)]
+        format: Option<String>,
+        /// Max events per provider (0 = all).
+        #[arg(long, default_value = "0")]
+        n: usize,
+        /// Concurrent in-flight classify calls per provider.
+        #[arg(long, default_value = "4")]
+        concurrency: usize,
+        /// Write the raw per-call results as JSON to a file.
+        #[arg(long)]
+        out: Option<String>,
+    },
 }

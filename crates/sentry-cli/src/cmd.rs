@@ -902,6 +902,29 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
         } => {
             test_payload(&payload, &path, &method)?;
         }
+        Command::Bench { action } => match action {
+            BenchCmd::Llm {
+                providers,
+                events,
+                format,
+                n,
+                concurrency,
+                out,
+            } => {
+                crate::bench_llm::run(
+                    crate::bench_llm::BenchArgs {
+                        providers: &providers,
+                        events: events.as_deref(),
+                        format: format.as_deref(),
+                        n,
+                        concurrency,
+                        out: out.as_deref(),
+                    },
+                    cfg,
+                )
+                .await?;
+            }
+        },
         Command::Auto {
             root,
             profile,
