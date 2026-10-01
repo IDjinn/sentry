@@ -212,7 +212,7 @@ async fn proxy_handler(
         })
         .collect();
 
-    let client_ip = crate::real_client_ip(&parts.headers, peer);
+    let client_ip = crate::real_client_ip_with(&parts.headers, peer, runtime.trust());
 
     // Sticky blocks deny before the pipeline runs — no event, no upstream.
     if runtime.is_hard_blocked(client_ip) {

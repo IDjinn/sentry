@@ -49,6 +49,15 @@ persist = true
 [rate_limit]
 backend = "memory"
 
+# Real client IP + trusted infrastructure (F7.2). The decoy sits behind
+# Cloudflare (orange cloud), so header-borne IPs are honored from the CF
+# ranges (bundled + auto-refreshed); direct-to-origin spoofing of
+# CF-Connecting-IP is ignored. Add your workstation / uptime-monitor IPs to
+# trusted_ips — they can never be banned, blocked or reported.
+[real_ip]
+cloudflare = true
+# trusted_ips = ["203.0.113.7"]
+
 # ── Rules engine ───────────────────────────────────────────────────────────
 [rules]
 
@@ -61,9 +70,15 @@ priority = 1
 match = 'ip=127.0.0.0/8 OR ip=10.0.0.0/8 OR ip=172.16.0.0/12 OR ip=192.168.0.0/16 OR ip=169.254.0.0/16'
 action = "allow"
 
-# Enforce packs that map to real actions on this box (blocklist + log).
+# Enforce packs that map to real actions on this box (blocklist + firewall).
 [[rules.pack]]
 name = "sensitive_paths"
+mode = "enforce"
+
+# On a decoy every broad bait pattern is genuinely hostile (F7.1): an ASPX
+# probe against a Rust/nginx box has no legitimate reader.
+[[rules.pack]]
+name = "honeypot_paths"
 mode = "enforce"
 
 [[rules.pack]]
@@ -190,6 +205,31 @@ type = "blocklist"
 [action.options]
 ttl_secs = 86400
 
+# Kernel-level bans (F7.3): honeypot scanners are dropped by nftables
+# before they reach anything. Backend auto-detects nftables → ipset →
+# firewalld; the compose host grants the container NET_ADMIN or the
+# systemd unit uses AmbientCapabilities=CAP_NET_ADMIN. `[real_ip]
+# trusted_ips` (admin/uptime-probe IPs) are never banned.
+[[action]]
+type = "challenge"
+provider = "firewall"
+[action.options]
+backend = "auto"
+ttl_secs = 86400
+rate_limit_ttl_secs = 600
+
+# Report the honeypot's catch to the community (F7.4): anything that earned
+# a Block here gets reported to AbuseIPDB (key in the stack .env). One
+# report per IP per day keeps the free tier's 1k/day quota safe. Categories
+# map from the signals (scans → Port Scan, probes → Web App Attack, …).
+# [[action]]
+# type = "report"
+# provider = "abuseipdb"
+# [action.options]
+# key_env = "SENTRY_ABUSEIPDB_KEY"
+# min_verdict = "block"
+# dedupe_hours = 24
+
 # Discord alert on High/Critical incidents. The URL lives in the VPS .env
 # (SENTRY_DISCORD_WEBHOOK_URL) — discord.com targets automatically get a
 # rich embed payload.
@@ -202,6 +242,19 @@ timeout_secs = 10
 
 [[action]]
 type = "log"
+
+# External IP reputation (F7.5): the decoy's catchers put most scanners in
+# the gray band (sensitive path hit + 404 sweeps ≈ score 30-70, not yet
+# ban-worthy on their own). Gray-band IPs get checked against AbuseIPDB and
+# a high community confidence escalates them to Block. Enable when an API
+# key is configured in the stack .env.
+# [ip_lookup]
+# enabled = true
+# provider = "abuseipdb"
+# key_env = "SENTRY_ABUSEIPDB_KEY"
+# trigger_above = 25
+# on_signals = ["sensitive_path", "directory_brute_force"]
+# max_per_hour = 500
 
 # ── LLM (TypeSafe jev — calibrated judgment API, no local compute) ─────────
 # provider "jev" = structured probabilistic classification (see

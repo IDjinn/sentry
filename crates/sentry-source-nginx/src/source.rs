@@ -27,6 +27,9 @@ pub struct NginxSourceConfig {
     pub format: String,
     /// Whether to start from the end of file (tail) or the beginning.
     pub start_from_end: bool,
+    /// Trusted proxies (F7.2): header-borne client IPs are honored only
+    /// from these peers. `None` = unconditional header precedence.
+    pub trust: Option<sentry_core::SharedTrustSet>,
 }
 
 impl Default for NginxSourceConfig {
@@ -35,6 +38,7 @@ impl Default for NginxSourceConfig {
             path: PathBuf::from("/var/log/nginx/access.log"),
             format: r#"$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent""#.to_string(),
             start_from_end: true,
+            trust: None,
         }
     }
 }
@@ -48,8 +52,11 @@ pub struct NginxSource {
 impl NginxSource {
     /// Create a new nginx source, compiling the format string.
     pub fn new(cfg: NginxSourceConfig) -> Result<Self> {
-        let fmt = LogFormat::compile(&cfg.format)
-            .map_err(|e| sentry_core::CoreError::Config(format!("nginx log_format: {e}")))?;
+        let fmt = match &cfg.trust {
+            Some(trust) => LogFormat::compile_with_trust(&cfg.format, trust.clone()),
+            None => LogFormat::compile(&cfg.format),
+        }
+        .map_err(|e| sentry_core::CoreError::Config(format!("nginx log_format: {e}")))?;
         Ok(Self {
             cfg,
             fmt: Arc::new(fmt),

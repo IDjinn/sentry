@@ -60,10 +60,15 @@ pub enum Command {
         #[command(subcommand)]
         action: RulesCmd,
     },
-    /// Manage reputation feeds (Tor exits, blocklists, …).
+    /// Manage reputation feeds (Tor exits, blocklists, datasets).
     Feeds {
         #[command(subcommand)]
         action: FeedsCmd,
+    },
+    /// Inspect the local firewall ban backends (nftables/ipset/firewalld).
+    Firewall {
+        #[command(subcommand)]
+        action: FirewallCmd,
     },
     /// Auth helpers (hash generation for `[server.auth]`).
     Auth {
@@ -266,12 +271,20 @@ pub enum RulesCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum FeedsCmd {
-    /// List configured feeds (name, tier, refresh, URL).
+    /// List configured feeds (name, kind, tier, refresh, URL).
     List,
     /// Fetch all feeds once and show entry counts (no daemon needed).
     Refresh,
     /// Refresh feeds, then look up an IP against them.
     Check { ip: String },
+}
+
+/// Local firewall ban backend status.
+#[derive(Debug, Subcommand)]
+pub enum FirewallCmd {
+    /// Detect available backends (nftables / ipset / firewalld) and their
+    /// privileges; shows live set sizes when a backend responds.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]

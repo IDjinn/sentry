@@ -121,6 +121,7 @@ fn signal_label(k: sentry_core::SignalKind) -> &'static str {
         TcpScanner => "tcp_scanner",
         ScanAttackCorrelation => "scan_attack_correlation",
         LlmMalicious => "llm_malicious",
+        ExternalReputation => "external_reputation",
         RuleHit => "rule_hit",
         Custom => "custom",
     }

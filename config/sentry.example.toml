@@ -234,7 +234,24 @@ mode  = "shadow"
 [[rules.pack]]
 name = "country_blocklist"
 mode  = "off"
+[rules.pack.params]
 # countries = ["RU", "CN"]   # ISO 3166-1 alpha-2
+
+# Broad honeypot bait from nginx-honeypot's honey.conf (F7.1): any `.aspx`,
+# `cgi-bin`, `node_modules`, `/actuator/health`, any dotfile path. Deliberate
+# bait on a decoy, but too generic to block on a real site — shadow default.
+[[rules.pack]]
+name = "honeypot_paths"
+mode  = "shadow"
+
+# Host allowlist (F7.1): requests whose Host header is not one of your
+# domains (including Host-less requests — bare-IP scans) are blocked.
+# Off by default; requires `params.domains`.
+[[rules.pack]]
+name = "host_allowlist"
+mode  = "off"
+[rules.pack.params]
+# domains = ["example.com", "www.example.com"]
 
 # Static inline rules (in addition to the DB-managed ones).
 [[rules.custom]]
@@ -295,8 +312,69 @@ action = "challenge"
 # tier = "authorized"
 # refresh_hours = 24
 #
+# Datasets (F7.6): `kind = "user_agent" | "path"` compiles a plain one-per-
+# line list (https, SSRF-guarded) into one synthetic rule — entries are
+# matched as case-insensitive literals. Unlike IP feeds there is no
+# enrichment tier: `action` defaults to "log" (annotate only); set
+# "block"/"challenge" to enforce. Disabled by default — nothing is shipped
+# until you add a dataset. A background refresh updates the service copy;
+# the rule itself is rebuilt on restart or rules hot-reload.
+#
+# [[rules.feeds]]
+# name = "bad_bots_ultimate"
+# kind = "user_agent"
+# url  = "https://raw.githubusercontent.com/mitchellkrogza/nginx-ultimate-bad-bot-blocker/master/_generator_lists/bad-user-agents.list"
+# refresh_hours = 24
+# action = "log"            # start in shadow; flip to "block" after auditing
+#
+# [[rules.feeds]]
+# name = "probe_paths"
+# kind = "path"
+# url  = "https://example.invalid/probe-paths.txt"
+# refresh_hours = 24
+# action = "challenge"
+#
+# Authenticated feeds: `headers_env` maps header name → env var (values
+# never live in the config file). Example: the AbuseIPDB blacklist
+# (subscriber feature, plain-text with `plaintext=true`).
+#
+# [[rules.feeds]]
+# name = "abuseipdb_blacklist"
+# url  = "https://api.abuseipdb.com/api/v2/blacklist?confidenceMinimum=90&plaintext=true"
+# tier = "malicious"
+# refresh_hours = 24
+# headers_env = { Key = "SENTRY_ABUSEIPDB_KEY" }
+#
 # enabled = true is the default; set enabled = false to pause a feed without
 # removing it.
+
+# Real client IP + trusted infrastructure (F7.2).
+[real_ip]
+# Peers allowed to set header-borne client IPs (CF-Connecting-IP,
+# True-Client-IP, X-Real-IP, XFF). Headers from any other peer are ignored —
+# a direct-to-origin client cannot spoof its IP with a forged header.
+# trusted_proxies = ["10.0.0.0/8", "192.0.2.1"]
+# Auto-include the Cloudflare ranges (bundled + refreshed daily from
+# cloudflare.com/ips-v4|ips-v6). Default true.
+# cloudflare = true
+# The nginx-honeypot TRUSTED_IPS concept: clients never to ban, block or
+# report (admins, uptime probes). They short-circuit the pipeline to Allow.
+# trusted_ips = ["203.0.113.7", "2001:db8::1"]
+# refresh_secs = 86400
+
+# On-demand external IP reputation (F7.5): gray-band IPs — local score
+# elevated but not yet acted on, or carrying a listed signal — are checked
+# against AbuseIPDB and the confidence score re-enters the pipeline (it can
+# only raise the verdict). Off by default; consumes API quota.
+[ip_lookup]
+enabled = false
+provider = "abuseipdb"
+key_env = "SENTRY_ABUSEIPDB_KEY"
+trigger_above = 25          # local risk score band start
+on_signals = []             # e.g. ["sensitive_path"] to widen the trigger
+cache_ttl_secs = 86400
+max_per_hour = 500          # quota guard (AbuseIPDB free tier: 1000/day)
+timeout_secs = 10
 
 # ── Sources ──────────────────────────────────────────────────────────────
 [[source]]
@@ -448,6 +526,36 @@ max_failures = 3               # circuit breaker: disable the provider after N c
 # ipv6_prefix = 64             # 1..=128; absent/128 keeps exact-address rules
 # list_name = "sentry_blocks"  # ^[a-z0-9_]+$, max 50 chars
 # account:   env SENTRY_CF_ACCOUNT (optional — derived from the zone when unset)
+
+# Local kernel-level ban (F7.3): bans are enforced by the machine's own
+# firewall instead of (or next to) a CDN edge. Backends, auto-detected in
+# this order: nftables (recommended — per-element timeouts, sub-ms bans),
+# legacy ipset+iptables, firewalld runtime ipsets. Needs root or
+# CAP_NET_ADMIN (systemd: AmbientCapabilities=CAP_NET_ADMIN) — see
+# `sentry firewall status`. The DB (`ip_state`) is the source of truth:
+# bans are re-seeded on restart and reconciled every 60s; `[real_ip]
+# trusted_ips` are never banned. Linux only.
+# [[action]]
+# type = "challenge"
+# provider = "firewall"
+# [action.options]
+# backend = "auto"             # auto | nftables | ipset | firewalld
+# ttl_secs = 86400             # Block/Challenge ban duration
+# rate_limit_ttl_secs = 600    # shorter TTL for RateLimit verdicts
+# table = "sentry"             # nftables table name
+# set_prefix = "sentry_blocks" # sets sentry_blocks_v4 / sentry_blocks_v6
+
+# Community abuse reporting (F7.4): reports IPs that earn an enforcing
+# verdict to AbuseIPDB or ReportedIP, with signal→category mapping and a
+# per-IP dedupe window (one report per IP per TTL — mind the daily quotas).
+# [[action]]
+# type = "report"
+# provider = "abuseipdb"       # abuseipdb | reportedip
+# [action.options]
+# key_env = "SENTRY_ABUSEIPDB_KEY"
+# min_verdict = "block"        # block | challenge | rate_limit
+# dedupe_hours = 24
+# timeout_secs = 10
 
 [[action]]
 type = "webhook"

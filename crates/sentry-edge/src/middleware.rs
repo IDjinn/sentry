@@ -25,7 +25,7 @@ use axum::response::{IntoResponse, Response};
 use sentry_core::analysis::Verdict;
 use sentry_core::event::{Event, HttpData, ProtocolData, SourceKind, Transport};
 
-use crate::{real_client_ip, EdgeRuntime};
+use crate::EdgeRuntime;
 
 /// How the middleware treats decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,7 +78,7 @@ pub async fn handler(State(runtime): State<EdgeRuntime>, req: Request, next: Nex
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|c| c.0.ip())
         .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
-    let client_ip = real_client_ip(&parts.headers, peer);
+    let client_ip = crate::real_client_ip_with(&parts.headers, peer, runtime.trust());
 
     // Sticky blocks deny before the pipeline runs — a blocked IP stays
     // blocked even when this request alone would score as benign.

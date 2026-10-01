@@ -28,11 +28,12 @@ use sentry_core::RiskLevel;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-/// A challenge action paired with its concrete provider handle (when the
-/// provider is built locally — currently only Cloudflare).
+/// A challenge action paired with its concrete provider handles (when the
+/// providers are built locally — Cloudflare edge rules, local firewall).
 struct ChallengeActionWithProvider {
     action: ChallengeAction,
     provider: Option<Arc<sentry_action_cloudflare::CloudflareProvider>>,
+    firewall: Option<Arc<sentry_action_firewall::FirewallProvider>>,
 }
 
 /// Deduplication cache: prevents processing the same event (by hash) within
@@ -128,13 +129,51 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         "starting sentry daemon"
     );
 
-    // Build the ruleset from configured packs + custom rules.
+    // Build the ruleset from configured packs + custom rules. Pack params
+    // flatten into `<pack>__<param>` keys (e.g. `host_allowlist__domains`);
+    // without this the param-driven packs silently never saw their params.
     let pack_modes: HashMap<String, String> = cfg
         .rules
         .packs
         .iter()
-        .map(|p| (p.name.clone(), p.mode.clone()))
+        .flat_map(|p| {
+            let mut entries = vec![(p.name.clone(), p.mode.clone())];
+            for (key, value) in &p.params {
+                let rendered = match value {
+                    toml::Value::String(s) => Some(s.clone()),
+                    toml::Value::Array(arr) => Some(
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                    _ => None,
+                };
+                if let Some(s) = rendered {
+                    entries.push((format!("{}__{}", p.name, key), s));
+                }
+            }
+            entries
+        })
         .collect();
+
+    // Reputation feeds (F3.7) + datasets (F7.6): fetch once at startup so
+    // enrichment is live and dataset rules have content before the ruleset
+    // is shared, then refresh in the background. A failing feed keeps its
+    // previous entries.
+    let reputation = if cfg.rules.feeds.iter().any(|f| f.enabled) {
+        let svc = Arc::new(sentry_reputation::ReputationService::new(&cfg.rules.feeds));
+        tokio::time::timeout(Duration::from_secs(120), svc.refresh_all())
+            .await
+            .map_err(|_| warn!("reputation feed startup sync timed out — continuing"))
+            .ok();
+        svc.log_summary().await;
+        svc.spawn_refresh_tasks();
+        Some(svc)
+    } else {
+        None
+    };
+
     let mut rules = build_default_ruleset(&pack_modes);
     // Static inline rules from `[[rules.custom]]` (config source).
     for parsed in sentry_core::rules::rules_from_config(&cfg.rules.custom) {
@@ -153,25 +192,41 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             Err(e) => warn!(feed = %feed.name, error = %e, "invalid feed config — skipped"),
         }
     }
+    // Dataset feeds (`kind = "user_agent" | "path"`, F7.6): one synthetic
+    // rule per dataset from the content fetched above. The rule carries the
+    // startup snapshot; a later background refresh updates the service's
+    // copy but not the rule (a restart or rules hot-reload picks it up).
+    if let Some(ref svc) = reputation {
+        for feed in cfg.rules.feeds.iter().filter(|f| f.enabled) {
+            if matches!(
+                feed.kind,
+                sentry_core::config::FeedKind::UserAgent | sentry_core::config::FeedKind::Path
+            ) {
+                match svc.dataset(&feed.name).await {
+                    Some(entries) => match sentry_core::reputation::dataset_rule(feed, &entries) {
+                        Ok(Some(rule)) => {
+                            info!(
+                                feed = %feed.name,
+                                entries = entries.len(),
+                                "dataset rule built"
+                            );
+                            rules.extend(std::iter::once(rule));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!(feed = %feed.name, error = %e, "invalid dataset rule — skipped")
+                        }
+                    },
+                    None => {
+                        warn!(feed = %feed.name, "dataset feed has no fetched content — skipped")
+                    }
+                }
+            }
+        }
+    }
     info!(rule_count = rules.len(), "ruleset built from default packs");
 
     let shared_rules: SharedRuleSet = shared(rules);
-
-    // Reputation feeds (F3.7): fetch once at startup so enrichment is live
-    // before the first event, then refresh in the background. A failing
-    // feed keeps its previous entries.
-    let reputation = if cfg.rules.feeds.iter().any(|f| f.enabled) {
-        let svc = Arc::new(sentry_reputation::ReputationService::new(&cfg.rules.feeds));
-        tokio::time::timeout(Duration::from_secs(120), svc.refresh_all())
-            .await
-            .map_err(|_| warn!("reputation feed startup sync timed out — continuing"))
-            .ok();
-        svc.log_summary().await;
-        svc.spawn_refresh_tasks();
-        Some(svc)
-    } else {
-        None
-    };
 
     // Open geo databases (graceful no-op if files absent).
     let geo = match sentry_geo::GeoLookup::open(&cfg.geo.city_db, &cfg.geo.asn_db) {
@@ -324,13 +379,25 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         ))
     });
 
+    // Trusted infrastructure (F7.2): proxies allowed to set header-borne
+    // client IPs (Cloudflare ranges + `[real_ip] trusted_proxies`) and
+    // never-ban clients (`[real_ip] trusted_ips`).
+    let shared_trust = sentry_core::SharedTrustSet::new(
+        sentry_core::TrustSet::from_config(&cfg.real_ip)
+            .map_err(|e| color_eyre::eyre::eyre!("[real_ip] {e}"))?,
+    );
+    if cfg.real_ip.cloudflare && cfg.real_ip.refresh_secs > 0 {
+        spawn_cloudflare_refresh(cfg.real_ip.clone(), shared_trust.clone());
+    }
+
     let mut pipeline_builder = Pipeline::with_config(
         Arc::clone(&shared_rules),
         route_validator,
         cfg.scorer.clone(),
         policy,
     )
-    .with_rate_limiter(build_rate_limiter(&cfg)?);
+    .with_rate_limiter(build_rate_limiter(&cfg)?)
+    .with_trust(shared_trust.clone());
     if let Some(ref t) = scan_tracker {
         pipeline_builder = pipeline_builder.with_scan_tracker(Arc::clone(t));
     }
@@ -473,7 +540,51 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     }
 
     // Build the plugin registry from config.
-    let (registry, cf_provider) = build_registry(&cfg, Arc::clone(&block_table))?;
+    let RegistryBundle {
+        registry,
+        cf_provider,
+        fw_provider,
+    } = build_registry(&cfg, Arc::clone(&block_table), &shared_trust)?;
+
+    // Firewall reconcile (F7.3): the DB (`ip_state`) is the source of
+    // truth — provision the sets, re-seed persisted bans after a restart,
+    // and keep the live sets converging in the background (manual
+    // unblocks from CLI/dashboard/other nodes, expired entries).
+    if let (Some(ref fw), Some(ref repo)) = (&fw_provider, &repo) {
+        let rows = repo.ip_state().blocked(10_000).await.unwrap_or_default();
+        let expected = expected_firewall_entries(&rows);
+        match fw.sync(&expected).await {
+            Ok((added, removed)) => {
+                info!(
+                    backend = fw.resolved_backend().map(|b| b.as_str()).unwrap_or("?"),
+                    added, removed, "firewall synced with ip_state"
+                );
+            }
+            Err(e) => warn!(error = %e, "firewall initial sync failed"),
+        }
+        let fw_task = Arc::clone(fw);
+        let repo_task = Arc::clone(repo);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await; // skip the immediate tick (startup sync above)
+            loop {
+                interval.tick().await;
+                let rows = repo_task
+                    .ip_state()
+                    .blocked(10_000)
+                    .await
+                    .unwrap_or_default();
+                let expected = expected_firewall_entries(&rows);
+                match fw_task.sync(&expected).await {
+                    Ok((added, removed)) if added > 0 || removed > 0 => {
+                        info!(added, removed, "firewall reconcile applied changes");
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "firewall reconcile failed"),
+                }
+            }
+        });
+    }
 
     // Local ML threat model: runs as a fork off the hot path (or inline /
     // shadow, per [ai] config) and feeds signals back via rescore_from.
@@ -499,6 +610,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     // Remote LLM classifier (Layer 2): escalates suspicious or quarantined
     // events off the hot path, bounded by a semaphore and a verdict cache.
     let llm_fork = build_llm_fork(&cfg);
+    let ip_lookup_fork = build_ip_lookup_fork(&cfg);
 
     if registry.source_count() == 0 {
         warn!("no sources configured — daemon will idle. Add [[source]] entries in sentry.toml");
@@ -553,6 +665,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         let tx = event_tx.clone();
         let geo_clone = geo.as_ref().map(Arc::clone);
         let reputation_clone = reputation.as_ref().map(Arc::clone);
+        let trust_clone = shared_trust.clone();
         tokio::spawn(async move {
             info!(source = source.name(), "starting source");
             match source.stream().await {
@@ -562,6 +675,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                             .client_ip
                             .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
                         let mut evt = raw.into_event(ip);
+                        mark_trusted(&mut evt, &trust_clone);
                         if let Some(ref g) = geo_clone {
                             g.enrich(&mut evt);
                         }
@@ -591,7 +705,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 "[deployment] mode = \"inline\" requires [edge] upstream"
             ));
         }
-        let enricher = make_enricher(&geo, &reputation);
+        let enricher = make_enricher(&geo, &reputation, &shared_trust);
         let (dec_tx, mut dec_rx) = mpsc::channel::<sentry_core::ProcessedEvent>(buffer);
         let proxy_cfg = sentry_edge::proxy::EdgeProxyConfig {
             listen: cfg.edge.listen.clone(),
@@ -606,6 +720,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             enricher.clone(),
             cfg.edge.body_capture_kb.saturating_mul(1024),
         )
+        .with_trust(shared_trust.clone())
         .with_block_table(Arc::clone(&block_table))
         .with_block_hits(metrics.edge_block_hits.clone());
         let edge_pipeline = cfg.edge.upstream.clone();
@@ -626,6 +741,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             (cfg.edge.tcp_listen.clone(), cfg.edge.tcp_upstream.clone())
         {
             let tcp_runtime = sentry_edge::EdgeRuntime::new(Arc::clone(&pipeline), enricher, 0)
+                .with_trust(shared_trust.clone())
                 .with_block_table(Arc::clone(&block_table))
                 .with_block_hits(metrics.edge_block_hits.clone());
             let (tcp_dec_tx, mut tcp_dec_rx) = mpsc::channel::<sentry_core::ProcessedEvent>(buffer);
@@ -885,6 +1001,20 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 }
             }
 
+            // IP lookup fork (F7.5): external reputation check for gray-band
+            // IPs, after the AI/LLM forks so a post-LLM score counts toward
+            // the trigger band.
+            if let Some(ref lookup) = ip_lookup_fork {
+                if lookup.should_run(&result) {
+                    lookup.spawn_fork(
+                        result.clone(),
+                        Arc::clone(&pipeline),
+                        registry.clone(),
+                        repo.clone(),
+                    );
+                }
+            }
+
             // Mirror offender strikes to Postgres and log escalations.
             if result.decision.action != sentry_core::Verdict::Allow {
                 if let Some(ref offender) = offender_tracker {
@@ -958,16 +1088,23 @@ enum Incoming {
 }
 
 /// Combined geo + reputation enrichment hook for the inline edge.
+///
+/// Trusted IPs (`[real_ip] trusted_ips`) are tagged `Authorized` before the
+/// feed enrichment runs (which only fills when still unset) so they never
+/// inherit a malicious tier from a feed.
 fn make_enricher(
     geo: &Option<Arc<sentry_geo::GeoLookup>>,
     reputation: &Option<Arc<sentry_reputation::ReputationService>>,
+    trust: &sentry_core::SharedTrustSet,
 ) -> Option<sentry_edge::Enricher> {
     if geo.is_none() && reputation.is_none() {
         return None;
     }
     let geo = geo.clone();
     let reputation = reputation.clone();
+    let trust = trust.clone();
     Some(Arc::new(move |evt: &mut Event| {
+        mark_trusted(evt, &trust);
         if let Some(ref g) = geo {
             g.enrich(evt);
         }
@@ -975,6 +1112,77 @@ fn make_enricher(
             r.enrich(evt);
         }
     }))
+}
+
+/// Tag a never-ban IP as reputation `Authorized` (idempotent; feeds only
+/// fill an unset reputation).
+fn mark_trusted(evt: &mut Event, trust: &sentry_core::SharedTrustSet) {
+    if evt.reputation.is_none() && trust.is_never_ban(evt.client_ip) {
+        evt.reputation = Some(sentry_core::ReputationInfo {
+            tier: sentry_core::rules::ReputationTier::Authorized,
+            source: "trusted_ips".into(),
+        });
+    }
+}
+
+/// Background task: refresh the Cloudflare ranges (`[real_ip] cloudflare`,
+/// F7.2) and swap them into the shared trust set. A failed or empty refresh
+/// keeps the previous ranges (the bundled constants at bootstrap).
+fn spawn_cloudflare_refresh(cfg: sentry_core::RealIpConfig, trust: sentry_core::SharedTrustSet) {
+    let secs = cfg.refresh_secs.max(60);
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "cloudflare ranges: http client build failed");
+                return;
+            }
+        };
+        let mut interval = tokio::time::interval(Duration::from_secs(secs));
+        loop {
+            interval.tick().await; // first tick fires immediately
+            let mut fetched = Vec::new();
+            for url in [
+                "https://www.cloudflare.com/ips-v4",
+                "https://www.cloudflare.com/ips-v6",
+            ] {
+                match client.get(url).send().await {
+                    Ok(resp) if resp.status().is_success() => match resp.text().await {
+                        Ok(text) => {
+                            fetched.extend(sentry_core::trust::parse_range_list(&text));
+                        }
+                        Err(e) => {
+                            warn!(url, error = %e, "cloudflare ranges: body read failed")
+                        }
+                    },
+                    Ok(resp) => {
+                        warn!(url, status = %resp.status(), "cloudflare ranges refresh failed")
+                    }
+                    Err(e) => warn!(url, error = %e, "cloudflare ranges refresh failed"),
+                }
+            }
+            if fetched.is_empty() {
+                warn!("cloudflare ranges refresh came back empty — keeping previous ranges");
+                continue;
+            }
+            // Config proxies + never-ban entries were validated at startup;
+            // rebuild the set with cloudflare = false and layer the fetched
+            // ranges on top.
+            let base_cfg = sentry_core::RealIpConfig {
+                cloudflare: false,
+                ..cfg.clone()
+            };
+            let mut next = sentry_core::TrustSet::from_config(&base_cfg)
+                .expect("real_ip entries were validated at startup");
+            next.add_proxies(fetched);
+            let proxies = next.proxy_count();
+            trust.update(next);
+            info!(trusted_ranges = proxies, "cloudflare ranges refreshed");
+        }
+    });
 }
 
 /// Resolve the incident for a High/Critical event (F4.5).
@@ -1481,6 +1689,188 @@ fn non_empty_or(value: &str, fallback: &str) -> String {
     }
 }
 
+/// External IP-reputation lookup fork (F7.5): checks "gray-band" IPs —
+/// local score elevated but not yet acted on, or carrying a configured
+/// suspicious signal — against the provider (AbuseIPDB `/check`) and feeds
+/// the confidence score back through [`Pipeline::rescore_from`], which can
+/// only raise the verdict. Runs after the AI/LLM forks so an elevated
+/// post-LLM score counts toward the trigger band. TTL cache per IP + a
+/// rolling-hour quota guard protect the provider's daily limits.
+struct IpLookupFork {
+    provider: Arc<dyn sentry_ai::IpLookupProvider>,
+    trigger_above: u8,
+    cache_ttl: Duration,
+    max_per_hour: u32,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    cache: std::sync::Mutex<HashMap<IpAddr, (Instant, u8)>>,
+    quota: std::sync::Mutex<(Instant, u32)>,
+    on_signals: Vec<sentry_core::analysis::SignalKind>,
+}
+
+impl IpLookupFork {
+    /// Whether the result qualifies for a lookup (band, signals, quota).
+    fn should_run(&self, r: &sentry_core::ProcessedEvent) -> bool {
+        // Block already acted; the lookup can only raise, so spend no quota.
+        if r.decision.action == sentry_core::Verdict::Block {
+            return false;
+        }
+        let band = r.analysis.risk_score >= self.trigger_above;
+        let signal_hit = !self.on_signals.is_empty()
+            && r.analysis
+                .signals
+                .iter()
+                .any(|s| self.on_signals.contains(&s.kind));
+        if !band && !signal_hit {
+            return false;
+        }
+        if let Some((ts, _)) = self.cache.lock().unwrap().get(&r.event.client_ip) {
+            if ts.elapsed() < self.cache_ttl {
+                return false;
+            }
+        }
+        let mut quota = self.quota.lock().unwrap();
+        if quota.0.elapsed() >= Duration::from_secs(3600) {
+            *quota = (Instant::now(), 0);
+        }
+        if quota.1 >= self.max_per_hour {
+            return false;
+        }
+        quota.1 += 1;
+        true
+    }
+
+    /// Check the IP (cache-aware).
+    async fn evaluate(&self, ip: IpAddr) -> Option<u8> {
+        if let Some((ts, score)) = self.cache.lock().unwrap().get(&ip) {
+            if ts.elapsed() < self.cache_ttl {
+                return Some(*score);
+            }
+        }
+        let _permit = self.semaphore.acquire().await;
+        match self.provider.check(ip).await {
+            Ok(res) => {
+                let mut cache = self.cache.lock().unwrap();
+                cache.retain(|_, (ts, _)| ts.elapsed() < self.cache_ttl);
+                cache.insert(ip, (Instant::now(), res.score));
+                Some(res.score)
+            }
+            Err(e) => {
+                warn!(provider = self.provider.name(), ip = %ip, error = %e, "ip lookup failed");
+                None
+            }
+        }
+    }
+
+    /// Spawn the fork evaluation for a processed event.
+    fn spawn_fork(
+        self: &Arc<Self>,
+        base: sentry_core::ProcessedEvent,
+        pipeline: Arc<Pipeline>,
+        registry: sentry_core::registry::Registry,
+        repo: Option<Arc<sentry_storage::Repo>>,
+    ) {
+        let fork = Arc::clone(self);
+        tokio::spawn(async move {
+            let Some(score) = fork.evaluate(base.event.client_ip).await else {
+                return;
+            };
+            // Provider confidence scales the weight: 25% ≈ +10, 100% ≈ +40.
+            let weight = ((u16::from(score) * 40) / 100).min(40) as u8;
+            if weight == 0 {
+                return;
+            }
+            let signals = vec![sentry_core::Signal {
+                kind: sentry_core::SignalKind::ExternalReputation,
+                weight,
+                detail: Some(format!("{} confidence_score={score}", fork.provider.name())),
+            }];
+            let updated = pipeline.rescore_from(&base, signals);
+            if updated.decision.action == base.decision.action {
+                return;
+            }
+            info!(
+                ip = %base.event.client_ip,
+                from = ?base.decision.action,
+                to = ?updated.decision.action,
+                score = updated.analysis.risk_score,
+                "ip lookup changed verdict"
+            );
+            if let Some(ref repo) = repo {
+                if let Err(e) = repo
+                    .events()
+                    .update_verdict(
+                        base.event.id,
+                        updated.decision.action,
+                        updated.analysis.risk_score,
+                        updated.analysis.risk_level,
+                    )
+                    .await
+                {
+                    warn!(error = %e, "ip lookup fork: failed to update event verdict");
+                }
+            }
+            for action in registry.actions() {
+                if action.applies_to(&updated.decision) {
+                    let ctx = incident_context(&repo, &updated).await;
+                    if let Err(e) = action
+                        .execute_with_context(&updated.event, &updated.decision, &ctx)
+                        .await
+                    {
+                        warn!(action = action.name(), error = %e, "ip lookup fork action failed");
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Build the IP lookup fork from `[ip_lookup]` config when enabled.
+fn build_ip_lookup_fork(cfg: &SentryConfig) -> Option<Arc<IpLookupFork>> {
+    let ilc = &cfg.ip_lookup;
+    if !ilc.enabled {
+        return None;
+    }
+    if ilc.provider != "abuseipdb" {
+        warn!(provider = %ilc.provider, "unknown ip_lookup provider — fork disabled");
+        return None;
+    }
+    let key = std::env::var(&ilc.key_env)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let Some(key) = key else {
+        warn!(env = %ilc.key_env, "ip_lookup key unset — fork disabled");
+        return None;
+    };
+    let on_signals = ilc
+        .on_signals
+        .iter()
+        .filter_map(|name| {
+            serde_json::from_value::<sentry_core::analysis::SignalKind>(serde_json::Value::String(
+                name.clone(),
+            ))
+            .map_err(|_| warn!(signal = %name, "unknown ip_lookup on_signals kind — skipped"))
+            .ok()
+        })
+        .collect();
+    info!(
+        provider = "abuseipdb",
+        trigger_above = ilc.trigger_above,
+        max_per_hour = ilc.max_per_hour,
+        "ip lookup fork enabled"
+    );
+    Some(Arc::new(IpLookupFork {
+        provider: Arc::new(sentry_ai::AbuseIpDbLookup::new(key, None)),
+        trigger_above: ilc.trigger_above,
+        cache_ttl: Duration::from_secs(ilc.cache_ttl_secs),
+        max_per_hour: ilc.max_per_hour.max(1),
+        semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+        cache: std::sync::Mutex::new(HashMap::new()),
+        quota: std::sync::Mutex::new((Instant::now(), 0)),
+        on_signals,
+    }))
+}
+
 /// Thin wrapper so the daemon can call the metrics server without importing
 /// the crate-internal module path in every call site.
 async fn serve_metrics(
@@ -1664,18 +2054,17 @@ fn print_event(evt: &Event, level: &RiskLevel, signals: &[String]) {
 
 /// Build the plugin registry from config.
 ///
-/// Returns the registry plus, when a Cloudflare challenge action is
-/// configured, a handle to the concrete `CloudflareProvider` (used by the
-/// background reaper and the CLI status commands).
+/// Returns the registry plus, when configured, handles to the concrete
+/// local providers (`CloudflareProvider` for the background reaper and CLI
+/// status commands; `FirewallProvider` for the DB reconcile loop).
 fn build_registry(
     cfg: &SentryConfig,
     block_table: Arc<sentry_core::BlockTable>,
-) -> color_eyre::Result<(
-    sentry_core::registry::Registry,
-    Option<Arc<sentry_action_cloudflare::CloudflareProvider>>,
-)> {
+    trust: &sentry_core::SharedTrustSet,
+) -> color_eyre::Result<RegistryBundle> {
     let mut builder = RegistryBuilder::new();
     let mut cf_provider: Option<Arc<sentry_action_cloudflare::CloudflareProvider>> = None;
+    let mut fw_provider: Option<Arc<sentry_action_firewall::FirewallProvider>> = None;
 
     for src in &cfg.sources {
         match src.kind.as_str() {
@@ -1699,6 +2088,7 @@ fn build_registry(
                         path: path.into(),
                         format,
                         start_from_end: true,
+                        trust: Some(trust.clone()),
                     },
                 )?;
                 builder.register_source(ns);
@@ -1813,6 +2203,58 @@ fn build_registry(
                     block_table.clone(),
                 ));
             }
+            ActionKind::Report => {
+                // Community abuse-database reporting (F7.4): `provider` picks
+                // abuseipdb | reportedip; the API key comes from `key_env`.
+                // An unset key skips the action with a warning — reporting is
+                // opt-in per deployment.
+                let provider_name = act.provider.as_deref().unwrap_or("abuseipdb").to_string();
+                let Some(provider) = sentry_action_report::ReportProvider::parse(&provider_name)
+                else {
+                    return Err(color_eyre::eyre::eyre!(
+                        "report action: unknown provider `{provider_name}` — known: abuseipdb, reportedip"
+                    ));
+                };
+                let key_env = act
+                    .options
+                    .get("key_env")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(provider.default_key_env())
+                    .to_string();
+                let key = std::env::var(&key_env)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let Some(key) = key else {
+                    warn!(
+                        env = key_env,
+                        "report provider key unset — report action skipped"
+                    );
+                    continue;
+                };
+                let min_verdict = match act.options.get("min_verdict").and_then(|v| v.as_str()) {
+                    Some(s) => sentry_action_report::parse_min_verdict(s)
+                        .map_err(|e| color_eyre::eyre::eyre!("{e}"))?,
+                    None => sentry_core::analysis::Verdict::Block,
+                };
+                let dedupe_hours = parse_ttl_secs(&act.options, 24).max(1);
+                let timeout = parse_ttl_secs(&act.options, 10).max(1);
+                let endpoint = act
+                    .options
+                    .get("endpoint")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                builder.register_action(sentry_action_report::ReportAction::new(
+                    sentry_action_report::ReportActionConfig {
+                        provider,
+                        key,
+                        min_verdict,
+                        dedupe_ttl: Duration::from_secs(dedupe_hours * 3600),
+                        timeout: Duration::from_secs(timeout),
+                        endpoint,
+                    },
+                ));
+            }
             ActionKind::Webhook => {
                 // The target URL is a credential for hosted chat webhooks
                 // (Discord etc.); `url_env` keeps it out of the config file.
@@ -1874,9 +2316,12 @@ fn build_registry(
                 ));
             }
             ActionKind::Cloudflare => {
-                if let Some(built) = build_challenge_action("cloudflare", &act.options)? {
+                if let Some(built) = build_challenge_action("cloudflare", &act.options, trust)? {
                     if cf_provider.is_none() {
                         cf_provider = built.provider;
+                    }
+                    if fw_provider.is_none() {
+                        fw_provider = built.firewall;
                     }
                     builder.register_action(built.action);
                 }
@@ -1887,9 +2332,12 @@ fn build_registry(
                         "challenge action requires `provider` (e.g. provider = \"cloudflare\")"
                     )
                 })?;
-                if let Some(built) = build_challenge_action(provider, &act.options)? {
+                if let Some(built) = build_challenge_action(provider, &act.options, trust)? {
                     if cf_provider.is_none() {
                         cf_provider = built.provider;
+                    }
+                    if fw_provider.is_none() {
+                        fw_provider = built.firewall;
                     }
                     builder.register_action(built.action);
                 }
@@ -1901,7 +2349,11 @@ fn build_registry(
         builder.register_action(LogAction);
     }
 
-    Ok((builder.build(), cf_provider))
+    Ok(RegistryBundle {
+        registry: builder.build(),
+        cf_provider,
+        fw_provider,
+    })
 }
 
 /// Effective blocklist TTL: `ttl_secs` of the first `[[action]]
@@ -1963,18 +2415,46 @@ fn parse_ipv6_prefix(opts: &HashMap<String, toml::Value>) -> Option<u8> {
     }
 }
 
+/// Build the firewall reconcile map from `ip_state` rows: IP → remaining
+/// ban TTL in seconds (`None` = permanent).
+fn expected_firewall_entries(
+    rows: &[sentry_storage::repo::IpStateRow],
+) -> HashMap<IpAddr, Option<u64>> {
+    let now = chrono::Utc::now();
+    rows.iter()
+        .filter_map(|r| {
+            let ip = r.ip.parse::<IpAddr>().ok()?;
+            let ttl = r
+                .expires_at
+                .map(|ts| (ts - now).num_seconds().max(1) as u64);
+            Some((ip, ttl))
+        })
+        .collect()
+}
+
+/// Locally-constructed provider handles returned alongside the registry.
+struct RegistryBundle {
+    registry: sentry_core::registry::Registry,
+    cf_provider: Option<Arc<sentry_action_cloudflare::CloudflareProvider>>,
+    fw_provider: Option<Arc<sentry_action_firewall::FirewallProvider>>,
+}
+
+type ProviderHandles = (
+    Arc<dyn ChallengeProvider>,
+    Option<Arc<sentry_action_cloudflare::CloudflareProvider>>,
+    Option<Arc<sentry_action_firewall::FirewallProvider>>,
+);
+
 fn build_challenge_action(
     provider_name: &str,
     options: &HashMap<String, toml::Value>,
+    trust: &sentry_core::SharedTrustSet,
 ) -> color_eyre::Result<Option<ChallengeActionWithProvider>> {
     let ttl = Duration::from_secs(parse_ttl_secs(options, 86400));
     let mode = parse_edge_mode(options);
     let opts = EdgeOptions { ttl, mode };
 
-    let (provider, cf_concrete): (
-        Arc<dyn ChallengeProvider>,
-        Option<Arc<sentry_action_cloudflare::CloudflareProvider>>,
-    ) = match provider_name {
+    let (provider, cf_concrete, fw_concrete): ProviderHandles = match provider_name {
         "cloudflare" => {
             let token = std::env::var("SENTRY_CF_TOKEN").unwrap_or_default();
             let zone = std::env::var("SENTRY_CF_ZONE").unwrap_or_default();
@@ -2005,11 +2485,48 @@ fn build_challenge_action(
                     account,
                 },
             ));
-            (cf.clone(), Some(cf))
+            (cf.clone(), Some(cf), None)
+        }
+        "firewall" => {
+            // Local kernel-level enforcement (F7.3): nftables/ipset/
+            // firewalld. Linux-only; needs CAP_NET_ADMIN (see deploy docs).
+            if !cfg!(target_os = "linux") {
+                warn!("firewall provider is Linux-only — skipping");
+                return Ok(None);
+            }
+            let backend = match options.get("backend").and_then(|v| v.as_str()) {
+                Some(s) => sentry_action_firewall::FirewallBackend::parse(s)
+                    .ok_or_else(|| {
+                        color_eyre::eyre::eyre!(
+                            "firewall action: unknown backend `{s}` — known: auto, nftables, ipset, firewalld"
+                        )
+                    })?,
+                None => None,
+            };
+            let rate_limit_ttl = Duration::from_secs(parse_ttl_secs(options, 600));
+            let fw = Arc::new(sentry_action_firewall::FirewallProvider::new(
+                sentry_action_firewall::FirewallConfig {
+                    backend,
+                    ttl,
+                    rate_limit_ttl,
+                    table: options
+                        .get("table")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("sentry")
+                        .to_string(),
+                    set_prefix: options
+                        .get("set_prefix")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("sentry_blocks")
+                        .to_string(),
+                },
+                Some(trust.clone()),
+            ));
+            (fw.clone(), None, Some(fw))
         }
         other => {
             return Err(color_eyre::eyre::eyre!(
-                "unknown challenge provider `{other}` — known: cloudflare"
+                "unknown challenge provider `{other}` — known: cloudflare, firewall"
             ));
         }
     };
@@ -2017,6 +2534,7 @@ fn build_challenge_action(
     Ok(Some(ChallengeActionWithProvider {
         action: ChallengeAction::new(provider, opts),
         provider: cf_concrete,
+        firewall: fw_concrete,
     }))
 }
 
@@ -2254,6 +2772,13 @@ fn _ensure_ruleset_import() -> RuleSet {
 #[cfg(test)]
 mod tests {
     use super::instance_label;
+    use super::IpLookupFork;
+    use sentry_core::analysis::{AnalysisResult, Decision, Signal, SignalKind, Verdict};
+    use sentry_core::event::{HttpData, ProtocolData, SourceKind};
+    use sentry_core::pipeline::ProcessedEvent;
+    use std::net::IpAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn configured_instance_id_wins() {
@@ -2266,5 +2791,108 @@ mod tests {
         let label = instance_label("");
         assert!(!label.is_empty());
         assert!(!label.contains(char::is_whitespace));
+    }
+
+    struct NoopLookup;
+
+    #[async_trait::async_trait]
+    impl sentry_ai::IpLookupProvider for NoopLookup {
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+        async fn check(&self, _ip: IpAddr) -> Result<sentry_ai::IpLookupResult, String> {
+            Ok(sentry_ai::IpLookupResult {
+                score: 80,
+                provider: "noop",
+            })
+        }
+    }
+
+    fn fork(trigger_above: u8, on_signals: Vec<SignalKind>, max_per_hour: u32) -> IpLookupFork {
+        IpLookupFork {
+            provider: Arc::new(NoopLookup),
+            trigger_above,
+            cache_ttl: Duration::from_secs(3600),
+            max_per_hour,
+            semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            quota: std::sync::Mutex::new((std::time::Instant::now(), 0)),
+            on_signals,
+        }
+    }
+
+    fn processed(ip: IpAddr, score: u8, signals: Vec<Signal>) -> ProcessedEvent {
+        let analysis = AnalysisResult {
+            risk_score: score,
+            signals,
+            ..AnalysisResult::default()
+        };
+        let evt = sentry_core::Event::new(
+            SourceKind::Synthetic,
+            ip,
+            ProtocolData::Http(HttpData::default()),
+        );
+        ProcessedEvent {
+            event: evt,
+            decision: Decision {
+                analysis: analysis.clone(),
+                action: Verdict::Allow,
+                override_reason: None,
+            },
+            analysis,
+            rule_hit: None,
+        }
+    }
+
+    #[test]
+    fn gray_band_triggers_block_does_not() {
+        let f = fork(25, Vec::new(), 100);
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        assert!(f.should_run(&processed(ip, 30, Vec::new())));
+        assert!(!f.should_run(&processed(ip, 10, Vec::new())));
+        let blocked = processed(ip, 100, Vec::new());
+        // A Block verdict already acted — no quota spent.
+        assert!(!f.should_run(&ProcessedEvent {
+            decision: Decision {
+                analysis: blocked.analysis.clone(),
+                action: Verdict::Block,
+                override_reason: None,
+            },
+            ..blocked
+        }));
+    }
+
+    #[test]
+    fn signal_trigger_beats_low_score() {
+        let f = fork(25, vec![SignalKind::SensitivePath], 100);
+        let ip: IpAddr = "203.0.113.6".parse().unwrap();
+        let hit = processed(
+            ip,
+            5,
+            vec![Signal {
+                kind: SignalKind::SensitivePath,
+                weight: 30,
+                detail: None,
+            }],
+        );
+        assert!(f.should_run(&hit));
+    }
+
+    #[test]
+    fn quota_is_per_rolling_hour() {
+        let f = fork(25, Vec::new(), 2);
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(f.should_run(&processed(ip, 30, Vec::new())));
+        assert!(f.should_run(&processed(ip, 31, Vec::new())));
+        assert!(!f.should_run(&processed(ip, 32, Vec::new())));
+    }
+
+    #[tokio::test]
+    async fn evaluate_caches_per_ip() {
+        let f = fork(25, Vec::new(), 100);
+        let ip: IpAddr = "203.0.113.8".parse().unwrap();
+        assert_eq!(f.evaluate(ip).await, Some(80));
+        assert_eq!(f.evaluate(ip).await, Some(80));
+        assert_eq!(f.cache.lock().unwrap().len(), 1);
     }
 }

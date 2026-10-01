@@ -70,6 +70,12 @@ pub struct SentryConfig {
     /// Inline edge settings (used when deployment.mode = "inline").
     #[serde(default)]
     pub edge: EdgeConfig,
+    /// Real client IP resolution, trusted proxies and never-ban IPs (F7.2).
+    #[serde(default)]
+    pub real_ip: RealIpConfig,
+    /// On-demand external IP reputation lookup (F7.5).
+    #[serde(default)]
+    pub ip_lookup: IpLookupConfig,
     /// Event sources.
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
@@ -396,6 +402,118 @@ fn default_correlation_enabled() -> bool {
 }
 fn default_correlation_window() -> u64 {
     900 // 15 minutes — the honeypot shot-calling window
+}
+
+/// Real client IP resolution and trusted infrastructure (F7.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealIpConfig {
+    /// Proxy CIDRs/IPs allowed to set header-borne client IPs
+    /// (`CF-Connecting-IP`, `True-Client-IP`, `X-Real-IP`, XFF). Header
+    /// candidates from any other peer are ignored (spoof guard).
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+    /// Include the bundled Cloudflare ranges in the trusted proxies
+    /// (refreshed from cloudflare.com/ips-v4|ips-v6 in the background).
+    #[serde(default = "default_real_ip_cloudflare")]
+    pub cloudflare: bool,
+    /// Clients never to ban, block or report (admins, uptime probes) —
+    /// the nginx-honeypot `TRUSTED_IPS`. They score as
+    /// `ReputationTier::Authorized` and short-circuit the pipeline to
+    /// `Allow`.
+    #[serde(default)]
+    pub trusted_ips: Vec<String>,
+    /// Cloudflare ranges refresh interval in seconds (0 disables refresh;
+    /// the bundled constants stay in effect).
+    #[serde(default = "default_real_ip_refresh")]
+    pub refresh_secs: u64,
+}
+
+impl Default for RealIpConfig {
+    fn default() -> Self {
+        Self {
+            trusted_proxies: Vec::new(),
+            cloudflare: default_real_ip_cloudflare(),
+            trusted_ips: Vec::new(),
+            refresh_secs: default_real_ip_refresh(),
+        }
+    }
+}
+
+fn default_real_ip_cloudflare() -> bool {
+    true
+}
+
+fn default_real_ip_refresh() -> u64 {
+    86400
+}
+
+/// On-demand external IP reputation lookup (F7.5): queries a provider
+/// (AbuseIPDB `/check`) for IPs in the "gray band" — local risk score
+/// elevated but not yet acted on — or carrying configured suspicious
+/// signals, then feeds the provider's confidence score back through
+/// `rescore_from` (which only ever raises the verdict).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpLookupConfig {
+    /// Enable the lookup fork (off by default — it consumes provider quota).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Provider name (`abuseipdb`).
+    #[serde(default = "default_ip_lookup_provider")]
+    pub provider: String,
+    /// Env var carrying the provider API key.
+    #[serde(default = "default_ip_lookup_key_env")]
+    pub key_env: String,
+    /// Look up IPs whose local risk score is at least this (0-100) but whose
+    /// verdict is not yet `Block`.
+    #[serde(default = "default_ip_lookup_trigger_above")]
+    pub trigger_above: u8,
+    /// Additional trigger: event carries any of these signal kinds
+    /// (snake_case names, e.g. `"sensitive_path"`). Empty = score band only.
+    #[serde(default)]
+    pub on_signals: Vec<String>,
+    /// Per-IP result cache TTL in seconds.
+    #[serde(default = "default_ip_lookup_cache_ttl")]
+    pub cache_ttl_secs: u64,
+    /// Provider quota guard: at most this many lookups per rolling hour.
+    #[serde(default = "default_ip_lookup_max_per_hour")]
+    pub max_per_hour: u32,
+    /// Per-request timeout in seconds.
+    #[serde(default = "default_ip_lookup_timeout")]
+    pub timeout_secs: u64,
+}
+
+impl Default for IpLookupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_ip_lookup_provider(),
+            key_env: default_ip_lookup_key_env(),
+            trigger_above: default_ip_lookup_trigger_above(),
+            on_signals: Vec::new(),
+            cache_ttl_secs: default_ip_lookup_cache_ttl(),
+            max_per_hour: default_ip_lookup_max_per_hour(),
+            timeout_secs: default_ip_lookup_timeout(),
+        }
+    }
+}
+
+fn default_ip_lookup_provider() -> String {
+    "abuseipdb".to_string()
+}
+fn default_ip_lookup_key_env() -> String {
+    "SENTRY_ABUSEIPDB_KEY".to_string()
+}
+fn default_ip_lookup_trigger_above() -> u8 {
+    25
+}
+fn default_ip_lookup_cache_ttl() -> u64 {
+    86400
+}
+fn default_ip_lookup_max_per_hour() -> u32 {
+    500
+}
+fn default_ip_lookup_timeout() -> u64 {
+    10
 }
 
 /// Behavioral attack detection over per-IP sliding windows (F3.8).
@@ -972,7 +1090,7 @@ pub struct RuleDefConfig {
     pub tags: Vec<String>,
 }
 
-/// A reputation feed to sync.
+/// A reputation feed or dataset to sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedConfig {
     /// Feed name (used as the rule tag prefix).
@@ -980,21 +1098,58 @@ pub struct FeedConfig {
     /// URL to fetch the feed from (http/https; loopback/private hosts are
     /// rejected).
     pub url: String,
+    /// Entry kind: `ip` (default — reputation ranges), `user_agent` or
+    /// `path` (plain one-per-line lists compiled into a synthetic rule,
+    /// F7.6).
+    #[serde(default)]
+    pub kind: FeedKind,
     /// Refresh interval in hours.
     #[serde(default = "default_feed_refresh")]
     pub refresh_hours: u32,
     /// Reputation tier entries are tagged with: `unknown` | `clean` |
-    /// `suspicious` | `malicious` | `datacenter` | `vpn` | `tor`.
+    /// `suspicious` | `malicious` | `datacenter` | `vpn` | `tor`. Only used
+    /// by `kind = "ip"`.
     #[serde(default = "default_feed_tier")]
     pub tier: String,
     /// Optional action for the synthetic feed rule (`block`, `challenge`,
-    /// `rate_limit`, …). Empty = enrichment only (match via the `tor` /
-    /// `vpn_proxy` packs or user rules).
+    /// `rate_limit`, …). For `kind = "ip"`: empty = enrichment only (match
+    /// via the `tor` / `vpn_proxy` packs or user rules). For `user_agent` /
+    /// `path` datasets: empty = `log` (annotate only).
     #[serde(default)]
     pub action: String,
     /// Whether the feed is fetched at all.
     #[serde(default = "default_feed_enabled")]
     pub enabled: bool,
+    /// Header name → env var name; the header is sent with the value of the
+    /// env var when set (e.g. authenticated feeds such as the AbuseIPDB
+    /// blacklist). Missing env vars are skipped silently.
+    #[serde(default)]
+    pub headers_env: HashMap<String, String>,
+}
+
+/// What a feed's entries represent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedKind {
+    /// IP ranges/CIDRs → [`ReputationStore`](crate::reputation::ReputationStore)
+    /// enrichment + synthetic reputation rule.
+    #[default]
+    Ip,
+    /// User-Agent substrings, one per line → synthetic UA rule.
+    UserAgent,
+    /// Path fragments, one per line → synthetic path rule.
+    Path,
+}
+
+impl FeedKind {
+    /// Lowercase stable name used in logs and config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ip => "ip",
+            Self::UserAgent => "user_agent",
+            Self::Path => "path",
+        }
+    }
 }
 
 impl Default for FeedConfig {
@@ -1002,10 +1157,12 @@ impl Default for FeedConfig {
         Self {
             name: String::new(),
             url: String::new(),
+            kind: FeedKind::default(),
             refresh_hours: default_feed_refresh(),
             tier: default_feed_tier(),
             action: String::new(),
             enabled: default_feed_enabled(),
+            headers_env: HashMap::new(),
         }
     }
 }
@@ -1074,6 +1231,9 @@ pub enum ActionKind {
     Webhook,
     /// `sentry-action-blocklist` — in-memory IP blocklist with TTL.
     Blocklist,
+    /// `sentry-action-report` — report enforcing-verdict IPs to community
+    /// abuse databases (provider: `abuseipdb` | `reportedip`, F7.4).
+    Report,
     /// Built-in log action — always present, emits a tracing line on act.
     #[default]
     Log,
@@ -1087,6 +1247,7 @@ impl ActionKind {
             Self::Challenge => "challenge",
             Self::Webhook => "webhook",
             Self::Blocklist => "blocklist",
+            Self::Report => "report",
             Self::Log => "log",
         }
     }

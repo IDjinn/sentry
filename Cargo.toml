@@ -14,6 +14,8 @@ members = [
     "crates/sentry-action-cloudflare",
     "crates/sentry-action-webhook",
     "crates/sentry-action-blocklist",
+    "crates/sentry-action-report",
+    "crates/sentry-action-firewall",
     "crates/sentry-cli",
 ]
 default-members = ["crates/sentry-cli"]
@@ -119,6 +121,8 @@ sentry-edge = { path = "crates/sentry-edge" }
 sentry-action-cloudflare = { path = "crates/sentry-action-cloudflare" }
 sentry-action-webhook = { path = "crates/sentry-action-webhook" }
 sentry-action-blocklist = { path = "crates/sentry-action-blocklist" }
+sentry-action-report = { path = "crates/sentry-action-report" }
+sentry-action-firewall = { path = "crates/sentry-action-firewall" }
 
 [profile.release]
 lto = "thin"

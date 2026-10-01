@@ -137,28 +137,9 @@ impl FamilyPrefilter {
             ("`", gate::CMD),
             ("$(", gate::CMD),
             ("&&", gate::CMD),
-            // sensitive path.
-            ("/.", gate::SENSITIVE),
-            ("wp-admin", gate::SENSITIVE),
-            ("wp-login", gate::SENSITIVE),
-            ("phpmyadmin", gate::SENSITIVE),
-            ("pma", gate::SENSITIVE),
-            ("adminer", gate::SENSITIVE),
-            ("wp-content", gate::SENSITIVE),
-            ("server-status", gate::SENSITIVE),
-            ("server-info", gate::SENSITIVE),
-            ("nginx-status", gate::SENSITIVE),
-            ("fpm-status", gate::SENSITIVE),
-            ("actuator", gate::SENSITIVE),
-            (".sql", gate::SENSITIVE),
-            (".bak", gate::SENSITIVE),
-            (".backup", gate::SENSITIVE),
-            (".old", gate::SENSITIVE),
-            (".swp", gate::SENSITIVE),
-            (".orig", gate::SENSITIVE),
-            (".save", gate::SENSITIVE),
-            ("/manager/html", gate::SENSITIVE),
-            // bad crawler (regex is a pure literal alternation).
+            // bad crawler (regex is a pure literal alternation). Sensitive-path
+            // literals are appended below from lists.rs (shared with the pack
+            // rules) so the two can never drift.
             ("sqlmap", gate::CRAWLER),
             ("nikto", gate::CRAWLER),
             ("nmap", gate::CRAWLER),
@@ -181,14 +162,35 @@ impl FamilyPrefilter {
             ("crawler4j", gate::CRAWLER),
             ("semrush", gate::CRAWLER),
             ("ahrefs", gate::CRAWLER),
+            // curated scanner tools (nginx-ultimate-bad-bot-blocker).
+            ("zmap", gate::CRAWLER),
+            ("rustscan", gate::CRAWLER),
+            ("unicornscan", gate::CRAWLER),
+            ("nuclei", gate::CRAWLER),
+            ("dirsearch", gate::CRAWLER),
+            ("feroxbuster", gate::CRAWLER),
+            ("ffuf", gate::CRAWLER),
+            ("wfuzz", gate::CRAWLER),
+            ("arachni", gate::CRAWLER),
+            ("openvas", gate::CRAWLER),
+            ("havij", gate::CRAWLER),
+            ("commix", gate::CRAWLER),
+            ("xsser", gate::CRAWLER),
+            ("dalfox", gate::CRAWLER),
+            ("gospider", gate::CRAWLER),
+            ("hakrawler", gate::CRAWLER),
+            ("webbandit", gate::CRAWLER),
+            ("emailcollector", gate::CRAWLER),
         ];
+        let mut patterns: Vec<(&str, u8)> = P.to_vec();
+        patterns.extend(crate::lists::sensitive_path_literals().map(|lit| (lit, gate::SENSITIVE)));
         let ac = aho_corasick::AhoCorasickBuilder::new()
             .ascii_case_insensitive(true)
-            .build(P.iter().map(|(p, _)| *p))
+            .build(patterns.iter().map(|(p, _)| *p))
             .expect("static patterns compile");
         Self {
             ac,
-            bits: P.iter().map(|(_, b)| *b).collect(),
+            bits: patterns.iter().map(|(_, b)| *b).collect(),
         }
     }
 
@@ -369,11 +371,11 @@ static CMD_INJECTION_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static SENSITIVE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:^/\.(?:env|git|svn|hg|bzr|ssh|aws|gcp|azure|kube|docker|terraform|npmrc|pypirc|netrc|htpasswd|ds_store))|(?:/(?:wp-admin|wp-login\.php|phpmyadmin|pma|adminer|wp-content|server-status|server-info|nginx-status|fpm-status|actuator(?:/env|/heapdump|/threaddump)))(?:/|$)|(?:\.(?:sql|bak|backup|old|swp|orig|save)$)|(?:/manager/html$)").unwrap()
+    Regex::new(&crate::lists::sensitive_paths_regex()).expect("sensitive path patterns compile")
 });
 
 static BAD_CRAWLER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:sqlmap|nikto|nmap|masscan|zgrab|nessus|acunetix|dirbuster|gobuster|wpscan|hydra|metasploit|burp|httrack|libwww|python-requests|curl/[0-9]|go-http-client|scrapy|crawler4j|semrush|ahrefs)").unwrap()
+    Regex::new(r"(?i)(?:sqlmap|nikto|nmap|masscan|zgrab|zmap|rustscan|unicornscan|nessus|acunetix|dirbuster|dirsearch|gobuster|feroxbuster|ffuf|wfuzz|wpscan|hydra|metasploit|burp|httrack|libwww|python-requests|curl/[0-9]|go-http-client|scrapy|crawler4j|semrush|ahrefs|nuclei|arachni|openvas|havij|commix|xsser|dalfox|gospider|hakrawler|webbandit|emailcollector)").unwrap()
 });
 
 // ── Detectors ────────────────────────────────────────────────────────────
@@ -856,6 +858,18 @@ mod proptests {
             "/manager/html",
             "/actuator/env",
             "/server-status",
+            "/_ignition/execute-solution",
+            "/Autodiscover/Autodiscover.xml",
+            "/mifs/.;/services/LogService",
+            "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
+            "/HNAP1",
+            "/remote/fgt_lang",
+            "/ecp/Current/exporttool/microsoft.exchange.ediscovery.exporttool.application",
+            "/RestAPI/LogonCustomization",
+            "/Telerik.Web.UI.WebResource.axd",
+            "/GponForm/diag_Form",
+            "/wp-includes/js/jquery/jquery.php",
+            "/adminer.php",
             "/",
             "/go_http_client",
             "/x?ua=python-requests/2.0",
@@ -917,12 +931,27 @@ mod proptests {
             "/db.sql",
             "/manager/html",
             "/server-info",
+            "/_ignition/execute-solution",
+            "/autodiscover/autodiscover.xml",
+            "/mifs/.;/services/LogService",
+            "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
+            "/hnap1",
+            "/remote/fgt_lang",
+            "/ecp/current/exporttool/microsoft.exchange.ediscovery.exporttool.application",
+            "/restapi/logoncustomization",
+            "/telerik.web.ui.webresource.axd",
+            "/gponform/diag_form",
+            "/wp-includes/js/jquery/jquery.php",
             "sqlmap/1.5",
             "Nmap Scripting Engine",
             "python-requests/2.31",
             "go-http-client/2.0",
             "Hydra v9",
             "masscan/1.3",
+            "Nuclei - Open-source project (github.com/projectdiscovery/nuclei)",
+            "ffuf/2.1",
+            "feroxbuster/2.10",
+            "dirsearch/v0.4.3",
         ];
         let pf = &*PREFILTER;
         for t in samples {

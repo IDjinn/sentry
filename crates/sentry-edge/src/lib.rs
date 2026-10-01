@@ -45,6 +45,7 @@ pub struct EdgeRuntime {
     mode: MiddlewareMode,
     block_table: Option<Arc<BlockTable>>,
     block_hits: Option<prometheus::Counter>,
+    trust: Option<sentry_core::SharedTrustSet>,
 }
 
 impl EdgeRuntime {
@@ -60,6 +61,7 @@ impl EdgeRuntime {
             mode: MiddlewareMode::Inline,
             block_table: None,
             block_hits: None,
+            trust: None,
         }
     }
 
@@ -68,6 +70,18 @@ impl EdgeRuntime {
     pub fn with_block_table(mut self, table: Arc<BlockTable>) -> Self {
         self.block_table = Some(table);
         self
+    }
+
+    /// Resolve the peer's real client IP with the trusted-proxy set (F7.2):
+    /// header-borne candidates only win when the peer is a trusted proxy.
+    pub fn with_trust(mut self, trust: sentry_core::SharedTrustSet) -> Self {
+        self.trust = Some(trust);
+        self
+    }
+
+    /// Trusted-proxy set, when attached.
+    pub fn trust(&self) -> Option<&sentry_core::SharedTrustSet> {
+        self.trust.as_ref()
     }
 
     /// Counter incremented on every fast-path denial.
@@ -103,6 +117,13 @@ impl EdgeRuntime {
     /// Returns true only for IPs on the block table; increments the block-hit
     /// counter and logs when it fires.
     pub fn is_hard_blocked(&self, ip: IpAddr) -> bool {
+        // Trusted IPs (`[real_ip] trusted_ips`) bypass even sticky blocks —
+        // the "you can't lock yourself out" guard (F7.2).
+        if let Some(trust) = &self.trust {
+            if trust.is_never_ban(ip) {
+                return false;
+            }
+        }
         let Some(table) = &self.block_table else {
             return false;
         };
@@ -120,7 +141,21 @@ impl EdgeRuntime {
 /// Resolve the real client IP by fixed precedence (ARCHITECTURE §8.1):
 /// `CF-Connecting-IP` > `True-Client-IP` > `X-Real-IP` > first XFF hop >
 /// peer address.
+///
+/// Legacy behavior: headers always win. Prefer [`Self::real_client_ip_with`]
+/// with a trust set on anything exposed to non-proxy peers.
 pub fn real_client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+    real_client_ip_with(headers, peer, None)
+}
+
+/// Like [`real_client_ip`], but header-borne candidates are only honored
+/// when `peer` is a trusted proxy (F7.2) — a direct-to-origin client cannot
+/// spoof a forged `CF-Connecting-IP`.
+pub fn real_client_ip_with(
+    headers: &HeaderMap,
+    peer: IpAddr,
+    trust: Option<&sentry_core::SharedTrustSet>,
+) -> IpAddr {
     let header_ip = |name: &str| -> Option<IpAddr> {
         headers
             .get(name)
@@ -128,11 +163,16 @@ pub fn real_client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
             .and_then(|v| v.split(',').next())
             .and_then(|v| v.trim().parse().ok())
     };
-    header_ip("cf-connecting-ip")
-        .or_else(|| header_ip("true-client-ip"))
-        .or_else(|| header_ip("x-real-ip"))
-        .or_else(|| header_ip("x-forwarded-for"))
-        .unwrap_or(peer)
+    let from_headers = || {
+        header_ip("cf-connecting-ip")
+            .or_else(|| header_ip("true-client-ip"))
+            .or_else(|| header_ip("x-real-ip"))
+            .or_else(|| header_ip("x-forwarded-for"))
+    };
+    match trust {
+        Some(trust) if !trust.is_trusted_proxy(peer) => peer,
+        _ => from_headers().unwrap_or(peer),
+    }
 }
 
 #[cfg(test)]

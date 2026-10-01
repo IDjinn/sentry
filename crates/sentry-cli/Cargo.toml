@@ -38,6 +38,8 @@ sentry-edge = { workspace = true }
 sentry-action-cloudflare = { workspace = true }
 sentry-action-webhook = { workspace = true }
 sentry-action-blocklist = { workspace = true }
+sentry-action-report = { workspace = true }
+sentry-action-firewall = { workspace = true }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -66,6 +68,7 @@ axum = { workspace = true }
 argon2 = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

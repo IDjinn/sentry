@@ -35,6 +35,7 @@ impl PackMode {
     pub fn all_pack_names() -> &'static [&'static str] {
         &[
             "sensitive_paths",
+            "honeypot_paths",
             "crawlers_bad",
             "crawlers_good",
             "empty_ua",
@@ -43,6 +44,7 @@ impl PackMode {
             "tor",
             "rate_scan",
             "country_blocklist",
+            "host_allowlist",
         ]
     }
 }
@@ -120,19 +122,40 @@ pub fn build_default_ruleset(pack_modes: &std::collections::HashMap<String, Stri
         .map(|s| PackMode::parse(s))
         .unwrap_or(PackMode::Off);
     if cb_mode2 != PackMode::Off {
-        let countries = pack_countries(pack_modes, "country_blocklist");
+        let countries = pack_list_param(pack_modes, "country_blocklist", "countries");
         if !countries.is_empty() {
             rules.extend(country_blocklist_rules(cb_mode2.is_enforce(), &countries));
+        }
+    }
+
+    let hp_mode = pack_modes
+        .get("honeypot_paths")
+        .map(|s| PackMode::parse(s))
+        .unwrap_or(PackMode::Shadow);
+    if hp_mode != PackMode::Off {
+        rules.extend(honeypot_path_rules(hp_mode.is_enforce()));
+    }
+
+    let hal_mode = pack_modes
+        .get("host_allowlist")
+        .map(|s| PackMode::parse(s))
+        .unwrap_or(PackMode::Off);
+    if hal_mode != PackMode::Off {
+        let domains = pack_list_param(pack_modes, "host_allowlist", "domains");
+        if !domains.is_empty() {
+            rules.extend(host_allowlist_rules(hal_mode.is_enforce(), &domains));
         }
     }
 
     RuleSet::new(rules)
 }
 
-/// Extract country codes from pack params.
-fn pack_countries(
+/// Extract a list param (`<pack>__<param>`) from the pack mode map; empty
+/// when the pack is off or the param is absent.
+fn pack_list_param(
     pack_modes: &std::collections::HashMap<String, String>,
     pack_name: &str,
+    param: &str,
 ) -> Vec<String> {
     pack_modes
         .get(pack_name)
@@ -143,7 +166,7 @@ fn pack_countries(
             }
             Some(())
         })
-        .and_then(|_| pack_modes.get(&format!("{pack_name}__countries")).cloned())
+        .and_then(|_| pack_modes.get(&format!("{pack_name}__{param}")).cloned())
         .map(|s| {
             s.trim_matches(|c: char| c == '[' || c == ']' || c == '"')
                 .split(',')
@@ -154,32 +177,27 @@ fn pack_countries(
         .unwrap_or_default()
 }
 
-/// Sensitive path rules — block access to `.env`, `.git/`, `.ssh/`, etc.
+/// Sensitive path rules — block access to `.env`, `.git/`, `.ssh/`, admin
+/// panels, and known CVE exploit probes. Patterns come from
+/// [`crate::lists::SENSITIVE_PATHS`] so the pack, the heuristic, and its
+/// prefilter stay in sync.
 fn sensitive_path_rules(enforce: bool) -> Vec<Rule> {
     let action = if enforce {
         RuleAction::Block
     } else {
         RuleAction::Log
     };
-    let paths: &[&str] = &[
-        r"^/\.(env|git|svn|hg|bzr|ssh|aws|gcp|azure|kube|docker|terraform|npmrc|pypirc|netrc|htpasswd|ds_store)",
-        r"/(wp-admin|wp-login\.php|phpmyadmin|pma|adminer|wp-content)(?:/|$)",
-        r"/server-status|/server-info|/nginx-status|/fpm-status",
-        r"/actuator(/env|/heapdump|/threaddump)",
-        r"\.(sql|bak|backup|old|swp|orig|save)$",
-        r"/manager/html$",
-    ];
-    let mut rules: Vec<Rule> = paths
+    let mut rules: Vec<Rule> = crate::lists::SENSITIVE_PATHS
         .iter()
         .enumerate()
-        .map(|(i, pat)| Rule {
+        .map(|(i, p)| Rule {
             id: format!("sensitive_path_{i}"),
             name: format!("block sensitive path ({i})"),
             priority: 5,
             enabled: true,
             match_: RuleMatch::Path {
                 op: crate::rules::PathOp::Regex,
-                pattern: format!("(?i){pat}"),
+                pattern: format!("(?i){}", p.pattern),
             },
             action,
             ttl: None,
@@ -208,6 +226,69 @@ fn sensitive_path_rules(enforce: bool) -> Vec<Rule> {
     rules
 }
 
+/// Honeypot path rules (nginx-honeypot `honey.conf` style) — broad bait
+/// paths that are too generic to block on a real site; shadow by default.
+fn honeypot_path_rules(enforce: bool) -> Vec<Rule> {
+    let action = if enforce {
+        RuleAction::Block
+    } else {
+        RuleAction::Log
+    };
+    crate::lists::HONEYPOT_PATHS
+        .iter()
+        .enumerate()
+        .map(|(i, pat)| Rule {
+            id: format!("honeypot_path_{i}"),
+            name: format!("honeypot path trap ({i})"),
+            priority: 8,
+            enabled: true,
+            match_: RuleMatch::Path {
+                op: crate::rules::PathOp::Regex,
+                pattern: format!("(?i){pat}"),
+            },
+            action,
+            ttl: None,
+            source: RuleSource::DefaultPack,
+            tags: vec!["honeypot_paths".into()],
+            created_at: None,
+        })
+        .collect()
+}
+
+/// Host allowlist rules — requests whose `Host` header is not one of the
+/// configured domains (including Host-less requests) are scanner/IDN
+/// homograph noise hitting the bare IP; blocked when enforced.
+fn host_allowlist_rules(enforce: bool, domains: &[String]) -> Vec<Rule> {
+    let action = if enforce {
+        RuleAction::Block
+    } else {
+        RuleAction::Log
+    };
+    let pattern = format!(
+        "^(?i)(?:{})(?::\\d+)?$",
+        domains
+            .iter()
+            .map(|d| regex::escape(d.trim()))
+            .collect::<Vec<_>>()
+            .join("|")
+    );
+    vec![Rule {
+        id: "host_allowlist".into(),
+        name: format!("require Host in {}", domains.join(",")),
+        priority: 8,
+        enabled: true,
+        match_: RuleMatch::Not(Box::new(RuleMatch::Header {
+            name: "host".into(),
+            op: crate::rules::StrOp::Regex { pattern },
+        })),
+        action,
+        ttl: None,
+        source: RuleSource::DefaultPack,
+        tags: vec!["host_allowlist".into()],
+        created_at: None,
+    }]
+}
+
 /// Bad crawler rules — block known scanner User-Agents.
 ///
 /// The list aggregates signatures from:
@@ -226,7 +307,7 @@ fn bad_crawler_rules(enforce: bool) -> Vec<Rule> {
         priority: 10,
         enabled: true,
         match_: RuleMatch::UserAgent(crate::rules::StrOp::Regex {
-            pattern: r"(?i)(sqlmap|nikto|nmap|masscan|zgrab|nessus|acunetix|dirbuster|gobuster|wpscan|hydra|metasploit|burp|httrack|libwww|python-requests|python-urllib|go-http-client|scrapy|crawler4j|semrush|ahrefs|mj12bot|dotbot|petalbot|bytespider|yandexaccessibilitybot|seznambot|dataforseobot|screaming.frog|sitechecker|siteauditbot|linkchecker|wget|curl/[0-9]|lwp-|mechanize|httpclient|okhttp|axios|got/|fetch/|node-fetch|java/|perl/|ruby|php/|lua-curl|winhttp|httprequest|scrapy-requests|httpx|subfinder|amass|theHarvester|shodan|censys|project.sonar|securitytrails|intelx\.io|censys\.io|netsparker|appscan|paros|ratproxy|w3af|skipfish|whatweb|joomscan|wpscan|droopescan|cloudflare-nginx|semrushbot|BLEXBot|BLEXBot/1\.0|bombabot|coccocbot|dotbot/1|duckduckbot|exabot|ezooms|facebot|facebookexternalhit|feedfetcher-google|googlebot|ia_archiver|icc-crawler|inversebot|ips-agent|java.*outeq|kalooga|koepa|libwww-perl|linkdex\.com|lwp-trivial|maui|mediapartners-google|meanpath|memorybot|mojeek|nejlo|netvamps|newsearch|page2rss|peach|picsearch|postrank|psyduck|purebot|pycurl|queryseekerspider|r6-commentreader|rssingbot|searchsite|seeker|semrush|seokicks|seznambot|seznambot/3\.0|showlink|simplepie|sitebot|sistrix|sogou|spbot|sputnik|surveybot|topicbot|trendictionbot|tuezilla|tweetmemebot|tweetbot|twiceler|twitterbot|universalfeedparser|urlappendbot|vagabondo|voilabot|vortex|wasalive|webcollage|webcrawler|webmon|webspider|wesee|wikiwix|wotbox|yacybot|yacy|yahooslurp|yahoo\!.slurp|yandexbot|yeti|yoofind|yoo|zao|zeal|zermelo|zeus|zibber|zitebot|zoombot|zoomspider|zoominfo|zyborg| crawly|crawl|scrap|spider|bot/|http|agent|fetch|check|monitor|scan|test|valid|analyz|index|track|survey|probe|collect|archive|validator|link|crawlbot|researchscan|preview|previewbot|content-fetcher|feedly|feedparser|inoreader|newsblur|tiny\.tiny|tinyrss|rss|atom|superfeedr|feedburner|bloglines|blogsearch|blogtrottr|blogping|weblogs|icerocket|blogument|blogosphere|blogster|blogflux|blogcatalog|blogrank|blogrolling|blogapart|blogometer|blogwise|blogburst|blogalytics|blogtactic|blogvertise|blogvertise|blogware|blogsmith|blogsmithmedia|blogomunity|blogosis|blogosurvey|blogowogo|blogpatrol|blogpulse|blogwise|blogwise|blogwise)".into(),
+            pattern: r"(?i)(sqlmap|nikto|nmap|masscan|zgrab|zmap|rustscan|unicornscan|nessus|acunetix|dirbuster|dirsearch|gobuster|feroxbuster|ffuf|wfuzz|wpscan|hydra|metasploit|burp|httrack|libwww|python-requests|python-urllib|go-http-client|scrapy|crawler4j|semrush|ahrefs|mj12bot|dotbot|petalbot|bytespider|yandexaccessibilitybot|seznambot|dataforseobot|screaming.frog|sitechecker|siteauditbot|linkchecker|nuclei|arachni|openvas|havij|commix|xsser|dalfox|gospider|hakrawler|webbandit|emailcollector|wget|curl/[0-9]|lwp-|mechanize|httpclient|okhttp|axios|got/|fetch/|node-fetch|java/|perl/|ruby|php/|lua-curl|winhttp|httprequest|scrapy-requests|httpx|subfinder|amass|theHarvester|shodan|censys|project.sonar|securitytrails|intelx\.io|censys\.io|netsparker|appscan|paros|ratproxy|w3af|skipfish|whatweb|joomscan|droopescan|cloudflare-nginx|semrushbot|BLEXBot|BLEXBot/1\.0|bombabot|coccocbot|dotbot/1|duckduckbot|exabot|ezooms|facebot|facebookexternalhit|feedfetcher-google|googlebot|ia_archiver|icc-crawler|inversebot|ips-agent|java.*outeq|kalooga|koepa|libwww-perl|linkdex\.com|lwp-trivial|maui|mediapartners-google|meanpath|memorybot|mojeek|nejlo|netvamps|newsearch|page2rss|peach|picsearch|postrank|psyduck|purebot|pycurl|queryseekerspider|r6-commentreader|rssingbot|searchsite|seeker|semrushbot|seokicks|seznambot|seznambot/3\.0|showlink|simplepie|sitebot|sistrix|sogou|spbot|sputnik|surveybot|topicbot|trendictionbot|tuezilla|tweetmemebot|tweetbot|twiceler|twitterbot|universalfeedparser|urlappendbot|vagabondo|voilabot|vortex|wasalive|webcollage|webcrawler|webmon|webspider|wesee|wikiwix|wotbox|yacybot|yacy|yahooslurp|yahoo\!.slurp|yandexbot|yeti|yoofind|yoo|zao|zeal|zermelo|zeus|zibber|zitebot|zoombot|zoomspider|zoominfo|zyborg| crawly|crawl|scrap|spider|bot/|http|agent|fetch|check|monitor|scan|test|valid|analyz|index|track|survey|probe|collect|archive|validator|link|crawlbot|researchscan|preview|previewbot|content-fetcher|feedly|feedparser|inoreader|newsblur|tiny\.tiny|tinyrss|rss|atom|superfeedr|feedburner|bloglines|blogsearch|blogtrottr|blogping|weblogs|icerocket|blogument|blogosphere|blogster|blogflux|blogcatalog|blogrank|blogrolling|blogapart|blogometer|blogwise|blogburst|blogalytics|blogtactic|blogvertise|blogware|blogsmith|blogsmithmedia|blogomunity|blogosis|blogosurvey|blogowogo|blogpatrol|blogpulse)".into(),
         }),
         action,
         ttl: None,

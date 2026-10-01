@@ -470,6 +470,12 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 check_feed_ip(cfg, &ip).await?;
             }
         },
+        Command::Firewall { action } => match action {
+            FirewallCmd::Status => {
+                let cfg = require_config(&cfg)?;
+                firewall_status(cfg).await;
+            }
+        },
         Command::Auth { action } => match action {
             AuthCmd::HashPassword { password } => {
                 let hash = crate::auth::hash_password(&password)?;
@@ -963,16 +969,76 @@ fn list_feeds(cfg: &SentryConfig) {
         return;
     }
     println!(
-        "{:<14} {:<11} {:<9} {:<8} URL",
-        "NAME", "TIER", "REFRESH", "ACTION"
+        "{:<14} {:<11} {:<11} {:<9} {:<8} URL",
+        "NAME", "KIND", "TIER", "REFRESH", "ACTION"
     );
     for f in feeds {
         let refresh = format!("{}h", f.refresh_hours);
         let action = if f.action.is_empty() { "-" } else { &f.action };
+        let tier = match f.kind {
+            sentry_core::config::FeedKind::Ip => f.tier.clone(),
+            _ => "-".to_string(),
+        };
         println!(
-            "{:<14} {:<11} {:<9} {:<8} {}",
-            f.name, f.tier, refresh, action, f.url
+            "{:<14} {:<11} {:<11} {:<9} {:<8} {}",
+            f.name,
+            f.kind.as_str(),
+            tier,
+            refresh,
+            action,
+            f.url
         );
+    }
+}
+
+/// `sentry firewall status` — probe the local ban backends (F7.3).
+async fn firewall_status(_cfg: &SentryConfig) {
+    if !cfg!(target_os = "linux") {
+        println!("firewall ban backends are Linux-only (nftables/ipset/firewalld).");
+        println!("This host is not Linux — the provider would be skipped at daemon startup.");
+    }
+    let mut detected = None;
+    for (backend, probe) in sentry_action_firewall::detect_probes() {
+        let (ok, out) = sentry_action_firewall::run_cmd(&probe).await;
+        let state = if ok { "available" } else { "unavailable" };
+        println!("{:<12} {state}", backend.as_str());
+        if ok && detected.is_none() {
+            detected = Some(backend);
+        }
+        let _ = out;
+    }
+    let Some(backend) = detected else {
+        println!("no usable backend — install nftables (recommended), ipset, or firewalld.");
+        println!(
+            "the daemon needs CAP_NET_ADMIN (systemd AmbientCapabilities) or a restricted sudoers stanza."
+        );
+        return;
+    };
+    let provider = sentry_action_firewall::FirewallProvider::new(
+        sentry_action_firewall::FirewallConfig {
+            backend: Some(backend),
+            ..Default::default()
+        },
+        None,
+    );
+    match provider.resolve_backend().await {
+        Ok(b) => println!("auto-selects: {}", b.as_str()),
+        Err(e) => println!("auto-select failed: {e}"),
+    }
+    match provider.list().await {
+        Ok(entries) => {
+            println!("live set entries: {} (sentry_blocks_v4/_v6)", entries.len());
+            for (ip, ttl) in entries.iter().take(10) {
+                match ttl {
+                    Some(secs) => println!("  {ip} (expires in {secs}s)"),
+                    None => println!("  {ip} (permanent)"),
+                }
+            }
+            if entries.len() > 10 {
+                println!("  … and {} more", entries.len() - 10);
+            }
+        }
+        Err(e) => println!("could not list sets: {e}"),
     }
 }
 

@@ -313,6 +313,7 @@ pub struct Pipeline {
     scan: Option<Arc<RwLock<ScanTracker>>>,
     behavior: Option<Arc<RwLock<BehaviorTracker>>>,
     correlation: Option<Arc<RwLock<CorrelationTracker>>>,
+    trust: Option<crate::trust::SharedTrustSet>,
 }
 
 /// Output of processing a single event.
@@ -367,7 +368,16 @@ impl Pipeline {
             scan: None,
             behavior: None,
             correlation: None,
+            trust: None,
         }
+    }
+
+    /// Attach the trusted-infrastructure set (F7.2): IPs in the never-ban
+    /// list short-circuit the pipeline to `Allow` (and `rescore_from`
+    /// refuses to elevate them), covering daemon and inline-edge paths.
+    pub fn with_trust(mut self, trust: crate::trust::SharedTrustSet) -> Self {
+        self.trust = Some(trust);
+        self
     }
 
     /// Attach a rate-limit backend (enables `RuleMatch::Rate` conditions).
@@ -409,6 +419,33 @@ impl Pipeline {
     /// Process a single event through the full pipeline.
     #[tracing::instrument(skip(self, evt), fields(id = %evt.id, ip = %evt.client_ip))]
     pub fn process(&self, evt: &Event) -> ProcessedEvent {
+        // Trusted IPs (F7.2 `[real_ip] trusted_ips`) are exempt from every
+        // detector and verdict — the "you can't lock yourself out" guard.
+        if let Some(trust) = &self.trust {
+            if trust.is_never_ban(evt.client_ip) {
+                return ProcessedEvent {
+                    event: evt.clone(),
+                    analysis: AnalysisResult {
+                        risk_score: 0,
+                        risk_level: RiskLevel::Info,
+                        signals: Vec::new(),
+                        verdict: Verdict::Allow,
+                    },
+                    decision: Decision {
+                        analysis: AnalysisResult {
+                            risk_score: 0,
+                            risk_level: RiskLevel::Info,
+                            signals: Vec::new(),
+                            verdict: Verdict::Allow,
+                        },
+                        action: Verdict::Allow,
+                        override_reason: Some("trusted ip".into()),
+                    },
+                    rule_hit: None,
+                };
+            }
+        }
+
         let ruleset = self.rules.read().unwrap();
 
         if let Some((rule, short_circuit)) =
@@ -596,6 +633,7 @@ impl Pipeline {
             SignalKind::TcpScanner => "tcp_scanner",
             SignalKind::ScanAttackCorrelation => "scan_attack_correlation",
             SignalKind::LlmMalicious => "llm_malicious",
+            SignalKind::ExternalReputation => "external_reputation",
             SignalKind::RuleHit => "rule_hit",
             SignalKind::Custom => "custom",
         };
@@ -638,6 +676,7 @@ impl Pipeline {
             SignalKind::TcpScanner => "tcp_scanner",
             SignalKind::ScanAttackCorrelation => "scan_attack_correlation",
             SignalKind::LlmMalicious => "llm_malicious",
+            SignalKind::ExternalReputation => "external_reputation",
             SignalKind::RuleHit => "rule_hit",
             SignalKind::Custom => "custom",
         };
@@ -733,6 +772,12 @@ impl Pipeline {
     ) -> ProcessedEvent {
         if extra_signals.is_empty() {
             return base.clone();
+        }
+        // Never elevate a trusted IP, no matter what a fork stage claims.
+        if let Some(trust) = &self.trust {
+            if trust.is_never_ban(base.event.client_ip) {
+                return base.clone();
+            }
         }
         let extra_weight: u8 = extra_signals
             .iter()

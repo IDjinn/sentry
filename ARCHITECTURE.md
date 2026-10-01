@@ -603,6 +603,72 @@ edge no request seguinte se o pipeline sozinho não re-derivasse Block.
   imediato; `sentry ip unblock` → delete no DB + NOTIFY → tabela recarrega e
   o IP volta a passar.
 
+### 8.7 IP real com trusted proxies, bans de kernel e report comunitário (F7)
+
+**Trusted proxies + TRUSTED_IPS (F7.2)** — `[real_ip]`: o parser nginx e a
+edge só honram IPs vindos de header (`CF-Connecting-IP` > `True-Client-IP` >
+`X-Real-IP` > XFF) quando o `$remote_addr`/peer é um **trusted proxy** —
+ranges Cloudflare embutidos (constants + refresh diário de
+cloudflare.com/ips-v4|ips-v6, task `spawn_cloudflare_refresh`) +
+`trusted_proxies` de config. Sem remote_addr no log_format vale o
+comportamento legado (quem escreve o log é o edge). Isso fecha o spoof de
+`CF-Connecting-IP` em tráfego direto-to-origin. `trusted_ips` (o conceito
+`TRUSTED_IPS` do nginx-honeypot — "não se trancar fora") nunca é banido,
+bloqueado ou reportado: short-circuit para `Allow` no `Pipeline::process`,
+guard no fast-path da edge (`is_hard_blocked`), guard final no provider de
+firewall, e reputação `Authorized` no enricher. Estado em
+`TrustSet`/`SharedTrustSet` (`crates/sentry-core/src/trust.rs`).
+
+**Bans de kernel (F7.3)** — crate `sentry-action-firewall`, provider
+`type = "challenge"`, `provider = "firewall"`: herda o filtro
+Block/Challenge/RateLimit do `ChallengeAction`. Backends com auto-detect
+(cacheado): **nftables** (recomendado — table `sentry` + sets
+`sentry_blocks_v4/_v6` com `flags timeout` + chain input `priority -1` drop;
+ban = 1 mensagem netlink com timeout por elemento, sem reaper),
+**ipset** legacy (`hash:ip timeout` + `iptables -m set`, regra inserida só
+após `-C`) e **firewalld** (ipsets runtime; sem timeout por entrada — a
+expiração fica no reconcile). O DB (`ip_state`) é a fonte da verdade:
+sync no startup (re-seed pós-restart) + reconcile a cada 60s (cobre unblock
+manual multi-node e expiração). Requer root ou `CAP_NET_ADMIN`; probe e
+tamanho dos sets em `sentry firewall status`. Linux-only (fora dele o
+provider é pulado com warning, padrão do braço cloudflare sem token).
+
+**Report comunitário (F7.4)** — crate `sentry-action-report`, action
+`type = "report"`, `provider = "abuseipdb" | "reportedip"`: mapeia os
+`SignalKind` para as categorias de cada API (SQLi→16, scans→14/61,
+brute force→18, bad bot→19, …; fallback Hacking), dedupe por IP com TTL
+(1 report/IP/janela — quotas diárias), backoff em 429 e circuit breaker de
+5 falhas (soft-disable até restart). Chaves por env (`SENTRY_ABUSEIPDB_KEY`,
+`SENTRY_REPORTEDIP_KEY`); feeds autenticadas via `headers_env`
+(header → env var) — ex.: blacklist do AbuseIPDB como `[[rules.feeds]]`.
+
+**Lookup externo da banda cinza (F7.5)** — `[ip_lookup]` +
+`sentry_ai::IpLookupProvider` (AbuseIPDB `/check`): fork assíncrono
+(espelha `AiFork`/`LlmFork`, roda **depois** deles) que consulta IPs com
+score local ≥ `trigger_above` (ou portando um sinal de `on_signals`) mas
+verdict ≠ Block; o `abuseConfidenceScore` vira o sinal
+`ExternalReputation` com peso escalado (25% ≈ +10 … 100% ≈ +40) re-entrando
+por `rescore_from` (só eleva). Cache LRU por IP com TTL + quota
+`max_per_hour` (rolling hour). IPs confiáveis nunca são consultados.
+
+**Datasets e listas compartilhadas (F7.1/F7.6)** —
+`crates/sentry-core/src/lists.rs` é a fonte única dos padrões de path
+sensível (pack `sensitive_paths` + heurística `SensitivePath` + literais do
+prefilter Aho-Corasick derivam da mesma tabela — impossível dessincronizar);
+inclui os probes de CVE do honey.conf (Laravel `_ignition`, PHPUnit
+`eval-stdin`, Exchange Autodiscover/ECP, MobileIron, Telerik, GPON,
+Fortinet, D-Link). Pack `honeypot_paths` (shadow default) para os padrões
+largos demais para enforce (`.aspx`, `cgi-bin`, `node_modules`, dotfiles).
+Pack `host_allowlist` (off; `params.domains`) bloqueia Host header fora da
+allowlist (inclusive requests sem Host — scan por IP direto); o parser
+nginx agora popula `HttpData.host`. Datasets: `[[rules.feeds]]` com
+`kind = "user_agent" | "path"` compila listas uma-por-linha em uma regra
+sintética de alternation literal (o crate regex acelera com Aho-Corasick
+internamente); `action` default `log`. Params de packs são achatados para
+`<pack>__<param>` no daemon (corrigindo o acesso de `country_blocklist` aos
+próprios countries). Roadmap F7.7: datasets DB-backed com import CLI e
+prefilter dinâmico (§23.3).
+
 ---
 
 ## 9. Detecção de Rotas Válidas
@@ -712,6 +778,21 @@ Packs shipados com o Sentry, ativáveis com uma linha. Cada pack é um conjunto 
 ### 10.3.1 Pack `sensitive_paths` — lista completa (default enforce)
 
 Arquivos e diretórios cujo acesso é **sempre bloqueado** por default. Cobertura dividida em categorias; cada entrada é uma regra `path regex` → `Block`. A lista é extensível via config/DB.
+
+> **F7.1 — fonte única de verdade**: os padrões efetivamente compilados
+> vivem em `crates/sentry-core/src/lists.rs` (`SENSITIVE_PATHS`) — pack,
+> heurística `SensitivePath` e as literais do prefilter Aho-Corasick
+> derivam todos da mesma tabela (com teste estrutural + corpus por ramo).
+> Além das categorias abaixo, a lista embute os probes de CVE do
+> [nginx-honeypot](https://github.com/dvershinin/nginx-honeypot)
+> (`honey.conf`): Laravel `_ignition/execute-solution`, PHPUnit
+> `eval-stdin.php`, Exchange `Autodiscover/Autodiscover.xml` + `/ecp/
+> Current/exporttool`, MobileIron `/mifs/.;/services/LogService`, ManageEngine
+> `/RestAPI/LogonCustomization`, Telerik `WebResource.axd`, GPON
+> `/GponForm/diag_Form`, Fortinet `/remote/fgt_lang`, D-Link `/HNAP1` e
+> `/wp-includes/*.php`. Os padrões largos demais para enforce (`.aspx`,
+> `cgi-bin`, `node_modules`, `/actuator/health`, qualquer dotfile) ficam no
+> pack `honeypot_paths` (shadow por padrão).
 
 **Credenciais & configuração:**
 
@@ -1500,3 +1581,23 @@ Critérios de "pronto" da F5/F6:
   AF_XDP vs kernel module.
 - F6: um provider de firewall E2E (block → edge real → expira) com
   testes de contrato + fixture; doc de deploy por plataforma.
+
+### 23.3 F7 — Roadmap restante (datasets completos)
+
+F7.1–F7.6 estão entregues (§8.7). Restante:
+
+- **[ ] F7.7 — Datasets DB-backed**: tabelas `datasets` +
+  `dataset_entries` + `DatasetRepo`; `sentry datasets import <file|url>`
+  seguindo o padrão `routes_import` (dedup, dry-run, NOTIFY
+  `sentry_datasets_changed`); enable/disable por dataset via CLI/dashboard;
+  prefilter Aho-Corasick dinâmico (hoje `PREFILTER` é estático em
+  `LazyLock` — converter para instância do engine com arc-swap) para que
+  UAs/paths importados acelerem heurísticas e não apenas regras; refresh de
+  dataset reconstruindo a regra sintética a quente (hoje o snapshot é do
+  startup). Status/resumo por dataset em `sentry datasets list`.
+- **[ ] F7.8 — ReportedIP check/lookup**: estender `IpLookupProvider` com
+  o ReportedIP (hoje só AbuseIPDB `/check`); mapear severity 1-10 das 63
+  categorias para o peso do sinal.
+- **[ ] F7.9 — `sentry feeds` para datasets**: `refresh` mostra contagens
+  de UAs/paths por dataset; `check` aceita `--user-agent`/`--path` para
+  testar o match de uma regra de dataset.

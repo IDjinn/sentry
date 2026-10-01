@@ -2871,6 +2871,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentry-action-firewall"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "sentry-core",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sentry-action-report"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "sentry-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sentry-action-webhook"
 version = "0.1.0"
 dependencies = [
@@ -2922,8 +2946,11 @@ dependencies = [
  "prometheus",
  "ratatui",
  "redis",
+ "reqwest",
  "sentry-action-blocklist",
  "sentry-action-cloudflare",
+ "sentry-action-firewall",
+ "sentry-action-report",
  "sentry-action-webhook",
  "sentry-ai",
  "sentry-core",

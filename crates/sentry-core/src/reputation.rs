@@ -14,9 +14,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use ipnet::IpNet;
 
 use crate::analysis::{Signal, SignalKind};
-use crate::config::FeedConfig;
+use crate::config::{FeedConfig, FeedKind};
 use crate::event::Event;
-use crate::rules::{ReputationTier, Rule, RuleAction, RuleMatch, RuleSource};
+use crate::rules::{PathOp, ReputationTier, Rule, RuleAction, RuleMatch, RuleSource, StrOp};
 
 /// Default weight of the `TorExitNode` signal (§16 risk table).
 pub const TOR_EXIT_NODE_WEIGHT: u8 = 15;
@@ -249,6 +249,78 @@ fn parse_rule_action(s: &str) -> Option<RuleAction> {
     }
 }
 
+/// Hard cap on dataset entries (F7.6): user-agent/path lists past this are
+/// a misconfigured source; the excess is dropped.
+pub const MAX_DATASET_ENTRIES: usize = 5000;
+
+/// Extract dataset entries from a plain-text body (F7.6): one entry per
+/// line, `#` comments and blank lines skipped. Unlike [`parse_feed`] the
+/// whole trimmed line is the entry (user-agents contain spaces).
+pub fn parse_string_list(body: &str) -> Vec<String> {
+    body.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .take(MAX_DATASET_ENTRIES)
+        .collect()
+}
+
+/// Build the synthetic rule for a `user_agent` / `path` dataset feed
+/// (F7.6): the entries compile into one case-insensitive literal
+/// alternation regex (the regex engine internally accelerates those with
+/// Aho-Corasick). Entries are matched as literals (`regex::escape`); an
+/// empty `action` defaults to `Log` (annotate only).
+pub fn dataset_rule(feed: &FeedConfig, entries: &[String]) -> Result<Option<Rule>, String> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let action_src = if feed.action.is_empty() {
+        "log"
+    } else {
+        &feed.action
+    };
+    let action = parse_rule_action(action_src).ok_or_else(|| {
+        format!(
+            "unknown feed action `{action_src}` (known: allow | block | challenge | rate_limit | log | tag)"
+        )
+    })?;
+    let pattern = format!(
+        "(?i)(?:{})",
+        entries
+            .iter()
+            .take(MAX_DATASET_ENTRIES)
+            .map(|e| regex::escape(e.trim()))
+            .collect::<Vec<_>>()
+            .join("|")
+    );
+    let (kind_label, match_) = match feed.kind {
+        FeedKind::UserAgent => (
+            "user-agent dataset",
+            RuleMatch::UserAgent(StrOp::Regex { pattern }),
+        ),
+        FeedKind::Path => (
+            "path dataset",
+            RuleMatch::Path {
+                op: PathOp::Regex,
+                pattern,
+            },
+        ),
+        FeedKind::Ip => return Err("dataset_rule called with kind = ip".into()),
+    };
+    Ok(Some(Rule {
+        id: format!("feed:{}", feed.name),
+        name: format!("{kind_label} `{}` ({} entries)", feed.name, entries.len()),
+        priority: 50,
+        enabled: true,
+        match_,
+        action,
+        ttl: None,
+        source: RuleSource::Feed,
+        tags: vec!["feed".into(), format!("feed:{}", feed.name)],
+        created_at: Some(chrono::Utc::now()),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +427,73 @@ mod tests {
         assert!(store.lookup(v4(1, 1, 1, 1)).is_none());
         assert!(store.lookup(v4(2, 2, 2, 2)).is_some());
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn parse_string_list_keeps_whole_lines() {
+        let body = "# comment\nMozilla/5.0 (compatible) Scanner\n\n  sqlmap/1.8  \n";
+        let list = parse_string_list(body);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], "Mozilla/5.0 (compatible) Scanner");
+        assert_eq!(list[1], "sqlmap/1.8");
+    }
+
+    #[test]
+    fn parse_string_list_caps_entries() {
+        let body = (0..MAX_DATASET_ENTRIES + 10)
+            .map(|i| format!("bot-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(parse_string_list(&body).len(), MAX_DATASET_ENTRIES);
+    }
+
+    #[test]
+    fn dataset_rule_builds_ua_regex_defaulting_to_log() {
+        let feed = FeedConfig {
+            name: "bad-bots".into(),
+            kind: crate::config::FeedKind::UserAgent,
+            url: "https://example.com/ua.txt".into(),
+            ..FeedConfig::default()
+        };
+        let rule = dataset_rule(&feed, &["sqlmap".into(), "Nuclei (v9)".into()])
+            .unwrap()
+            .expect("rule built");
+        assert_eq!(rule.id, "feed:bad-bots");
+        assert_eq!(rule.action, RuleAction::Log);
+        match &rule.match_ {
+            RuleMatch::UserAgent(StrOp::Regex { pattern }) => {
+                let re = regex::Regex::new(pattern).unwrap();
+                assert!(re.is_match("SQLMAP/1.8"));
+                assert!(re.is_match("something Nuclei (v9) here"));
+                assert!(!re.is_match("Mozilla/5.0"));
+            }
+            other => panic!("unexpected match: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dataset_rule_path_kind_and_explicit_action() {
+        let feed = FeedConfig {
+            name: "probe-paths".into(),
+            kind: crate::config::FeedKind::Path,
+            action: "challenge".into(),
+            ..FeedConfig::default()
+        };
+        let rule = dataset_rule(&feed, &["/wp-login.php".into()])
+            .unwrap()
+            .expect("rule built");
+        assert_eq!(rule.action, RuleAction::Challenge);
+        assert!(matches!(rule.match_, RuleMatch::Path { .. }));
+    }
+
+    #[test]
+    fn dataset_rule_empty_entries_is_none() {
+        let feed = FeedConfig {
+            name: "empty".into(),
+            kind: crate::config::FeedKind::Path,
+            ..FeedConfig::default()
+        };
+        assert!(dataset_rule(&feed, &[]).unwrap().is_none());
     }
 
     #[test]

@@ -27,6 +27,11 @@ pub struct LogFormat {
     re: Regex,
     /// Ordered list of capture names (excluding the implicit full-match).
     fields: Vec<String>,
+    /// Trusted proxies (F7.2): when set, header-borne client IPs only win
+    /// over `$remote_addr` if the remote address is itself a trusted proxy
+    /// (Cloudflare ranges + `[real_ip] trusted_proxies`). `None` keeps the
+    /// legacy unconditional precedence (log writer is the edge).
+    trust: Option<sentry_core::SharedTrustSet>,
 }
 
 impl LogFormat {
@@ -35,6 +40,23 @@ impl LogFormat {
     /// Each `$var` (or `${var}`) becomes a named capture; everything else
     /// is escaped literally. The resulting regex matches a single line.
     pub fn compile(format: &str) -> Result<Self, String> {
+        Self::compile_inner(format, None)
+    }
+
+    /// Like [`Self::compile`], but honoring a trusted-proxy set: header
+    /// candidates (`CF-Connecting-IP`, `True-Client-IP`, `X-Real-IP`, XFF)
+    /// are only trusted when `$remote_addr` is in the set.
+    pub fn compile_with_trust(
+        format: &str,
+        trust: sentry_core::SharedTrustSet,
+    ) -> Result<Self, String> {
+        Self::compile_inner(format, Some(trust))
+    }
+
+    fn compile_inner(
+        format: &str,
+        trust: Option<sentry_core::SharedTrustSet>,
+    ) -> Result<Self, String> {
         let mut re = String::from("^");
         let mut fields = Vec::new();
         let bytes = format.as_bytes();
@@ -62,7 +84,7 @@ impl LogFormat {
         }
         re.push('$');
         let re = Regex::new(&re).map_err(|e| format!("invalid compiled regex: {e}"))?;
-        Ok(Self { re, fields })
+        Ok(Self { re, fields, trust })
     }
 
     /// Parse a single log line into a [`RawEvent`].
@@ -88,6 +110,7 @@ impl LogFormat {
         let mut method: Option<HttpMethod> = None;
         let mut path = String::new();
         let mut query: Option<String> = None;
+        let mut host: Option<String> = None;
         let mut status: Option<u16> = None;
         let mut user_agent: Option<String> = None;
         let mut referer: Option<String> = None;
@@ -108,6 +131,11 @@ impl LogFormat {
                 "http_cf_connecting_ip" => cf_ip = val.parse().ok(),
                 "http_true_client_ip" => true_client_ip = val.parse().ok(),
                 "http_x_real_ip" => x_real_ip = val.parse().ok(),
+                "http_host" | "host" => {
+                    if val != "-" {
+                        host = Some(val.to_string());
+                    }
+                }
                 "request" => {
                     // "$request" = "METHOD PATH HTTP/1.1"
                     let parts: Vec<&str> = val.splitn(3, ' ').collect();
@@ -156,16 +184,28 @@ impl LogFormat {
             }
         }
 
-        let client_ip = cf_ip
-            .or(true_client_ip)
-            .or(x_real_ip)
-            .or(forwarded_ip)
-            .or(remote_ip);
+        // Real client IP resolution (ARCHITECTURE §8.1). Without a trust
+        // set, header-borne candidates always win (legacy behavior: the log
+        // writer is the edge). With one (`[real_ip]`), they only win when
+        // `$remote_addr` is a trusted proxy — a direct-to-origin client
+        // cannot spoof a forged `CF-Connecting-IP`. `-` (nginx's empty
+        // marker) never parses, so absent headers fall through cleanly.
+        let header_ip = cf_ip.or(true_client_ip).or(x_real_ip).or(forwarded_ip);
+        let client_ip = match (&self.trust, remote_ip) {
+            (_, None) | (None, _) => header_ip.or(remote_ip),
+            (Some(trust), Some(peer)) => {
+                if trust.is_trusted_proxy(peer) {
+                    header_ip.or(Some(peer))
+                } else {
+                    Some(peer)
+                }
+            }
+        };
 
         let protocol = ProtocolData::Http(HttpData {
             method,
             scheme: None,
-            host: None,
+            host,
             path,
             query,
             fragment: None,
@@ -383,5 +423,46 @@ mod tests {
             evt.client_ip,
             Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 33)))
         );
+    }
+
+    /// F7.2: with a trust set, header-borne IPs are honored only from
+    /// trusted-proxy peers; a direct client cannot spoof them. The
+    /// structured `host` field is populated from `$http_host`.
+    #[test]
+    fn trusted_proxy_gate_and_host_capture() {
+        let trust = sentry_core::SharedTrustSet::new(
+            sentry_core::TrustSet::from_config(&sentry_core::config::RealIpConfig {
+                cloudflare: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let fmt = LogFormat::compile_with_trust(
+            r#"$remote_addr "$request" $status "$http_cf_connecting_ip" "$http_host""#,
+            trust,
+        )
+        .unwrap();
+
+        // Behind Cloudflare: the CF edge is a trusted proxy → header wins.
+        let via_cf = r#"108.162.192.5 "GET / HTTP/1.1" 200 "198.51.100.7" "example.com""#;
+        let evt = fmt.parse_line(via_cf).expect("cf line matches");
+        assert_eq!(
+            evt.client_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)))
+        );
+
+        // Direct-to-origin: the forged header is ignored, remote wins.
+        let direct = r#"198.51.100.9 "GET / HTTP/1.1" 200 "6.6.6.6" "example.com""#;
+        let evt = fmt.parse_line(direct).expect("direct line matches");
+        assert_eq!(
+            evt.client_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)))
+        );
+
+        // Host header lands in the structured field.
+        match evt.protocol {
+            ProtocolData::Http(ref h) => assert_eq!(h.host.as_deref(), Some("example.com")),
+            _ => panic!("expected http"),
+        }
     }
 }

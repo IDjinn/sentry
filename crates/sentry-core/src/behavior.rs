@@ -61,6 +61,18 @@ pub const DEFAULT_WORDLIST: &[&str] = &[
     "/actuator",
     "/manager/html",
     "/jenkins",
+    "/adminer.php",
+    "/_ignition",
+    "/eval-stdin.php",
+    "/hnap1",
+    "/remote/fgt_lang",
+    "/gponform",
+    "/autodiscover",
+    "/restapi/logoncustomization",
+    "/telerik.web.ui",
+    "/cgi-bin",
+    "/node_modules",
+    "/vendor/phpunit",
 ];
 
 /// User-Agent substrings of legitimate crawlers, exempt from

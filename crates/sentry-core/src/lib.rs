@@ -20,6 +20,7 @@ pub mod correlation;
 pub mod error;
 pub mod event;
 pub mod heuristics;
+pub mod lists;
 pub mod offender;
 pub mod packs;
 pub mod pipeline;
@@ -32,6 +33,7 @@ pub mod rules;
 pub mod scan;
 pub mod source;
 pub mod tcpfp;
+pub mod trust;
 
 pub use action::{Action, ActionContext};
 pub use analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};
@@ -41,10 +43,10 @@ pub use challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
 pub use config::{
     ActionConfig, ActionKind, AiConfig, AuthTokenConfig, AuthUserConfig, BehaviorConfig,
     CoreConfig, CorrelationConfig, DeploymentConfig, EdgeConfig, EscalationConfig, FeedConfig,
-    GeoConfig, LlmConfig, MetricsConfig, PolicyConfig, PolicyOverrideConfig, PostgresConfig,
-    RateLimitConfig, RouteDefConfig, RouteLearnerConfig, RoutesConfig, RuleDefConfig,
-    RulePackConfig, RulesConfig, ScanConfig, ScorerConfig, SentryConfig, ServerAuthConfig,
-    ServerConfig, SourceConfig, StorageConfig,
+    FeedKind, GeoConfig, IpLookupConfig, LlmConfig, MetricsConfig, PolicyConfig,
+    PolicyOverrideConfig, PostgresConfig, RateLimitConfig, RealIpConfig, RouteDefConfig,
+    RouteLearnerConfig, RoutesConfig, RuleDefConfig, RulePackConfig, RulesConfig, ScanConfig,
+    ScorerConfig, SentryConfig, ServerAuthConfig, ServerConfig, SourceConfig, StorageConfig,
 };
 pub use correlation::CorrelationTracker;
 pub use error::{CoreError, Result};
@@ -61,8 +63,8 @@ pub use policy::VerdictPolicy;
 pub use ratelimit::{InMemoryRateLimiter, RateLimitBackend};
 pub use registry::{Registry, RegistryBuilder};
 pub use reputation::{
-    feed_rule, parse_feed, reputation_signals, ReputationStore, KNOWN_BAD_IP_WEIGHT,
-    TOR_EXIT_NODE_WEIGHT, VPN_PROXY_WEIGHT,
+    dataset_rule, feed_rule, parse_feed, parse_string_list, reputation_signals, ReputationStore,
+    KNOWN_BAD_IP_WEIGHT, MAX_DATASET_ENTRIES, TOR_EXIT_NODE_WEIGHT, VPN_PROXY_WEIGHT,
 };
 pub use rules::{
     dsl, rules_from_config, shared, ReputationTier, Rule, RuleAction, RuleId, RuleMatch, RuleSet,
@@ -70,3 +72,4 @@ pub use rules::{
 };
 pub use scan::ScanTracker;
 pub use source::Source;
+pub use trust::{SharedTrustSet, TrustSet};

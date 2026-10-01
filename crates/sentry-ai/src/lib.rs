@@ -12,6 +12,7 @@
 
 pub mod features;
 pub mod llm;
+pub mod lookup;
 pub mod threat;
 
 #[cfg(feature = "onnx")]
@@ -22,4 +23,5 @@ pub use llm::{
     ClassifyRequest, ClassifyResponse, ExplainRequest, JevProvider, LlmProvider, LlmUsage,
     MockLlmProvider, OllamaProvider, OpenRouterProvider,
 };
+pub use lookup::{AbuseIpDbLookup, IpLookupProvider, IpLookupResult};
 pub use threat::ThreatModel;

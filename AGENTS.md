@@ -383,6 +383,53 @@ não em runtime.
   firewall/plataforma — providers OPNsense/pfSense (alias tables),
   nginx (deny-list + reload), HAProxy maps, export Suricata/fast.log;
   todos via trait `ChallengeProvider` (sem mudar regras/pipeline)
+- **F7** (concluída): Honeypot hardening — trusted IPs, bans de kernel,
+  report comunitário, datasets (detalhes em `ARCHITECTURE.md` §8.7)
+  - ✅ F7.1 Listas compartilhadas (`lists.rs` fonte única: pack
+    `sensitive_paths` + heurística + literais do prefilter derivam da mesma
+    tabela) + probes de CVE do honey.conf + pack `honeypot_paths`
+    (shadow default) + pack `host_allowlist` (off; `params.domains`,
+    Host header fora da allowlist → Block) + wordlist do behavior
+    estendida + UAs de scanner curadas (bad-bot-blocker) +
+    `HttpData.host` populado pelo parser nginx — testes estrutural/
+    corpus em `lists.rs`
+  - ✅ F7.2 `[real_ip]` (`TrustSet`/`SharedTrustSet` em `trust.rs`):
+    header-borne IPs só vencem de trusted proxies (ranges Cloudflare
+    embutidos + refresh diário + `trusted_proxies`); `trusted_ips`
+    (TRUSTED_IPS do nginx-honeypot) nunca é banido — Allow no pipeline,
+    guard no fast-path da edge e no provider firewall, reputação
+    `Authorized`; parser com `compile_with_trust` (matriz CF/spoof
+    testada) — 7 testes em `trust.rs`
+  - ✅ F7.3 Bans de kernel (`sentry-action-firewall`, provider
+    `provider = "firewall"`): backends nftables (table `sentry`, sets
+    `sentry_blocks_v4/_v6` com timeout, chain input `-1` drop) / ipset
+    (`hash:ip timeout` + `iptables -m set` com `-C` antes de `-I`) /
+    firewalld (ipsets runtime) com auto-detect; DB é fonte da verdade —
+    sync no startup + reconcile 60s; `sentry firewall status`;
+    Linux-only (skip com warning em outro OS) — builders/parsers puros
+    testados
+  - ✅ F7.4 Report comunitário (`sentry-action-report`,
+    `type = "report"`, `provider = "abuseipdb"|"reportedip"`): mapeamento
+    SignalKind→categorias (AbuseIPDB 1-23, ReportedIP 63 categorias),
+    dedupe LRU por IP com TTL, backoff 429, circuit breaker 5 falhas,
+    `min_verdict` configurável; `FeedConfig.headers_env` para feeds
+    autenticadas (blacklist do AbuseIPDB como feed)
+  - ✅ F7.5 Lookup externo (`[ip_lookup]` +
+    `sentry_ai::IpLookupProvider`, AbuseIPDB `/check`): fork async após
+    AI/LLM — IPs na banda cinza (score ≥ `trigger_above` ou sinal de
+    `on_signals`, verdict ≠ Block) viram sinal `ExternalReputation` com
+    peso escalado pelo `abuseConfidenceScore` via `rescore_from`; cache
+    TTL por IP + quota `max_per_hour` — 4 testes do fork no daemon
+  - ✅ F7.6 Datasets mínimos (`[[rules.feeds]] kind = "user_agent" |
+    "path"`): listas uma-por-linha → regra sintética `feed:<name>`
+    (alternation literal case-insensitive, cap 5000; action default
+    `log`); `parse_string_list`/`dataset_rule`/`MAX_DATASET_ENTRIES` no
+    core; exemplo bad-bot-blocker no `sentry.example.toml`. Params de
+    packs agora são achatados (`<pack>__<param>`) no daemon — corrigindo
+    `country_blocklist__countries`, que nunca chegava ao builder
+  - ⏸️ F7.7-F7.9 (roadmap `ARCHITECTURE.md` §23.3): datasets DB-backed
+    com import CLI + prefilter dinâmico, ReportedIP check, feeds CLI p/
+    datasets
 
 Backlog detalhado em `ARCHITECTURE.md` §23.
 
@@ -393,7 +440,7 @@ Backlog detalhado em `ARCHITECTURE.md` §23.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 334 testes passando sem features; 336 com
+# Resultado esperado: 381 testes passando sem features; 383 com
 # --features sentry-cli/onnx (adiciona os 2 testes de inferência ONNX)
 ```
 

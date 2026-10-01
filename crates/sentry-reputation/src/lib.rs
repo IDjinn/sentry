@@ -51,6 +51,9 @@ pub struct ReputationService {
     store: Arc<RwLock<ReputationStore>>,
     feeds: Vec<FeedConfig>,
     status: Arc<Mutex<HashMap<String, FeedStatus>>>,
+    /// Fetched entries of `user_agent` / `path` dataset feeds (F7.6),
+    /// keyed by feed name. IP feeds never land here.
+    datasets: Arc<Mutex<HashMap<String, Vec<String>>>>,
 }
 
 impl ReputationService {
@@ -81,6 +84,7 @@ impl ReputationService {
             store: Arc::new(RwLock::new(ReputationStore::new())),
             feeds,
             status: Arc::new(Mutex::new(HashMap::new())),
+            datasets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -108,7 +112,8 @@ impl ReputationService {
         join_all(self.feeds.iter().map(|f| self.refresh_one(f))).await;
     }
 
-    /// Fetch one feed and swap its entries in the shared store.
+    /// Fetch one feed and swap its entries in the shared store (or, for
+    /// `user_agent` / `path` datasets, in the dataset map — F7.6).
     ///
     /// Errors are recorded in the per-feed status either way, so a feed that
     /// never synced shows up in `statuses` with its reason.
@@ -123,18 +128,60 @@ impl ReputationService {
         }
     }
 
+    /// Snapshot of a dataset feed's fetched entries (F7.6).
+    pub async fn dataset(&self, name: &str) -> Option<Vec<String>> {
+        self.datasets.lock().await.get(name).cloned()
+    }
+
     async fn fetch_and_apply(&self, feed: &FeedConfig) -> Result<usize, ReputationError> {
-        let tier = ReputationTier::parse(&feed.tier).ok_or_else(|| {
-            ReputationError::Url(format!(
-                "feed `{}`: unknown reputation tier `{}`",
-                feed.name, feed.tier
-            ))
-        })?;
+        let body = self.fetch_body(feed).await?;
+        let entries = match feed.kind {
+            sentry_core::config::FeedKind::Ip => {
+                let tier = ReputationTier::parse(&feed.tier).ok_or_else(|| {
+                    ReputationError::Url(format!(
+                        "feed `{}`: unknown reputation tier `{}`",
+                        feed.name, feed.tier
+                    ))
+                })?;
+                let nets = parse_feed(&body);
+                let count = nets.len();
+                self.store
+                    .write()
+                    .unwrap()
+                    .replace_feed(&feed.name, tier, nets);
+                count
+            }
+            sentry_core::config::FeedKind::UserAgent | sentry_core::config::FeedKind::Path => {
+                let list = sentry_core::parse_string_list(&body);
+                let count = list.len();
+                self.datasets.lock().await.insert(feed.name.clone(), list);
+                count
+            }
+        };
+
+        let mut status = self.status.lock().await;
+        let entry = status.entry(feed.name.clone()).or_default();
+        entry.entries = entries;
+        entry.last_refresh = Some(Utc::now());
+        entry.last_error = None;
+        Ok(entries)
+    }
+
+    /// SSRF-guarded fetch of a feed body (shared by IP feeds and datasets).
+    async fn fetch_body(&self, feed: &FeedConfig) -> Result<String, ReputationError> {
         let url = validate_feed_url(&feed.url)?;
         if let Some(host) = url.host_str() {
             resolve_host(host, url.port_or_known_default().unwrap_or(80)).await?;
         }
-        let response = self.client.get(url).timeout(FETCH_TIMEOUT).send().await?;
+        let mut request = self.client.get(url).timeout(FETCH_TIMEOUT);
+        for (header, env_var) in &feed.headers_env {
+            if let Ok(value) = std::env::var(env_var) {
+                if !value.is_empty() {
+                    request = request.header(header.as_str(), value);
+                }
+            }
+        }
+        let response = request.send().await?;
         if !response.status().is_success() {
             return Err(ReputationError::Fetch(format!(
                 "feed `{}`: HTTP {}",
@@ -156,19 +203,7 @@ impl ReputationService {
             }
             body.extend_from_slice(&chunk);
         }
-        let nets = parse_feed(&String::from_utf8_lossy(&body));
-        let entries = nets.len();
-        self.store
-            .write()
-            .unwrap()
-            .replace_feed(&feed.name, tier, nets);
-
-        let mut status = self.status.lock().await;
-        let entry = status.entry(feed.name.clone()).or_default();
-        entry.entries = entries;
-        entry.last_refresh = Some(Utc::now());
-        entry.last_error = None;
-        Ok(entries)
+        Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
     /// Spawn one background refresh task per feed (cadence = `refresh_hours`).
