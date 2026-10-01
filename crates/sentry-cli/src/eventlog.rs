@@ -36,35 +36,30 @@ fn truncate(s: &str, max_chars: usize) -> String {
 pub struct SignalSummary {
     pub kind: String,
     pub weight: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
 /// Flat per-event summary (Grafana-friendly: no nested protocol payloads).
+///
+/// Every field is always serialized (`null` instead of omitted): consumers
+/// like the Grafana Infinity datasource infer columns from the first row,
+/// so the key set must be identical across events regardless of protocol.
 #[derive(Debug, Clone, Serialize)]
 pub struct EventSummary {
     pub ts: String,
     pub ip: String,
     pub source: String,
     pub protocol: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
     pub verdict: String,
     pub risk_level: String,
     pub score: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub asn: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_hit: Option<String>,
     pub signals: Vec<SignalSummary>,
 }
@@ -321,6 +316,54 @@ mod tests {
         assert_eq!(s.signals[0].weight, 60);
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"verdict\":\"block\""));
+    }
+
+    #[test]
+    fn summary_serializes_stable_key_set() {
+        let keys = |s: &EventSummary| {
+            let v = serde_json::to_value(s).unwrap();
+            v.as_object().unwrap().keys().cloned().collect::<Vec<_>>()
+        };
+        let http = EventSummary::from_processed(&http_evt("203.0.113.9", "/a", Some(404)));
+        let raw = EventSummary::from_processed(&ProcessedEvent {
+            event: Event::new(
+                SourceKind::Synthetic,
+                "10.0.0.1".parse().unwrap(),
+                ProtocolData::Raw(sentry_core::event::RawData {
+                    note: "x".into(),
+                    bytes: vec![],
+                }),
+            ),
+            analysis: AnalysisResult::default(),
+            decision: Decision {
+                analysis: AnalysisResult::default(),
+                action: Verdict::Allow,
+                override_reason: None,
+            },
+            rule_hit: None,
+        });
+        assert_eq!(keys(&http), keys(&raw));
+        let v = serde_json::to_value(&raw).unwrap();
+        for k in [
+            "ts",
+            "ip",
+            "source",
+            "protocol",
+            "method",
+            "path",
+            "host",
+            "status",
+            "user_agent",
+            "verdict",
+            "risk_level",
+            "score",
+            "country",
+            "asn",
+            "rule_hit",
+            "signals",
+        ] {
+            assert!(v.get(k).is_some(), "missing key {k}");
+        }
     }
 
     #[test]

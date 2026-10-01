@@ -400,70 +400,7 @@
           "source": "url",
           "url": "http://host.docker.internal:9100/api/events?limit=100",
           "format": "table",
-          "root_selector": "$[*]",
-          "refId": "events",
-          "columns": [
-            {
-              "selector": "ts",
-              "text": "Time",
-              "type": "string"
-            },
-            {
-              "selector": "ip",
-              "text": "IP",
-              "type": "string"
-            },
-            {
-              "selector": "source",
-              "text": "Source",
-              "type": "string"
-            },
-            {
-              "selector": "method",
-              "text": "Method",
-              "type": "string"
-            },
-            {
-              "selector": "path",
-              "text": "Path",
-              "type": "string"
-            },
-            {
-              "selector": "status",
-              "text": "Status",
-              "type": "number"
-            },
-            {
-              "selector": "verdict",
-              "text": "Verdict",
-              "type": "string"
-            },
-            {
-              "selector": "risk_level",
-              "text": "Level",
-              "type": "string"
-            },
-            {
-              "selector": "score",
-              "text": "Score",
-              "type": "number"
-            },
-            {
-              "selector": "country",
-              "text": "Country",
-              "type": "string"
-            },
-            {
-              "selector": "asn",
-              "text": "ASN",
-              "type": "number"
-            },
-            {
-              "selector": "signals",
-              "text": "Signals",
-              "type": "string"
-            }
-          ]
+          "refId": "events"
         }
       ],
       "fieldConfig": {
@@ -500,7 +437,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Verdict"
+              "options": "verdict"
             },
             "properties": [
               {
@@ -528,6 +465,54 @@
                     }
                   }
                 ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "host"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "user_agent"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ip"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 130
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ts"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 180
               }
             ]
           }
