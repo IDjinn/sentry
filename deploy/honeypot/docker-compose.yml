@@ -147,7 +147,9 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:11.2.0
+    # 11.6.16: minimum the Infinity 4.0.0 plugin accepts (grafanaDependency
+    # >=11.6.11 <12) — on 11.2.x the plugin frontend 404s on react/jsx-runtime.
+    image: grafana/grafana:11.6.16
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:?set in .env}
