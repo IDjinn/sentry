@@ -542,16 +542,19 @@ mod tests {
             analysis: AnalysisResult::default(),
             action: Verdict::Block,
             override_reason: None,
+            log_level: None,
         };
         let rate = Decision {
             analysis: AnalysisResult::default(),
             action: Verdict::RateLimit,
             override_reason: None,
+            log_level: None,
         };
         let allow = Decision {
             analysis: AnalysisResult::default(),
             action: Verdict::Allow,
             override_reason: None,
+            log_level: None,
         };
         assert!(mk(Verdict::Block).applies_to(&block));
         assert!(!mk(Verdict::Block).applies_to(&rate));

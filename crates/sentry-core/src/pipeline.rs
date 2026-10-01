@@ -450,6 +450,7 @@ impl Pipeline {
                         },
                         action: Verdict::Allow,
                         override_reason: Some("trusted ip".into()),
+                        log_level: None,
                     },
                     rule_hit: None,
                 };
@@ -507,6 +508,7 @@ impl Pipeline {
                     analysis: result.clone(),
                     action: verdict,
                     override_reason: Some(format!("rule '{}' short-circuited", rule.id)),
+                    log_level: rule.log_level,
                 };
                 return ProcessedEvent {
                     event: evt.clone(),
@@ -613,6 +615,7 @@ impl Pipeline {
             analysis: analysis.clone(),
             action,
             override_reason,
+            log_level: None,
         };
 
         ProcessedEvent {
@@ -787,6 +790,7 @@ impl Pipeline {
             analysis: analysis.clone(),
             action,
             override_reason,
+            log_level: None,
         };
 
         ProcessedEvent {
@@ -849,6 +853,7 @@ impl Pipeline {
             analysis: analysis.clone(),
             action,
             override_reason,
+            log_level: base.decision.log_level,
         };
         if decision.action != Verdict::Allow {
             if let Some(ref offender) = self.offender {
@@ -942,6 +947,7 @@ mod tests {
             source: crate::rules::RuleSource::Config,
             tags: vec![],
             created_at: None,
+            log_level: None,
         }]);
         p.swap_rules(new_rules);
         let evt = http_evt("/api/users");

@@ -1201,6 +1201,10 @@ pub struct RuleDefConfig {
     /// Free-form tags for grouping.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Console verbosity for events this rule matches: `silent` (no event
+    /// line at all), `info` (default), `warn` or `error`.
+    #[serde(default)]
+    pub log_level: Option<String>,
 }
 
 /// A reputation feed or dataset to sync.

@@ -234,6 +234,7 @@ pub fn feed_rule(feed: &FeedConfig) -> Result<Option<Rule>, String> {
         source: RuleSource::Feed,
         tags: vec!["feed".into(), format!("feed:{}", feed.name)],
         created_at: Some(chrono::Utc::now()),
+        log_level: None,
     }))
 }
 
@@ -318,6 +319,7 @@ pub fn dataset_rule(feed: &FeedConfig, entries: &[String]) -> Result<Option<Rule
         source: RuleSource::Feed,
         tags: vec!["feed".into(), format!("feed:{}", feed.name)],
         created_at: Some(chrono::Utc::now()),
+        log_level: None,
     }))
 }
 

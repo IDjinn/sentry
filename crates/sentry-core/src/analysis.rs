@@ -225,6 +225,42 @@ impl AnalysisResult {
     }
 }
 
+/// Console verbosity applied to events matched by a rule (`log_level` on
+/// `[[rules.custom]]`). Default (absent) behaves like `info` — the current
+/// behavior of printing every processed event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RuleLogLevel {
+    /// Do not print the event to the console at all (still persisted and
+    /// dispatched to actions).
+    #[serde(rename = "silent")]
+    Silent,
+    /// Print the event line (the default).
+    #[default]
+    #[serde(rename = "info")]
+    Info,
+    /// Emit the event through the `warn` log level.
+    #[serde(rename = "warn")]
+    Warn,
+    /// Emit the event through the `error` log level.
+    #[serde(rename = "error")]
+    Error,
+}
+
+impl RuleLogLevel {
+    /// Parse the config string form (`silent`|`info`|`warn`|`error`).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "silent" | "off" => Ok(Self::Silent),
+            "info" => Ok(Self::Info),
+            "warn" => Ok(Self::Warn),
+            "error" => Ok(Self::Error),
+            other => Err(format!(
+                "unknown log_level '{other}' (expected silent|info|warn|error)"
+            )),
+        }
+    }
+}
+
 /// A decision is the analysis result enriched with the final action to take,
 /// after policy rules have been applied (e.g. "High + new IP → Challenge").
 ///
@@ -239,4 +275,8 @@ pub struct Decision {
     pub action: Verdict,
     /// Optional reason explaining why policy overrode the detector, if any.
     pub override_reason: Option<String>,
+    /// Console verbosity for this event, taken from the matching rule's
+    /// `log_level` (short-circuit rules only). `None` = default behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<RuleLogLevel>,
 }

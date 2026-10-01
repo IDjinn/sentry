@@ -647,6 +647,7 @@ mod tests {
             source: RuleSource::Config,
             tags: vec![],
             created_at: None,
+            log_level: None,
         };
         std::sync::Arc::new(sentry_core::Pipeline::new(
             RuleSet::new(vec![rule]),

@@ -269,6 +269,7 @@ mod tests {
             analysis,
             action: verdict,
             override_reason: None,
+            log_level: None,
         }
     }
 
@@ -339,6 +340,7 @@ mod tests {
             analysis,
             action: Verdict::Allow,
             override_reason: None,
+            log_level: None,
         };
         let payload = discord_payload(&evt, &decision, &sample_ctx(None));
         let names: Vec<&str> = payload["embeds"][0]["fields"]
@@ -378,6 +380,7 @@ mod tests {
             analysis,
             action: Verdict::Block,
             override_reason: None,
+            log_level: None,
         };
         let evt = sample_event();
         action
@@ -402,6 +405,7 @@ mod tests {
             analysis,
             action: Verdict::Block,
             override_reason: None,
+            log_level: None,
         };
         assert!(action.applies_to(&decision));
         let mut allow = decision.clone();

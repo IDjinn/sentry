@@ -184,6 +184,7 @@ mod tests {
             analysis: AnalysisResult::empty(),
             action: verdict,
             override_reason: None,
+            log_level: None,
         }
     }
 

@@ -240,6 +240,7 @@ mod tests {
                 analysis: AnalysisResult::default(),
                 action: Verdict::Block,
                 override_reason: None,
+                log_level: None,
             },
             rule_hit: None,
         }
@@ -339,6 +340,7 @@ mod tests {
                 analysis: AnalysisResult::default(),
                 action: Verdict::Allow,
                 override_reason: None,
+                log_level: None,
             },
             rule_hit: None,
         });
@@ -384,6 +386,7 @@ mod tests {
                 analysis: AnalysisResult::default(),
                 action: Verdict::Allow,
                 override_reason: None,
+                log_level: None,
             },
             rule_hit: None,
         };

@@ -171,6 +171,10 @@ pub struct Rule {
     pub source: RuleSource,
     /// Free-form tags for grouping/inspection (`vpn`, `crawler`, …).
     pub tags: Vec<String>,
+    /// Console verbosity for events this rule short-circuits on
+    /// (`silent` suppresses the event line entirely). `None` = default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<crate::analysis::RuleLogLevel>,
     /// When the rule was created (for DB/feed rules).
     pub created_at: Option<DateTime<Utc>>,
 }
@@ -210,6 +214,12 @@ pub fn rules_from_config(defs: &[crate::config::RuleDefConfig]) -> Vec<Result<Ru
                 dsl::parse(&def.r#match).map_err(|e| format!("rule '{}': {e}", def.name))?;
             let action =
                 parse_rule_action(&def.action).map_err(|e| format!("rule '{}': {e}", def.name))?;
+            let log_level = def
+                .log_level
+                .as_deref()
+                .map(crate::analysis::RuleLogLevel::parse)
+                .transpose()
+                .map_err(|e| format!("rule '{}': {e}", def.name))?;
             Ok(Rule {
                 id: rule_slug(&def.name),
                 name: def.name.clone(),
@@ -220,7 +230,9 @@ pub fn rules_from_config(defs: &[crate::config::RuleDefConfig]) -> Vec<Result<Ru
                 ttl: None,
                 source: RuleSource::Config,
                 tags: def.tags.clone(),
+                log_level,
                 created_at: None,
+                log_level: None,
             })
         })
         .collect()
@@ -951,6 +963,7 @@ mod tests {
             source: RuleSource::Config,
             tags: vec![],
             created_at: None,
+                log_level: None,
         };
         let block_env = Rule {
             id: "block-env".into(),
@@ -966,6 +979,7 @@ mod tests {
             source: RuleSource::Config,
             tags: vec![],
             created_at: None,
+                log_level: None,
         };
         let rs = RuleSet::new(vec![allow_internal, block_env]);
 
@@ -1004,6 +1018,7 @@ mod tests {
             source: RuleSource::Config,
             tags: vec![],
             created_at: None,
+                log_level: None,
         }]);
         let evt = http_event("/", "8.8.8.8");
         assert!(rs.evaluate(&evt).is_none());
@@ -1024,6 +1039,7 @@ mod tests {
             source: RuleSource::Config,
             tags: vec![],
             created_at: None,
+                log_level: None,
         }]);
         let evt = http_event("/", "1.2.3.4");
         assert!(rs.evaluate(&evt).is_none());
@@ -1076,6 +1092,7 @@ mod tests {
             source: RuleSource::Config,
             tags: vec![],
             created_at: None,
+                log_level: None,
         }
     }
 

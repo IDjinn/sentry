@@ -215,6 +215,7 @@ fn sensitive_path_rules(enforce: bool) -> Vec<Rule> {
             source: RuleSource::DefaultPack,
             tags: vec!["sensitive_paths".into()],
             created_at: None,
+        log_level: None,
         })
         .collect();
 
@@ -232,6 +233,7 @@ fn sensitive_path_rules(enforce: bool) -> Vec<Rule> {
         source: RuleSource::DefaultPack,
         tags: vec!["sensitive_paths".into(), "allowlist".into()],
         created_at: None,
+        log_level: None,
     });
 
     rules
@@ -262,6 +264,7 @@ fn honeypot_path_rules(enforce: bool) -> Vec<Rule> {
             source: RuleSource::DefaultPack,
             tags: vec!["honeypot_paths".into()],
             created_at: None,
+        log_level: None,
         })
         .collect()
 }
@@ -297,6 +300,7 @@ fn host_allowlist_rules(enforce: bool, domains: &[String]) -> Vec<Rule> {
         source: RuleSource::DefaultPack,
         tags: vec!["host_allowlist".into()],
         created_at: None,
+        log_level: None,
     }]
 }
 
@@ -325,6 +329,7 @@ fn bad_crawler_rules(enforce: bool) -> Vec<Rule> {
         source: RuleSource::DefaultPack,
         tags: vec!["crawlers_bad".into()],
         created_at: None,
+        log_level: None,
     }]
 }
 
@@ -348,6 +353,7 @@ fn empty_ua_rules(enforce: bool) -> Vec<Rule> {
         source: RuleSource::DefaultPack,
         tags: vec!["empty_ua".into()],
         created_at: None,
+        log_level: None,
     }]
 }
 
@@ -370,6 +376,7 @@ fn http_anomaly_rules(enforce: bool) -> Vec<Rule> {
             source: RuleSource::DefaultPack,
             tags: vec!["http_anomaly".into()],
             created_at: None,
+        log_level: None,
         },
         Rule {
             id: "http_anomaly_connect".into(),
@@ -382,6 +389,7 @@ fn http_anomaly_rules(enforce: bool) -> Vec<Rule> {
             source: RuleSource::DefaultPack,
             tags: vec!["http_anomaly".into()],
             created_at: None,
+        log_level: None,
         },
     ]
 }
@@ -404,6 +412,7 @@ fn vpn_proxy_rules(enforce: bool) -> Vec<Rule> {
         source: RuleSource::DefaultPack,
         tags: vec!["vpn_proxy".into()],
         created_at: None,
+        log_level: None,
     }]
 }
 
@@ -425,6 +434,7 @@ fn tor_rules(enforce: bool) -> Vec<Rule> {
         source: RuleSource::DefaultPack,
         tags: vec!["tor".into()],
         created_at: None,
+        log_level: None,
     }]
 }
 
@@ -460,6 +470,7 @@ fn good_crawler_rules(_enforce: bool, bot_verify: bool) -> Vec<Rule> {
         source: RuleSource::DefaultPack,
         tags: vec!["crawlers_good".into()],
         created_at: None,
+        log_level: None,
     };
 
     if bot_verify {
@@ -508,6 +519,7 @@ fn rate_scan_rules(enforce: bool) -> Vec<Rule> {
         source: RuleSource::DefaultPack,
         tags: vec!["rate_scan".into()],
         created_at: None,
+        log_level: None,
     }]
 }
 
@@ -534,5 +546,6 @@ fn country_blocklist_rules(enforce: bool, countries: &[String]) -> Vec<Rule> {
         source: RuleSource::DefaultPack,
         tags: vec!["country_blocklist".into()],
         created_at: None,
+        log_level: None,
     }]
 }

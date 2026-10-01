@@ -793,6 +793,7 @@ impl RuleRepo {
                 source,
                 tags: row.tags,
                 created_at: Some(row.created_at),
+                log_level: None,
             });
         }
 
