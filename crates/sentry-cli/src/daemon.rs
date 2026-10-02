@@ -610,6 +610,17 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         });
     }
     {
+        let pipeline = Arc::clone(&pipeline);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                pipeline.prune_pending();
+            }
+        });
+    }
+    {
         let table = Arc::clone(&block_table);
         let metrics = metrics.clone();
         tokio::spawn(async move {

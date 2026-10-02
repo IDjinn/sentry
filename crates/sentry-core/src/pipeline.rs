@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};
 use crate::behavior::BehaviorTracker;
@@ -315,7 +315,17 @@ pub struct Pipeline {
     correlation: Option<Arc<RwLock<CorrelationTracker>>>,
     trust: Option<crate::trust::SharedTrustSet>,
     bot: Option<crate::botverify::SharedBotVerifier>,
+    /// Signals raised by response-phase observations (inline edge): applied
+    /// to the next request from the same IP, since request-phase verdicts
+    /// are decided before any response exists.
+    pending: RwLock<HashMap<IpAddr, Vec<(Instant, Signal)>>>,
 }
+
+/// Queued response signals older than this are dropped, both on drain and
+/// in [`Pipeline::prune_pending`] — the behavior they describe is long gone.
+const PENDING_TTL: Duration = Duration::from_secs(60);
+/// Per-IP cap on queued response signals (drop-oldest beyond it).
+const PENDING_MAX_PER_IP: usize = 16;
 
 /// Output of processing a single event.
 #[derive(Debug, Clone)]
@@ -371,6 +381,7 @@ impl Pipeline {
             correlation: None,
             trust: None,
             bot: None,
+            pending: RwLock::new(HashMap::new()),
         }
     }
 
@@ -540,6 +551,22 @@ impl Pipeline {
             });
         }
         signals.extend(self.routes.read().unwrap().validate(evt));
+        // Response-phase feedback (inline edge): scan/behavior trackers key
+        // on the HTTP status, which only exists after a response was served —
+        // signals they raised on earlier responses apply to this request.
+        // Drained once, TTL-filtered so stale queues don't bite.
+        if evt.http().is_some() {
+            let now = Instant::now();
+            let mut pending = self.pending.write().unwrap();
+            if let Some(queued) = pending.remove(&evt.client_ip) {
+                signals.extend(
+                    queued
+                        .into_iter()
+                        .filter(|(ts, _)| now.duration_since(*ts) < PENDING_TTL)
+                        .map(|(_, s)| s),
+                );
+            }
+        }
         if let Some(ref scan) = self.scan {
             if let Some(http) = evt.http() {
                 let mut tracker = scan.write().unwrap();
@@ -624,6 +651,64 @@ impl Pipeline {
             decision: self.apply_escalation(evt, decision),
             rule_hit: None,
         }
+    }
+
+    /// Feed the response phase of an inline-edge request into the stateful
+    /// trackers with the now-known response status, and queue the resulting
+    /// signals for the *next* request from the same IP.
+    ///
+    /// The request-phase [`process`](Self::process) call runs before any
+    /// response exists (`HttpData.status` is `None` on the edge), so the
+    /// status-gated detectors — [`ScanTracker`](crate::scan::ScanTracker)
+    /// (4xx windows) and the `BehaviorTracker` detectors — are blind at that
+    /// point. This method is the feedback half: called by the edge once the
+    /// response status is known (upstream status, or the edge's own
+    /// 403/429/301), it performs the real tracker feed — exactly one stateful
+    /// feed per request, since the request-phase call was a no-op — and
+    /// enqueues the raised signals, which the next `process` call for the IP
+    /// drains into scoring, policy and escalation.
+    ///
+    /// Returns the signals produced by this observation.
+    pub fn observe_response(
+        &self,
+        ip: IpAddr,
+        path: &str,
+        status: u16,
+        user_agent: Option<&str>,
+    ) -> Vec<Signal> {
+        let mut signals = Vec::new();
+        if let Some(ref scan) = self.scan {
+            signals.extend(scan.write().unwrap().record(ip, path, Some(status)));
+        }
+        if let Some(ref behavior) = self.behavior {
+            signals.extend(
+                behavior
+                    .write()
+                    .unwrap()
+                    .record(ip, path, Some(status), user_agent),
+            );
+        }
+        if !signals.is_empty() {
+            let now = Instant::now();
+            let mut pending = self.pending.write().unwrap();
+            let entry = pending.entry(ip).or_default();
+            if entry.len() + signals.len() > PENDING_MAX_PER_IP {
+                let overflow = entry.len() + signals.len() - PENDING_MAX_PER_IP;
+                entry.drain(..overflow.min(entry.len()));
+            }
+            entry.extend(signals.iter().map(|s| (now, s.clone())));
+        }
+        signals
+    }
+
+    /// Drop expired queued response signals (daemon prune task).
+    pub fn prune_pending(&self) {
+        let now = Instant::now();
+        let mut pending = self.pending.write().unwrap();
+        pending.retain(|_, queued| {
+            queued.retain(|(ts, _)| now.duration_since(*ts) < PENDING_TTL);
+            !queued.is_empty()
+        });
     }
 
     /// Record a strike for a non-Allow decision and escalate the verdict if
@@ -1166,6 +1251,189 @@ mod tests {
             .any(|s| s.kind == SignalKind::RandomScan));
         assert!(r.analysis.risk_score >= 33);
         assert_eq!(r.decision.action, Verdict::RateLimit);
+    }
+
+    fn http_evt_from_ip(ip: IpAddr, path: &str) -> Event {
+        Event::new(
+            SourceKind::Synthetic,
+            ip,
+            ProtocolData::Http(HttpData {
+                path: path.to_string(),
+                ..Default::default()
+            }),
+        )
+    }
+
+    #[test]
+    fn response_observation_queues_scan_signals_for_next_request() {
+        let scan = Arc::new(RwLock::new(ScanTracker::new(60, 8, 1000)));
+        let p =
+            Pipeline::new(RuleSet::default(), RouteValidator::default()).with_scan_tracker(scan);
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23));
+
+        // Request phase has no status (the edge scores before proxying), so
+        // the burst alone stays LOW/Allow...
+        for i in 0..8 {
+            let r = p.process(&http_evt_from_ip(ip, &format!("/f{i}.php")));
+            assert_eq!(r.decision.action, Verdict::Allow);
+            // ...and the response phase feeds the tracker with the real 404.
+            let sigs = p.observe_response(ip, &format!("/f{i}.php"), 404, None);
+            if i < 7 {
+                assert!(
+                    sigs.iter().all(|s| s.kind != SignalKind::RandomScan),
+                    "iteration {i}"
+                );
+            } else {
+                assert!(
+                    sigs.iter().any(|s| s.kind == SignalKind::RandomScan),
+                    "8th distinct path must cross the threshold"
+                );
+            }
+        }
+        // The next request carries the queued signal and gets enforced.
+        // 18 (UA+route) + 25 (RandomScan) + 10 repetition = 53 → High.
+        let next = p.process(&http_evt_from_ip(ip, "/g.php"));
+        assert!(next
+            .analysis
+            .signals
+            .iter()
+            .any(|s| s.kind == SignalKind::RandomScan));
+        assert_eq!(next.decision.action, Verdict::Challenge);
+    }
+
+    #[test]
+    fn pending_response_signals_do_not_leak_across_ips() {
+        let scan = Arc::new(RwLock::new(ScanTracker::new(60, 2, 1000)));
+        let p =
+            Pipeline::new(RuleSet::default(), RouteValidator::default()).with_scan_tracker(scan);
+        let scanner = std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23));
+        let other = std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 99));
+
+        assert!(p.observe_response(scanner, "/a.php", 404, None).is_empty());
+        p.observe_response(scanner, "/b.php", 404, None);
+
+        let r = p.process(&http_evt_from_ip(other, "/c.php"));
+        assert!(r
+            .analysis
+            .signals
+            .iter()
+            .all(|s| s.kind != SignalKind::RandomScan));
+        assert_eq!(r.decision.action, Verdict::Allow);
+    }
+
+    #[test]
+    fn successful_responses_leave_no_pending_signals() {
+        let scan = Arc::new(RwLock::new(ScanTracker::new(60, 2, 2)));
+        let p =
+            Pipeline::new(RuleSet::default(), RouteValidator::default()).with_scan_tracker(scan);
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23));
+
+        for i in 0..10 {
+            p.process(&http_evt_from_ip(ip, &format!("/api/items/{i}")));
+            assert!(p
+                .observe_response(ip, &format!("/api/items/{i}"), 200, None)
+                .is_empty());
+        }
+        let r = p.process(&http_evt_from_ip(ip, "/api/items/11"));
+        assert!(r
+            .analysis
+            .signals
+            .iter()
+            .all(|s| s.kind != SignalKind::RandomScan && s.kind != SignalKind::ScanBehavior));
+        // No state leaked: a single 404 after all the 200s starts from zero.
+        assert!(p.observe_response(ip, "/first-404", 404, None).is_empty());
+    }
+
+    #[test]
+    fn pending_signals_are_consumed_once() {
+        let scan = Arc::new(RwLock::new(ScanTracker::new(60, 1, 1000)));
+        let p =
+            Pipeline::new(RuleSet::default(), RouteValidator::default()).with_scan_tracker(scan);
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23));
+
+        p.observe_response(ip, "/a.php", 404, None);
+        let first = p.process(&http_evt_from_ip(ip, "/b.php"));
+        assert!(first
+            .analysis
+            .signals
+            .iter()
+            .any(|s| s.kind == SignalKind::RandomScan));
+        let second = p.process(&http_evt_from_ip(ip, "/c.php"));
+        assert!(second
+            .analysis
+            .signals
+            .iter()
+            .all(|s| s.kind != SignalKind::RandomScan));
+    }
+
+    #[test]
+    fn prune_pending_keeps_live_entries() {
+        let scan = Arc::new(RwLock::new(ScanTracker::new(60, 1, 1000)));
+        let p =
+            Pipeline::new(RuleSet::default(), RouteValidator::default()).with_scan_tracker(scan);
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23));
+
+        p.observe_response(ip, "/a.php", 404, None);
+        p.prune_pending();
+        let r = p.process(&http_evt_from_ip(ip, "/b.php"));
+        assert!(r
+            .analysis
+            .signals
+            .iter()
+            .any(|s| s.kind == SignalKind::RandomScan));
+    }
+
+    #[test]
+    fn response_observation_feeds_behavior_trackers() {
+        let behavior = Arc::new(RwLock::new(BehaviorTracker::new(300, 3, 100, 100)));
+        let p = Pipeline::new(RuleSet::default(), RouteValidator::default())
+            .with_behavior_tracker(behavior);
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23));
+        let ua = "Mozilla/5.0 (X11; Linux x86_64)";
+
+        for _ in 0..3 {
+            p.process(&http_evt_from_ip(ip, "/login"));
+            p.observe_response(ip, "/login", 401, Some(ua));
+        }
+        let next = p.process(&http_evt_from_ip(ip, "/login"));
+        assert!(next
+            .analysis
+            .signals
+            .iter()
+            .any(|s| s.kind == SignalKind::AuthBruteForce));
+    }
+
+    #[test]
+    fn recurring_response_signals_escalate_to_block() {
+        let scan = Arc::new(RwLock::new(ScanTracker::new(60, 8, 1000)));
+        let cfg = escalation_cfg();
+        let offender = Arc::new(RwLock::new(OffenderTracker::from_config(&cfg)));
+        let p = Pipeline::new(RuleSet::default(), RouteValidator::default())
+            .with_scan_tracker(scan)
+            .with_offender(Arc::clone(&offender), cfg);
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23));
+
+        let mut verdicts = Vec::new();
+        for i in 0..14 {
+            let r = p.process(&http_evt_from_ip(ip, &format!("/f{i}.php")));
+            verdicts.push(r.decision.action);
+            p.observe_response(ip, &format!("/f{i}.php"), 404, None);
+        }
+        assert_eq!(
+            &verdicts[..8],
+            &[Verdict::Allow; 8],
+            "no status at request phase: all allowed"
+        );
+        // The drained RandomScan lands at 53 (18+25+10 repetition) → High →
+        // Challenge from the first violating request; strikes then carry it
+        // to Block at the 5th violation.
+        assert_eq!(
+            &verdicts[8..12],
+            &[Verdict::Challenge; 4],
+            "queued scan signals + strikes climb the ladder"
+        );
+        assert_eq!(verdicts[12], Verdict::Block);
+        assert_eq!(verdicts[13], Verdict::Block);
     }
 
     fn http_evt_from(ip: IpAddr, path: &str, status: u16) -> Event {

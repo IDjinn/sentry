@@ -311,6 +311,17 @@ não em runtime.
     explícito; fan-in `Incoming::{Raw,Processed}` — edge roda o mesmo
     `Arc<Pipeline>` (trackers não duplo-contam) e entrega o resultado pronto;
     `deploy/k8s/edge-sidecar.yaml`; ver `ARCHITECTURE.md` §8.3)
+  - ✅ F3.9.1 Feedback da fase de resposta na edge inline (`Pipeline::observe_response`
+    + fila `pending` por-IP no core; o proxy publica o evento **depois** da
+    resposta com `HttpData.status` real — antes, eventos `[http_proxy]`
+    nasciam `status: None` e ScanTracker/BehaviorTracker (4xx) e o pack
+    `rate_scan` ficavam cegos para tráfego inline, mantendo scanners em
+    LOW/Allow para sempre; sinais observados na resposta (upstream ou
+    403/429/301 da própria edge) entram no próximo request do mesmo IP via
+    fila TTL 60s/cap 16, passando por repetição/correlação/policy/escalada —
+    rajada de paths distintos agora termina em 429/403 + BlockTable; prune
+    via `pipeline.prune_pending()` na tarefa de prune do daemon; middleware
+    embutido segue publicando na fase de request — follow-up)
   - ✅ F3.10 Correlação scan→ataque cross-IP + taxonomia de scanners
     (`correlation.rs`: `CorrelationTracker` com janelas deslizantes por
     /24 (v4), /64 (v6) e ASN, cap 64/chave, prune no daemon; o pipeline

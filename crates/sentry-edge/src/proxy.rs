@@ -303,33 +303,85 @@ async fn proxy_handler_inner(State(state): State<ProxyState>, req: Request) -> R
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
         .map(|c| c.0.port());
 
-    let processed = runtime.process(evt);
-    // Hand the decided event to the daemon for persistence + actions.
-    let _ = decided.try_send(processed.clone());
+    let mut processed = runtime.process(evt);
+    let ua = processed.event.http().and_then(|h| h.user_agent.clone());
+    let path = processed
+        .event
+        .http()
+        .map(|h| h.path.clone())
+        .unwrap_or_default();
 
-    match processed.decision.action {
-        sentry_core::analysis::Verdict::Allow => {}
+    let resp = match processed.decision.action {
+        sentry_core::analysis::Verdict::Allow => {
+            serve_allow(
+                &parts,
+                &body_bytes,
+                is_tls,
+                redirect_https,
+                &client,
+                &upstream,
+            )
+            .await
+        }
         sentry_core::analysis::Verdict::RateLimit => {
-            return pages::rate_limit_page(Some(processed.event.id))
+            pages::rate_limit_page(Some(processed.event.id))
         }
         sentry_core::analysis::Verdict::Challenge => {
             match runtime.challenge_gate(&parts.headers, client_ip, Some(processed.event.id)) {
-                crate::ChallengeGate::Pass => {}
-                crate::ChallengeGate::Page(page) => return page,
-                crate::ChallengeGate::Blocked(page) => return page,
+                crate::ChallengeGate::Pass => {
+                    serve_allow(
+                        &parts,
+                        &body_bytes,
+                        is_tls,
+                        redirect_https,
+                        &client,
+                        &upstream,
+                    )
+                    .await
+                }
+                crate::ChallengeGate::Page(page) => page,
+                crate::ChallengeGate::Blocked(page) => page,
                 crate::ChallengeGate::Disabled => {
-                    return pages::challenge_required_page(Some(processed.event.id))
+                    pages::challenge_required_page(Some(processed.event.id))
                 }
             }
         }
         sentry_core::analysis::Verdict::Block | sentry_core::analysis::Verdict::Quarantine => {
-            return pages::block_page(Some(processed.event.id))
+            pages::block_page(Some(processed.event.id))
         }
-    }
+    };
 
-    // Plain-HTTP → HTTPS redirect (F8): verdicts above already applied, so
-    // port-80 traffic stays monitored and enforced; benign requests get the
-    // 301 instead of double-hitting the upstream.
+    // Response-phase feedback: the request-phase pipeline saw no status (the
+    // response did not exist yet), so the status-keyed trackers (scan,
+    // behavior) are fed here with the real code — their signals are queued
+    // for the next request from this IP. The event is published only now so
+    // it carries the response status it displays.
+    let status = resp.status().as_u16();
+    if let sentry_core::ProtocolData::Http(http) = &mut processed.event.protocol {
+        http.status = Some(status);
+    }
+    runtime
+        .pipeline()
+        .observe_response(client_ip, &path, status, ua.as_deref());
+    let _ = decided.try_send(processed);
+
+    resp
+}
+
+/// Allow path (and challenge-passed requests): plain-HTTP → HTTPS redirect
+/// (F8) when configured, otherwise forward to the upstream and pass its
+/// response through.
+async fn serve_allow(
+    parts: &axum::http::request::Parts,
+    body_bytes: &[u8],
+    is_tls: bool,
+    redirect_https: bool,
+    client: &reqwest::Client,
+    upstream: &str,
+) -> Response {
+    // Plain-HTTP → HTTPS redirect (F8): port-80 traffic stays monitored and
+    // enforced; benign requests get the 301 instead of double-hitting the
+    // upstream.
     if redirect_https && !is_tls {
         if let Some(host) = parts
             .headers
@@ -370,9 +422,8 @@ async fn proxy_handler_inner(State(state): State<ProxyState>, req: Request) -> R
             fwd = fwd.header(name, val);
         }
     }
-    let body_out = body_bytes.clone();
-    if !body_out.is_empty() {
-        fwd = fwd.body(body_out);
+    if !body_bytes.is_empty() {
+        fwd = fwd.body(body_bytes.to_vec());
     }
 
     match fwd.send().await {
@@ -490,5 +541,123 @@ mod tests {
             dec_rx.try_recv().is_ok(),
             "redirected request was monitored"
         );
+    }
+
+    /// Minimal upstream answering 404 to everything (honeypot decoy).
+    async fn spawn_404_upstream() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn decided_events_carry_upstream_status() {
+        let upstream = spawn_404_upstream().await;
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: format!("http://{upstream}"),
+                decided: dec_tx,
+                redirect_https: false,
+            });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/some/missing.php")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let pe = dec_rx.try_recv().expect("decided event published");
+        match &pe.event.protocol {
+            sentry_core::ProtocolData::Http(h) => assert_eq!(h.status, Some(404)),
+            other => panic!("expected http event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn scanner_burst_is_enforced_from_queued_response_signals() {
+        let upstream = spawn_404_upstream().await;
+        let scan = std::sync::Arc::new(std::sync::RwLock::new(
+            sentry_core::scan::ScanTracker::from_config(&sentry_core::config::ScanConfig::default()),
+        ));
+        let escalation = sentry_core::config::EscalationConfig::default();
+        let offender = std::sync::Arc::new(std::sync::RwLock::new(
+            sentry_core::offender::OffenderTracker::from_config(&escalation),
+        ));
+        let pipeline = std::sync::Arc::new(
+            sentry_core::pipeline::Pipeline::new(
+                sentry_core::RuleSet::default(),
+                sentry_core::RouteValidator::new(vec![]),
+            )
+            .with_scan_tracker(scan)
+            .with_offender(offender, escalation),
+        );
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(64);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: format!("http://{upstream}"),
+                decided: dec_tx,
+                redirect_https: false,
+            });
+
+        let mut statuses = Vec::new();
+        for i in 0..20 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/scan{i}.php").as_str())
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            statuses.push(resp.status().as_u16());
+        }
+
+        // The scan window fills while the honeypot answers 404; from the 9th
+        // request on the queued scan signals enforce (challenge/block pages
+        // are both 403) and escalation carries the burst to a hard Block.
+        assert_eq!(
+            &statuses[..8],
+            &[404; 8],
+            "honeypot serves the burst while the window fills"
+        );
+        assert_eq!(statuses[8], 403, "{statuses:?}");
+        assert_eq!(statuses.last(), Some(&403), "{statuses:?}");
+
+        // Every decided event carries the response status it displayed.
+        let mut saw_404 = false;
+        let mut saw_403 = false;
+        while let Ok(pe) = dec_rx.try_recv() {
+            if let sentry_core::ProtocolData::Http(h) = &pe.event.protocol {
+                assert!(h.status.is_some(), "event without response status");
+                match h.status {
+                    Some(404) => saw_404 = true,
+                    Some(403) => saw_403 = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_404 && saw_403);
     }
 }

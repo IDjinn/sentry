@@ -474,6 +474,23 @@ inline              client → sentry-edge → nginx → app
   retornam ao daemon pelo mesmo fan-in (`Incoming::Processed`): persistência,
   actions e forks disparam uma única vez; o `Arc<Pipeline>` é compartilhado,
   então rate-limiter/scan/behavior/offender **não** contam em dobro.
+- **Feedback da fase de resposta (F3.9.1)**: o pipeline roda na fase de
+  request, antes de existir resposta — `HttpData.status` nasce `None` na
+  edge. Detectores que dependem de status (ScanTracker, detectores
+  401/403/404 do BehaviorTracker, `RuleMatch::Status`) seriam cegos para
+  todo tráfego `[http_proxy]`. O proxy então publica o evento **depois** da
+  resposta, com o status real (upstream, ou 403/429/301 da própria edge), e
+  chama `Pipeline::observe_response(ip, path, status, ua)`, que alimenta os
+  trackers com o status (a chamada de request-phase com `None` é no-op, então
+  cada request conta exatamente uma vez) e enfileira os sinais gerados numa
+  fila por-IP (TTL 60s, cap 16) — drenada no **próximo** request do mesmo
+  IP, passando por repetição, correlação, policy e escalada. Uma rajada de
+  paths 404 distintos passa a ser desafiada a partir do ~9º request e chega
+  a Block (BlockTable) pela escalada. Limitação: `RuleMatch::Status` é
+  avaliado na fase de request e segue sem casar para tráfego inline (o
+  ScanTracker cobre o mesmo gap behavioralmente); o middleware embutido
+  (`sentry_middleware`) ainda publica na fase de request — mesmo tratamento
+  é follow-up.
 - **`sentry_middleware` (F3.1)**: o mesmo runtime exposto como middleware
   axum (`from_fn_with_state(rt, sentry_edge::middleware::handler)`) em modos
   `Inline` (bloqueia antes do handler) ou `Shadow` (anexa a decisão e
