@@ -696,3 +696,12 @@ timeout_secs = 10
 
 [[action]]
 type = "log"
+# ── Protocol schemas (F9) ────────────────────────────────────────────────
+# Validates frames on non-standard ports against YAML protocol schemas
+# (see crates/sentry-protocol/tests/fixtures/game-relay.protocol.yaml).
+[protocol]
+enabled = false
+dir = "schemas"              # watched for add/modify/remove (live reload)
+safety_poll_secs = 60        # safety rescan catching lost fs events
+debounce_ms = 500            # fs-event coalescing window
+max_schemas = 64

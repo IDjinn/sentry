@@ -86,6 +86,12 @@ pub enum Command {
         #[command(subcommand)]
         action: BotsCmd,
     },
+    /// Protocol schema validation (F9): compile/inspect YAML protocol
+    /// descriptions and test raw frames against them.
+    Protocol {
+        #[command(subcommand)]
+        action: ProtocolCmd,
+    },
     /// Auth helpers (hash generation for `[server.auth]`).
     Auth {
         #[command(subcommand)]
@@ -373,6 +379,29 @@ pub enum FirewallCmd {
     /// Detect available backends (nftables / ipset / firewalld) and their
     /// privileges; shows live set sizes when a backend responds.
     Status,
+}
+
+/// Protocol schema commands (F9).
+#[derive(Debug, Subcommand)]
+pub enum ProtocolCmd {
+    /// Compile every `*.protocol.yaml` in a directory and report errors.
+    Validate {
+        /// Schema directory (defaults to `[protocol] dir`).
+        dir: Option<String>,
+    },
+    /// List compiled protocols: ports, messages and policies.
+    List {
+        /// Schema directory (defaults to `[protocol] dir`).
+        dir: Option<String>,
+    },
+    /// Validate one raw frame (hex) against one schema file.
+    Check {
+        /// Schema file to compile.
+        schema: String,
+        /// Frame bytes as hex (e.g. 00000024...).
+        #[arg(long)]
+        hex: String,
+    },
 }
 
 /// rDNS bot verification commands (F7.7).

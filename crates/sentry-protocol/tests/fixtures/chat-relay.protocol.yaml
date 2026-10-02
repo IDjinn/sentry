@@ -1,0 +1,36 @@
+# Sentry Protocol Schema — WebSocket JSON chat relay (F9 fixture)
+id: chat-relay
+version: "1.0.0"
+description: "Self-describing JSON protocol over WebSocket: no custom macros
+  needed, the same DSL covers text protocols (validate ops apply to the
+  decoded string fields)."
+
+transport:
+  protocol: ws
+  ports: [8080]
+  flags: {path: "/ws"}
+
+on_message:
+  run: "parse_header! {as: header, size: 1}"
+
+types:
+  LPStr: {prefix: u16, decode: utf8, max_len: 4096}
+
+policies:
+  default: {weight: 20}
+  unknown_header: {weight: 35}
+
+messages:
+  hello_event:
+    when: {header: 104}
+    validate:
+      - client: LPStr len<33 alnum
+  publish_event:
+    when: {header: 112}
+    after: [hello_event]
+    validate:
+      - channel: LPStr >0 <64 alnum
+      - payload: LPStr len<4096 printable
+  ping_event:
+    when: {header: 107}
+    keepalive: true

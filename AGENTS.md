@@ -526,7 +526,80 @@ telemetria de handshake + provider de appliance
     never-ban). Wire no `build_challenge_action` (braço opnsense/pfsense,
     sem reconcile daemon-side)
 
-Backlog detalhado em `ARCHITECTURE.md` §23.
+# F9 (concluída): Protocol Schemas — DSL de descrição/validação de
+# protocolos em portas não padrão (`sentry-protocol`)
+  - ✅ F9.1 Crate `sentry-protocol` (pura: sem I/O, sem dep de
+    sentry-core; `#![forbid(unsafe_code)]`): modelo serde do DSL v3 com
+    validação estrita — `transport {protocol, ports, flags}`, `mode:
+    shadow|enforce`, `on_message.run` (pipe sugar de átomos),
+    `types` (macros de leitura DEFINIDAS POR PROTOCOLO: sugar one-liner
+    `{prefix/fixed/terminator, decode, mask_ok, max_len}` ou body de
+    steps de uma mini-máquina de registradores — atribuição com
+    **expressão infix** (`acc: "(b0 and 0x38) >> 3"`; ops palavra
+    `and/or/xor/shl/shr/add/sub/mul/not` + sugar simbólico `& | ^ << >>
+    + - *`, unário `-`; precedência C-like), I/O `read`/`decode`/`peek`,
+    `while min!(expr, cap):` (bound provável em compile-time,
+    iterações clampeiam), `if <expr>:` com bloco (branch só-para-frente),
+    statement macros `check_mask!/check_range!/check_len!` e
+    `return <reg>`; nomes de registrador reservados (ops/átomos)),
+    `policies` nomeadas
+    (`default` obrigatório; weight/on_repeat), `messages {when
+    obrigatório — união dos when = allowlist implícito, overlap = erro
+    de carga; after (sequência); policy; keepalive {cadence, rate_limit};
+    validate one-liners: TIPO >n <n len>n len<n regex in not_in req +
+    charsets}`. Ops com tokenizer próprio (aspas, vírgula). Erros
+    `ProtocolError` thiserror; fixtures `game-relay`/`chat-relay`
+  - ✅ F9.2 Compilador + VM (tabela de instruções, "FSM/JIT-like" em
+    safe Rust): schema → `Compiled {protocols, by_port}`; macros custom
+    desugaram para a MESMA `Vec<Instr>` (inlining, custo runtime zero);
+    dispatch por `when` (HashMap p/ chave uniforme, linear p/ resto);
+    framing capturado do `check_len!` em `FrameSpec` (host usa para
+    splitar o stream); VM com cursor de bytes + registers `[Value;16]`,
+    zero-regex no caminho default (op `regex` = `Arc<Regex>` compilada
+    no load, linear-time); `ProtocolEngine` = `ArcSwap<Compiled>`
+    (swap = hot-reload atômico) + `feed_on` free fn + `ConnectionState`
+    por conexão (seen-set p/ after, keepalive windows, escalação
+    on_repeat); guardas de DoS: 16 regs, 512 instrs/mensagem, `while`
+    com cap provável em compile-time (`if` = branch só-para-frente,
+    terminação garantida), aninhamento ≤8; proptests de equivalência
+    compilado× referência + never-panic em bytes arbitrários
+  - ✅ F9.3 SIMD (feature `simd`, off por default): scan de terminador
+    via `memchr` e validação UTF-8 via `simdutf8` (crates pure-Rust,
+    fallbacks escalares); bench comparativo `simd_vs_scalar` no mesmo
+    run (dev-deps sempre presentes)
+  - ✅ F9.4 Hot-reload live: watcher `notify` v6 (debounce 500ms +
+    coalescência) + rescan full por fingerprint (mtime+size) + safety
+    poll 60s; compile falho mantém o set anterior (all-or-nothing);
+    `[protocol]` no config (`enabled`, `dir`, `safety_poll_secs`,
+    `debounce_ms`, `max_schemas`); CLI `sentry protocol
+    validate|list|check <schema> --hex` + `config validate` compila os
+    schemas
+  - ✅ F9.5 Integração edge + core: `SignalKind::ProtocolViolation`
+    (weight 25 default, override por `[scorer.weights]`); edge-tcp com
+    pump validado client→server quando um schema guarda a porta local e
+    declara framing — `enforce` fecha a conexão, `shadow` encaminha e
+    sinaliza 1 evento/conexão via `rescore_from` (weight = policy,
+    escalated dobra); métricas `sentry_protocol_violations_total
+    {schema, policy}` + `sentry_protocol_frames_total{schema}`;
+    benches: frame compilado ~0,68µs vs baseline regex ~20,8µs (~30×),
+    read_until memchr 27ns vs escalar 1,10µs (~41×) — números em
+    `ARCHITECTURE.md` §24
+  - ✅ F9.6 Sintaxe v3.1 do body (feedback de usabilidade): operadores
+    binários **infixos** (palavra canônica + sugar simbólico), `{}`
+    desnecessários removidos dos steps (`- acc: "…"` direto),
+    `repeat {times, max}` → `while min!(n, 4):` (bound constante ou
+    `min!(expr, cap)` — cap exigido em compile-time, iterações
+    clampeiam), `mask_ok/range_ok/len_ok` → statement macros
+    `check_mask!(reg, bits, value)` / `check_range!(reg, min, max)` /
+    `check_len!(reg, min, max)`, `neg_if` → `if <expr>:` com bloco
+    (`Instr::BranchIfZero` forward-only + `Instr::Loop{bound, cap}` +
+    `Instr::Not`) e operador `not` (negação lógica 0↔1); novo módulo
+    `expr.rs` (parser Pratt, `-5` dobra para literal); pool de
+    temporários com free-list no compilador; testes de folding de `if`
+    constante, aridade de statement, registrador reservado e VLInt
+    negativo end-to-end
+
+Backlog detalhado em `ARCHITECTURE.md` §23 (e §24 para o F9).
 
 ### Status atual (verificação contínua)
 
@@ -535,7 +608,7 @@ Backlog detalhado em `ARCHITECTURE.md` §23.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 453 testes passando sem features (455 com
+# Resultado esperado: 509 testes passando sem features (511 com
 # --features sentry-cli/onnx — os 2 testes de inferência ONNX)
 ```
 

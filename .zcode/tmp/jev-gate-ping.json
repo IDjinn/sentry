@@ -1,0 +1,24 @@
+{
+  "model": "typesafe/jev-1.13",
+  "state": "Contexto: DSL v3 do 'Sentry Protocol Schemas' (yaml; dispatch por when mapa; allowlist = união dos when; policies nomeadas; runtime mantém set de mensagens/nomes já vistas por conexão). Campo atual 'gate: [sso_ticket_event]' significa: esta mensagem só é válida se as mensagens listadas já apareceram antes na conexão (pré-condição de sequência, ex. login antes de tudo). Usuário pergunta: 'gate é um bom nome para isso?'. Segundo pedido: 'seria interessante também identificar payload que identificam conexão ativa como ping etc' — mensagens de keepalive/heartbeat (ping/pong/noop) existem em quase todo protocolo e têm semântica própria: válidas em qualquer estágio, sem gate, payload mínimo/vazio, rate esperado baixo, e são sinal de conexão viva (afeta TTL/prune da conexão no runtime — hoje conexão parada N segundos vira stale; com keepalive declarado, ping reseta o timer). Também abre detecção: ping flood (rate acima do normal) = violação; conexão que NUNCA pinga mas fica aberta = suspeita. Perguntas:",
+  "questions": {
+    "gate_name": {
+      "type": "choice",
+      "instructions": "Nome do campo de pré-condição de sequência (atual gate: [msg]). Criterios: legível por não-nativo, óbvio no contexto yaml, não colide com termos de security/waf (gate soa como gatekeeper WAF, pode confundir com enforcement).",
+      "criteria": {
+        "after": "after: [sso_ticket_event] — 'só depois de X aparecer'; direto, temporal, curto.",
+        "needs": "needs: [sso_ticket_event] — legível como frase (move_event needs sso_ticket_event).",
+        "keep_gate": "Manter gate."
+      }
+    },
+    "keepalive_model": {
+      "type": "choice",
+      "instructions": "Como modelar keepalive (ping/pong) no schema?",
+      "criteria": {
+        "keepalive_key": "Chave dedicada por mensagem: 'keepalive: true' (e opcional keepalive: {interval: 30s, max_rate: 2/60s}) — o runtime a trata: vale em qualquer estágio, reseta o TTL da conexão, sem gate necessário; métricas de health (sentry_connection_health) e violação de ping flood quando excede max_rate.",
+        "any_stage_flag": "Flag genérica any_stage: true que serve para ping e para qualquer outra mensagem válida em qualquer estágio; keepalive/ttl vira consequência configurável separada: on_message: {keepalive_ttl: 30s}.",
+        "implicit_ping": "Convenção implícita: mensagens chamadas ping/pong/heartbeat recebem o tratamento automaticamente — zero config, mas mágica escondida."
+      }
+    }
+  }
+}

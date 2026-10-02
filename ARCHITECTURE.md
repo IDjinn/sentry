@@ -1763,3 +1763,118 @@ via rDNS) e F7.11 (JS challenge na edge inline + provider nginx). Restante:
   `import --kind user_agent|path|ja3 --name <n> [--action <a>] [--dry-run]`
   aceita arquivo ou URL; `enable/disable/delete` notificam o mesmo canal;
   `fetch` re-busca os datasets com `source_url` e re-publica contagens.
+
+## 24. F9 — Protocol Schemas (`sentry-protocol`) — DSL de descrição de protocolos
+
+> Descrever protocolos customizados (portas não padrão, game servers,
+> serviços binários) em YAML e validar os frames com confiança — mais
+> rápido que regex no caminho default. O formato usa JSON Schema como
+> núcleo mental (tipos/constraints) mas é uma DSL própria orientada a
+> wire formats binários e textuais; macros de leitura são **definidas por
+> protocolo** no próprio schema (a crate shipa só átomos universais).
+
+### 24.1 Formato do schema (`*.protocol.yaml`)
+
+- `transport`: `protocol: tcp|udp|ws`, `ports`, `flags` de socket.
+- `mode`: `shadow` (default — só sinaliza) | `enforce` (host fecha a
+  conexão na 1ª violação).
+- `on_message.run`: pipeline de átomos por frame — `check_len!`
+  (framing length-prefixed com args offset/size/endian/counts/max) e
+  `parse_header!` (produz a variável de dispatch, default `header`);
+  pipe `|` é sugar de lista.
+- `types`: macros de leitura customizadas por protocolo, duas formas:
+  - sugar one-liner: `LPStr: {prefix: u16, decode: utf8, max_len: 4096}`;
+  - body de steps (mini-máquina de registradores):
+
+    ```yaml
+    VLInt:
+      body:
+        - b0: "read u8"
+        - n: "(b0 and 0x38) >> 3"
+        - acc: "b0 and 0x03"
+        - while min!(n, 4):
+            - bi: "read u8"
+            - check_mask!(bi, 0xC0, 0x40)
+            - acc: "(acc << 6) or (bi and 0x3F)"
+        - sign: "b0 and 0x04"
+        - if sign:
+            - acc: "-acc"
+        - return acc
+    ```
+
+    Atribuição aceita **expressão infix** (ops palavra `and/or/xor/shl/
+    shr/add/sub/mul/not` com sugar simbólico `& | ^ << >> + - *`, unário
+    `-`, precedência C-like) ou chamada de átomo de I/O
+    (`read`/`decode`/`peek`). `while` exige bound provável em
+    compile-time — constante ou `min!(expr, cap)`; as iterações
+    clampeiam ao cap. `if <expr>:` executa o bloco quando ≠ 0 (branch
+    só-para-frente; `return` dentro de `if` funciona). Checagens são
+    statement macros do body — `check_mask!(reg, bits, value)`,
+    `check_range!(reg, min, max)`, `check_len!(reg, min, max)`
+    (namespace separado dos átomos do `run:`). Registradores não podem
+    usar palavras reservadas (operadores/átomos). Compila por inlining
+    para a mesma tabela de instruções (custo runtime zero vs macro
+    nativa). Integers VL-style radam aqui.
+- `policies`: severidade nomeada (`default` obrigatório; `weight`,
+  `on_repeat {count, window, escalate}`); violações citam a policy pelo
+  nome (`sentry_protocol_violations_total{schema, policy}`).
+- `messages`: dispatch **obrigatório** por mapa `when` (variável de
+  macro → escalar; lista = OR; união dos `when` = allowlist implícito;
+  overlap = erro de carga), `after: [msg]` (pré-condição de sequência,
+  era "gate"), `keepalive: true|{cadence, rate_limit}` (reseta TTL,
+  flood vira violação), `validate` one-liners por campo:
+  `campo: TIPO >n <n len>n len<n regex '…' b64 b64url hex alnum digits
+  printable in 'a','b' not_in <dataset> req` (em valores numéricos
+  `>n/<n` são valor; em strings/bytes são tamanho).
+
+### 24.2 Runtime: compilado + VM (tabela de instruções)
+
+- Schema carregado 1×, compilado para `Compiled { protocols, by_port }`;
+  cada mensagem vira um programa linear `Vec<Instr>` executado por um
+  loop estreito com cursor de bytes e registers `[Value; 16]` — sem
+  regex no caminho default (o op `regex` só roda no campo que o
+  declarou, `Arc<Regex>` compilada no load; a crate é linear-time).
+- `ProtocolEngine` = `ArcSwap<Compiled>`: hot-reload é um swap de
+  ponteiro, sem downtime; `ConnectionState` por conexão (sem locks):
+  set de mensagens vistas (`after`), timers de keepalive, contadores de
+  `on_repeat` para escalação.
+- **SIMD (feature `simd`)**: scan de terminador via `memchr` e
+  validação UTF-8 via `simdutf8`; fallbacks escalares quando off.
+- Compilação com guardas de DoS: ≤16 registradores, ≤512 instruções por
+  mensagem, `while` com cap provável em compile-time (`if` compila para
+  branch só-para-frente — programas sempre terminam), aninhamento ≤8
+  (schemas são compartilháveis).
+
+### 24.3 Integração
+
+- Edge-tcp: após o sticky-block, se um schema guarda a porta local e
+  declara framing, o client→server passa por pump validado (frame
+  splitado pelo `check_len!`, validado, e encaminhado); `enforce`
+  fecha na violação, `shadow` encaminha e sinaliza (1 evento por
+  conexão via `rescore_from` + `SignalKind::ProtocolViolation`,
+  weight = weight da policy, `escalated` dobra).
+- Hot-reload: watcher `notify` v6 (debounce 500ms, coalescendo eventos)
+  + rescan full por fingerprint (mtime+size) + safety poll 60s; compile
+  falho mantém o set anterior (all-or-nothing).
+- CLI: `sentry protocol validate|list|check <schema> --hex <bytes>`;
+  `config validate` compila os schemas quando `[protocol] enabled`.
+- Métricas: `sentry_protocol_violations_total{schema, policy}`,
+  `sentry_protocol_frames_total{schema}`; `sentry_signal_kinds_total`
+  ganha `protocol_violation` de graça.
+
+### 24.4 Números (§22, Win11/MSVC/release, fixtures `game-relay`)
+
+| Bench | Tempo |
+| --- | --- |
+| `protocol/frame_sso` (VM compilada) | ~0,74 µs |
+| `regex/frame_sso_baseline` (validação 100% regex equivalente) | ~24,6 µs (**~33×**) |
+| `protocol/dispatch_unknown_header` | ~0,50 µs |
+| `protocol/stream_100_frames` | ~66 µs (~0,66 µs/frame) |
+| `compile_game_schema` (one-time) | ~190 µs |
+| `simd_vs_scalar/read_until` (4 KiB) | memchr 27 ns vs escalar 1,22 µs (**~45×**) |
+| `simd_vs_scalar/utf8_validate` (4 KiB) | simdutf8 32 ns vs std 75 ns (~2,3×) |
+
+Critério ≥5× vs regex baseline: superado (~33×). Limitações v1: apenas
+a direção client→server; UDP/WS declarados no formato mas o pump
+validado hoje cobre edge-tcp (ws/udp ficam para §23.x); sem branch
+condicional no corpo de macros (decisão de design — auditabilidade).

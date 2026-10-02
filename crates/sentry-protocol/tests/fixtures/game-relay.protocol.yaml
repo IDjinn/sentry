@@ -1,0 +1,71 @@
+# Sentry Protocol Schema — legacy game server SSO port (F9 fixture)
+id: game-relay
+version: "1.0.0"
+description: "Legacy game-server binary protocol on a non-standard port: 4-byte
+  big-endian length prefix (header+data), 2-byte big-endian header,
+  positional payload. VLInt/LPStr are defined here, not built into
+  sentry-protocol."
+
+transport:
+  protocol: tcp
+  ports: [14901]
+  flags: {nodelay: "true"}
+
+on_message:
+  run: "check_len! | parse_header!"
+
+types:
+  # 2-byte big-endian length prefix + UTF-8 bytes (length-prefixed UTF-8 string).
+  LPStr: {prefix: u16, decode: utf8, max_len: 1024}
+
+  # VLInt: signed variable-length radix-64. First byte carries the
+  # 0b01 marker, a 3-bit byte count, a sign bit and the 2 low value bits;
+  # continuation bytes contribute 6 bits each.
+  VLInt:
+    body:
+      - b0: "read u8"
+      - n: "(b0 and 0x38) >> 3"
+      - acc: "b0 and 0x03"
+      - while min!(n, 4):
+          - bi: "read u8"
+          - check_mask!(bi, 0xC0, 0x40)
+          - acc: "(acc << 6) or (bi and 0x3F)"
+      - sign: "b0 and 0x04"
+      - if sign:
+          - acc: "-acc"
+      - return acc
+
+policies:
+  default: {weight: 20}
+  unknown_header:
+    weight: 35
+    on_repeat: {count: 3, window: 60s, escalate: true}
+  ticket_abuse: {weight: 40}
+
+messages:
+  sso_ticket_event:
+    when: {header: 400}
+    validate:
+      - sso_ticket: LPStr >2 <64 regex 'GAME-[a-zA-Z0-9]+-3324'
+
+  move_event:
+    when: {header: 3626}
+    after: [sso_ticket_event]
+    policy: ticket_abuse
+    validate:
+      - x: VLInt >-1 <149
+      - y: VLInt >-1 <149
+
+  chat_event:
+    when: {header: 2064}
+    after: [sso_ticket_event]
+    validate:
+      - text: LPStr len<100 printable
+      - gesture: LPStr in '','smile','sad','angry'
+      - bubble: VLInt >-1 <1000
+
+  ping_event:
+    when: {header: 4096}
+    keepalive: {cadence: 30s, rate_limit: 2/60s}
+    validate:
+      - payload: LPStr len<8

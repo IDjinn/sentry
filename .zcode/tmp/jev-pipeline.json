@@ -1,0 +1,42 @@
+{
+  "model": "typesafe/jev-1.13",
+  "state": "Contexto: DSL v3 do 'Sentry Protocol Schemas' (yaml; Sentry Rust core puro sem I/O; macros built-in registry — yaml só invoca por nome com args, decisão Jev 0.98; DSL de expressão livre foi REJEITADO antes 0.02; shadow default; ~4µs/evento). Estado atual do design: transport {protocol, ports, flags} → on_first_message {run: [check_len!, filter_header!{dataset, on_unknown, policy}]} → types {aliases = macro built-in + args} → policies nomeadas {weight, on_repeat} → messages {gate/gate_any/groups, policy:} — sem FSM (substituída por gate 'requer id x antes de y'). NOVO sketch do usuário (texto): 'transport: {protocol: tcp, ports: [14901]} / on_message: {run: check_len! | check_header! | parse_header!} / types: {HString: read_habbo_string!} / messages: {sso_ticket_event: {requires: header == 400 // header id match (header is variable from parse_header macro), validate: read HString as sso_ticket | validate_ticket!}}'. Mudanças propostas: (1) on_message único com pipeline em pipe (check_len! | check_header! | parse_header!) em vez de on_first_message + lista; (2) macros produzem VARIÁVEIS no contexto (parse_header! → variável header); (3) dispatch de mensagens por EXPRESSÃO (requires: header == 400) em vez de mapa id→corpo; mensagens nomeadas (sso_ticket_event) em vez de chaveadas por id; (4) validate: pipeline de leitura/validação por campo (read HString as sso_ticket | validate_ticket!). Tensões a decidir: expressão '==' minimalista pode ser aceitável mesmo com expressão geral rejeitada (só equality sobre variáveis de macro, sem lógica composicional); pipes inline 'a | b' vs lista yml (equivalentes semanticamente — pipe é sugar de lista); mensagens nomeadas precisam de ordem determinística de avaliação (yaml mapping preserva? usar requires como dispatch único e rejeitar overlaps?); check_header! sem args agora — dataset foi embora? quem define os ids válidos se o dispatch é por expressão (resposta provável: a união dos requires de messages vira implicitamente o allowlist — eliminar filter_header! explícito). Perguntas abaixo decidem a forma final.",
+  "questions": {
+    "expression_scope": {
+      "type": "choice",
+      "instructions": "requires: header == 400 é uma expressão. Expressão geral já foi rejeitada (0.02), mas equality minimalista sobre variáveis de macros pode valer. Qual escopo de expressão permitir em requires (e só nele)?",
+      "criteria": {
+        "eq_only": "Só igualdade contra variáveis de macro: header == 400, header == 400 | 4001 (multi-valor como OR). Sem &&, sem comparações, sem variáveis derivadas. Parse trivial, auditável, cobre o caso.",
+        "full_compare": "Igualdade + comparações (>, <) + &&/||/! sobre variáveis — expressividade p/ ranges de header e flags compostas, com parser pequeno mas real.",
+        "no_expr": "Nenhuma expressão: volta a ser dataset/filter declarativo (requires: {header_in: [400]}) — o pipe do run resolve, requires nunca avalia lógica."
+      }
+    },
+    "dispatch_model": {
+      "type": "choice",
+      "instructions": "Dispatch de mensagens: como o validador decide qual bloco de messages avaliar, com mensagens nomeadas + requires por expressão?",
+      "criteria": {
+        "requires_union": "A união dos requires de todas as messages É o allowlist implícito: nenhuma mensagem casou = ProtocolViolation(unknown) — filter_header! com dataset explícito é removido do run (só check_len! | parse_header!); overlap entre requires = erro de carga do schema (fail-fast, determinístico). Nome da mensagem vira label para métricas/metrics/rules DSL.",
+        "explicit_map": "Manter mapa id→mensagem como fonte de dispatch; requires na mensagem é só o gate entre mensagens (como já decidido); nome é sugar do id.",
+        "first_match": "Avalia requires na ordem do arquivo e usa o primeiro match (yaml map ordenado; overlap permitido e silencioso)."
+      }
+    },
+    "pipe_semantics": {
+      "type": "choice",
+      "instructions": "Forma do pipeline de macros (run) e do validate: pipes inline 'a | b' vs listas yml, e semântica de variáveis?",
+      "criteria": {
+        "pipe_sugar": "Pipe inline é sugar de lista yml (loader normaliza para [a, b]); macros declaram outputs que viram variáveis do contexto (parse_header! {as: header} — binding explícito opcional; macro pode prover nome default); validate: aceita mesma sintaxe; primeiro macro que falha short-circuita com a policy do bloco.",
+        "lists_only": "Só listas yml (sem pipe inline) — uma sintaxe só, verbosa mas inequívoca; variáveis com binding explícito obrigatório (as:).",
+        "pipe_real": "Pipe é semântica real de streaming (stdout de um macro = stdin do próximo, estilo shell) — mais expressivo, modelo mental de dados entre macros mais complexo."
+      }
+    },
+    "validate_ticket": {
+      "type": "choice",
+      "instructions": "No sketch, validate: read HString as sso_ticket | validate_ticket! — o validate_ticket! implica validação SEMÂNTICA de domínio (o ticket é válido?) além da estrutural. Onde isso vive?",
+      "criteria": {
+        "structural_only": "Schemas validam ESTRUTURA (shape, tipos, gates, limites); semântica de domínio (ticket válido, token correto) nunca esteve no escopo — é da aplicação; validate_ticket! não existe como macro, e o máximo é existir (ex. pattern/length) no próprio campo.",
+        "builtin_hooks": "Macros de domínio built-in para casos comuns e seguros de checar (validate_len!, validate_charset!, validate_not_in! dataset de tickets revogados via dataset DB) — mas nunca I/O de aplicação nem lógica de negócio no validador.",
+        "custom_hooks": "Permitir hooks nomeados que a aplicação registra no daemon (trait ProtocolHook) — o yaml cita validate_ticket! e o deploy pluga a implementação; schema deixa de ser autocontido/auditável."
+      }
+    }
+  }
+}

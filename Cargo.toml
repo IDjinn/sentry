@@ -6,6 +6,7 @@ members = [
     "crates/sentry-ai",
     "crates/sentry-geo",
     "crates/sentry-reputation",
+    "crates/sentry-protocol",
     "crates/sentry-source-nginx",
     "crates/sentry-source-syslog",
     "crates/sentry-source-cloudflare",
@@ -72,6 +73,10 @@ hmac = "0.12"
 aho-corasick = "1.1"
 criterion = "0.5"
 
+# SIMD-accelerated byte scanning / UTF-8 validation (F9, feature `simd`)
+memchr = "2"
+simdutf8 = "0.1"
+
 # Dynamic heuristic lists (F7.7): lock-free swap of prefilter/regex sets
 arc-swap = "1"
 
@@ -121,6 +126,7 @@ sentry-storage = { path = "crates/sentry-storage" }
 sentry-ai = { path = "crates/sentry-ai" }
 sentry-geo = { path = "crates/sentry-geo" }
 sentry-reputation = { path = "crates/sentry-reputation" }
+sentry-protocol = { path = "crates/sentry-protocol" }
 sentry-source-nginx = { path = "crates/sentry-source-nginx" }
 sentry-source-syslog = { path = "crates/sentry-source-syslog" }
 sentry-source-cloudflare = { path = "crates/sentry-source-cloudflare" }

@@ -1,0 +1,24 @@
+{
+  "model": "typesafe/jev-1.13",
+  "state": "Contexto: DSL v3 do 'Sentry Protocol Schemas' (yaml; dispatch de mensagens por união das condições; variável header produzida por parse_header!; expressão minimalista == aprovada; ops encadeáveis por campo: >n <n len>n regex b64 in 'a','b' req not_in). Duas mudanças pedidas pelo usuário: (1) renomear operador enum para in (aceito, decisão tomada). (2) 'requires parece estranho, seria melhor como um tipo de hashmap?' — forma atual: 'requires: header == 400' (string com == minimalista; multi-valor header == 400 | 4001). Alternativas hashmap: 'when: {header: 400}' ou 'when: {header: [400, 4001]}' ou 'when: {header: 400, flags: [encrypted]}' — mais yaml-nativo, dispatch vira match de mapa (cada chave = variável de macro, valor = scalar ou lista = OR); sem parser de expressão nenhum. A pergunta implícita dele sobre 'é necessário?': requires/when cumpre 2 papéis — dispatch (qual mensagem é) e gate implícito do allowlist (união das condições = ids válidos); sem ele o dispatch precisa voltar a ser mapa id→mensagem. Perguntas:",
+  "questions": {
+    "when_form": {
+      "type": "choice",
+      "instructions": "Forma final da condição de dispatch da mensagem (substitui requires)?",
+      "criteria": {
+        "when_map": "when como mapa variável→valor: when: {header: 400}; lista = OR: when: {header: [400, 4001]}; múltiplas chaves = AND. Sem parser de ==; yaml puro; união dos when = allowlist; overlap = erro de carga. Novas variáveis de macros (ex. flag de crypto) entram como chave nova.",
+        "when_scalar_map": "when: {header: 400} para o caso comum, mas aceitar também string 'header == 400' como escape p/ casos que um mapa não cobre (2 sintaxes no mesmo campo).",
+        "keep_requires": "Manter requires: header == 400 como está (só renomear nada)."
+      }
+    },
+    "dispatch_necessity": {
+      "type": "choice",
+      "instructions": "O when/dispatch explícito por mensagem é necessário ou pode ser implícito?",
+      "criteria": {
+        "when_required": "Obrigatório: cada mensagem tem when; é o mecanismo de dispatch e a fonte do allowlist — sem when = erro de carga.",
+        "default_when": "Opcional com default: mensagens sem when herdamos um when gerado do nome/ordem — arriscado: dispatch ambíguo.",
+        "when_on_group": "when pode viver no grupo (mensagens agrupadas compartilham when com lista de headers) — menos repetição: group: {when: {header: [400, 3626]}, messages: {...}} com fallback para header individual dentro do grupo."
+      }
+    }
+  }
+}

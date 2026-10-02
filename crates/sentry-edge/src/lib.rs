@@ -23,6 +23,7 @@ pub mod challenge;
 pub mod clienthello;
 pub mod middleware;
 pub mod pages;
+pub mod protocol;
 pub mod proxy;
 pub mod tcp_listener;
 #[cfg(feature = "edge-tls")]
@@ -57,6 +58,7 @@ use sentry_core::config::ChallengeBackend;
 use sentry_core::event::Event;
 use sentry_core::pipeline::Pipeline;
 use sentry_core::BlockTable;
+use sentry_protocol::ProtocolEngine;
 use uuid::Uuid;
 
 use crate::challenge::{cookie_value, JsChallenge, COOKIE_NAME};
@@ -94,6 +96,8 @@ pub struct EdgeRuntime {
     challenge_backend: ChallengeBackend,
     tls_metrics: Option<TlsMetrics>,
     request_duration: Option<prometheus::Histogram>,
+    protocol_engine: Option<Arc<ProtocolEngine>>,
+    protocol_metrics: Option<crate::protocol::ProtocolMetrics>,
 }
 
 impl EdgeRuntime {
@@ -116,7 +120,30 @@ impl EdgeRuntime {
             challenge_backend: ChallengeBackend::default(),
             tls_metrics: None,
             request_duration: None,
+            protocol_engine: None,
+            protocol_metrics: None,
         }
+    }
+
+    /// Attach the protocol validation engine (F9) and its metrics.
+    pub fn with_protocol(
+        mut self,
+        engine: Arc<ProtocolEngine>,
+        metrics: Option<crate::protocol::ProtocolMetrics>,
+    ) -> Self {
+        self.protocol_engine = Some(engine);
+        self.protocol_metrics = metrics;
+        self
+    }
+
+    /// Protocol validation engine, when attached.
+    pub fn protocol_engine(&self) -> Option<&Arc<ProtocolEngine>> {
+        self.protocol_engine.as_ref()
+    }
+
+    /// Protocol metrics handles, when attached.
+    pub fn protocol_metrics(&self) -> Option<&crate::protocol::ProtocolMetrics> {
+        self.protocol_metrics.as_ref()
     }
 
     /// Consult `table` before the pipeline runs so a sticky block denies

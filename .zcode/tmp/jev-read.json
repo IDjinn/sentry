@@ -1,0 +1,23 @@
+{
+  "model": "typesafe/jev-1.13",
+  "state": "Contexto: DSL v3 do 'Sentry Protocol Schemas' (yaml; Sentry Rust core puro; macros built-in; pipe = sugar de lista; requires com == minimalista; dispatch por união dos requires; gate por nome de mensagem; policies nomeadas). Bloco de validação de mensagem ATUAL (que o usuário acabou de rejeitar como verboso e confuso, texto dele: 'a expression de read e validacao esta muito verbosa e confusa'): 'validate: [read HString as sso_ticket, validate_len! {field: sso_ticket, max: 512}, validate_charset! {field: sso_ticket, class: base64_url}]' e 'validate: [read VL64 as x | read VL64 as y, validate_range! {field: x, min: 0, max: 148}, ...]'. Problemas: nome do campo repetido (read as X + field: X), leitura e constraint separadas em sintaxes diferentes (macro pipe vs args), validate_*! com field: explícito é boilerplate. Alternativas a decidir (todas mantêm: macros built-in registry, tipos/aliases do bloco types, constraints viram args do read implícito, ordem de leitura = ordem declarada para binário posicional):",
+  "questions": {
+    "read_form": {
+      "type": "choice",
+      "instructions": "Qual forma para o bloco de leitura+constraints de uma mensagem? Criterios: menos verbosidade, legibilidade, um modelo mental só (ler é validar), retrocompatibilidade com validação de JSON (chat-relay) onde não há 'read' posicional.",
+      "criteria": {
+        "field_map": "read vira mapa nome→tipo+constraints inline: 'read: {sso_ticket: HString {max: 512, charset: base64_url}, x: VL64 {min: 0, max: 148}, y: VL64 {min: 0, max: 148}}' — constraints direto no tipo, sem validate_*!, sem field:; validadores JSON usam o mesmo mapa (tipo = json schema inline).",
+        "field_list": "Lista ordenada com sugar: '- sso_ticket: HString(512) | b64url' — mais compacto ainda, mas sintaxe nova de parênteses/pipe por campo, dois mini-DSLs (yaml + expressão).",
+        "typed_schema": "Manter JSON Schema puro no campo body/validate (properties/required) e gerar as leituras a partir do wire type — zero sintaxe nova de leitura, mas perde a leitura posicional explícita que o binário precisa."
+      }
+    },
+    "shared_reads": {
+      "type": "choice",
+      "instructions": "Mensagens do mesmo protocolo repetem leituras iguais (ex. vários eventos começam com o mesmo header/contexto). Vale ter reuso?",
+      "criteria": {
+        "no_reuse": "Sem reuso: cada mensagem lista seus campos completos — verboso mas explícito, zero indireção (só compensa se o schema tiver dezenas de mensagens repetitivas).",
+        "named_composite": "types aceita tipos compostos nomeados: types.Header: [id: VL64, room: VL64] e mensagens usam 'read: {ctx: Header, ...}' — reuso explícito e local ao arquivo."
+      }
+    }
+  }
+}

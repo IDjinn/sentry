@@ -37,6 +37,8 @@ pub struct Metrics {
     pub edge_tls_failures: prometheus::Counter,
     pub edge_tls_sni_mismatches: prometheus::Counter,
     pub edge_tls_cert_not_after: prometheus::Gauge,
+    pub protocol_violations: prometheus::CounterVec,
+    pub protocol_frames: prometheus::CounterVec,
     pub block_table_size: prometheus::Gauge,
     pub signal_kinds: prometheus::CounterVec,
     pub signals: prometheus::CounterVec,
@@ -131,6 +133,22 @@ impl Metrics {
         let block_table_size = prometheus::Gauge::new(
             "sentry_block_table_size",
             "IPs currently held in the in-memory block table.",
+        )
+        .unwrap();
+        let protocol_violations = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sentry_protocol_violations_total",
+                "Protocol schema violations, by schema and policy (F9).",
+            ),
+            &["schema", "policy"],
+        )
+        .unwrap();
+        let protocol_frames = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sentry_protocol_frames_total",
+                "Frames validated against a protocol schema (F9).",
+            ),
+            &["schema"],
         )
         .unwrap();
         let signals = prometheus::CounterVec::new(
@@ -266,6 +284,14 @@ impl Metrics {
             registry.register(Box::new(m.clone())).ok();
         }
         registry
+            .register(Box::new(protocol_violations.clone()))
+            .map_err(|e| warn!(error = %e, "register protocol violations"))
+            .ok();
+        registry
+            .register(Box::new(protocol_frames.clone()))
+            .map_err(|e| warn!(error = %e, "register protocol frames"))
+            .ok();
+        registry
             .register(Box::new(edge_tls_cert_not_after.clone()))
             .ok();
         registry
@@ -319,6 +345,8 @@ impl Metrics {
             edge_tls_failures,
             edge_tls_sni_mismatches,
             edge_tls_cert_not_after,
+            protocol_violations,
+            protocol_frames,
             block_table_size,
             signal_kinds,
             signals,

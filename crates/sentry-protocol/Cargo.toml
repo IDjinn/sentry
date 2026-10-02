@@ -1,0 +1,35 @@
+[package]
+name = "sentry-protocol"
+description = "Protocol schema DSL for Sentry: compile YAML wire-protocol descriptions into instruction-table validators (F9)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+# SIMD-accelerated hot paths: memchr (terminator scans) and simdutf8
+# (UTF-8 validation). Pure-Rust crates; scalar fallbacks otherwise.
+# Enabled by default for the daemon; keep off to force the scalar path.
+simd = ["dep:memchr", "dep:simdutf8"]
+
+[dependencies]
+arc-swap = { workspace = true }
+memchr = { workspace = true, optional = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+simdutf8 = { workspace = true, optional = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+# Always available for the simd_vs_scalar comparison bench.
+memchr = { workspace = true }
+simdutf8 = { workspace = true }
+
+[[bench]]
+name = "perf"
+harness = false

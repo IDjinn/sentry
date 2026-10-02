@@ -1,0 +1,51 @@
+{
+  "model": "typesafe/jev-1.13",
+  "state": "Projeto: Sentry (C:\\dev\\rust\\sentry) — monitor de acessos em tempo real para serviços expostos à internet. Arquitetura: Rust workspace, pipeline rules→heuristics→scorer→decider; Event modular via enum ProtocolData (HttpData, TcpData, TlsHandshake, SyslogData); plugins Source/Action via traits; edge inline (reverse proxy axum, TLS 443, edge-tcp para não-HTTP); regras DSL com packs; datasets DB-backed (user_agent/path) com hot-reload; actions provider-agnostic (Cloudflare, firewall, OPNsense, nginx). Pedido do usuário (texto original): 'precisa ser criado agora um sistema que posso criar um \"protocol\" description, por exemplo, um sistema websockets onde posso descrever em formato yaml-like como os dados sao, assim posso validar/invalidar com maior confianca e ter mais seguranca em portas nao padrao (como ws). seria entao tambem interessante converter os formatos padrao para tambem yaml, assim podendo descrever/compartilhar formatacao de protocolos.' Objetivo: definir a linguagem de descrição de protocolo, onde a validação roda no Sentry, quais conversores de formatos padrão implementar primeiro, modo de falha padrão, e onde os schemas vivem/versionam. Restrições do repo: sem unsafe, thiserror em libs, core puro sem I/O, features pesadas opcionais, dados modulares em ProtocolData (nunca campos soltos no Event), heurísticas rodam sobre texto decodificado. Filosofia do projeto: rejeitar tráfego legítimo em produção é caro — packs sensíveis nascem em shadow, enforce é opt-in explícito.",
+  "questions": {
+    "schema_language": {
+      "type": "choice",
+      "instructions": "Escolha a linguagem de descrição de protocolo yaml-like. Pesos: (a) rigor de validação, (b) facilidade de autoria humana, (c) reaproveitamento de ecossistema existente, (d) compartilhabilidade.",
+      "criteria": {
+        "custom_dsl": "Sintaxe própria yaml-like desenhada para protocolos binários/texto arbitrários (mensagens, campos, sequências, framing).",
+        "json_schema_superset": "JSON Schema como núcleo (types/required/pattern) com extensões para framing/sequência de mensagens.",
+        "asyncapi_ext": "AsyncAPI 3 diretamente com extensões x-sentry para validação de frames."
+      }
+    },
+    "runtime_integration": {
+      "type": "choice",
+      "instructions": "Onde a validação de protocolo deve rodar no Sentry para dar 'mais segurança em portas não padrão'? Pipeline atual: rules→heuristics→scorer; Event é modular via enum ProtocolData.",
+      "criteria": {
+        "new_protocoldata": "Novo ProtocolData::Ws(MessageData) + fonte/edge ws que valida contra o schema e emite sinal ProtocolViolation para o pipeline (score/regras/verdict existentes).",
+        "standalone_validator": "Validador isolado (crate próprio) que os plugins consultam, sem nova variante no Event.",
+        "edge_enforce": "Validação só na edge inline: frames fora do schema rejeitados/logados na conexão, sem passar pelo pipeline."
+      }
+    },
+    "converter_scope": {
+      "type": "choice",
+      "instructions": "Quais formatos padrão devem ter conversores para/de YAML de protocolo na primeira versão? Critério: valor para descrever/compartilhar protocolos + viabilidade de conversão determinística.",
+      "criteria": {
+        "asyncapi_first": "AsyncAPI 3 (já descreve ws/mensagens; mira natural do ecossistema de mensageria).",
+        "openapi_ws": "OpenAPI 3.1 (descreve ws via callbacks/webhooks, mas é adaptado).",
+        "protobuf_openapi": "Protobuf (.proto) + OpenAPI 3.1: cobre binário e REST."
+      }
+    },
+    "failure_mode": {
+      "type": "choice",
+      "instructions": "Qual modo de falha padrão para a validação de protocolo, dado que rejeitar tráfego legítimo em produção é caro e o projeto prefere shadow por padrão com enforce opt-in?",
+      "criteria": {
+        "shadow_default": "Default shadow (só sinal/log, nunca bloqueia); enforce por rota/porta opt-in via pack de regras.",
+        "enforce_default": "Default enforce: frame fora do schema = ProtocolViolation peso alto → Block.",
+        "config_per_listener": "Cada listener/porta declara mode = shadow|enforce no TOML; sem default global."
+      }
+    },
+    "schema_storage": {
+      "type": "choice",
+      "instructions": "Onde os schemas de protocolo devem viver e como versionar/compartilhar, dado que o Sentry já tem datasets DB-backed (DatasetRepo, NOTIFY hot-reload, CLI datasets import/fetch) e packs de regras em TOML?",
+      "criteria": {
+        "datasets_db": "Reusar datasets DB-backed (como user_agent/path) + CLI datasets, com kind = \"protocol\".",
+        "regra_dsl": "Nova condição DSL (ex.: protocol_violation = true) + packs de regras; schemas em arquivos do repo/config.",
+        "both": "Schemas como arquivos versionáveis + registro DB opcional para hot-reload multi-nó."
+      }
+    }
+  }
+}

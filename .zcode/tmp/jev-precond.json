@@ -1,0 +1,33 @@
+{
+  "model": "typesafe/jev-1.13",
+  "state": "Contexto: DSL v3 do 'Sentry Protocol Schemas' (yaml sem prefixo x-sentry; transport: protocol tcp/ws + ports + flags; on_connect com FSM opt-in de estados implícitos; on_first_message com pipeline de macros built-in check_len!/filter_header!; types com primitivas Rust i32 etc + macros built-in; messages; policy mode shadow default). Sentry: Rust, core puro sem I/O, sinal ProtocolViolation no pipeline, shadow default, ~4µs/evento alvo. NOVO pedido do usuário (texto): 'auth ou nao, seria melhor apenas algo como requer id x antes de poder mandar y. e isso tambem poder definir a severidade (talvez sempre com um policy: nome_policy) para facilitar?'. Ou seja: (1) substituir/abolir a máquina de estados (initial/transitions) por pré-condições declarativas simples do tipo requires: {message: 3626, after: 2064} — 'Move requer ter recebido Chat (ou Login) antes'; sem estados nomeados, só pares requerido→requerente, avaliados contra o histórico de mensagens da conexão (set de ids vistos). (2) Severidade sempre por referência a uma policy nomeada (policy: auth_gate) — blocos policy nomeados declarados no arquivo (ou globais/reusáveis entre schemas), cada um com weight/mode/escalate, e violações citam a policy pelo nome; facilita ajustar severidade num lugar só. Tensões: perde-se a expressividade de FSM para fluxos com estados reutilizáveis múltiplos (ex. authed permite 10 mensagens — com requires basta declarar 1 regra no id comum de gate vs 10 pares de transição?); requires acumulado como set é O(1) por mensagem, FSM é lookup também — custo igual. Perguntas abaixo decidem.",
+  "questions": {
+    "requires_model": {
+      "type": "choice",
+      "instructions": "Substituir a FSM (on_connect.initial/transitions) por pré-condições declarativas 'requires' (pares requerido→requerente avaliados contra o set de ids já vistos na conexão)?",
+      "criteria": {
+        "requires_only": "Sim, só requires: cada mensagem (ou grupo via after) declara requires: [ids] opcionais; connection history = set de ids vistos; FSM removida do DSL. Mais simples, cobre o caso auth-gate que motivou tudo.",
+        "requires_plus_fsm": "requires como atalho comum, mas manter a FSM opt-in para fluxos que precisam de estados nomeados reais (ex. partida com fases, negociação multi-passo onde a mesma msg tem validade dependendo da fase e muda a fase).",
+        "requires_from_fsm": "Manter FSM como fonte e requires como sugar que compila para ela."
+      }
+    },
+    "policy_refs": {
+      "type": "choice",
+      "instructions": "Severidade por policy nomeada: como funciona a referência e o escopo das policies?",
+      "criteria": {
+        "named_inline": "Policies nomeadas declaradas no mesmo arquivo (policies: {auth_gate: {weight: 40, on_repeat: escalate...}}); regras/macros citam policy: auth_gate; um policy: default obrigatório. Ajuste central no arquivo, schemas autocontidos e compartilháveis.",
+        "named_global": "Policies vivem em arquivo/config global do Sentry (reutilizáveis entre schemas, ex. a mesma strict_auth para todos os protocolos); schemas só citam o nome; loader valida que existe.",
+        "both_scopes": "Policies globais config + override local por schema (o nome local vence); CLI sentry protocol validate mostra a policy efetiva."
+      }
+    },
+    "gate_grouping": {
+      "type": "choice",
+      "instructions": "Como declarar 'essas N mensagens exigem ter passado pelo gate' sem repetir requires em cada uma (caso authed com 10 mensagens)?",
+      "criteria": {
+        "after_group": "Mensagens podem ser agrupadas: messages.gated: {...} ou requires com grupo — regra única 'gate: [2064]' + 'gated by: [2064]' aplica a todas.",
+        "defaults_inherit": "messages declara um requires: default que todas herdam; cada mensagem pode sobrescrever com requires: [] ou outro.",
+        "repeat_ok": "Repetição é aceitável: cada mensagem declara a sua requires explicitamente (verboso, mas zero mágica)."
+      }
+    }
+  }
+}

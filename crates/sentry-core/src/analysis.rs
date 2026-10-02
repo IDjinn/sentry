@@ -160,6 +160,11 @@ pub enum SignalKind {
     /// TLS ClientHello with a missing or unknown SNI on the inline HTTPS
     /// front (F8): scanners probing by IP against the 443 honeypot.
     TlsSniMismatch,
+    /// A frame violated its protocol schema (F9): framing mismatch, header
+    /// outside the implicit allowlist, sequence (`after`) violation,
+    /// keepalive flood or a failed field constraint. `detail` carries the
+    /// schema, message label and the VM reason.
+    ProtocolViolation,
     /// A custom rule matched (the rule id is carried in `detail`).
     RuleHit,
     /// Any other signal not yet cataloged.
@@ -168,6 +173,10 @@ pub enum SignalKind {
 
 /// Default weight for [`SignalKind::TlsSniMismatch`] (F8).
 pub const TLS_SNI_MISMATCH_WEIGHT: u8 = 20;
+
+/// Default weight for [`SignalKind::ProtocolViolation`] (F9); schemas
+/// override it per named policy at runtime, this is the fallback.
+pub const PROTOCOL_VIOLATION_WEIGHT: u8 = 25;
 
 /// What the pipeline decided to do with the event.
 ///

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use sentry_core::analysis::Verdict;
 use sentry_core::event::{SourceKind, TcpData, TcpStage, Transport};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -43,6 +43,12 @@ pub async fn serve_tcp(
     })?;
     info!(listen = %cfg.listen, upstream = %cfg.upstream, "edge-tcp listening");
     let connect_timeout = Duration::from_secs(cfg.connect_timeout_secs.max(1));
+    let local_port: u16 = cfg
+        .listen
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
     loop {
         let Ok((inbound, peer)) = listener.accept().await else {
             continue;
@@ -57,6 +63,7 @@ pub async fn serve_tcp(
             inbound,
             peer,
             connect_timeout,
+            local_port,
         ));
     }
 }
@@ -68,6 +75,7 @@ async fn handle_conn(
     mut inbound: TcpStream,
     peer: SocketAddr,
     connect_timeout: Duration,
+    local_port: u16,
 ) {
     // Sticky blocks close the connection before the pipeline runs.
     if runtime.is_hard_blocked(peer.ip()) {
@@ -112,9 +120,100 @@ async fn handle_conn(
             }
         };
     if let Some(mut outbound) = upstream_conn {
-        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+        let protocol = runtime.protocol_engine().and_then(|eng| {
+            crate::protocol::ProtocolConnection::bind(
+                eng,
+                local_port,
+                runtime.protocol_metrics().cloned(),
+            )
+        });
+        match protocol {
+            Some(conn) => {
+                validated_pump(inbound, outbound, conn, runtime, decided, peer).await;
+                return;
+            }
+            None => {
+                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+            }
+        }
         let _ = inbound.shutdown().await;
     }
+}
+
+/// Client→server direction validated against the protocol schema; the
+/// server→client direction passes through untouched.
+async fn validated_pump(
+    inbound: TcpStream,
+    outbound: TcpStream,
+    mut conn: crate::protocol::ProtocolConnection,
+    runtime: EdgeRuntime,
+    decided: mpsc::Sender<sentry_core::ProcessedEvent>,
+    peer: SocketAddr,
+) {
+    let (mut in_read, mut in_write) = tokio::io::split(inbound);
+    let (mut out_read, mut out_write) = tokio::io::split(outbound);
+
+    let upstream = async {
+        let mut buf = [0u8; 8192];
+        loop {
+            match in_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let ingest = conn.ingest(&buf[..n]);
+                    for frame in &ingest.forward {
+                        if out_write.write_all(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    if !ingest.violations.is_empty() && !conn.reported() {
+                        conn.mark_reported();
+                        report_violations(&ingest.violations, &conn, &runtime, &decided, peer);
+                    }
+                    if ingest.disconnect || ingest.framing_broken {
+                        info!(ip = %peer.ip(), "edge-protocol: connection closed by enforce policy");
+                        break;
+                    }
+                }
+            }
+        }
+    };
+
+    let downstream = async {
+        let _ = tokio::io::copy(&mut out_read, &mut in_write).await;
+    };
+
+    tokio::select! {
+        _ = upstream => {},
+        _ = downstream => {},
+    }
+    let _ = in_write.shutdown().await;
+    let _ = out_write.shutdown().await;
+}
+
+fn report_violations(
+    violations: &[sentry_protocol::Violation],
+    conn: &crate::protocol::ProtocolConnection,
+    runtime: &EdgeRuntime,
+    decided: &mpsc::Sender<sentry_core::ProcessedEvent>,
+    peer: SocketAddr,
+) {
+    let signals = conn.signals(violations);
+    if signals.is_empty() {
+        return;
+    }
+    let mut evt = sentry_core::event::Event::new(
+        sentry_core::event::SourceKind::Tcp,
+        peer.ip(),
+        sentry_core::ProtocolData::Tcp(TcpData {
+            stage: TcpStage::Data,
+            ..TcpData::default()
+        }),
+    );
+    evt.transport = Transport::Tcp;
+    evt.client_port = Some(peer.port());
+    let processed = runtime.process(evt);
+    let processed = runtime.pipeline().rescore_from(&processed, signals);
+    let _ = decided.try_send(processed);
 }
 
 #[cfg(test)]
@@ -160,6 +259,7 @@ mod tests {
             inbound,
             peer,
             Duration::from_secs(1),
+            0,
         )
         .await;
 
@@ -189,6 +289,7 @@ mod tests {
             inbound,
             peer,
             Duration::from_secs(1),
+            0,
         )
         .await;
 

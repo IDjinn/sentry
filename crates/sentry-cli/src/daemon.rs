@@ -9,6 +9,7 @@
 //! 6. For each event: enrich (geo) → dedupe → pipeline → persist → actions
 //! 7. Prints colored events to stdout and logs decisions
 
+use notify::Watcher;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -257,6 +258,42 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     let metrics = crate::metrics::Metrics::new();
     metrics.set_instance(&instance_label(&cfg.deployment.instance_id));
     let event_log = crate::eventlog::EventLog::new();
+
+    // Protocol schema validation (F9): compile schemas at startup and keep
+    // a hot-swappable engine; an fs watcher recompiles on add/modify/remove.
+    let protocol_engine: Option<Arc<sentry_protocol::ProtocolEngine>> = if cfg.protocol.enabled {
+        match crate::protocol_cmd::compile_dir(&cfg.protocol.dir, cfg.protocol.max_schemas) {
+            Ok((compiled, errors)) if errors.is_empty() => {
+                let n = compiled.protocols.len();
+                info!(
+                    schemas = n,
+                    dir = %cfg.protocol.dir.display(),
+                    "protocol schemas compiled"
+                );
+                Some(Arc::new(sentry_protocol::ProtocolEngine::new(compiled)))
+            }
+            Ok((_, errors)) => {
+                for e in &errors {
+                    warn!(error = %e, "protocol schema failed to compile");
+                }
+                warn!("protocol validation disabled for this run (compile errors)");
+                None
+            }
+            Err(e) => {
+                warn!(error = %e, "protocol dir scan failed; validation disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(ref engine) = protocol_engine {
+        let watcher_cfg = cfg.protocol.clone();
+        let watcher_engine = Arc::clone(engine);
+        tokio::spawn(async move {
+            protocol_watcher(watcher_cfg, watcher_engine).await;
+        });
+    }
 
     // Optionally connect to Postgres for persistence + hot-reload.
     let repo = if !cfg.storage.postgres.url.is_empty() {
@@ -846,6 +883,10 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             failures: metrics.edge_tls_failures.clone(),
             sni_mismatches: metrics.edge_tls_sni_mismatches.clone(),
         });
+        let runtime = match &protocol_engine {
+            Some(eng) => runtime.with_protocol(Arc::clone(eng), protocol_metrics_handles(&metrics)),
+            None => runtime,
+        };
         let runtime = if let Some(ref v) = bot_verifier {
             runtime.with_bot_verifier(Arc::clone(v))
         } else {
@@ -963,6 +1004,12 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 .with_trust(shared_trust.clone())
                 .with_block_table(Arc::clone(&block_table))
                 .with_block_hits(metrics.edge_block_hits.clone());
+            let tcp_runtime = match &protocol_engine {
+                Some(eng) => {
+                    tcp_runtime.with_protocol(Arc::clone(eng), protocol_metrics_handles(&metrics))
+                }
+                None => tcp_runtime,
+            };
             let (tcp_dec_tx, mut tcp_dec_rx) = mpsc::channel::<sentry_core::ProcessedEvent>(buffer);
             let tcp_cfg = sentry_edge::tcp_listener::TcpEdgeConfig {
                 listen: tcp_listen.clone(),
@@ -3340,6 +3387,115 @@ impl sentry_core::Action for LogAction {
 #[allow(dead_code)]
 fn _ensure_ruleset_import() -> RuleSet {
     RuleSet::default()
+}
+
+/// Metrics handles for the protocol validator (F9).
+fn protocol_metrics_handles(
+    metrics: &crate::metrics::Metrics,
+) -> Option<sentry_edge::protocol::ProtocolMetrics> {
+    Some(sentry_edge::protocol::ProtocolMetrics {
+        violations: metrics.protocol_violations.clone(),
+        frames: metrics.protocol_frames.clone(),
+    })
+}
+
+/// Watches the schema directory and hot-swaps the compiled set on
+/// add/modify/remove. `notify` events coalesce through a debounce window;
+/// a safety poll catches lost events. A failed compile keeps the previous
+/// set (all-or-nothing).
+async fn protocol_watcher(
+    cfg: sentry_core::config::ProtocolConfig,
+    engine: Arc<sentry_protocol::ProtocolEngine>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(64);
+    let watch_dir = cfg.dir.clone();
+    let watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        if res.is_ok() {
+            let _ = tx.try_send(());
+        }
+    });
+    let mut watcher = match watcher {
+        Ok(w) => {
+            let mut w = w;
+            match w.watch(&watch_dir, notify::RecursiveMode::NonRecursive) {
+                Ok(()) => Some(w),
+                Err(e) => {
+                    warn!(error = %e, dir = %watch_dir.display(), "protocol watch failed; using safety poll only");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "protocol watcher unavailable; using safety poll only");
+            None
+        }
+    };
+    let _ = &mut watcher; // dropping the watcher stops the watch
+
+    let debounce = Duration::from_millis(cfg.debounce_ms.max(100));
+    let safety = Duration::from_secs(cfg.safety_poll_secs.max(10));
+    let mut fingerprint = dir_fingerprint(&cfg.dir);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(safety) => {}
+            _ = rx.recv() => {
+                // Coalesce bursts of fs events within the debounce window.
+                while matches!(
+                    tokio::time::timeout(debounce, rx.recv()).await,
+                    Ok(Some(()))
+                ) {}
+            }
+        }
+        let fresh = dir_fingerprint(&cfg.dir);
+        if fresh == fingerprint {
+            continue;
+        }
+        fingerprint = fresh;
+        match crate::protocol_cmd::compile_dir(&cfg.dir, cfg.max_schemas) {
+            Ok((compiled, errors)) if errors.is_empty() => {
+                let n = compiled.protocols.len();
+                engine.swap(compiled);
+                info!(schemas = n, "protocol schemas hot-reloaded");
+            }
+            Ok((_, errors)) => {
+                for e in &errors {
+                    warn!(error = %e, "protocol reload skipped: schema error");
+                }
+            }
+            Err(e) => warn!(error = %e, "protocol reload scan failed"),
+        }
+    }
+}
+
+/// Stable fingerprint of a schema directory: file set + mtime + size.
+fn dir_fingerprint(dir: &std::path::Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut entries: Vec<(u64, u64)> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .filter_map(|m| {
+                    Some((
+                        m.modified()
+                            .ok()?
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()?
+                            .as_nanos() as u64,
+                        m.len(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort();
+    for (t, l) in &entries {
+        (t, l).hash(&mut h);
+    }
+    let count = entries.len() as u64;
+    count.hash(&mut h);
+    h.finish()
 }
 
 #[cfg(test)]

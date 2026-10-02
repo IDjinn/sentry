@@ -16,6 +16,7 @@ pub mod datasets;
 pub mod eventlog;
 pub mod logging;
 pub mod metrics;
+pub mod protocol_cmd;
 #[cfg(feature = "rate-redis")]
 pub mod rate_redis;
 pub mod routes_import;

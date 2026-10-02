@@ -601,6 +601,19 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 bots_check(&ip, &ua).await?;
             }
         },
+        Command::Protocol { action } => match action {
+            ProtocolCmd::Validate { dir } => {
+                let cfg = require_config(&cfg)?;
+                crate::protocol_cmd::protocol_validate(cfg, dir)?;
+            }
+            ProtocolCmd::List { dir } => {
+                let cfg = require_config(&cfg)?;
+                crate::protocol_cmd::protocol_list(cfg, dir)?;
+            }
+            ProtocolCmd::Check { schema, hex } => {
+                crate::protocol_cmd::protocol_check(&schema, &hex)?;
+            }
+        },
         Command::Auth { action } => match action {
             AuthCmd::HashPassword { password } => {
                 let hash = crate::auth::hash_password(&password)?;
@@ -784,6 +797,26 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                         "config INVALID: {} custom rule(s) failed to compile",
                         errors.len()
                     );
+                }
+                if cfg.protocol.enabled {
+                    let dir = &cfg.protocol.dir;
+                    match crate::protocol_cmd::compile_dir(dir, cfg.protocol.max_schemas) {
+                        Ok((_, es)) if es.is_empty() => {
+                            println!("  protocol:  OK ({})", dir.display());
+                        }
+                        Ok((_, es)) => {
+                            for e in &es {
+                                eprintln!("invalid protocol schema: {e}");
+                            }
+                            color_eyre::eyre::bail!(
+                                "config INVALID: {} protocol schema(s) failed to compile",
+                                es.len()
+                            );
+                        }
+                        Err(e) => {
+                            color_eyre::eyre::bail!("config INVALID: protocol dir: {e}");
+                        }
+                    }
                 }
                 println!("config OK");
                 println!("  sources:   {}", cfg.sources.len());

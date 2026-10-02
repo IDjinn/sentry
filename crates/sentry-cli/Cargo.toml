@@ -30,6 +30,8 @@ sentry-storage = { workspace = true }
 sentry-ai = { workspace = true }
 sentry-geo = { workspace = true }
 sentry-reputation = { workspace = true }
+sentry-protocol = { workspace = true }
+notify = { workspace = true }
 sentry-source-nginx = { workspace = true }
 sentry-source-syslog = { workspace = true }
 sentry-source-cloudflare = { workspace = true }

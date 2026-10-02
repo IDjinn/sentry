@@ -13,7 +13,6 @@ sentry-core = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
-notify = { workspace = true }
 regex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

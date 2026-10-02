@@ -79,6 +79,9 @@ pub struct SentryConfig {
     /// On-demand external IP reputation lookup (F7.5).
     #[serde(default)]
     pub ip_lookup: IpLookupConfig,
+    /// Protocol schema validation (F9).
+    #[serde(default)]
+    pub protocol: ProtocolConfig,
     /// Event sources.
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
@@ -572,6 +575,54 @@ fn default_ip_lookup_max_per_hour() -> u32 {
 }
 fn default_ip_lookup_timeout() -> u64 {
     10
+}
+
+/// Protocol schema validation (F9): compiles YAML protocol descriptions
+/// and validates frames on non-standard ports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolConfig {
+    /// Enable the protocol validator (off by default).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory holding `*.protocol.yaml` schemas (watched for live
+    /// add/modify/remove).
+    #[serde(default = "default_protocol_dir")]
+    pub dir: PathBuf,
+    /// Safety rescan interval in seconds (catches fs-event losses).
+    #[serde(default = "default_protocol_safety_poll_secs")]
+    pub safety_poll_secs: u64,
+    /// Debounce window in milliseconds coalescing fs events before a
+    /// full-directory rescan.
+    #[serde(default = "default_protocol_debounce_ms")]
+    pub debounce_ms: u64,
+    /// Max compiled schemas accepted from the directory.
+    #[serde(default = "default_protocol_max_schemas")]
+    pub max_schemas: usize,
+}
+
+impl Default for ProtocolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: default_protocol_dir(),
+            safety_poll_secs: default_protocol_safety_poll_secs(),
+            debounce_ms: default_protocol_debounce_ms(),
+            max_schemas: default_protocol_max_schemas(),
+        }
+    }
+}
+
+fn default_protocol_dir() -> PathBuf {
+    PathBuf::from("schemas")
+}
+fn default_protocol_safety_poll_secs() -> u64 {
+    60
+}
+fn default_protocol_debounce_ms() -> u64 {
+    500
+}
+fn default_protocol_max_schemas() -> usize {
+    64
 }
 
 /// Behavioral attack detection over per-IP sliding windows (F3.8).
