@@ -363,7 +363,9 @@ async fn proxy_handler_inner(State(state): State<ProxyState>, req: Request) -> R
     runtime
         .pipeline()
         .observe_response(client_ip, &path, status, ua.as_deref());
-    let _ = decided.try_send(processed);
+    if let Err(e) = decided.try_send(processed) {
+        warn!(error = %e, "failed to publish decided event");
+    }
 
     resp
 }

@@ -174,7 +174,11 @@ async fn handle_conn(
         .unwrap_or_else(|| "unknown".to_string());
 
     if let Some(hello) = &hello {
-        emit_handshake_event(&runtime, &cfg, &decided, peer, hello, &version, &cipher).await;
+        let blocked =
+            emit_handshake_event(&runtime, &cfg, &decided, peer, hello, &version, &cipher).await;
+        if blocked {
+            return;
+        }
     }
 
     // Serve the decrypted requests through the same router as plain HTTP.
@@ -231,10 +235,10 @@ async fn emit_handshake_event(
     hello: &ClientHello,
     version: &str,
     cipher: &str,
-) {
+) -> bool {
     let mismatch = sni_mismatch(&cfg.allowed_hosts, hello.sni.as_deref());
     if !cfg.handshake_events && mismatch.is_none() {
-        return;
+        return false;
     }
     let data = sentry_core::event::TlsData {
         sni: hello.sni.clone(),
@@ -281,6 +285,7 @@ async fn emit_handshake_event(
         // dropped, which is exactly the enforcement the edge wants here.
         info!(ip = %peer.ip(), "edge-tls: connection blocked by pipeline verdict");
     }
+    blocked
 }
 
 /// `None` when the SNI check is disabled or the SNI is allowed.
