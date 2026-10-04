@@ -198,7 +198,7 @@ impl EventRepo {
     /// Fetch recent events (newest first).
     pub async fn recent(&self, limit: i64) -> Result<Vec<EventRow>> {
         let rows = sqlx::query_as::<_, EventRow>(
-            r#"SELECT id, timestamp, source, client_ip::text AS client_ip,
+            r#"SELECT id, timestamp, source, host(client_ip) AS client_ip,
                       client_port, server_port, asn, country,
                       protocol, risk_score, risk_level, verdict, signals, raw,
                       duration_ms, process_us
@@ -218,7 +218,7 @@ impl EventRepo {
     /// Used by the background route learner to scan a sliding window.
     pub async fn recent_since(&self, since: DateTime<Utc>) -> Result<Vec<EventRow>> {
         let rows = sqlx::query_as::<_, EventRow>(
-            r#"SELECT id, timestamp, source, client_ip::text AS client_ip,
+            r#"SELECT id, timestamp, source, host(client_ip) AS client_ip,
                       client_port, server_port, asn, country,
                       protocol, risk_score, risk_level, verdict, signals, raw,
                       duration_ms, process_us
@@ -323,7 +323,7 @@ impl EventRepo {
         // client_ip is INET; sqlx decodes it into ip types, not String —
         // cast to text for the (ip, count) aggregate.
         let rows: Vec<(String, i64)> = sqlx::query_as(
-            r#"SELECT client_ip::text, COUNT(*)::bigint AS n
+            r#"SELECT host(client_ip), COUNT(*)::bigint AS n
                FROM events WHERE timestamp >= $1
                GROUP BY client_ip ORDER BY n DESC LIMIT $2"#,
         )
@@ -509,7 +509,7 @@ impl IncidentRepo {
     /// Fetch unresolved incidents.
     pub async fn unresolved(&self, limit: i64) -> Result<Vec<IncidentRow>> {
         let rows = sqlx::query_as::<_, IncidentRow>(
-            r#"SELECT id, event_id, created_at, client_ip::text AS client_ip,
+            r#"SELECT id, event_id, created_at, host(client_ip) AS client_ip,
                       risk_level, action, resolved, acknowledged_at, notes
                FROM incidents
                WHERE resolved = false
@@ -612,9 +612,14 @@ impl IpStateRepo {
     }
 
     /// List blocked IPs.
+    ///
+    /// IPs come back through `host()` because `ip::text` on an INET column
+    /// renders CIDR notation (`203.0.113.7/32`), which `IpAddr::from_str`
+    /// rejects — consumers that parse the value (block-table pre-warm,
+    /// hot-reload) would silently drop every row.
     pub async fn blocked(&self, limit: i64) -> Result<Vec<IpStateRow>> {
         let rows = sqlx::query_as::<_, IpStateRow>(
-            r#"SELECT ip::text AS ip, status, reason, expires_at, updated_at
+            r#"SELECT host(ip) AS ip, status, reason, expires_at, updated_at
                FROM ip_state
                WHERE status = 'blocked'
                ORDER BY updated_at DESC
@@ -654,7 +659,7 @@ impl IpStateRepo {
                    total_violations = ip_state.total_violations + 1,
                    last_violation_at = now(),
                    updated_at = now()
-               RETURNING ip::text AS ip, strikes, total_violations, last_violation_at"#,
+               RETURNING host(ip) AS ip, strikes, total_violations, last_violation_at"#,
         )
         .bind(ip.to_string())
         .bind(window_secs as f64)
@@ -667,7 +672,7 @@ impl IpStateRepo {
     /// Offender state for a single IP (strikes, totals, last violation).
     pub async fn offender(&self, ip: IpAddr) -> Result<Option<OffenderRow>> {
         let row = sqlx::query_as::<_, OffenderRow>(
-            r#"SELECT ip::text AS ip, strikes, total_violations, last_violation_at
+            r#"SELECT host(ip) AS ip, strikes, total_violations, last_violation_at
                FROM ip_state WHERE ip = $1::inet"#,
         )
         .bind(ip.to_string())
@@ -680,7 +685,7 @@ impl IpStateRepo {
     /// Offenders with live strikes inside the window (startup pre-warm).
     pub async fn recent_offenders(&self, window_secs: u64, limit: i64) -> Result<Vec<OffenderRow>> {
         let rows = sqlx::query_as::<_, OffenderRow>(
-            r#"SELECT ip::text AS ip, strikes, total_violations, last_violation_at
+            r#"SELECT host(ip) AS ip, strikes, total_violations, last_violation_at
                FROM ip_state
                WHERE strikes > 0
                  AND last_violation_at >= now() - make_interval(secs => $1)
