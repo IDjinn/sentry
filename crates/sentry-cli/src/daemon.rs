@@ -1212,6 +1212,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                         .unwrap_or_else(|| "pipeline".to_string());
                     let expires_db = chrono::Utc::now()
                         + chrono::Duration::from_std(block_ttl).unwrap_or_default();
+                    let table = Arc::clone(&block_table);
                     tokio::spawn(async move {
                         if let Err(e) = repo
                             .ip_state()
@@ -1219,7 +1220,9 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                             .await
                         {
                             warn!(error = %e, "failed to mirror block to db");
+                            return;
                         }
+                        table.block(ip, Some(expires));
                         if let Err(e) = repo.pool().notify("sentry_blocks_changed").await {
                             warn!(error = %e, "failed to notify block change");
                         }
