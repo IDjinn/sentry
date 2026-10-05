@@ -125,6 +125,10 @@ fn signal_label(k: sentry_core::SignalKind) -> &'static str {
         ExternalReputation => "external_reputation",
         TlsSniMismatch => "tls_sni_mismatch",
         ProtocolViolation => "protocol_violation",
+        UploadTypeMismatch => "upload_type_mismatch",
+        UploadPolyglot => "upload_polyglot",
+        UploadExecutable => "upload_executable",
+        UploadFlood => "upload_flood",
         RuleHit => "rule_hit",
         Custom => "custom",
     }

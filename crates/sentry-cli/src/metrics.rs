@@ -31,6 +31,7 @@ pub struct Metrics {
     pub dedupe_drops: prometheus::Counter,
     pub correlation_hits: prometheus::Counter,
     pub edge_block_hits: prometheus::Counter,
+    pub edge_uploads_inspected: prometheus::Counter,
     pub bot_verifications: prometheus::CounterVec,
     pub edge_challenge: prometheus::CounterVec,
     pub edge_tls_handshakes: prometheus::CounterVec,
@@ -83,6 +84,12 @@ impl Metrics {
             "sentry_edge_block_hits_total",
             "Connections denied by the inline edge fast-path for IPs on the \
              block table (sticky blocks enforced before the pipeline).",
+        )
+        .unwrap();
+        let edge_uploads_inspected = prometheus::Counter::new(
+            "sentry_edge_uploads_inspected_total",
+            "Requests whose body went through upload inspection (F10) — \
+             multipart parts parsed and upload heuristics fed.",
         )
         .unwrap();
         let bot_verifications = prometheus::CounterVec::new(
@@ -264,6 +271,7 @@ impl Metrics {
             &dedupe_drops,
             &correlation_hits,
             &edge_block_hits,
+            &edge_uploads_inspected,
         ] {
             registry.register(Box::new(m.clone())).ok();
         }
@@ -339,6 +347,7 @@ impl Metrics {
             dedupe_drops,
             correlation_hits,
             edge_block_hits,
+            edge_uploads_inspected,
             bot_verifications,
             edge_challenge,
             edge_tls_handshakes,

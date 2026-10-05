@@ -75,9 +75,14 @@ async fn handler_inner(
 ) -> Response {
     let (mut parts, body) = req.into_parts();
 
-    // Capture the body up to the configured cap (0 = don't buffer).
-    let (captured, body) = if runtime.body_cap() > 0 {
-        match axum::body::to_bytes(body, runtime.body_cap()).await {
+    // Buffer the body up to the capture cap — raised to the inspection cap
+    // when uploads are enabled (F10). 0 = don't buffer (unless inspection).
+    let cap = match runtime.uploads_inspection() {
+        Some(insp) => runtime.body_cap().max(insp.inspect_bytes),
+        None => runtime.body_cap(),
+    };
+    let (buffered, body) = if cap > 0 {
+        match axum::body::to_bytes(body, cap).await {
             Ok(bytes) => (Some(bytes.to_vec()), axum::body::Body::from(bytes)),
             Err(_) => {
                 return (
@@ -89,6 +94,25 @@ async fn handler_inner(
         }
     } else {
         (None, body)
+    };
+    // Persistence keeps `body_capture_kb` semantics; the pipeline analyzes a
+    // (possibly longer) inspection prefix.
+    let captured = buffered.as_ref().and_then(|b| {
+        if runtime.body_cap() == 0 {
+            return None;
+        }
+        let end = b.len().min(runtime.body_cap());
+        Some(b[..end].to_vec())
+    });
+    let (upload_meta, analysis_body) = match buffered.as_deref() {
+        Some(b) => runtime.inspect_body(
+            parts
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            b,
+        ),
+        None => (None, None),
     };
 
     let peer = parts
@@ -140,8 +164,9 @@ async fn handler_inner(
         user_agent: headers.get("user-agent").cloned(),
         referer: headers.get("referer").cloned(),
         headers,
-        body: captured,
+        body: analysis_body.clone().or_else(|| captured.clone()),
         cookies: Some(crate::challenge::parse_cookies(&parts.headers)),
+        uploads: upload_meta,
         upstream_time_ms: None,
     };
 
@@ -152,7 +177,10 @@ async fn handler_inner(
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|c| c.0.port());
 
-    let processed = runtime.process(evt);
+    let mut processed = runtime.process(evt);
+    if let Some(http) = processed.event.http_mut() {
+        http.body = captured.clone();
+    }
 
     if runtime.mode() == MiddlewareMode::Shadow {
         parts.extensions.insert(processed);
@@ -345,5 +373,98 @@ mod tests {
         assert_eq!(percent_decode("/a%2fb"), "/a/b");
         assert_eq!(percent_decode("/plain"), "/plain");
         assert_eq!(percent_decode("/bad%zz"), "/bad%zz");
+    }
+
+    // ── Upload inspection (F10) ──────────────────────────────────────────
+
+    fn upload_runtime(mode: MiddlewareMode, enforce: bool) -> EdgeRuntime {
+        let mut cfg = sentry_core::config::UploadsConfig::default();
+        cfg.enabled = true;
+        if enforce {
+            cfg.mode = sentry_core::config::UploadMode::Enforce;
+        }
+        let mut pipeline = Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        );
+        pipeline.configure_uploads(&cfg);
+        EdgeRuntime::new(std::sync::Arc::new(pipeline), None, 4096)
+            .with_mode(mode)
+            .with_uploads(crate::UploadsInspection {
+                inspect_bytes: 64 * 1024,
+                max_files: 16,
+            })
+    }
+
+    fn form_app(rt: EdgeRuntime) -> Router {
+        Router::new()
+            .route("/", get(ok_handler).post(ok_handler))
+            .route_layer(axum::middleware::from_fn_with_state(rt.clone(), handler))
+            .with_state(rt)
+    }
+
+    #[tokio::test]
+    async fn uploads_sqli_in_form_field_blocks_inline() {
+        let app = form_app(upload_runtime(MiddlewareMode::Inline, true));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(axum::body::Body::from("user=admin%27+OR+1%3D1--"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn uploads_clean_form_passes_with_body_intact() {
+        let app = form_app(upload_runtime(MiddlewareMode::Inline, true));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(axum::body::Body::from("user=maria&next=%2Fhome"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn uploads_decision_extension_keeps_capture_semantics() {
+        // body_capture_kb = 4096 in this runtime: the handler-visible event
+        // keeps the captured body, and shadow decisions carry upload metadata.
+        let rt = upload_runtime(MiddlewareMode::Shadow, false);
+        let counter = prometheus::Counter::new("mw_uploads_test", "test").unwrap();
+        let rt = rt.with_uploads_inspected(counter.clone());
+        let app = Router::new()
+            .route("/", get(ok_handler).post(ok_handler))
+            .route_layer(axum::middleware::from_fn_with_state(rt.clone(), handler))
+            .with_state(rt);
+        let gif = b"GIF89a\x00<?php eval($_POST); ?>".to_vec();
+        let mut body = Vec::new();
+        body.extend_from_slice(b"--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.gif\"\r\nContent-Type: image/gif\r\n\r\n");
+        body.extend_from_slice(&gif);
+        body.extend_from_slice(b"\r\n--B--\r\n");
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "multipart/form-data; boundary=B")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "shadow never blocks");
+        assert_eq!(counter.get(), 1.0, "inspected counter incremented");
     }
 }

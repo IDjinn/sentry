@@ -268,6 +268,7 @@ impl Parser {
             }
             "query" => self.parse_str_op_atom(inline_val, RuleMatch::Query),
             "body" => self.parse_str_op_atom(inline_val, RuleMatch::Body),
+            "upload_filename" => self.parse_str_op_atom(inline_val, RuleMatch::UploadFilename),
             "method" => {
                 let val = self.resolve_value(inline_val)?;
                 Ok(RuleMatch::Method(HttpMethod::from_str_lossy(&val)))

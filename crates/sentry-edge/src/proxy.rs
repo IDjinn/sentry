@@ -227,8 +227,50 @@ async fn proxy_handler_inner(
         .map(|c| c.0.ip())
         .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
 
-    // Buffer the body for forwarding (≥1 MiB) and capture the first
-    // `body_cap` bytes for inspection when enabled.
+    // While upload inspection is armed, the inspection cap IS the body cap:
+    // bodies beyond it are refused outright (413), and the buffered bytes are
+    // what the heuristics analyze. The declared length is checked before any
+    // buffering; chunked bodies hit the cap inside `to_bytes`.
+    let declared_len = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if let Some(insp) = runtime.uploads_inspection() {
+        if declared_len.is_some_and(|len| len > insp.inspect_bytes) {
+            return (
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds the upload inspection cap",
+            )
+                .into_response();
+        }
+        let body_bytes = match axum::body::to_bytes(body, insp.inspect_bytes).await {
+            Ok(b) => b.to_vec(),
+            Err(_) => {
+                return (
+                    axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds the upload inspection cap",
+                )
+                    .into_response();
+            }
+        };
+        return proxy_inspected(
+            runtime,
+            client,
+            upstream,
+            decided,
+            redirect_https,
+            parts,
+            body_bytes,
+            is_tls,
+            peer,
+            start,
+        )
+        .await;
+    }
+
+    // Inspection disabled: legacy behavior — buffer for forwarding (≥1 MiB)
+    // and capture the first `body_cap` bytes for persistence when enabled.
     let forward_cap = runtime.body_cap().max(1024 * 1024);
     let body_bytes = match axum::body::to_bytes(body, forward_cap).await {
         Ok(b) => b.to_vec(),
@@ -240,6 +282,36 @@ async fn proxy_handler_inner(
                 .into_response();
         }
     };
+    proxy_inspected(
+        runtime,
+        client,
+        upstream,
+        decided,
+        redirect_https,
+        parts,
+        body_bytes,
+        is_tls,
+        peer,
+        start,
+    )
+    .await
+}
+
+/// Shared tail of the proxy handler once the body is buffered: upload
+/// inspection, pipeline, verdict and upstream forwarding.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_inspected(
+    runtime: crate::EdgeRuntime,
+    client: reqwest::Client,
+    upstream: String,
+    decided: mpsc::Sender<sentry_core::ProcessedEvent>,
+    redirect_https: bool,
+    parts: axum::http::request::Parts,
+    body_bytes: Vec<u8>,
+    is_tls: bool,
+    peer: std::net::IpAddr,
+    start: Instant,
+) -> Response {
     let captured = if runtime.body_cap() > 0 {
         Some(
             body_bytes
@@ -250,6 +322,13 @@ async fn proxy_handler_inner(
     } else {
         None
     };
+    let (upload_meta, analysis_body) = runtime.inspect_body(
+        parts
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        &body_bytes,
+    );
 
     let headers: std::collections::HashMap<String, String> = parts
         .headers
@@ -293,8 +372,9 @@ async fn proxy_handler_inner(
         user_agent: headers.get("user-agent").cloned(),
         referer: headers.get("referer").cloned(),
         headers,
-        body: captured,
+        body: analysis_body.clone().or_else(|| captured.clone()),
         cookies: Some(crate::challenge::parse_cookies(&parts.headers)),
+        uploads: upload_meta,
         upstream_time_ms: None,
     };
     let mut evt = sentry_core::event::Event::new(
@@ -308,6 +388,11 @@ async fn proxy_handler_inner(
         .map(|c| c.0.port());
 
     let mut processed = runtime.process(evt);
+    // Restore the persistence semantics of `HttpData.body` (capture cap only
+    // — the analysis prefix above never lands in the published event).
+    if let Some(http) = processed.event.http_mut() {
+        http.body = captured.clone();
+    }
     let ua = processed.event.http().and_then(|h| h.user_agent.clone());
     let path = processed
         .event
@@ -558,6 +643,240 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         addr
+    }
+
+    // ── Upload inspection (F10) ──────────────────────────────────────────
+
+    fn upload_cfg(enforce: bool, inspect_kb: usize) -> sentry_core::config::UploadsConfig {
+        let mut cfg = sentry_core::config::UploadsConfig::default();
+        cfg.enabled = true;
+        cfg.inspect_kb = inspect_kb;
+        if enforce {
+            cfg.mode = sentry_core::config::UploadMode::Enforce;
+        }
+        cfg
+    }
+
+    fn upload_pipeline(
+        cfg: &sentry_core::config::UploadsConfig,
+    ) -> std::sync::Arc<sentry_core::pipeline::Pipeline> {
+        let mut pipeline = sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        );
+        pipeline.configure_uploads(cfg);
+        std::sync::Arc::new(pipeline)
+    }
+
+    fn multipart_form(parts: &[(&str, &str, &str, &[u8])]) -> (String, Vec<u8>) {
+        let mut out = Vec::new();
+        for (name, filename, ct, content) in parts {
+            out.extend_from_slice(b"--SENTRY\r\n");
+            out.extend_from_slice(
+                format!(
+                    "Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: {ct}\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            out.extend_from_slice(content);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"--SENTRY--\r\n");
+        ("multipart/form-data; boundary=SENTRY".to_string(), out)
+    }
+
+    async fn upload_request(
+        app: Router,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> axum::http::Response<axum::body::Body> {
+        app.oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/upload")
+                .header("content-type", content_type)
+                .header("content-length", body.len().to_string())
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn clean_upload_is_forwarded_with_metadata() {
+        let upstream = spawn_404_upstream().await;
+        let cfg = upload_cfg(true, 1024);
+        let runtime = crate::EdgeRuntime::new(upload_pipeline(&cfg), None, 0).with_uploads(
+            crate::UploadsInspection {
+                inspect_bytes: (cfg.inspect_kb as usize) * 1024,
+                max_files: 16,
+            },
+        );
+        let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: format!("http://{upstream}"),
+                decided: dec_tx,
+                redirect_https: false,
+            });
+        let (ct, body) = multipart_form(&[("f", "cat.png", "image/png", b"\x89PNG\r\n\x1a\nxx")]);
+        let resp = upload_request(app, &ct, body).await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "forwarded"
+        );
+        let pe = dec_rx.try_recv().expect("decided event");
+        match &pe.event.protocol {
+            sentry_core::ProtocolData::Http(h) => {
+                let uploads = h.uploads.as_ref().expect("upload metadata on event");
+                assert_eq!(uploads.len(), 1);
+                assert_eq!(uploads[0].filename.as_deref(), Some("cat.png"));
+                assert_eq!(uploads[0].kind, sentry_core::event::UploadKind::Image);
+                assert_eq!(h.body, None, "body_capture_kb=0 keeps nothing persisted");
+            }
+            other => panic!("expected http event, got {other:?}"),
+        }
+        assert!(
+            pe.analysis
+                .signals
+                .iter()
+                .all(|s| s.kind != sentry_core::analysis::SignalKind::UploadTypeMismatch),
+            "clean png must stay quiet"
+        );
+    }
+
+    #[tokio::test]
+    async fn polyglot_upload_blocks_in_enforce_mode() {
+        let upstream = spawn_404_upstream().await;
+        let cfg = upload_cfg(true, 1024);
+        let runtime = crate::EdgeRuntime::new(upload_pipeline(&cfg), None, 0).with_uploads(
+            crate::UploadsInspection {
+                inspect_bytes: (cfg.inspect_kb as usize) * 1024,
+                max_files: 16,
+            },
+        );
+        let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: format!("http://{upstream}"),
+                decided: dec_tx,
+                redirect_https: false,
+            });
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(b"\x00<?php system($_GET['c']); ?>");
+        let (ct, body) = multipart_form(&[("f", "avatar.gif", "image/gif", &gif)]);
+        let resp = upload_request(app, &ct, body).await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "blocked pre-upstream"
+        );
+        let pe = dec_rx.try_recv().expect("decided event");
+        let sig = pe
+            .analysis
+            .signals
+            .iter()
+            .find(|s| s.kind == sentry_core::analysis::SignalKind::UploadPolyglot)
+            .expect("polyglot signal");
+        assert_eq!(sig.weight, 60, "enforce mode carries full weight");
+    }
+
+    #[tokio::test]
+    async fn polyglot_upload_forwards_in_shadow_mode() {
+        let upstream = spawn_404_upstream().await;
+        let cfg = upload_cfg(false, 1024);
+        let runtime = crate::EdgeRuntime::new(upload_pipeline(&cfg), None, 0).with_uploads(
+            crate::UploadsInspection {
+                inspect_bytes: (cfg.inspect_kb as usize) * 1024,
+                max_files: 16,
+            },
+        );
+        let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: format!("http://{upstream}"),
+                decided: dec_tx,
+                redirect_https: false,
+            });
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(b"\x00<?php eval($_POST); ?>");
+        let (ct, body) = multipart_form(&[("f", "avatar.gif", "image/gif", &gif)]);
+        let resp = upload_request(app, &ct, body).await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "shadow forwards"
+        );
+        let pe = dec_rx.try_recv().expect("decided event");
+        let sig = pe
+            .analysis
+            .signals
+            .iter()
+            .find(|s| s.kind == sentry_core::analysis::SignalKind::UploadPolyglot)
+            .expect("shadow still detects");
+        assert_eq!(sig.weight, 0, "shadow mode zeroes the weight");
+    }
+
+    #[tokio::test]
+    async fn oversized_body_rejected_while_uploads_enabled() {
+        let cfg = upload_cfg(true, 1);
+        let runtime = crate::EdgeRuntime::new(upload_pipeline(&cfg), None, 0).with_uploads(
+            crate::UploadsInspection {
+                inspect_bytes: 1024,
+                max_files: 16,
+            },
+        );
+        let (dec_tx, _dec_rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: "http://127.0.0.1:9".to_string(),
+                decided: dec_tx,
+                redirect_https: false,
+            });
+        let big = vec![0x41u8; 4096];
+        let (ct, body) = multipart_form(&[("f", "big.bin", "application/octet-stream", &big)]);
+        let resp = upload_request(app, &ct, body).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn uploads_inspected_counter_increments() {
+        let cfg = upload_cfg(true, 1024);
+        let counter = prometheus::Counter::new("uploads_inspected_test", "test").unwrap();
+        let runtime = crate::EdgeRuntime::new(upload_pipeline(&cfg), None, 0)
+            .with_uploads(crate::UploadsInspection {
+                inspect_bytes: (cfg.inspect_kb as usize) * 1024,
+                max_files: 16,
+            })
+            .with_uploads_inspected(counter.clone());
+        let (dec_tx, _dec_rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: "http://127.0.0.1:9".to_string(),
+                decided: dec_tx,
+                redirect_https: false,
+            });
+        let (ct, body) = multipart_form(&[("f", "a.txt", "text/plain", b"hi")]);
+        let resp = upload_request(app, &ct, body).await;
+        let _ = resp.status();
+        assert_eq!(counter.get(), 1.0);
     }
 
     #[tokio::test]

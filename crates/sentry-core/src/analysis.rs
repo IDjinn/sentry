@@ -165,6 +165,20 @@ pub enum SignalKind {
     /// keepalive flood or a failed field constraint. `detail` carries the
     /// schema, message label and the VM reason.
     ProtocolViolation,
+    /// Uploaded file whose actual bytes disagree with its declared
+    /// content type or extension (F10) — e.g. a PNG that is really a ZIP.
+    UploadTypeMismatch,
+    /// Uploaded file carrying hidden executable payload (F10): polyglot
+    /// image (GIF/JPEG + PHP), SVG with embedded script, webshell markers
+    /// in EXIF/metadata or trailing bytes.
+    UploadPolyglot,
+    /// Uploaded file that is really an executable/script (F10): PE/ELF/shebang
+    /// bytes under an image name, or a server-side script extension
+    /// (`upload.php.jpg`, `.jsp`, `.asp`…).
+    UploadExecutable,
+    /// One IP pushed an abnormal number of uploads (count or total bytes)
+    /// through the inline edge within the flood window (F10).
+    UploadFlood,
     /// A custom rule matched (the rule id is carried in `detail`).
     RuleHit,
     /// Any other signal not yet cataloged.
@@ -177,6 +191,15 @@ pub const TLS_SNI_MISMATCH_WEIGHT: u8 = 20;
 /// Default weight for [`SignalKind::ProtocolViolation`] (F9); schemas
 /// override it per named policy at runtime, this is the fallback.
 pub const PROTOCOL_VIOLATION_WEIGHT: u8 = 25;
+
+/// Default weight for [`SignalKind::UploadTypeMismatch`] (F10).
+pub const UPLOAD_TYPE_MISMATCH_WEIGHT: u8 = 30;
+/// Default weight for [`SignalKind::UploadPolyglot`] (F10).
+pub const UPLOAD_POLYGLOT_WEIGHT: u8 = 60;
+/// Default weight for [`SignalKind::UploadExecutable`] (F10).
+pub const UPLOAD_EXECUTABLE_WEIGHT: u8 = 50;
+/// Default weight for [`SignalKind::UploadFlood`] (F10).
+pub const UPLOAD_FLOOD_WEIGHT: u8 = 25;
 
 /// What the pipeline decided to do with the event.
 ///

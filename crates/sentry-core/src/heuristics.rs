@@ -34,22 +34,64 @@ pub trait Heuristic: Send + Sync {
     ///
     /// `text` carries the URL-decoded path/query (empty for non-HTTP events),
     /// computed once per event by the engine.
-    fn analyze(&self, evt: &Event, text: &DecodedHttp) -> Vec<Signal>;
+    fn analyze(&self, evt: &Event, text: &DecodedHttp<'_>) -> Vec<Signal>;
 }
 
-/// URL-decoded path and query, shared by all text detectors (F5).
+/// URL-decoded path and query, shared by all text detectors (F5), plus the
+/// parsed request body (F10): multipart parts and urlencoded form values,
+/// computed once per event.
 #[derive(Default)]
-pub struct DecodedHttp {
+pub struct DecodedHttp<'a> {
     /// Percent-decoded request path (`%27` → `'`, `+`/`%20` → space).
     pub path: String,
     /// Percent-decoded query string; empty when the event has no query.
     pub query: String,
+    /// Parsed multipart parts (empty for non-multipart bodies).
+    pub uploads: Vec<crate::multipart::UploadPart<'a>>,
+    /// Parsed urlencoded form values (empty for non-form bodies).
+    pub form: Vec<(String, String)>,
 }
 
-impl DecodedHttp {
-    fn of(http: &HttpData) -> Self {
+/// Multipart parts parsed per event — generous enough for real forms, tight
+/// enough that a hostile body can't make the engine parse thousands.
+const MAX_PARSE_PARTS: usize = 64;
+
+impl<'a> DecodedHttp<'a> {
+    fn of(http: &'a HttpData) -> Self {
         let (path, query) = http_text(http);
-        Self { path, query }
+        let (uploads, form) = body_parts(http);
+        Self {
+            path,
+            query,
+            uploads,
+            form,
+        }
+    }
+}
+
+/// Split a request body into (multipart parts, urlencoded values). Only the
+/// declared `Content-Type` decides the parser; JSON bodies stay unparsed and
+/// are text-scanned by the content heuristic.
+fn body_parts(http: &HttpData) -> (Vec<crate::multipart::UploadPart<'_>>, Vec<(String, String)>) {
+    let Some(body) = http.body.as_deref() else {
+        return (Vec::new(), Vec::new());
+    };
+    if body.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let Some(ct) = http.headers.get("content-type").map(|s| s.as_str()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let ct_lower = ct.to_ascii_lowercase();
+    if ct_lower.starts_with("multipart/") {
+        (
+            crate::multipart::parse_multipart(ct, body, MAX_PARSE_PARTS),
+            Vec::new(),
+        )
+    } else if ct_lower.contains("x-www-form-urlencoded") {
+        (Vec::new(), crate::multipart::parse_urlencoded(body))
+    } else {
+        (Vec::new(), Vec::new())
     }
 }
 
@@ -314,9 +356,19 @@ pub struct HeuristicEngine {
     detectors: Vec<Box<dyn Heuristic>>,
 }
 
+impl Default for HeuristicEngine {
+    fn default() -> Self {
+        Self::with_defaults()
+    }
+}
+
 impl HeuristicEngine {
-    /// Create a new engine with the default set of detectors.
+    /// Create a new engine with the default set of detectors. Upload
+    /// inspection (F10) starts **disabled** — call
+    /// [`with_uploads_scan`](Self::with_uploads_scan) with the `[uploads]`
+    /// projection to arm it.
     pub fn with_defaults() -> Self {
+        let scan = crate::uploads::UploadsScan::default();
         Self {
             detectors: vec![
                 Box::new(SqlInjection),
@@ -329,8 +381,23 @@ impl HeuristicEngine {
                 Box::new(BadCrawler),
                 Box::new(EmptyUserAgent),
                 Box::new(TcpScanner),
+                Box::new(UploadFilename::new(scan.clone())),
+                Box::new(UploadContent::new(scan.clone())),
+                Box::new(UploadImage::new(scan)),
             ],
         }
+    }
+
+    /// Re-arm the upload detectors (F10) with a new `[uploads]` projection.
+    /// Disabled scans make them zero-cost early returns.
+    pub fn with_uploads_scan(mut self, scan: crate::uploads::UploadsScan) -> Self {
+        self.detectors.retain(|d| !d.name().starts_with("upload_"));
+        self.detectors
+            .push(Box::new(UploadFilename::new(scan.clone())));
+        self.detectors
+            .push(Box::new(UploadContent::new(scan.clone())));
+        self.detectors.push(Box::new(UploadImage::new(scan)));
+        self
     }
 
     /// Run all detectors and collect signals.
@@ -719,7 +786,7 @@ impl Heuristic for TcpScanner {
     fn name(&self) -> &'static str {
         "tcp_scanner"
     }
-    fn analyze(&self, evt: &Event, _text: &DecodedHttp) -> Vec<Signal> {
+    fn analyze(&self, evt: &Event, _text: &DecodedHttp<'_>) -> Vec<Signal> {
         let code = match evt.tcp().and_then(|t| t.fingerprint.as_deref()) {
             Some(c) => c,
             None => return vec![],
@@ -732,6 +799,296 @@ impl Heuristic for TcpScanner {
             }],
             None => vec![],
         }
+    }
+}
+
+// ── Upload detectors (F10) ───────────────────────────────────────────────
+
+/// Signal weight under the current `[uploads] mode`: full weights in
+/// `enforce`, zero in `shadow` (detection still logs and metricizes).
+fn upload_weight(scan: &crate::uploads::UploadsScan, base: u8) -> u8 {
+    if scan.enforce {
+        base
+    } else {
+        0
+    }
+}
+
+/// Match an attack-text regex family over upload-borne text and return the
+/// corresponding reused `SignalKind`/weight pair (same weights as the URL
+/// counterparts — the attack is the same, only the surface differs).
+fn text_family_match(text: &str) -> Option<(SignalKind, u8, &'static str)> {
+    if SQLI_RE.is_match(text) {
+        return Some((SignalKind::SqlInjection, 60, "sql"));
+    }
+    if XSS_RE.is_match(text) {
+        return Some((SignalKind::Xss, 45, "xss"));
+    }
+    if LOG4SHELL_RE.is_match(text) {
+        return Some((SignalKind::Log4Shell, 80, "log4shell"));
+    }
+    if CMD_INJECTION_RE.is_match(text) {
+        return Some((SignalKind::Rce, 70, "cmd"));
+    }
+    if LFI_RE.is_match(text) {
+        return Some((SignalKind::Lfi, 50, "lfi"));
+    }
+    if PATH_TRAVERSAL_RE.is_match(text) {
+        return Some((SignalKind::PathTraversal, 40, "traversal"));
+    }
+    None
+}
+
+/// Injection patterns in uploaded **filenames** (`../../shell.php`,
+/// `img'.jpg" OR 1=1--`, `${jndi:…}.png`) and hostile extension tricks
+/// (double extensions, null bytes, server-side scripts).
+pub struct UploadFilename {
+    scan: crate::uploads::UploadsScan,
+}
+
+impl UploadFilename {
+    /// Build with an `[uploads]` projection.
+    pub fn new(scan: crate::uploads::UploadsScan) -> Self {
+        Self { scan }
+    }
+}
+
+impl Heuristic for UploadFilename {
+    fn name(&self) -> &'static str {
+        "upload_filename"
+    }
+    fn analyze(&self, _evt: &Event, text: &DecodedHttp<'_>) -> Vec<Signal> {
+        if !self.scan.enabled {
+            return vec![];
+        }
+        for part in &text.uploads {
+            let Some(filename) = part.filename.as_deref() else {
+                continue;
+            };
+            let decoded = crate::multipart::decode_component(filename);
+            if let Some((kind, base, family)) = text_family_match(&decoded) {
+                return vec![Signal {
+                    kind,
+                    weight: upload_weight(&self.scan, base),
+                    detail: Some(format!("upload filename {family}: {filename}")),
+                }];
+            }
+            if decoded.contains('\0') || decoded.contains("../") || decoded.contains("..\\") {
+                return vec![Signal {
+                    kind: SignalKind::PathTraversal,
+                    weight: upload_weight(&self.scan, 40),
+                    detail: Some(format!("upload filename traversal: {filename}")),
+                }];
+            }
+            if crate::uploads::extension(Some(&decoded))
+                .is_some_and(|ext| self.scan.blocked_extensions.contains(&ext))
+            {
+                return vec![Signal {
+                    kind: SignalKind::UploadExecutable,
+                    weight: upload_weight(&self.scan, crate::analysis::UPLOAD_EXECUTABLE_WEIGHT),
+                    detail: Some(format!("blocked upload extension: {filename}")),
+                }];
+            }
+            if let Some(name) = filename.rsplit_once('.').map(|(base, _)| base) {
+                if crate::uploads::extension(Some(name))
+                    .is_some_and(|ext| self.scan.blocked_extensions.contains(&ext))
+                {
+                    return vec![Signal {
+                        kind: SignalKind::UploadExecutable,
+                        weight: upload_weight(
+                            &self.scan,
+                            crate::analysis::UPLOAD_EXECUTABLE_WEIGHT,
+                        ),
+                        detail: Some(format!("double blocked extension: {filename}")),
+                    }];
+                }
+            }
+        }
+        vec![]
+    }
+}
+
+/// Injection patterns inside upload **content**: multipart form fields,
+/// textual files (SVG/HTML/JSON uploads), urlencoded form values and —
+/// when `[uploads] scan_json` is on — raw JSON bodies.
+pub struct UploadContent {
+    scan: crate::uploads::UploadsScan,
+}
+
+impl UploadContent {
+    /// Build with an `[uploads]` projection.
+    pub fn new(scan: crate::uploads::UploadsScan) -> Self {
+        Self { scan }
+    }
+
+    fn scan_piece(&self, label: String, raw: &[u8]) -> Vec<Signal> {
+        let text = String::from_utf8_lossy(&raw[..raw.len().min(crate::uploads::TEXT_SCAN_CAP)]);
+        match text_family_match(&text) {
+            Some((kind, base, family)) => vec![Signal {
+                kind,
+                weight: upload_weight(&self.scan, base),
+                detail: Some(format!("{label}: {family}")),
+            }],
+            None => vec![],
+        }
+    }
+}
+
+impl Heuristic for UploadContent {
+    fn name(&self) -> &'static str {
+        "upload_content"
+    }
+    fn analyze(&self, evt: &Event, text: &DecodedHttp<'_>) -> Vec<Signal> {
+        if !self.scan.enabled {
+            return vec![];
+        }
+        for part in &text.uploads {
+            if !crate::multipart::is_scannable_text(part.content_type.as_deref(), part.content) {
+                continue;
+            }
+            let label = match (part.name.as_deref(), part.filename.as_deref()) {
+                (_, Some(f)) => format!("upload file {f}"),
+                (Some(n), None) => format!("upload field {n}"),
+                (None, None) => "upload part".to_string(),
+            };
+            let sigs = self.scan_piece(label, part.content);
+            if !sigs.is_empty() {
+                return sigs;
+            }
+        }
+        for (name, value) in &text.form {
+            let sigs = self.scan_piece(format!("form field {name}"), value.as_bytes());
+            if !sigs.is_empty() {
+                return sigs;
+            }
+        }
+        if self.scan.scan_json {
+            if let Some(http) = evt.http() {
+                if let Some(body) = http.body.as_deref() {
+                    if crate::multipart::looks_like_json(
+                        http.headers.get("content-type").map(|s| s.as_str()),
+                        body,
+                    ) {
+                        let sigs = self.scan_piece("json body".to_string(), body);
+                        if !sigs.is_empty() {
+                            return sigs;
+                        }
+                    }
+                }
+            }
+        }
+        vec![]
+    }
+}
+
+/// Malicious **file content** (F10): magic bytes that disagree with the
+/// declared type, executables disguised as images, and polyglot payloads
+/// (GIF+PHP, JPEG with appended webshell, EXIF comment scripts).
+pub struct UploadImage {
+    scan: crate::uploads::UploadsScan,
+}
+
+impl UploadImage {
+    /// Build with an `[uploads]` projection.
+    pub fn new(scan: crate::uploads::UploadsScan) -> Self {
+        Self { scan }
+    }
+}
+
+impl Heuristic for UploadImage {
+    fn name(&self) -> &'static str {
+        "upload_image"
+    }
+    fn analyze(&self, evt: &Event, text: &DecodedHttp<'_>) -> Vec<Signal> {
+        if !self.scan.enabled {
+            return vec![];
+        }
+        for part in &text.uploads {
+            if part.filename.is_none() {
+                continue;
+            }
+            if let Some(sig) = self.inspect(
+                part.content,
+                part.filename.as_deref(),
+                part.content_type.as_deref(),
+            ) {
+                return vec![sig];
+            }
+        }
+        // Direct binary upload (PUT/POST of an image or opaque body without
+        // multipart framing): the whole body is one unnamed file.
+        if let Some(http) = evt.http() {
+            if text.uploads.is_empty() {
+                if let Some(body) = http.body.as_deref() {
+                    let ct = http.headers.get("content-type").map(|s| s.as_str());
+                    let binary_put = matches!(
+                        http.method,
+                        Some(crate::event::HttpMethod::Put | crate::event::HttpMethod::Post)
+                    ) && ct.is_some_and(|c| {
+                        let c = c.to_ascii_lowercase();
+                        c.starts_with("image/") || c.starts_with("application/octet-stream")
+                    });
+                    if binary_put {
+                        if let Some(sig) = self.inspect(body, None, ct) {
+                            return vec![sig];
+                        }
+                    }
+                }
+            }
+        }
+        vec![]
+    }
+}
+
+impl UploadImage {
+    fn inspect(
+        &self,
+        content: &[u8],
+        filename: Option<&str>,
+        content_type: Option<&str>,
+    ) -> Option<Signal> {
+        if content.is_empty() {
+            return None;
+        }
+        let kind = crate::uploads::sniff_kind(content, filename, content_type);
+        let declared_img = crate::uploads::declared_image(filename, content_type);
+        use crate::event::UploadKind;
+        if declared_img
+            && matches!(
+                kind,
+                UploadKind::Archive | UploadKind::Executable | UploadKind::Pdf
+            )
+        {
+            return Some(Signal {
+                kind: SignalKind::UploadTypeMismatch,
+                weight: upload_weight(&self.scan, crate::analysis::UPLOAD_TYPE_MISMATCH_WEIGHT),
+                detail: Some(format!(
+                    "declared image carries {kind:?} bytes: {}",
+                    filename.unwrap_or("<unnamed>")
+                )),
+            });
+        }
+        if kind == UploadKind::Executable {
+            return Some(Signal {
+                kind: SignalKind::UploadExecutable,
+                weight: upload_weight(&self.scan, crate::analysis::UPLOAD_EXECUTABLE_WEIGHT),
+                detail: Some(format!(
+                    "executable upload: {}",
+                    filename.unwrap_or("<unnamed>")
+                )),
+            });
+        }
+        if let Some(marker) = crate::uploads::hidden_payload_markers(content, kind) {
+            return Some(Signal {
+                kind: SignalKind::UploadPolyglot,
+                weight: upload_weight(&self.scan, crate::analysis::UPLOAD_POLYGLOT_WEIGHT),
+                detail: Some(format!(
+                    "hidden payload marker {marker:?} in {}",
+                    filename.unwrap_or("<unnamed>")
+                )),
+            });
+        }
+        None
     }
 }
 
@@ -843,6 +1200,227 @@ mod tests {
             signals.len() >= 3,
             "expected at least 3 signals, got {signals:?}"
         );
+    }
+
+    // ── Upload heuristics (F10) ──────────────────────────────────────────
+
+    use crate::config::UploadsConfig;
+    use crate::uploads::UploadsScan;
+
+    fn upload_engine(mode_enforce: bool) -> HeuristicEngine {
+        let mut cfg = UploadsConfig::default();
+        cfg.enabled = true;
+        if mode_enforce {
+            cfg.mode = crate::config::UploadMode::Enforce;
+        }
+        HeuristicEngine::with_defaults().with_uploads_scan(UploadsScan::from_config(&cfg))
+    }
+
+    fn upload_evt(
+        content_type: &str,
+        body: Vec<u8>,
+        method: Option<crate::event::HttpMethod>,
+    ) -> Event {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("content-type".to_string(), content_type.to_string());
+        Event::new(
+            SourceKind::Synthetic,
+            std::net::IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            ProtocolData::Http(HttpData {
+                path: "/upload".to_string(),
+                method,
+                headers,
+                body: Some(body),
+                user_agent: Some("Mozilla/5.0".to_string()),
+                ..Default::default()
+            }),
+        )
+    }
+
+    fn multipart_body(filename: &str, content_type: &str, content: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"--XBOUND\r\n");
+        out.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+                .as_bytes(),
+        );
+        out.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+        out.extend_from_slice(content);
+        out.extend_from_slice(b"\r\n--XBOUND--\r\n");
+        out
+    }
+
+    const MULTIPART_CT: &str = "multipart/form-data; boundary=XBOUND";
+
+    #[test]
+    fn upload_sqli_in_filename_is_detected() {
+        let e = upload_evt(
+            MULTIPART_CT,
+            multipart_body("' OR 1=1--.png", "image/png", b"\x89PNG\r\n\x1a\n"),
+            Some(crate::event::HttpMethod::Post),
+        );
+        let signals = upload_engine(true).analyze(&e);
+        let sig = signals
+            .iter()
+            .find(|s| s.kind == SignalKind::SqlInjection)
+            .expect("sqli filename must be flagged");
+        assert_eq!(sig.weight, 60);
+        assert!(sig.detail.as_deref().unwrap().contains("upload filename"));
+    }
+
+    #[test]
+    fn upload_svg_with_script_flags_xss_via_content() {
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>";
+        let e = upload_evt(
+            MULTIPART_CT,
+            multipart_body("logo.svg", "image/svg+xml", svg),
+            Some(crate::event::HttpMethod::Post),
+        );
+        let signals = upload_engine(true).analyze(&e);
+        assert!(signals.iter().any(|s| s.kind == SignalKind::Xss));
+    }
+
+    #[test]
+    fn upload_gif_php_polyglot_flags_polyglot() {
+        let mut content = b"GIF89a".to_vec();
+        content.extend_from_slice(&[0; 16]);
+        content.extend_from_slice(b"<?php system($_GET['c']); ?>");
+        let e = upload_evt(
+            MULTIPART_CT,
+            multipart_body("avatar.gif", "image/gif", &content),
+            Some(crate::event::HttpMethod::Post),
+        );
+        let signals = upload_engine(true).analyze(&e);
+        let sig = signals
+            .iter()
+            .find(|s| s.kind == SignalKind::UploadPolyglot)
+            .expect("GIF+PHP polyglot must be flagged");
+        assert_eq!(sig.weight, 60);
+    }
+
+    #[test]
+    fn upload_exe_disguised_as_image_flags_mismatch() {
+        let e = upload_evt(
+            MULTIPART_CT,
+            multipart_body("setup.jpg", "image/jpeg", b"MZ\x90\x00executable"),
+            Some(crate::event::HttpMethod::Post),
+        );
+        let signals = upload_engine(true).analyze(&e);
+        assert!(signals
+            .iter()
+            .any(|s| s.kind == SignalKind::UploadTypeMismatch));
+    }
+
+    #[test]
+    fn upload_blocked_extension_flags_executable() {
+        let e = upload_evt(
+            MULTIPART_CT,
+            multipart_body("shell.php", "application/octet-stream", b"<?php echo 1;"),
+            Some(crate::event::HttpMethod::Post),
+        );
+        let signals = upload_engine(true).analyze(&e);
+        let sig = signals
+            .iter()
+            .find(|s| s.kind == SignalKind::UploadExecutable)
+            .expect(".php upload must be flagged");
+        assert_eq!(sig.weight, 50);
+    }
+
+    #[test]
+    fn upload_clean_png_stays_quiet() {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[0; 64]);
+        let e = upload_evt(
+            MULTIPART_CT,
+            multipart_body("photo.png", "image/png", &png),
+            Some(crate::event::HttpMethod::Post),
+        );
+        assert!(upload_engine(true).analyze(&e).is_empty());
+    }
+
+    #[test]
+    fn upload_form_field_sqli_is_detected() {
+        let e = upload_evt(
+            "application/x-www-form-urlencoded",
+            b"user=admin%27+OR+1%3D1--&next=/".to_vec(),
+            Some(crate::event::HttpMethod::Post),
+        );
+        let signals = upload_engine(true).analyze(&e);
+        let sig = signals
+            .iter()
+            .find(|s| s.kind == SignalKind::SqlInjection)
+            .expect("urlencoded sqli must be flagged");
+        assert!(sig.detail.as_deref().unwrap().contains("form field user"));
+    }
+
+    #[test]
+    fn upload_json_body_scan_is_gated_by_config() {
+        let clean = upload_evt(
+            "application/json",
+            br#"{"comment":"hello world","n":42}"#.to_vec(),
+            Some(crate::event::HttpMethod::Post),
+        );
+        assert!(upload_engine(true).analyze(&clean).is_empty());
+        let payload = br#"{"q":"' OR 1=1--"}"#.to_vec();
+        let e = upload_evt(
+            "application/json",
+            payload,
+            Some(crate::event::HttpMethod::Post),
+        );
+        assert!(upload_engine(true)
+            .analyze(&e)
+            .iter()
+            .any(|s| s.kind == SignalKind::SqlInjection));
+        let mut cfg = UploadsConfig::default();
+        cfg.enabled = true;
+        cfg.mode = crate::config::UploadMode::Enforce;
+        cfg.scan_json = false;
+        let engine =
+            HeuristicEngine::with_defaults().with_uploads_scan(UploadsScan::from_config(&cfg));
+        assert!(
+            engine.analyze(&e).is_empty(),
+            "scan_json=false skips json bodies"
+        );
+    }
+
+    #[test]
+    fn upload_shadow_mode_zeroes_weights_but_still_detects() {
+        let content = format!("GIF89a{}", "<?php eval($_POST); ?>");
+        let e = upload_evt(
+            MULTIPART_CT,
+            multipart_body("cat.gif", "image/gif", content.as_bytes()),
+            Some(crate::event::HttpMethod::Post),
+        );
+        let signals = upload_engine(false).analyze(&e);
+        let sig = signals
+            .iter()
+            .find(|s| s.kind == SignalKind::UploadPolyglot)
+            .expect("shadow mode still detects");
+        assert_eq!(sig.weight, 0);
+    }
+
+    #[test]
+    fn upload_inspection_disabled_is_zero_cost() {
+        let content = format!("GIF89a{}", "<?php eval($_POST); ?>");
+        let e = upload_evt(
+            MULTIPART_CT,
+            multipart_body("cat.gif", "image/gif", content.as_bytes()),
+            Some(crate::event::HttpMethod::Post),
+        );
+        assert!(HeuristicEngine::with_defaults().analyze(&e).is_empty());
+    }
+
+    #[test]
+    fn upload_direct_binary_put_is_scanned() {
+        let e = upload_evt(
+            "image/png",
+            b"MZ\x90\x00not-really-png".to_vec(),
+            Some(crate::event::HttpMethod::Put),
+        );
+        let signals = upload_engine(true).analyze(&e);
+        assert!(signals
+            .iter()
+            .any(|s| s.kind == SignalKind::UploadTypeMismatch));
     }
 }
 

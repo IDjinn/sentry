@@ -67,6 +67,18 @@ use crate::middleware::MiddlewareMode;
 /// Optional event enrichment hook (geo / reputation) supplied by the host.
 pub type Enricher = Arc<dyn Fn(&mut Event) + Send + Sync>;
 
+/// Request-body inspection settings (F10), projected from `[uploads]` by
+/// the daemon. `None` = inspection disabled (bodies stream/buffer exactly
+/// as before).
+#[derive(Debug, Clone, Copy)]
+pub struct UploadsInspection {
+    /// Per-request inspection cap in bytes (bodies beyond it are rejected
+    /// with 413 while uploads are enabled).
+    pub inspect_bytes: usize,
+    /// Max multipart parts parsed per request.
+    pub max_files: usize,
+}
+
 /// Gate outcome for a `Challenge` verdict (F7.8).
 #[derive(Debug)]
 pub enum ChallengeGate {
@@ -98,6 +110,8 @@ pub struct EdgeRuntime {
     request_duration: Option<prometheus::Histogram>,
     protocol_engine: Option<Arc<ProtocolEngine>>,
     protocol_metrics: Option<crate::protocol::ProtocolMetrics>,
+    uploads: Option<UploadsInspection>,
+    uploads_inspected: Option<prometheus::Counter>,
 }
 
 impl EdgeRuntime {
@@ -122,7 +136,86 @@ impl EdgeRuntime {
             request_duration: None,
             protocol_engine: None,
             protocol_metrics: None,
+            uploads: None,
+            uploads_inspected: None,
         }
+    }
+
+    /// Arm request-body inspection (F10): bodies are buffered up to the
+    /// inspection cap, multipart parts become upload metadata on the event,
+    /// and the upload heuristics see the bytes.
+    pub fn with_uploads(mut self, inspection: UploadsInspection) -> Self {
+        self.uploads = Some(inspection);
+        self
+    }
+
+    /// Inspection settings, when armed.
+    pub fn uploads_inspection(&self) -> Option<UploadsInspection> {
+        self.uploads
+    }
+
+    /// `sentry_edge_uploads_inspected_total` counter — requests whose body
+    /// went through upload inspection.
+    pub fn with_uploads_inspected(mut self, counter: prometheus::Counter) -> Self {
+        self.uploads_inspected = Some(counter);
+        self
+    }
+
+    /// Effective request-body buffering cap (bytes): the base capture cap
+    /// (≥ 1 MiB forward floor on the proxy) raised to the inspection cap
+    /// when uploads are enabled.
+    pub fn buffer_cap(&self) -> usize {
+        let mut cap = self.body_cap.max(1024 * 1024);
+        if let Some(insp) = self.uploads {
+            cap = cap.max(insp.inspect_bytes);
+        }
+        cap
+    }
+
+    /// F10: inspect a buffered request body — parse multipart metadata for
+    /// the event and produce the byte prefix the upload heuristics should
+    /// analyze. Returns `(upload metadata, analysis prefix)`; both `None`
+    /// when inspection is disabled (or the body is empty).
+    ///
+    /// Inspection is orthogonal to persistence: `HttpData.body` keeps its
+    /// `body_capture_kb` semantics — callers overwrite it back after the
+    /// pipeline ran.
+    pub fn inspect_body(
+        &self,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> (Option<Vec<sentry_core::event::UploadInfo>>, Option<Vec<u8>>) {
+        let Some(insp) = self.uploads else {
+            return (None, None);
+        };
+        if body.is_empty() {
+            return (None, None);
+        }
+        if let Some(counter) = &self.uploads_inspected {
+            counter.inc();
+        }
+        let parts = content_type
+            .filter(|ct| ct.to_ascii_lowercase().starts_with("multipart/"))
+            .map(|ct| sentry_core::multipart::parse_multipart(ct, body, insp.max_files))
+            .unwrap_or_default();
+        let files: Vec<sentry_core::event::UploadInfo> = parts
+            .iter()
+            .filter(|p| p.filename.is_some())
+            .map(|p| sentry_core::event::UploadInfo {
+                field_name: p.name.clone(),
+                filename: p.filename.clone(),
+                content_type: p.content_type.clone(),
+                size: p.content.len() as u64,
+                kind: sentry_core::uploads::sniff_kind(
+                    p.content,
+                    p.filename.as_deref(),
+                    p.content_type.as_deref(),
+                ),
+            })
+            .collect();
+        let analysis = body.get(..insp.inspect_bytes).unwrap_or(body).to_vec();
+        let meta = if files.is_empty() { None } else { Some(files) };
+        (meta, Some(analysis))
     }
 
     /// Attach the protocol validation engine (F9) and its metrics.

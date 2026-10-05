@@ -387,6 +387,9 @@ pub enum RuleMatch {
     Query(StrOp),
     /// Match request body bytes (when available).
     Body(StrOp),
+    /// Match uploaded file names (F10, inline sources only): fires when any
+    /// multipart part declares a filename matching the operator.
+    UploadFilename(StrOp),
     /// Match the coarse protocol kind.
     Protocol(ProtocolKind),
     /// Match a TLS fingerprint.
@@ -632,6 +635,18 @@ impl RuleMatch {
                 .map(|b| {
                     let s = String::from_utf8_lossy(b);
                     match_str_op(op, &s)
+                })
+                .unwrap_or(false),
+            Self::UploadFilename(op) => evt
+                .http()
+                .and_then(|h| h.uploads.as_ref())
+                .map(|uploads| {
+                    uploads.iter().any(|u| {
+                        u.filename
+                            .as_deref()
+                            .map(|f| match_str_op(op, f))
+                            .unwrap_or(false)
+                    })
                 })
                 .unwrap_or(false),
             Self::Protocol(p) => evt.protocol_kind() == *p,

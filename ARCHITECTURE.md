@@ -1895,3 +1895,97 @@ Critério ≥5× vs regex baseline: superado (~33×). Limitações v1: apenas
 a direção client→server; UDP/WS declarados no formato mas o pump
 validado hoje cobre edge-tcp (ws/udp ficam para §23.x); sem branch
 condicional no corpo de macros (decisão de design — auditabilidade).
+
+## 25. F10 — Inspeção de uploads e corpo de requisição (inline edge)
+
+> Até F9 o pipeline enxergava path/query/headers/TLS — o **corpo** da
+> requisição era capturado (`[edge] body_capture_kb`) mas nunca analisado
+> (só a condição DSL `body`). O F10 faz a edge inline inspecionar uploads
+> (multipart), formulários (urlencoded) e corpos JSON: SQLi/XSS/injection
+> em filenames e campos, imagens poliglotas, executáveis disfarçados e
+> flood de volume — tudo byte-level, sem ML e sem AV externo, decidido
+> **antes** do upstream receber o request.
+
+### 25.1 Escopo e limites
+
+- **Só inline** (`[deployment] mode = "inline"`): fontes passivas (tail de
+  access.log, syslog, CF Logs) não carregam corpo — `[uploads] enabled`
+  fora do inline loga um warning no startup e é no-op.
+- **Captura ≠ inspeção**: o pipeline analisa o prefixo `inspect_kb` do
+  corpo, mas `HttpData.body` (persistência) continua obedecendo
+  `body_capture_kb` — restaurado após o `process` no proxy e no
+  middleware. Com `body_capture_kb = 0` (default) nada do corpo persiste.
+- **Memória**: enquanto `[uploads]` está ativo, o cap de inspeção É o cap
+  do corpo (corpo maior = 413, checado por content-length antes de
+  bufferar); o teto de memória passa a ser ~requisições concorrentes ×
+  `inspect_kb` (default 4 MiB).
+- **Não-goals**: `features.rs` do sentry-ai intocado (paridade treino/
+  inferência do ONNX commitado); sem ClamAV/AV externo; sem ML de visão;
+  `serde_json` não entra no core (JSON é scanned como texto).
+
+### 25.2 Camadas (todas em `sentry-core`, puras)
+
+1. **Parser** (`multipart.rs`): `parse_multipart` RFC 7578 (CRLF-tolerante,
+   `filename*` RFC 5987, aninhado rejeitado, cap de partes),
+   `parse_urlencoded`, `looks_like_json`, `is_scannable_text`.
+2. **Classificação** (`uploads.rs`): `sniff_kind` por magic bytes
+   (PNG/JPEG/GIF/WebP/BMP → Image; ZIP/gzip/bzip2 → Archive; PDF; MZ/ELF/
+   Mach-O/shebang → Executable; texto decodificável → Text).
+3. **Poliglotas** (`hidden_payload_markers`): marcadores executáveis
+   (`<?php`, `<script`, `system(`, `shell_exec(`, `eval(base64_decode`,
+   `/etc/passwd`, …) no head (8 KiB) e tail (4 KiB) de partes
+   Image/Archive/Pdf — texto (SVG/HTML) é coberto pelo content scan
+   (sem dupla contagem de sinal).
+4. **Heurísticas** (`heuristics.rs`, `gate_bit() = None` — early-return
+   sem corpo; o prefilter Aho-Corasick u8 fica intocado):
+   - `UploadFilename` — regexes de attack-text no filename (decodificado)
+     + `\0`/`../` + extensão bloqueada (inclusive dupla: `shell.php.jpg`).
+   - `UploadContent` — as mesmas regexes sobre partes textuais (campos de
+     formulário, SVG/HTML/JSON), valores urlencoded e corpo JSON (quando
+     `[uploads] scan_json`); cap 512 KiB/parte.
+   - `UploadImage` — mismatch declarado×real (imagem que é ZIP/EXE/PDF),
+     executável puro, poliglota; cobre também uploads binários diretos
+     (PUT/POST `image/*`|`octet-stream` sem multipart).
+5. **Volume** (`UploadTracker`): janela deslizante por-IP de arquivos e
+   bytes (`[uploads.flood]`) → `UploadFlood`; prune 60 s no daemon.
+
+### 25.3 Sinais e pesos
+
+| Sinal | Peso default | Disparo |
+| --- | --- | --- |
+| `upload_type_mismatch` | 30 | magic bytes ≠ content-type/extensão declarada (imagem que é ZIP/EXE/PDF) |
+| `upload_polyglot` | 60 | payload executável escondido em imagem/arquivo/PDF |
+| `upload_executable` | 50 | MZ/ELF/shebang ou extensão bloqueada (`blocked_extensions`) |
+| `upload_flood` | 25 | `[uploads.flood]` arquivos/MiB por IP na janela |
+
+Injeção em filename/campo/corpo **reemite** os sinais existentes
+(`sql_injection`, `xss`, `log4shell`, `rce`, `lfi`, `path_traversal`) com
+os mesmos pesos e `detail` prefixado (`upload filename …`, `form field …`,
+`json body`) — dashboards, `[scorer.weights]` e escalada funcionam sem
+mudança. Em `mode = "shadow"` (default) **todo sinal de origem-upload nasce
+com peso 0**: detecta, loga e metriciza, mas não bloqueia; `enforce`
+aplica os pesos plenos e o veredito sai antes do proxy.
+
+### 25.4 Config e operação
+
+```toml
+[uploads]
+enabled = false            # opt-in; warning fora de inline
+mode = "shadow"            # shadow | enforce
+inspect_kb = 4096          # cap de inspeção/request (também o limite de 413)
+max_files = 16             # partes multipart por request
+scan_json = true           # scan textual de corpos JSON
+blocked_extensions = ["php", "phtml", "jsp", "asp", "aspx", "exe", …]
+[uploads.flood]
+window_secs = 60
+max_uploads = 30
+max_total_mb = 50
+```
+
+- DSL: `upload_filename contains ".php"` (`RuleMatch::UploadFilename`) —
+  compõe com as demais condições (ex. restringir a `/api/upload`).
+- Evento: `HttpData.uploads` (metadados only: `field_name`, `filename`,
+  `content_type`, `size`, `kind`); eventlog expõe `uploads` com key-set
+  estável (`null` quando ausente).
+- Métricas: `sentry_edge_uploads_inspected_total`; os sinais entram em
+  `sentry_signal_kinds_total` de graça.

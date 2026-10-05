@@ -428,10 +428,48 @@ pub struct HttpData {
     pub body: Option<Vec<u8>>,
     /// Parsed cookies, when available.
     pub cookies: Option<HashMap<String, String>>,
+    /// Uploaded files detected in the request body (F10, inline sources
+    /// only): metadata only — file content never lands on the event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploads: Option<Vec<UploadInfo>>,
     /// Upstream response time in milliseconds (`$upstream_response_time`,
     /// first value when nginx reports a comma-separated list).
     #[serde(default)]
     pub upstream_time_ms: Option<u64>,
+}
+
+/// Metadata about one uploaded file (F10).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UploadInfo {
+    /// Form field name the file came in on.
+    pub field_name: Option<String>,
+    /// Client-declared file name.
+    pub filename: Option<String>,
+    /// Client-declared part content type.
+    pub content_type: Option<String>,
+    /// Declared size in bytes (as buffered for inspection).
+    pub size: u64,
+    /// Byte-level classification (magic bytes first, declaration as hint).
+    pub kind: UploadKind,
+}
+
+/// Byte-level classification of an uploaded file (F10).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadKind {
+    /// Textual content (form field, JSON, SVG/HTML, plain text).
+    Text,
+    /// Raster image (PNG/JPEG/GIF/WebP/BMP) — verified by magic bytes.
+    Image,
+    /// ZIP container (docx/xlsx/jar and friends included).
+    Archive,
+    /// Executable or script (PE/ELF/Mach-O magic, shebang).
+    Executable,
+    /// PDF document.
+    Pdf,
+    /// Unrecognized content.
+    #[default]
+    Unknown,
 }
 
 /// TCP-specific observation (packet capture path).

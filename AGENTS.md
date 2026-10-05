@@ -610,7 +610,57 @@ telemetria de handshake + provider de appliance
     constante, aridade de statement, registrador reservado e VLInt
     negativo end-to-end
 
-Backlog detalhado em `ARCHITECTURE.md` §23 (e §24 para o F9).
+# F10 (concluída): Inspeção de uploads e corpo de requisição (inline edge) —
+# SQLi/XSS/injection em filenames e campos de formulário, imagens poliglotas
+# e executáveis disfarçados, flood de uploads
+  - ✅ F10.1 Parser de corpo puro (`sentry-core/src/multipart.rs`):
+    `parse_multipart` RFC 7578 (CRLF-tolerante, `filename*` RFC 5987,
+    rejeita aninhado, cap de partes), `parse_urlencoded`
+    (percent-decode + `+`→espaço), `looks_like_json`, `is_scannable_text`
+    (sniff de printable para partes sem content-type) — 9 testes
+  - ✅ F10.2 Modelo: `HttpData.uploads: Option<Vec<UploadInfo>>`
+    (metadados only — conteúdo nunca persiste; `skip_serializing_if`),
+    `UploadInfo`/`UploadKind` (Text/Image/Archive/Executable/Pdf/Unknown),
+    sniffing por magic bytes (`uploads::sniff_kind`: PNG/JPEG/GIF/WebP/BMP,
+    ZIP/gzip/bzip2, PDF, MZ/ELF/Mach-O/shebang)
+  - ✅ F10.3 Sinais (F10): `UploadTypeMismatch` (30 — declarado × real),
+    `UploadPolyglot` (60 — marcadores executáveis em head 8 KiB/tail 4 KiB
+    de imagens/arquivos/PDF; SVG com script cai no `Xss` do content scan —
+    sem dupla contagem), `UploadExecutable` (50 — MZ/ELF/shebang ou
+    extensão bloqueada, incl. extensão dupla `shell.php.jpg`),
+    `UploadFlood` (25 — volume). Reuso: injeção em filename/campo reemite
+    `SqlInjection`/`Xss`/`Log4Shell`/`Rce`/`Lfi`/`PathTraversal` com
+    `detail = "upload …"/"form field …"/"json body"` (dashboards e
+    `[scorer.weights]` existentes funcionam de graça)
+  - ✅ F10.4 Heurísticas (`heuristics.rs` + `uploads.rs`):
+    `UploadFilename`/`UploadContent`/`UploadImage` com `gate_bit() = None`
+    (early-return sem body — não toca no prefilter u8 cheio);
+    `DecodedHttp<'a>` ganha `uploads` (multipart parse-once, cap 64) e
+    `form` (urlencoded); cap de scan textual 512 KiB/parte; uploads diretos
+    binários (PUT/POST image/*|octet-stream sem multipart) também são
+    inspecionados; config via `UploadsScan` (`with_uploads_scan`) —
+    desligado por default (custo zero); 11 testes + 3 no pipeline
+  - ✅ F10.5 `[uploads]` (`config.rs`): `enabled` (opt-in; warning no
+    daemon quando ativo fora de inline), `mode = "shadow"|"enforce"`
+    (shadow = sinais de origem-upload com peso 0, detecta/loga/metriciza
+    sem bloquear), `inspect_kb` (4 MiB default; enquanto ativo, corpo >
+    inspect_kb = 413 e o teto de memória é ~requisições concorrentes ×
+    inspect_kb), `max_files`, `scan_json`, `blocked_extensions`,
+    `[uploads.flood]` (janela/arquivos/MiB → `UploadTracker` por-IP com
+    prune 60 s no daemon)
+  - ✅ F10.6 Edge: `EdgeRuntime::with_uploads(UploadsInspection)` +
+    `inspect_body` — inspeção é ortogonal à persistência: o pipeline
+    analisa o prefixo `inspect_kb` e `HttpData.body` volta ao
+    `body_capture_kb` depois do `process` (captura ≠ inspeção); proxy e
+    middleware compartilham o caminho; métrica
+    `sentry_edge_uploads_inspected_total`; eventlog `uploads` (metadados,
+    key-set estável com `null`)
+  - ✅ F10.7 DSL: `RuleMatch::UploadFilename(StrOp)` + chave
+    `upload_filename` (ex.: `path starts_with "/api/upload" AND
+    upload_filename contains ".php"` → Block) — 1 teste round-trip +
+    match
+
+Backlog detalhado em `ARCHITECTURE.md` §23 (§24 para o F9, §25 para o F10).
 
 ### Status atual (verificação contínua)
 
@@ -619,7 +669,7 @@ Backlog detalhado em `ARCHITECTURE.md` §23 (e §24 para o F9).
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 509 testes passando sem features (511 com
+# Resultado esperado: 552+ testes passando sem features (554 com
 # --features sentry-cli/onnx — os 2 testes de inferência ONNX)
 ```
 

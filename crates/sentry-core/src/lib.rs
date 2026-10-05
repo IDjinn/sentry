@@ -22,6 +22,7 @@ pub mod error;
 pub mod event;
 pub mod heuristics;
 pub mod lists;
+pub mod multipart;
 pub mod offender;
 pub mod packs;
 pub mod pipeline;
@@ -36,6 +37,7 @@ pub mod source;
 pub mod tcpfp;
 pub mod trust;
 pub mod trusted_lists;
+pub mod uploads;
 
 pub use action::{Action, ActionContext};
 pub use analysis::{
@@ -55,14 +57,14 @@ pub use config::{
     MetricsConfig, PolicyConfig, PolicyOverrideConfig, PostgresConfig, RateLimitConfig,
     RealIpConfig, RouteDefConfig, RouteLearnerConfig, RoutesConfig, RuleDefConfig, RulePackConfig,
     RulesConfig, ScanConfig, ScorerConfig, SentryConfig, ServerAuthConfig, ServerConfig,
-    SourceConfig, StorageConfig,
+    SourceConfig, StorageConfig, UploadFloodConfig, UploadMode, UploadsConfig,
 };
 pub use correlation::CorrelationTracker;
 pub use error::{CoreError, Result};
 pub use event::{
     Direction, Event, GeoInfo, HttpData, HttpMethod, ProtocolData, ProtocolKind, RawData, RawEvent,
     ReputationInfo, SourceKind, SyslogData, TcpData, TcpFlags, TcpStage, TlsData, Transport,
-    UdpData,
+    UdpData, UploadInfo, UploadKind,
 };
 pub use heuristics::{Heuristic, HeuristicEngine};
 pub use offender::OffenderTracker;
@@ -83,3 +85,4 @@ pub use scan::ScanTracker;
 pub use source::Source;
 pub use trust::{SharedTrustSet, TrustSet};
 pub use trusted_lists::{matching_presets, preset, PRESETS};
+pub use uploads::{UploadTracker, UploadsScan};

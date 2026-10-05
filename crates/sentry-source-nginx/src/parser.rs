@@ -228,6 +228,7 @@ impl LogFormat {
             headers,
             body: None,
             cookies: None,
+            uploads: None,
             upstream_time_ms,
         });
 

@@ -423,6 +423,20 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         ))
     });
 
+    // Upload-volume tracker (F10): per-IP flood window over files/bytes.
+    let upload_tracker = cfg.uploads.enabled.then(|| {
+        Arc::new(std::sync::RwLock::new(
+            sentry_core::uploads::UploadTracker::from_config(&cfg.uploads),
+        ))
+    });
+    if cfg.uploads.enabled && !cfg.deployment.is_inline() {
+        warn!(
+            "[uploads] enabled but [deployment] mode is not \"inline\" — request \
+             bodies never reach passive sources (log tails), so upload inspection \
+             has nothing to analyze; switch to inline to enforce it"
+        );
+    }
+
     // Cross-IP scan→attack correlation (F3.10 shot-calling pattern).
     let correlation_tracker = cfg.correlation.enabled.then(|| {
         Arc::new(std::sync::RwLock::new(
@@ -497,6 +511,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     )
     .with_rate_limiter(build_rate_limiter(&cfg)?)
     .with_trust(shared_trust.clone());
+    pipeline_builder.configure_uploads(&cfg.uploads);
     if let Some(ref v) = bot_verifier {
         pipeline_builder = pipeline_builder.with_bot_verifier(Arc::clone(v));
     }
@@ -505,6 +520,9 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     }
     if let Some(ref t) = behavior_tracker {
         pipeline_builder = pipeline_builder.with_behavior_tracker(Arc::clone(t));
+    }
+    if let Some(ref t) = upload_tracker {
+        pipeline_builder = pipeline_builder.with_upload_tracker(Arc::clone(t));
     }
     if let Some(ref t) = correlation_tracker {
         pipeline_builder = pipeline_builder.with_correlation_tracker(Arc::clone(t));
@@ -588,6 +606,17 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         });
     }
     if let Some(ref t) = behavior_tracker {
+        let t = Arc::clone(t);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                t.write().unwrap().prune();
+            }
+        });
+    }
+    if let Some(ref t) = upload_tracker {
         let t = Arc::clone(t);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -894,6 +923,27 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             failures: metrics.edge_tls_failures.clone(),
             sni_mismatches: metrics.edge_tls_sni_mismatches.clone(),
         });
+        let runtime = if cfg.uploads.enabled {
+            let inspect_bytes = cfg
+                .uploads
+                .inspect_kb
+                .saturating_mul(1024)
+                .clamp(64 * 1024, 64 * 1024 * 1024);
+            info!(
+                mode = cfg.uploads.mode.as_str(),
+                inspect_kb = cfg.uploads.inspect_kb,
+                max_files = cfg.uploads.max_files,
+                "upload inspection enabled (F10)"
+            );
+            runtime
+                .with_uploads(sentry_edge::UploadsInspection {
+                    inspect_bytes,
+                    max_files: cfg.uploads.max_files.clamp(1, 256),
+                })
+                .with_uploads_inspected(metrics.edge_uploads_inspected.clone())
+        } else {
+            runtime
+        };
         let runtime = match &protocol_engine {
             Some(eng) => runtime.with_protocol(Arc::clone(eng), protocol_metrics_handles(&metrics)),
             None => runtime,

@@ -571,6 +571,27 @@ title = "Verifying your browser..."
 # A presented cookie that fails verification gets a terminal 403 (no retry
 # loop); no cookie or an expired one re-serves the 503 interstitial.
 
+# ── Upload & request-body inspection (F10) ───────────────────────────────
+# Inline-edge only: bodies are buffered, multipart/urlencoded/JSON parsed
+# and scored by the upload heuristics — SQLi/XSS/injection inside filenames
+# and form fields, polyglot images (GIF+PHP, SVG with script, webshell in
+# EXIF), executables disguised as images, per-IP upload floods.
+# Passive sources (log tails) never see bodies, so this is a no-op there.
+# While enabled, bodies larger than inspect_kb are rejected with 413 and
+# the in-memory ceiling is ~concurrent requests × inspect_kb.
+[uploads]
+enabled = false
+mode = "shadow"              # shadow (detect + log, weight-0 signals) | enforce
+inspect_kb = 4096            # per-request inspection cap (also the 413 limit)
+max_files = 16               # multipart parts parsed per request
+scan_json = true             # text-scan JSON bodies (API payloads) too
+# Filename extensions that always raise UploadExecutable:
+blocked_extensions = ["php", "phtml", "php5", "jsp", "jspx", "asp", "aspx", "exe", "dll", "sh", "bat", "ps1"]
+[uploads.flood]
+window_secs = 60
+max_uploads = 30             # files per IP in the window (0 = off)
+max_total_mb = 50            # total MiB per IP in the window
+
 # ── Actions ──────────────────────────────────────────────────────────────
 # blocklist: feeds the shared block table on Block verdicts; the daemon
 # mirrors the same blocks to ip_state (dashboard-visible, restart-safe).

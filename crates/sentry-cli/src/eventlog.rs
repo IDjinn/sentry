@@ -53,6 +53,18 @@ pub struct TlsSummary {
     pub alpn: Option<String>,
 }
 
+/// Uploaded-file metadata condensed for the event log (F10). Populated for
+/// HTTP events that carried multipart uploads; `null` otherwise (stable key
+/// set for Grafana consumers).
+#[derive(Debug, Clone, Serialize)]
+pub struct UploadSummary {
+    pub field_name: Option<String>,
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+    pub size: u64,
+    pub kind: String,
+}
+
 /// Flat per-event summary (Grafana-friendly: no nested protocol payloads).
 ///
 /// Every field is always serialized (`null` instead of omitted): consumers
@@ -70,6 +82,7 @@ pub struct EventSummary {
     pub status: Option<u16>,
     pub user_agent: Option<String>,
     pub tls: Option<TlsSummary>,
+    pub uploads: Option<Vec<UploadSummary>>,
     pub verdict: String,
     pub risk_level: String,
     pub score: u8,
@@ -131,6 +144,23 @@ impl EventSummary {
                 version: t.version.clone(),
                 cipher: t.cipher.clone(),
                 alpn: t.alpn.clone(),
+            }),
+            uploads: http.and_then(|h| {
+                h.uploads.as_ref().map(|list| {
+                    list.iter()
+                        .take(8)
+                        .map(|u| UploadSummary {
+                            field_name: u.field_name.clone(),
+                            filename: u.filename.clone(),
+                            content_type: u.content_type.clone(),
+                            size: u.size,
+                            kind: serde_json::to_string(&u.kind)
+                                .unwrap_or_default()
+                                .trim_matches('"')
+                                .to_string(),
+                        })
+                        .collect()
+                })
             }),
             verdict: serde_json::to_string(&pe.decision.action)
                 .unwrap_or_default()
@@ -397,6 +427,7 @@ mod tests {
             "status",
             "user_agent",
             "tls",
+            "uploads",
             "verdict",
             "risk_level",
             "score",
@@ -410,6 +441,54 @@ mod tests {
         ] {
             assert!(v.get(k).is_some(), "missing key {k}");
         }
+    }
+
+    #[test]
+    fn http_uploads_surface_in_the_summary() {
+        let pe = ProcessedEvent {
+            event: Event::new(
+                SourceKind::HttpProxy,
+                "203.0.113.4".parse().unwrap(),
+                ProtocolData::Http(HttpData {
+                    path: "/upload".into(),
+                    uploads: Some(vec![sentry_core::event::UploadInfo {
+                        field_name: Some("file".into()),
+                        filename: Some("a.png".into()),
+                        content_type: Some("image/png".into()),
+                        size: 2048,
+                        kind: sentry_core::event::UploadKind::Image,
+                    }]),
+                    ..Default::default()
+                }),
+            ),
+            analysis: AnalysisResult::default(),
+            decision: Decision {
+                analysis: AnalysisResult::default(),
+                action: Verdict::Allow,
+                override_reason: None,
+                log_level: None,
+            },
+            rule_hit: None,
+        };
+        let s = EventSummary::from_processed(&pe);
+        let uploads = s.uploads.as_ref().unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].filename.as_deref(), Some("a.png"));
+        assert_eq!(uploads[0].kind, "image");
+        assert_eq!(uploads[0].size, 2048);
+        // Key set stays stable against a no-upload event.
+        let plain = EventSummary::from_processed(&http_evt("10.0.0.1", "/x", None));
+        let keys = |s: &EventSummary| {
+            serde_json::to_value(s)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&s), keys(&plain));
+        assert!(serde_json::to_value(&plain).unwrap()["uploads"].is_null());
     }
 
     #[test]

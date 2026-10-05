@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::analysis::{AnalysisResult, Decision, RiskLevel, Signal, SignalKind, Verdict};
 use crate::behavior::BehaviorTracker;
-use crate::config::{EscalationConfig, RouteDefConfig, ScorerConfig};
+use crate::config::{EscalationConfig, RouteDefConfig, ScorerConfig, UploadsConfig};
 use crate::correlation::{self, CorrelationScope, CorrelationTracker};
 use crate::event::Event;
 use crate::heuristics::HeuristicEngine;
@@ -23,6 +23,7 @@ use crate::policy::VerdictPolicy;
 use crate::ratelimit::RateLimitBackend;
 use crate::rules::{RuleSet, SharedRuleSet};
 use crate::scan::ScanTracker;
+use crate::uploads::UploadTracker;
 
 /// Route definition for the route validator.
 ///
@@ -312,6 +313,7 @@ pub struct Pipeline {
     escalation: EscalationConfig,
     scan: Option<Arc<RwLock<ScanTracker>>>,
     behavior: Option<Arc<RwLock<BehaviorTracker>>>,
+    upload: Option<Arc<RwLock<UploadTracker>>>,
     correlation: Option<Arc<RwLock<CorrelationTracker>>>,
     trust: Option<crate::trust::SharedTrustSet>,
     bot: Option<crate::botverify::SharedBotVerifier>,
@@ -378,11 +380,28 @@ impl Pipeline {
             escalation: EscalationConfig::default(),
             scan: None,
             behavior: None,
+            upload: None,
             correlation: None,
             trust: None,
             bot: None,
             pending: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Arm upload inspection (F10): projects `[uploads]` onto the heuristic
+    /// engine. Call once at construction; upload heuristics default to a
+    /// zero-cost disabled scan.
+    pub fn configure_uploads(&mut self, cfg: &UploadsConfig) -> &mut Self {
+        self.heuristics = std::mem::take(&mut self.heuristics)
+            .with_uploads_scan(crate::uploads::UploadsScan::from_config(cfg));
+        self
+    }
+
+    /// Attach the upload-volume tracker (F10): per-IP flood window over
+    /// files and bytes.
+    pub fn with_upload_tracker(mut self, tracker: Arc<RwLock<UploadTracker>>) -> Self {
+        self.upload = Some(tracker);
+        self
     }
 
     /// Attach the trusted-infrastructure set (F7.2): IPs in the never-ban
@@ -584,6 +603,14 @@ impl Pipeline {
                 ));
             }
         }
+        if let Some(ref upload) = self.upload {
+            if let Some(uploads) = evt.http().and_then(|h| h.uploads.as_ref()) {
+                if !uploads.is_empty() {
+                    let mut tracker = upload.write().unwrap();
+                    signals.extend(tracker.record(evt.client_ip, uploads));
+                }
+            }
+        }
         if let Some(ref corr) = self.correlation {
             let mut tracker = corr.write().unwrap();
             for s in &signals {
@@ -764,6 +791,10 @@ impl Pipeline {
             SignalKind::ExternalReputation => "external_reputation",
             SignalKind::TlsSniMismatch => "tls_sni_mismatch",
             SignalKind::ProtocolViolation => "protocol_violation",
+            SignalKind::UploadTypeMismatch => "upload_type_mismatch",
+            SignalKind::UploadPolyglot => "upload_polyglot",
+            SignalKind::UploadExecutable => "upload_executable",
+            SignalKind::UploadFlood => "upload_flood",
             SignalKind::RuleHit => "rule_hit",
             SignalKind::Custom => "custom",
         };
@@ -810,6 +841,10 @@ impl Pipeline {
             SignalKind::ExternalReputation => "external_reputation",
             SignalKind::TlsSniMismatch => "tls_sni_mismatch",
             SignalKind::ProtocolViolation => "protocol_violation",
+            SignalKind::UploadTypeMismatch => "upload_type_mismatch",
+            SignalKind::UploadPolyglot => "upload_polyglot",
+            SignalKind::UploadExecutable => "upload_executable",
+            SignalKind::UploadFlood => "upload_flood",
             SignalKind::RuleHit => "rule_hit",
             SignalKind::Custom => "custom",
         };
@@ -1754,6 +1789,88 @@ mod tests {
         let m = crate::rules::dsl::parse("bot_verified=google").unwrap();
         assert!(matches!(m, RuleMatch::BotVerified(v) if v == "google"));
         assert!(crate::rules::dsl::parse("bot_verified=bogus").is_err());
+    }
+
+    #[test]
+    fn dsl_upload_filename_condition_matches_parts() {
+        let m = crate::rules::dsl::parse(r#"upload_filename contains ".php""#).unwrap();
+        assert!(matches!(m, RuleMatch::UploadFilename(_)));
+
+        let with_upload = Event::new(
+            SourceKind::Synthetic,
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            ProtocolData::Http(HttpData {
+                path: "/upload".into(),
+                uploads: Some(vec![crate::event::UploadInfo {
+                    field_name: Some("file".into()),
+                    filename: Some("shell.php".into()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+        );
+        assert!(m.matches(&with_upload));
+
+        let clean = Event::new(
+            SourceKind::Synthetic,
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            ProtocolData::Http(HttpData {
+                path: "/upload".into(),
+                uploads: Some(vec![crate::event::UploadInfo {
+                    filename: Some("cat.png".into()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+        );
+        assert!(!m.matches(&clean));
+        assert!(!m.matches(&http_evt("/upload")));
+    }
+
+    #[test]
+    fn upload_flood_signal_flows_through_pipeline() {
+        let mut cfg = crate::config::UploadsConfig::default();
+        cfg.enabled = true;
+        cfg.flood.max_uploads = 2;
+        let upload_tracker = Arc::new(RwLock::new(crate::uploads::UploadTracker::from_config(
+            &cfg,
+        )));
+        let mut p = pipeline().with_upload_tracker(upload_tracker);
+        p.configure_uploads(&cfg);
+
+        let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23));
+        let uploads = vec![crate::event::UploadInfo {
+            filename: Some("f.bin".into()),
+            size: 1024,
+            ..Default::default()
+        }];
+        let evt_with = |uploads: Vec<crate::event::UploadInfo>| {
+            Event::new(
+                SourceKind::Synthetic,
+                ip,
+                ProtocolData::Http(HttpData {
+                    path: "/upload".into(),
+                    user_agent: Some("Mozilla/5.0".into()),
+                    uploads: Some(uploads),
+                    ..Default::default()
+                }),
+            )
+        };
+        assert!(p
+            .process(&evt_with(uploads.clone()))
+            .analysis
+            .signals
+            .iter()
+            .all(|s| s.kind != SignalKind::UploadFlood));
+        let second = p.process(&evt_with(uploads));
+        assert!(
+            second
+                .analysis
+                .signals
+                .iter()
+                .any(|s| s.kind == SignalKind::UploadFlood && s.weight == 0),
+            "shadow mode: detected at threshold but weight 0"
+        );
     }
 
     #[test]

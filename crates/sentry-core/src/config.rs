@@ -82,6 +82,9 @@ pub struct SentryConfig {
     /// Protocol schema validation (F9).
     #[serde(default)]
     pub protocol: ProtocolConfig,
+    /// Request-body/upload inspection (F10, inline edge only).
+    #[serde(default)]
+    pub uploads: UploadsConfig,
     /// Event sources.
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
@@ -623,6 +626,137 @@ fn default_protocol_debounce_ms() -> u64 {
 }
 fn default_protocol_max_schemas() -> usize {
     64
+}
+
+/// Request-body/upload inspection (F10): the inline edge buffers the body,
+/// parses multipart/urlencoded/JSON and the upload heuristics score what
+/// they find — SQLi/XSS in filenames and form fields, polyglot images,
+/// executables disguised as images, flood volume.
+///
+/// Only meaningful with `[deployment] mode = "inline"`: passive sources
+/// (log tails) never see request bodies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadsConfig {
+    /// Enable upload inspection (off by default; requires inline mode).
+    #[serde(default)]
+    pub enabled: bool,
+    /// `shadow` (detect + log, weight-0 signals) | `enforce` (full weights,
+    /// verdicts block/challenge before the upstream sees the request).
+    #[serde(default)]
+    pub mode: UploadMode,
+    /// Per-request inspection cap in KiB — bodies larger than this are
+    /// rejected with 413 while uploads are enabled (they also raise the
+    /// proxy forward cap, so enabling uploads consciously raises the
+    /// memory ceiling: concurrent requests × this size).
+    #[serde(default = "default_uploads_inspect_kb")]
+    pub inspect_kb: usize,
+    /// Max multipart parts parsed per request.
+    #[serde(default = "default_uploads_max_files")]
+    pub max_files: usize,
+    /// Text-scan JSON bodies as well (SQLi/XSS inside API payloads).
+    #[serde(default = "default_uploads_scan_json")]
+    pub scan_json: bool,
+    /// Filename extensions that always raise `UploadExecutable`
+    /// (lowercase, without the dot).
+    #[serde(default = "default_uploads_blocked_extensions")]
+    pub blocked_extensions: Vec<String>,
+    /// Volume thresholds (`UploadFlood`).
+    #[serde(default)]
+    pub flood: UploadFloodConfig,
+}
+
+impl Default for UploadsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: UploadMode::default(),
+            inspect_kb: default_uploads_inspect_kb(),
+            max_files: default_uploads_max_files(),
+            scan_json: default_uploads_scan_json(),
+            blocked_extensions: default_uploads_blocked_extensions(),
+            flood: UploadFloodConfig::default(),
+        }
+    }
+}
+
+fn default_uploads_inspect_kb() -> usize {
+    4096
+}
+fn default_uploads_max_files() -> usize {
+    16
+}
+fn default_uploads_scan_json() -> bool {
+    true
+}
+fn default_uploads_blocked_extensions() -> Vec<String> {
+    [
+        "php", "phtml", "php5", "jsp", "jspx", "asp", "aspx", "exe", "dll", "sh", "bat", "ps1",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Enforcement posture of upload inspection (F10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UploadMode {
+    /// Detection only: signals are emitted with weight 0 (still logged and
+    /// metricized) so thresholds can be tuned before anything blocks.
+    #[default]
+    Shadow,
+    /// Full weights: polyglot/executable uploads score into Block/Challenge
+    /// verdicts before the upstream sees the request.
+    Enforce,
+}
+
+impl UploadMode {
+    /// Whether `[uploads] mode = "enforce"`.
+    pub fn is_enforce(self) -> bool {
+        self == Self::Enforce
+    }
+
+    /// Lowercase stable name used in logs and config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+/// Volume thresholds for the per-IP upload flood window (F10).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadFloodConfig {
+    /// Sliding window duration in seconds.
+    #[serde(default = "default_uploads_flood_window")]
+    pub window_secs: u64,
+    /// Files per IP in the window that trigger `UploadFlood` (0 = off).
+    #[serde(default = "default_uploads_flood_max_uploads")]
+    pub max_uploads: u32,
+    /// Total uploaded MiB per IP in the window that trigger `UploadFlood`.
+    #[serde(default = "default_uploads_flood_max_total_mb")]
+    pub max_total_mb: u32,
+}
+
+impl Default for UploadFloodConfig {
+    fn default() -> Self {
+        Self {
+            window_secs: default_uploads_flood_window(),
+            max_uploads: default_uploads_flood_max_uploads(),
+            max_total_mb: default_uploads_flood_max_total_mb(),
+        }
+    }
+}
+
+fn default_uploads_flood_window() -> u64 {
+    60
+}
+fn default_uploads_flood_max_uploads() -> u32 {
+    30
+}
+fn default_uploads_flood_max_total_mb() -> u32 {
+    50
 }
 
 /// Behavioral attack detection over per-IP sliding windows (F3.8).
@@ -1565,6 +1699,35 @@ mod tests {
         assert_eq!(parsed.challenge_backend, ChallengeBackend::Sentry);
 
         let err = toml::from_str::<EdgeConfig>("challenge_backend = \"bunny\"");
+        assert!(err.is_err(), "typos must fail at config-load time");
+    }
+
+    #[test]
+    fn uploads_default_is_shadow_and_off() {
+        let c = UploadsConfig::default();
+        assert!(!c.enabled);
+        assert_eq!(c.mode, UploadMode::Shadow);
+        assert_eq!(c.inspect_kb, 4096);
+        assert_eq!(c.max_files, 16);
+        assert!(c.scan_json);
+        assert!(c.blocked_extensions.iter().any(|e| e == "php"));
+        assert_eq!(c.flood.max_uploads, 30);
+
+        let parsed: UploadsConfig = toml::from_str(
+            r#"
+            enabled = true
+            mode = "enforce"
+            inspect_kb = 8192
+            blocked_extensions = ["php", "jsp"]
+        "#,
+        )
+        .unwrap();
+        assert!(parsed.enabled);
+        assert!(parsed.mode.is_enforce());
+        assert_eq!(parsed.inspect_kb, 8192);
+        assert_eq!(parsed.blocked_extensions, vec!["php", "jsp"]);
+
+        let err = toml::from_str::<UploadsConfig>("mode = \"block\"");
         assert!(err.is_err(), "typos must fail at config-load time");
     }
 }
