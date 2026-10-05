@@ -205,7 +205,11 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Respons
     resp
 }
 
-async fn proxy_handler_inner(State(state): State<ProxyState>, req: Request, start: Instant) -> Response {
+async fn proxy_handler_inner(
+    State(state): State<ProxyState>,
+    req: Request,
+    start: Instant,
+) -> Response {
     let ProxyState {
         runtime,
         client,
