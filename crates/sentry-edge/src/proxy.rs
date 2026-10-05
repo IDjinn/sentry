@@ -198,14 +198,14 @@ struct ProxyState {
 async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Response {
     let start = Instant::now();
     let runtime = state.runtime.clone();
-    let resp = proxy_handler_inner(State(state), req).await;
+    let resp = proxy_handler_inner(State(state), req, start).await;
     if let Some(h) = runtime.request_duration.as_ref() {
         h.observe(start.elapsed().as_secs_f64());
     }
     resp
 }
 
-async fn proxy_handler_inner(State(state): State<ProxyState>, req: Request) -> Response {
+async fn proxy_handler_inner(State(state): State<ProxyState>, req: Request, start: Instant) -> Response {
     let ProxyState {
         runtime,
         client,
@@ -265,7 +265,7 @@ async fn proxy_handler_inner(State(state): State<ProxyState>, req: Request) -> R
     // and the log line.
     if runtime.is_hard_blocked(client_ip) {
         let trace = Uuid::new_v4();
-        tracing::info!(ip = %client_ip, trace_id = %trace, "edge fast-path: blocked ip denied before pipeline (no event persisted)");
+        tracing::info!(ip = %client_ip, trace_id = %trace, elapsed = ?start.elapsed(), "edge fast-path: blocked ip denied before pipeline (no event persisted)");
         return pages::block_page(Some(trace));
     }
     let http = sentry_core::event::HttpData {

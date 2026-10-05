@@ -60,14 +60,19 @@ impl EdgeRuntime {
 /// `middleware::from_fn_with_state(runtime, sentry_edge::middleware::handler)`.
 pub async fn handler(State(runtime): State<EdgeRuntime>, req: Request, next: Next) -> Response {
     let start = Instant::now();
-    let resp = handler_inner(State(runtime.clone()), req, next).await;
+    let resp = handler_inner(State(runtime.clone()), req, next, start).await;
     if let Some(h) = runtime.request_duration.as_ref() {
         h.observe(start.elapsed().as_secs_f64());
     }
     resp
 }
 
-async fn handler_inner(State(runtime): State<EdgeRuntime>, req: Request, next: Next) -> Response {
+async fn handler_inner(
+    State(runtime): State<EdgeRuntime>,
+    req: Request,
+    next: Next,
+    start: Instant,
+) -> Response {
     let (mut parts, body) = req.into_parts();
 
     // Capture the body up to the configured cap (0 = don't buffer).
@@ -99,7 +104,7 @@ async fn handler_inner(State(runtime): State<EdgeRuntime>, req: Request, next: N
     // log line.
     if runtime.is_hard_blocked(client_ip) {
         let trace = Uuid::new_v4();
-        tracing::info!(ip = %client_ip, trace_id = %trace, "edge fast-path: blocked ip denied before pipeline (no event persisted)");
+        tracing::info!(ip = %client_ip, trace_id = %trace, elapsed = ?start.elapsed(), "edge fast-path: blocked ip denied before pipeline (no event persisted)");
         return pages::block_page(Some(trace));
     }
 
