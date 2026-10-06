@@ -1,325 +1,282 @@
-# Sentry — Monitor de Acessos com Detecção de Ameaças por IA
+# Sentry — Access Monitor with AI Threat Detection
 
-> Status: **Planejamento**
-> Linguagem: **Rust** (multi-plataforma: Linux, macOS, Windows, BSD)
-> Interface atual: **CLI** (dashboard web futuramente)
-> Repositório: `C:\dev\rust\sentry`
-
----
-
-## 1. Visão Geral
-
-O **Sentry** é um observador de acessos em tempo real para serviços expostos à internet. Começa monitorando o **nginx** (via access logs), mas é desenhado para escalar para **qualquer porta/protocolo** (HTTP, TCP, proxies reversos, packet capture, syslog). Usa IA + heurísticas para detectar payloads maliciosos, comportamento suspeito, rotas inválidas e calcula um **nível de risco** por requisição/IP. Integra-se com **Cloudflare** para challenge/block em camada de edge.
-
-### 1.1 Objetivos
-
-- **Modularidade total**: cada origem de dados (nginx, tcp, http-proxy) é um plugin por trás de um trait comum.
-- **Tempo real**: stream de eventos, não batch.
-- **Precisão**: combinar regras determinísticas (rápidas, zero falso-positivo conhecido) com IA (para o desconhecido).
-- **Ação**: não apenas detectar — bloquear, desafiar, rate-limitar.
-- **Multi-plataforma**: um único binário em Rust.
-- **Operável**: CLI rica para tail ao vivo, relatórios, export, gestão de blocklist.
-
-### 1.2 Não-objetivos (fase atual)
-
-- Dashboard web (fase futura, via Tauri ou backend HTTP separado).
-- Substituir um WAF comercial — é complementar.
-- Deep packet inspection de protocolos não-HTTP na fase 1.
+> Status: **Planning**
+> Language: **Rust** (multi-platform: Linux, macOS, Windows, BSD)
+> Current interface: **CLI** (web dashboard in the future)
+> Repository: `C:\dev\rust\sentry`
 
 ---
 
-## 2. Arquitetura de Alto Nível
+## 1. Overview
+
+**Sentry** is a real-time access observer for services exposed to the internet. It starts by monitoring **nginx** (via access logs) but is designed to scale to **any port/protocol** (HTTP, TCP, reverse proxies, packet capture, syslog). It uses AI + heuristics to detect malicious payloads, suspicious behavior and invalid routes, computing a **risk level** per request/IP. It integrates with **Cloudflare** for edge-layer challenge/block.
+
+### 1.1 Goals
+
+- **Total modularity**: each data origin (nginx, tcp, http-proxy) is a plugin behind a common trait.
+- **Real time**: event stream, not batch.
+- **Precision**: combine deterministic rules (fast, known zero false-positives) with AI (for the unknown).
+- **Action**: not just detect — block, challenge, rate-limit.
+- **Multi-platform**: a single Rust binary.
+- **Operable**: rich CLI for live tail, reports, export, blocklist management.
+
+### 1.2 Non-goals (current phase)
+
+- Web dashboard (future phase, via Tauri or a separate HTTP backend).
+- Replace a commercial WAF — it is complementary.
+- Deep packet inspection of non-HTTP protocols in phase 1.
+
+---
+
+## 2. High-Level Architecture
 
 ```mermaid
 flowchart TB
-    subgraph Sources[Camada de Fontes — Plugins]
-        N1[Nginx Access Log]
-        N2[HTTP Proxy Middleware]
-        N3[TCP Capture]
-        N4[Syslog / Journald]
-        N5[Cloudflare Logs]
+    subgraph Sources["Source Layer — Plugins"]
+        N1["Nginx Access Log"]
+        N2["Sentry Edge (Inline)"]
+        N3["TCP Capture"]
+        N4["Syslog / Journald"]
+        N5["Cloudflare Logs"]
     end
 
-    subgraph Core[Core Sentry]
-        ING[Ingestor<br/>Normaliza p/ Event]
-        PIPE[Pipeline de Análise]
-        AI[Motor de IA]
-        HEUR[Heurísticas/Regras]
-        ROUTE[Validador de Rotas]
-        RISK[Score de Risco]
-        DECID[Decisor / Política]
+    subgraph Core["Sentry Core"]
+        ING["Ingestor<br/>real-IP (trusted proxies) + dedupe + geo/ASN"]
+        FAST["Rules Engine (fast path, ~µs)<br/>Allow › Block/Challenge/RateLimit › Log/Tag"]
+        HEUR["Heuristics<br/>SQLi · XSS · traversal · uploads · bot verify"]
+        BEH["Trackers<br/>scan · behavior · correlation · offenders"]
+        RISK["Scorer + Policy"]
+        ESC["Escalation (strikes)"]
+        AI["AI Risk Classification<br/>ONNX + LLM (only raises the score)"]
     end
 
-    subgraph Actions[Camada de Ações — Plugins]
-        A1[Block IP]
-        A2[Rate Limit]
-        A3[Cloudflare Challenge]
-        A4[Alerta Webhook]
-        A5[Log/Store]
+    subgraph Actions["Action Layer — Plugins"]
+        A1["Blocklist / BlockTable"]
+        A2["Kernel firewall (nftables/ipset/OPNsense)"]
+        A3["Edge challenge (Cloudflare · PoW · nginx)"]
+        A4["Webhook / Report / SIEM"]
+        A5["Log / Postgres / metrics"]
     end
 
-    subgraph Storage[Persistência]
-        DB[(SQLite / Postgres)]
-        BL[(Blocklist state)]
-    end
-
-    Sources --> ING
-    ING --> PIPE
-    PIPE --> HEUR
-    PIPE --> AI
-    PIPE --> ROUTE
-    HEUR --> RISK
-    AI --> RISK
-    ROUTE --> RISK
-    RISK --> DECID
-    DECID --> Actions
-    Actions --> Storage
-    DECID --> Storage
+    Sources --> ING --> FAST
+    FAST -- "verdict" --> ESC --> Actions
+    FAST -- "no rule hit" --> HEUR --> BEH --> RISK
+    RISK -- "gray-zone" --> AI
+    AI -- "rescore_from (only raises)" --> RISK
+    RISK --> ESC
 ```
 
-### 2.1 Princípios de design
+### 2.1 Network positioning (layers and modes)
 
-1. **Trait `Source`**: todo plugin implementa `fn stream_events(&self) -> impl Stream<Item = RawEvent>`. Adicionar nginx = implementar o trait.
-2. **Trait `Action`**: `fn execute(&self, decision: &Decision) -> Result<()>`. Block, Challenge, Alert etc.
-3. **Event normalizado**: um único `struct Event` independente da origem. O core nunca sabe se veio do nginx ou do TCP.
-4. **Pipeline assíncrono**: `tokio` + canais. Cada estágio é um actor/fan-out.
-5. **Configuração declarativa**: `sentry.toml` define fontes ativas, ações ativas, thresholds.
+Each layer is an independent barrier — whatever slips past one still hits the
+next. The `[deployment] mode` chooses where Sentry sits:
+
+```mermaid
+flowchart LR
+    subgraph passive["Passive mode (default)"]
+        direction TB
+        P1["Internet"] --> P2["Cloudflare<br/><b>L7</b> · challenge/block"]
+        P2 --> P3["Kernel firewall<br/><b>L3/L4</b> · nftables / ipset"]
+        P3 --> P4["Your service<br/><i>nginx · ssh · etc</i>"]
+
+        MON["Sentry pipeline"]
+        P4 -.->|"logs / syslog"| MON
+        MON -.->|"challenge"| P2
+        MON -.->|"bans"| P3
+    end
+
+    subgraph inline["Inline mode — Sentry edge"]
+        direction TB
+        I1["Internet"] --> I2["Kernel firewall<br/><b>L3/L4</b> · BlockTable bans"]
+        I2 --> SEDGE
+
+        subgraph SEDGE["Sentry edge (in-path)"]
+            direction TB
+            S1["TLS + edge-tcp<br/><b>L4/L6</b> · JA3/JA4 · SNI · port 443"]
+            S2["Reverse proxy<br/><b>L7</b> · rules · heuristics · uploads · PoW"]
+            S1 --> S2
+        end
+
+        SEDGE --> I5["Your service<br/><i>nginx · ssh · etc</i>"]
+    end
+
+    passive ~~~ inline
+```
+
+- **Passive**: Sentry off-path — ingests logs/syslog/pcap and enforces via
+  providers (CF API, kernel bans, nginx includes, webhooks).
+- **Inline**: traffic passes through the edge — 403/429/challenge decided
+  before the upstream, `BlockTable` denies on the fast path before the
+  pipeline runs.
+- The modes **compose**: the CDN challenge filters first (cheapest), kernel
+  bans stop everything below HTTP, and the inline proxy catches whatever
+  reaches the host. Details on each variant in §8.3.
+
+### 2.2 Design principles
+
+1. **`Source` trait**: every plugin implements `fn stream_events(&self) -> impl Stream<Item = RawEvent>`. Adding nginx = implementing the trait.
+2. **`Action` trait**: `fn execute(&self, decision: &Decision) -> Result<()>`. Block, Challenge, Alert, etc.
+3. **Normalized event**: a single `struct Event` independent of the origin. The core never knows whether it came from nginx or TCP.
+4. **Asynchronous pipeline**: `tokio` + channels. Each stage is an actor/fan-out.
+5. **Declarative configuration**: `sentry.toml` defines active sources, active actions, thresholds.
 
 ---
 
-## 3. Stack Técnica
+## 3. Technical Stack
 
-| Camada         | Crate / Tecnologia                                                                                    | Justificativa                                                                        |
+| Layer          | Crate / Technology                                                                                    | Rationale                                                                            |
 | -------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| Async runtime  | `tokio`                                                                                               | Padrão de facto, multi-plataforma                                                    |
-| CLI            | `clap` (derive) + `ratatui` para TUI live                                                             | Ergonomia, subcomandos, painel ao vivo                                               |
-| Config         | `serde` + `toml` + `figment` (env+file merge)                                                         | Override por env var em prod                                                         |
-| Logs/Tracing   | `tracing` + `tracing-subscriber`                                                                      | Structured logging, spans por requisição                                             |
-| Parser nginx   | `nom` ou `regex` + `serde`                                                                            | Linhas de log access_log custom format                                               |
+| Async runtime  | `tokio`                                                                                               | De facto standard, multi-platform                                                    |
+| CLI            | `clap` (derive) + `ratatui` for live TUI                                                              | Ergonomics, subcommands, live panel                                                  |
+| Config         | `serde` + `toml` + `figment` (env+file merge)                                                         | Env var override in production                                                       |
+| Logs/Tracing   | `tracing` + `tracing-subscriber`                                                                      | Structured logging, spans per request                                                |
+| Nginx parser   | `nom` or `regex` + `serde`                                                                            | Custom-format access_log lines                                                       |
 | HTTP client    | `reqwest` (rustls)                                                                                    | Cloudflare API, webhooks, geolookup                                                  |
-| ML/IA local    | `ort` (ONNX Runtime) + `candle` fallback                                                              | Inferência local sem depender de API externa                                         |
-| LLM (opcional) | trait `LlmProvider` + adapters: **OpenRouter** (rota p/ qualquer modelo), `async-openai`, `ollama-rs` | Análise de payload complexa sob demanda, provider-agnostic                           |
-| Storage        | `sqlx` com **Postgres** default (migrations sqlx), SQLite opcional via feature                        | Mesmo schema, troca por feature flag; Postgres suporta HA e múltiplos nós desde cedo |
-| Geolookup      | `maxminddb` (DB local)                                                                                | Sem chamada externa por evento                                                       |
-| IPC/Embeddable | `core` como lib crate (`sentry-core`)                                                                 | Futuro dashboard consome a mesma lib                                                 |
-| Serialização   | `serde` + `serde_json`                                                                                | Eventos, export, API futura                                                          |
-| Erros          | `thiserror` (lib) + `color-eyre` (bin)                                                                | Ergonomia + backtraces legíveis                                                      |
-| Testes         | `proptest` + `insta` (snapshots) + `wiremock`                                                         | Payloads maliciosos, fixtures de log                                                 |
-| Build/Release  | `cargo-dist` ou `cross`                                                                               | Binários multi-OS                                                                    |
+| Local ML/AI    | `ort` (ONNX Runtime) + `candle` fallback                                                              | Local inference without depending on an external API                                 |
+| LLM (optional) | trait `LlmProvider` + adapters: **OpenRouter** (route to any model), `async-openai`, `ollama-rs`      | Complex payload analysis on demand, provider-agnostic                                |
+| Storage        | `sqlx` with **Postgres** default (sqlx migrations), optional SQLite via feature                       | Same schema, swapped by feature flag; Postgres supports HA and multiple nodes early on |
+| Geolookup      | `maxminddb` (local DB)                                                                                | No external call per event                                                           |
+| IPC/Embeddable | `core` as a lib crate (`sentry-core`)                                                                 | A future dashboard consumes the same lib                                             |
+| Serialization  | `serde` + `serde_json`                                                                                | Events, export, future API                                                           |
+| Errors         | `thiserror` (lib) + `color-eyre` (bin)                                                                | Ergonomics + readable backtraces                                                     |
+| Testing        | `proptest` + `insta` (snapshots) + `wiremock`                                                         | Malicious payloads, log fixtures                                                     |
+| Build/Release  | `cargo-dist` or `cross`                                                                               | Multi-OS binaries                                                                    |
 
 ---
 
-## 4. Modelo de Dados
+## 4. Data Model
 
-O `Event` é **modular por design**: campos comuns a qualquer origem vivem no top-level; o que é específico de protocolo fica em `ProtocolData` (enum extensível). Hoje `Http` cobre nginx; amanhã `Tcp`, `Udp`, `Tls` etc. entram sem mudar o core — basta a source popular a variante correspondente. As heurísticas e o scorer operam sobre o `Event` e fazem _pattern matching_ em `protocol`, ignorando campos ausentes.
+The `Event` is **modular by design**: fields common to any origin live at
+the top level (`id`, `timestamp`, `source`, `transport`, `client_ip`,
+geo/ASN, bytes, `raw`…); protocol-specific data lives in `ProtocolData`
+(extensible enum): `Http` (nginx, edge, CF Logs), `Tcp` (pcap capture,
+SYN→Data stages), `Udp`, `TlsHandshake` (SNI/JA3/JA4) and `Raw` (fallback).
+The canonical reference is the code — `crates/sentry-core/src/event.rs` and
+the types in `http_data.rs`/`tcp.rs` — and the user-facing description
+lives in the [documentation](https://sentry.lucas-romero.com).
 
-```rust
-// sentry-core/src/event.rs
-pub struct Event {
-    // --- comuns a qualquer protocolo ---
-    pub id: Uuid,
-    pub timestamp: DateTime<Utc>,
-    pub source: SourceKind,          // Nginx, Tcp, HttpProxy, CloudflareLogs...
-    pub transport: Transport,        // Tcp | Udp | Tls | Internal
-    pub client_ip: IpAddr,
-    pub client_port: Option<u16>,
-    pub server_port: Option<u16>,    // porta exposta observada
-    pub geo: Option<GeoInfo>,
-    pub asn: Option<u32>,
-    pub direction: Direction,        // Inbound | Outbound
-    pub bytes_in: Option<u64>,
-    pub bytes_out: Option<u64>,
-    pub duration_ms: Option<u64>,
-    pub raw: Option<String>,         // registro original p/ auditoria
+> **Golden rule**: no pipeline stage assumes `ProtocolData::Http`.
+> Heuristics and rules pattern-match on `evt.http()` / `evt.tcp()` /
+> `evt.tls()` and return `None` for variants they don't handle — so the
+> same pipeline runs for nginx today and TCP/TLS capture tomorrow. New
+> protocol = new `ProtocolData` variant + helper in `impl Event` +
+> update `protocol_kind()`; **never** loose fields at the top level.
 
-    // --- específico do protocolo ---
-    pub protocol: ProtocolData,
-}
+HTTP heuristics run over the **URL-decoded** form of the path/query
+(`heuristics::http_text`), so `%27`/`+` cannot bypass them.
 
-pub enum ProtocolData {
-    Http(HttpData),
-    Tcp(TcpData),
-    Udp(UdpData),
-    TlsHandshake(TlsData),
-    Raw(RawData),                    // fallback: bytes + nota
-    // futuras variantes entram aqui sem quebrar consumidores
-}
-
-pub struct HttpData {
-    pub method: HttpMethod,
-    pub scheme: Option<String>,      // http | https
-    pub host: Option<String>,
-    pub path: String,
-    pub query: Option<String>,
-    pub fragment: Option<String>,
-    pub status: Option<u16>,
-    pub user_agent: Option<String>,
-    pub referer: Option<String>,
-    pub headers: HashMap<String, String>,
-    pub body: Option<Vec<u8>>,       // quando disponível (proxy/middleware)
-    pub cookies: Option<HashMap<String, String>>,
-}
-
-pub struct TcpData {
-    pub flags: TcpFlags,             // syn/fin/rst/ack...
-    pub payload: Option<Vec<u8>>,    // bytes do stream reconstruído (quando capturável)
-    pub stream_id: Option<u64>,      // p/ correlacionar segmentos
-    pub stage: TcpStage,             // Syn | SynAck | Data | Fin | Reset
-}
-
-pub struct UdpData {
-    pub payload: Option<Vec<u8>>,
-    pub dns_query: Option<String>,   // se for DNS reconhecido
-}
-
-pub struct TlsData {
-    pub sni: Option<String>,
-    pub ja3: Option<String>,         // fingerprint TLS
-    pub ja4: Option<String>,
-    pub cipher: Option<String>,
-    pub version: Option<String>,
-}
-
-pub struct RawData {
-    pub note: String,
-    pub bytes: Vec<u8>,
-}
-
-// Helpers de ergonomia: e.kind_http() -> Option<&HttpData> etc.
-impl Event {
-    pub fn http(&self)  -> Option<&HttpData>  { match &self.protocol { ProtocolData::Http(d) => Some(d), _ => None } }
-    pub fn tcp(&self)   -> Option<&TcpData>   { match &self.protocol { ProtocolData::Tcp(d) => Some(d), _ => None } }
-    pub fn tls(&self)   -> Option<&TlsData>   { match &self.protocol { ProtocolData::TlsHandshake(d) => Some(d), _ => None } }
-    pub fn is_http(&self) -> bool { matches!(self.protocol, ProtocolData::Http(_)) }
-}
-```
-
-> **Regra**: nenhum estágio do pipeline pode assumir `ProtocolData::Http`. Heurísticas HTTP verificam `evt.http()` e retornam `None` para outras variantes; heurísticas TCP fazem o análogo. Assim o mesmo pipeline roda para nginx hoje e para captura TCP amanhã.
-
-pub struct AnalysisResult {
-pub risk_score: u8, // 0..=100
-pub risk_level: RiskLevel, // Info|Low|Medium|High|Critical
-pub signals: Vec<Signal>, // o que disparou
-pub verdict: Verdict, // Allow|Challenge|Block|Quarantine
-}
-
-pub enum Signal {
-PathTraversal, SqlInjection, Xss, CmdInjection,
-UnknownRoute, ScanBehavior, AbnormalRate,
-SuspiciousUA, TorExitNode, KnownBadIp,
-AnomalousPayload(/_ modelo _/),
-Custom(String),
-}
-
-````
+The pipeline output is an `AnalysisResult { risk_score: u8, risk_level:
+Info..Critical, signals: Vec<Signal>, verdict: Verdict }` — see §5 and §6.
 
 ---
 
-## 5. Fluxo de uma Requisição
+## 5. Flow of a Request
 
 ```mermaid
 sequenceDiagram
-    participant N as Nginx (log)
+    participant SRC as Source (nginx/edge/syslog/TCP)
     participant I as Ingestor
-    participant P as Pipeline
-    participant H as Heurísticas
-    participant R as Rotas
-    participant SC as Scan trackers
-    participant S as Scorer
-    participant D as Decisor (policy)
-    participant E as Escalonamento (strikes)
-    participant AI as IA (ONNX, fork)
-    participant CF as Cloudflare API
+    participant F as Rules Engine (fast path)
+    participant H as Heuristics + Routes + Trackers
+    participant S as Scorer + Policy
+    participant E as Escalation (strikes)
+    participant AI as AI Forks (ONNX + LLM)
+    participant A as Actions
     participant DB as Postgres
 
-    N->>I: linha de access_log
-    I->>P: Event (dedupe + geo)
-    P->>H: regex/sigs (SQLi, XSS, LFI...)
-    P->>R: path existe? método permitido?
-    P->>SC: janela 4xx por IP
-    H-->>S: signals + pesos
-    R-->>S: UnknownRoute / MethodNotAllowed
-    SC-->>S: RandomScan / ScanBehavior
-    S->>S: score + level (bônus de repetição)
-    S->>D: AnalysisResult
-    D->>E: verdict não-Allow → +1 strike
-    E->>E: strikes ≥ challenge_at/block_at → eleva verdict
-    par fork assíncrono (não bloqueia o hot path)
-        D->>AI: se score ≥ ai.min_score
-        AI-->>D: AnomalousPayload → rescore_from (só eleva)
+    SRC->>I: log line / request / handshake
+    I->>F: Event (real-IP + dedupe + geo/ASN)
+    alt rule matches (Allow/Block/Challenge/RateLimit)
+        F->>E: verdict short-circuits (heuristics skipped)
+    else no rule
+        F->>H: proceeds to analysis
+        H->>H: heuristics (decoded text + uploads)<br/>routes · scan · behavior · correlation
+        H->>S: signals + weights
+        S->>S: score + level
+        S->>E: AnalysisResult
+        opt score ≥ ai.min_score (gray-zone)
+            par async AI fork — does not block the hot path
+                S->>AI: event
+                AI-->>S: rescore_from (only raises, never lowers)
+            end
+        end
     end
-    alt Block/Challenge/RateLimit
-        D->>CF: access rule (block/challenge)
-        D->>DB: evento + strike persistido
-    else Allow
-        D->>DB: métricas only
-    end
-    D-->>N: (não interfere no nginx; modo inline no futuro)
+    E->>E: non-Allow verdict → +1 strike<br/>strikes ≥ challenge_at/block_at → escalates verdict
+    E->>A: final verdict + ActionContext
+    A->>A: BlockTable/firewall (ban) · CF (challenge/block)<br/>webhook · report · SIEM
+    A->>DB: event + incident + ip_state
 ```
 
-### 5.1 Estágios do pipeline (ordem fixa, knobs configuráveis)
+In **inline** mode the same `Arc<Pipeline>` runs inside the edge: the
+`BlockTable` fast path denies banned IPs **before** the pipeline, and the
+verdict becomes an HTTP response (403/429/challenge page) instead of an
+API call. Details in §8.3 and §8.6.
 
-O hot path é **síncrono e determinístico**; a IA roda ao lado, como fork:
+### 5.1 Pipeline stages (fixed order, configurable knobs)
+
+The hot path is **synchronous and deterministic**; AI scoring runs
+alongside as a fork:
 
 ```
-rules (fast path) → heurísticas → rotas → scan → behavior → correlation → scorer → policy → escalation
-                                                                            └→ IA (fork/inline/shadow) → rescore_from
+rules (fast path) → heuristics → routes → scan → behavior → correlation → scorer → policy → escalation
+                                                                            └→ AI (fork/inline/shadow) → rescore_from
 ```
 
-- **scan** (`[scan]`): janela deslizante por IP contando apenas respostas 4xx.
-  ≥ `distinct_paths` paths **distintos** → `RandomScan` (peso 25, acumulativo —
-  cobre sweeps de `/.env*`, `/a1b2.php`…); ≥ `not_found` respostas 4xx →
-  `ScanBehavior` (peso 35). Paths unknown **nunca** são aprendidos como rota
-  (anti-poisoning — aprender silenciaria o próprio sinal); use
-  `sentry report --unknown-paths` para promover rotas legítimas à config.
-- **correlation** (`[correlation]`, F3.10): janelas deslizantes por /24 (v4),
-  /64 (v6) e ASN. Sinais de scan (`RandomScan`/`ScanBehavior`/`TcpScanner` —
-  SYNs do source `tcp` alimentam a mesma janela que sweeps HTTP) registram o
-  scanner; um sinal de ataque de **outro** IP no mesmo prefixo (preferido) ou
-  ASN dentro de `window_secs` (default 900 = 15 min) emite
-  `ScanAttackCorrelation` (peso 20) — o padrão "shot calling" de honeypots.
-  Detalhes em §8.5.
-- **escalation** (`[escalation]`): cada verdict não-Allow conta 1 strike por
-  IP. `challenge_at` strikes → eleva p/ Challenge; `block_at` → Block (só
-  eleva, nunca rebaixa; Allow não conta strike). Strikes decaem após
-  `window_secs` (default 7d — sobrevive ao TTL de edge rules de 24h) e são
-  espelhados na tabela `ip_state` (`strikes`/`total_violations`/
-  `last_violation_at`) com pre-warm no startup: reincidente pós-expiração é
-  re-bloqueado no primeiro evento violador. `sentry ip forgive <ip>` reseta.
-- **IA** (`[ai]`): modelo clássico (regressão logística sobre 25 features
-  extraídas em Rust — `sentry-ai/src/features.rs`) via ONNX (`--features
-  onnx`). `mode = "fork"` (default, assíncrono com semaphore + cache por
-  hash de payload), `inline` (bloqueante antes das actions) ou `shadow`
-  (só loga). `trigger` = `above_score|always|quarantine_only`. O resultado
-  entra por `Pipeline::rescore_from`, que **só soma** (a IA nunca reduz o
-  score). Treino: `sentry model export [--synthetic]` → CSV com as mesmas
-  features da inferência → `python tools/train_model.py` → ONNX.
+- **scan** (`[scan]`): sliding window per IP counting only 4xx responses.
+  ≥ `distinct_paths` **distinct** paths → `RandomScan` (weight 25, cumulative —
+  covers sweeps of `/.env*`, `/a1b2.php`…); ≥ `not_found` 4xx responses →
+  `ScanBehavior` (weight 35). Unknown paths are **never** learned as routes
+  (anti-poisoning — learning them would silence the signal itself); use
+  `sentry report --unknown-paths` to promote legitimate routes into config.
+- **correlation** (`[correlation]`, F3.10): sliding windows per /24 (v4),
+  /64 (v6) and ASN. Scan signals (`RandomScan`/`ScanBehavior`/`TcpScanner` —
+  SYNs from the `tcp` source feed the same window as HTTP sweeps) register
+  the scanner; an attack signal from **another** IP on the same prefix
+  (preferred) or ASN within `window_secs` (default 900 = 15 min) emits
+  `ScanAttackCorrelation` (weight 20) — the honeypot "shot calling" pattern.
+  Details in §8.5.
+- **escalation** (`[escalation]`): each non-Allow verdict counts 1 strike
+  per IP. `challenge_at` strikes → escalates to Challenge; `block_at` →
+  Block (only escalates, never lowers; Allow doesn't count a strike).
+  Strikes decay after `window_secs` (default 7d — survives the 24h TTL of
+  edge rules) and are mirrored into the `ip_state` table
+  (`strikes`/`total_violations`/`last_violation_at`) with pre-warm at
+  startup: a repeat offender post-expiry is re-blocked on the first
+  violating event. `sentry ip forgive <ip>` resets it.
+- **AI** (`[ai]`): classic model (logistic regression over 25 features
+  extracted in Rust — `sentry-ai/src/features.rs`) via ONNX
+  (`--features onnx`). `mode = "fork"` (default, async with semaphore +
+  cache per payload hash), `inline` (blocking before actions) or `shadow`
+  (log only). `trigger` = `above_score|always|quarantine_only`. The result
+  enters via `Pipeline::rescore_from`, which **only adds** (AI never
+  lowers the score). Training: `sentry model export [--synthetic]` → CSV
+  with the same inference features → `python tools/train_model.py` → ONNX.
 
 ---
 
-## 6. Níveis de Risco e Vereditos
+## 6. Risk Levels and Verdicts
 
-| Score  | Level    | Cor      | Veredito padrão        |
+| Score  | Level    | Color    | Default verdict        |
 | ------ | -------- | -------- | ---------------------- |
-| 0–9    | Info     | cinza    | Allow                  |
-| 10–29  | Low      | azul     | Allow + observação     |
-| 30–49  | Medium   | amarelo  | Rate-limit crescente   |
-| 50–74  | High     | laranja  | Challenge (Cloudflare) |
-| 75–100 | Critical | vermelho | Block IP + alerta      |
+| 0–9    | Info     | gray     | Allow                  |
+| 10–29  | Low      | blue     | Allow + observation    |
+| 30–49  | Medium   | yellow   | Increasing rate-limit  |
+| 50–74  | High     | orange   | Challenge (Cloudflare) |
+| 75–100 | Critical | red      | Block IP + alert       |
 
-Política configurável por rota/IP-range/ASN. Ex: `/admin/*` tem threshold mais baixo.
+Policy is configurable per route/IP-range/ASN. E.g.: `/admin/*` has a lower threshold.
 
-Acima da política roda o **escalonamento de reincidentes** (`[escalation]`): cada
-verdict não-Allow soma 1 strike por IP; `challenge_at` strikes elevam o verdict
-para Challenge e `block_at` para Block (defaults 3/5, janela de 7d, persistido
-em `ip_state`). Um IP que "sempre dá MED 48" é escalado após algumas repetições
-em vez de ficar para sempre 2 pontos abaixo do threshold de High.
+On top of policy runs the **repeat-offender escalation** (`[escalation]`):
+each non-Allow verdict adds 1 strike per IP; `challenge_at` strikes escalate
+the verdict to Challenge and `block_at` to Block (defaults 3/5, 7d window,
+persisted in `ip_state`). An IP that "always lands MED 48" is escalated after
+a few repetitions instead of staying 2 points below the High threshold forever.
 
 ---
 
-## 7. Modularidade — Plugins
+## 7. Modularity — Plugins
 
-### 7.1 Trait de Source
+### 7.1 Source trait
 
 ```rust
 // sentry-core/src/source.rs
@@ -329,14 +286,14 @@ pub trait Source: Send + Sync {
     async fn stream(&self) -> anyhow::Result<mpsc::Receiver<RawEvent>>;
 }
 
-// Implementações:
-// sentry-source-nginx    -> tail do access.log
-// sentry-source-http     -> middleware axum/actix que recebe cópia
-// sentry-source-tcp      -> captura via `pnet`/`pcap` (libpcap)
-// sentry-source-cloudflare -> pull de logs via API em polling
+// Implementations:
+// sentry-source-nginx    -> tails access.log
+// sentry-source-http     -> axum/actix middleware receiving a copy
+// sentry-source-tcp      -> capture via `pnet`/`pcap` (libpcap)
+// sentry-source-cloudflare -> pulls logs via polling API
 ```
 
-### 7.2 Trait de Action
+### 7.2 Action trait
 
 ```rust
 // sentry-core/src/action.rs
@@ -346,61 +303,61 @@ pub trait Action: Send + Sync {
     async fn execute(&self, evt: &Event, decision: &Decision) -> anyhow::Result<()>;
 }
 
-// Implementações:
-// sentry-action-cloudflare  -> regras de firewall, challenge
-// sentry-action-blocklist   -> estado local (para inline proxy)
+// Implementations:
+// sentry-action-cloudflare  -> firewall rules, challenge
+// sentry-action-blocklist   -> local state (for inline proxy)
 // sentry-action-webhook     -> Discord/Slack/Telegram/email
 // sentry-action-iptables    -> nftables/iptables (Linux)
-// sentry-action-log         -> registrar em DB
+// sentry-action-log         -> write to DB
 ```
 
-### 7.3 Registro dinâmico
+### 7.3 Dynamic registration
 
-Cada plugin expõe `pub fn register(reg: &mut Registry)`. O binário habilita plugins via feature flags Cargo + entry em `sentry.toml`. **Sem recompilar para ativar/desativar** — só config.
+Each plugin exposes `pub fn register(reg: &mut Registry)`. The binary enables plugins via Cargo feature flags + an entry in `sentry.toml`. **No recompiling to enable/disable** — config only.
 
 ---
 
-## 8. Integração Cloudflare (Sinergia de Challenge)
+## 8. Cloudflare Integration (Challenge Synergy)
 
 ```mermaid
 flowchart LR
-    EVT[Evento High/Critical] --> CF1{Cloudflare habilitado?}
-    CF1 -->|sim| CF2[Resolver zona+IP]
-    CF2 --> CF3{Já bloqueado recentemente?}
-    CF3 -->|não| CF4[Criar/Atualizar firewall rule]
-    CF3 -->|sim| CF5[Estender TTL]
+    EVT[High/Critical event] --> CF1{Cloudflare enabled?}
+    CF1 -->|yes| CF2[Resolve zone+IP]
+    CF2 --> CF3{Recently blocked already?}
+    CF3 -->|no| CF4[Create/Update firewall rule]
+    CF3 -->|yes| CF5[Extend TTL]
     CF4 --> CF6["Challenge mode: js_challenge / managed_challenge / block"]
-    CF6 --> CF7[Webhook confirmação]
-    CF1 -->|não| BL[Blocklist local only]
+    CF6 --> CF7[Webhook confirmation]
+    CF1 -->|no| BL[Local blocklist only]
 ```
 
 - Tokens via env (`SENTRY_CF_TOKEN`, `SENTRY_CF_ZONE`).
-- Cache local de IPs já desafiados (TTL configurável) para não bombardear a API.
-- Modos: `block`, `js_challenge`, `managed_challenge`, `rate_limit`.
-- **Importante**: na fase 1 o Sentry é **read-only + Cloudflare action**. Não há inline proxy. Inline é fase futura (`sentry-proxy`).
+- Local cache of already-challenged IPs (configurable TTL) to avoid hammering the API.
+- Modes: `block`, `js_challenge`, `managed_challenge`, `rate_limit`.
+- **Important**: in phase 1 Sentry is **read-only + Cloudflare action**. There is no inline proxy. Inline is a future phase (`sentry-proxy`).
 
-### 8.1 IP real do cliente (atrás de CDN/proxy)
+### 8.1 Real client IP (behind CDN/proxy)
 
-Atrás da Cloudflare, `$remote_addr` no access log do nginx é o IP do **edge** da
-CDN, não do cliente — bloquear/ranquear esse IP seria inútil. A resolução do IP
-real é **automática** no `sentry-source-nginx`, por precedência fixa (o
-primeiro que parseia vence, independente da ordem no `log_format`):
+Behind Cloudflare, `$remote_addr` in the nginx access log is the IP of the
+CDN **edge**, not the client — blocking/scoring that IP would be useless.
+Real-IP resolution is **automatic** in `sentry-source-nginx`, by fixed
+precedence (first one that parses wins, regardless of `log_format` order):
 
 1. `$http_cf_connecting_ip` (Cloudflare)
-2. `$http_true_client_ip` (Cloudflare Enterprise / outros CDNs)
+2. `$http_true_client_ip` (Cloudflare Enterprise / other CDNs)
 3. `$http_x_real_ip`
-4. `$http_x_forwarded_for` / `$proxy_add_x_forwarded_for` (primeiro da cadeia)
+4. `$http_x_forwarded_for` / `$proxy_add_x_forwarded_for` (first in the chain)
 5. `$remote_addr` / `$remote_addr_v6`
 
-Basta incluir o header no `log_format` do nginx (e no `format` do source) —
-ex.: `... "$http_user_agent" "$http_cf_connecting_ip"`. Quando o header está
-ausente (tráfego direto), o nginx loga `-` e o parser cai para o próximo
-candidato. Além disso, **todo token `http_*` capturado** vira um header no
-`HttpData.headers` do evento (ex.: `http_cf_connecting_ip` →
-`cf-connecting-ip`), habilitando regras DSL `header.X` sobre logs. Geo/ASN,
-dedupe, storage e actions consomem o IP já resolvido automaticamente.
+Just include the header in the nginx `log_format` (and in the source `format`) —
+e.g.: `... "$http_user_agent" "$http_cf_connecting_ip"`. When the header is
+absent (direct traffic), nginx logs `-` and the parser falls back to the
+next candidate. Additionally, **every captured `http_*` token** becomes a
+header in `HttpData.headers` (e.g.: `http_cf_connecting_ip` →
+`cf-connecting-ip`), enabling DSL rules `header.X` over logs. Geo/ASN,
+dedupe, storage and actions consume the already-resolved IP automatically.
 
-Exemplo de `log_format` recomendado atrás da Cloudflare:
+Example of recommended `log_format` behind Cloudflare:
 
 ```nginx
 log_format sentry '$remote_addr - $remote_user [$time_local] "$request" '
@@ -408,492 +365,516 @@ log_format sentry '$remote_addr - $remote_user [$time_local] "$request" '
                   '"$http_cf_connecting_ip"';
 ```
 
-### 8.2 Bloqueio /64 IPv6 via IP Lists (F2.14)
+### 8.2 IPv6 /64 blocking via IP Lists (F2.14)
 
-IP Access Rules da Cloudflare aceitam **endereços exatos** (`ip`/`ip6`) —
-verificado ao vivo em 2026-08-30: zone e account endpoints rejeitam target
-`ip6_range`, e `ip6` rejeita CIDR. Um host IPv6 com privacy extensions
-rotaciona o interface ID dentro do /64 e escapa de regras /128. A solução é
-um **IP List** account-level (aceita CIDR, incl. /64) alimentado pelo Sentry
-+ **uma** custom rule na zona:
+Cloudflare IP Access Rules accept **exact addresses** (`ip`/`ip6`) —
+verified live on 2026-08-30: zone and account endpoints reject target
+`ip6_range`, and `ip6` rejects CIDR. An IPv6 host with privacy extensions
+rotates the interface ID within the /64 and escapes /128 rules. The
+solution is an account-level **IP List** (accepts CIDR, incl. /64) fed by
+Sentry + **one** custom rule on the zone:
 
 ```text
 (ip.src in $sentry_blocks)  →  action: block
 ```
 
-- **Opt-in**: `[action.options] ipv6_prefix = 64` (default 128 = access
-  rules exatas, comportamento anterior). `list_name` default `sentry_blocks`.
-- **Account id**: derivado automaticamente do `GET /zones/{zone}`
+- **Opt-in**: `[action.options] ipv6_prefix = 64` (default 128 = exact
+  access rules, previous behavior). `list_name` default `sentry_blocks`.
+- **Account id**: automatically derived from `GET /zones/{zone}`
   (`result.account.id`); override via `SENTRY_CF_ACCOUNT`.
-- **Roteamento de verdict**: IPv6 `Block`/`RateLimit` → item /64 na lista
-  (action da rule é `block`; `rate_limit` não é expressível por item — mesmo
-  fallback dos access rules). IPv6 `Challenge` → access rule /128 (desafio é
-  interativo/per-browser). IPv4 → access rules (inalterado).
-- **TTL**: no `comment` de cada item, mesmo formato dos notes de access
-  rules (`sentry:<ts>:<ttl>`) — reaper deleta expirados, reconcile adota
-  vivos, POST de item é idempotente (duplicata sobrescreve o comment).
-- **Dedupe cache** keyed pelo endereço de rede do /64 (rotação colapsa na
-  mesma chave).
-- **Degradação suave**: sem permissões (`Account Filter Lists: Edit`,
-  `Zone Rulesets: Edit`) ou limite de plano → modo lista soft-disable com
-  warning, IPv6 cai para access rules exatas, reaper re-tenta provisioning a
-  cada ciclo. Falhas de lista **não** contam no circuit breaker principal.
-- **Planos**: IP Lists disponíveis em todos (Free inclui 1 lista/10k itens;
-  Pro/Business 10 listas) — cf. docs Cloudflare WAF Lists.
+- **Verdict routing**: IPv6 `Block`/`RateLimit` → /64 item in the list
+  (the rule action is `block`; `rate_limit` is not expressible per item —
+  same fallback as access rules). IPv6 `Challenge` → /128 access rule
+  (challenge is interactive/per-browser). IPv4 → access rules (unchanged).
+- **TTL**: in each item's `comment`, same format as access-rule notes
+  (`sentry:<ts>:<ttl>`) — reaper deletes expired, reconcile adopts live
+  ones, item POST is idempotent (duplicate overwrites the comment).
+- **Dedupe cache** keyed by the /64 network address (rotation collapses to
+  the same key).
+- **Graceful degradation**: without permissions (`Account Filter Lists:
+  Edit`, `Zone Rulesets: Edit`) or on plan limits → soft-disable list mode
+  with a warning, IPv6 falls back to exact access rules, reaper retries
+  provisioning each cycle. List failures **do not** count against the main
+  circuit breaker.
+- **Plans**: IP Lists available on all (Free includes 1 list/10k items;
+  Pro/Business 10 lists) — cf. Cloudflare WAF Lists docs.
 
-Fluxo no `apply()`:
+Flow inside `apply()`:
 
 ```mermaid
 flowchart LR
-    V[Verdict Block/RateLimit + IPv6] --> P{ipv6_prefix configurado?}
-    P -->|não| AR[Access rule /128]
-    P -->|sim| L[Lista disponível?]
-    L -->|sim| IL["POST item /64 (comment sentry:ts:ttl)"]
-    L -->|não| AR
+    V[Verdict Block/RateLimit + IPv6] --> P{ipv6_prefix configured?}
+    P -->|no| AR[Access rule /128]
+    P -->|yes| L[List available?]
+    L -->|yes| IL["POST /64 item (comment sentry:ts:ttl)"]
+    L -->|no| AR
     V2[Verdict Challenge / IPv4] --> AR
 ```
 
-### 8.3 Modos de deployment (F3.9)
+### 8.3 Deployment modes (F3.9)
 
-`[deployment] mode` escolhe onde o Sentry senta em relação à aplicação:
+`[deployment] mode` chooses where Sentry sits relative to the application:
 
 ```text
-passive (default)   client → nginx → app        Sentry lê access.log / syslog /
-                                                pcap e age ex-post (webhook, CF API,
-                                                blocklist). Zero risco de path.
+passive (default)   client → nginx → app        Sentry reads access.log / syslog /
+                                                pcap and acts ex-post (webhook, CF API,
+                                                blocklist). Zero path risk.
 
 inline              client → sentry-edge → nginx → app
-                    Sentry é o front: aplica o verdict ANTES do upstream
+                    Sentry is the front: applies the verdict BEFORE the upstream
                     (Block→403 · RateLimit→429 · Challenge→challenge page ·
-                    Allow→proxy). Alvo de latência de verdict: ≤50 ms.
+                    Allow→proxy). Verdict latency target: ≤50 ms.
 ```
 
-- **`edge-http` (F3.9a, crate `sentry-edge`)**: reverse proxy inline. O
-  startup exige **opt-in explícito** (`mode = "inline"`) **+ health check do
-  backend** — edge sobre backend morto vira outage. Eventos decididos
-  retornam ao daemon pelo mesmo fan-in (`Incoming::Processed`): persistência,
-  actions e forks disparam uma única vez; o `Arc<Pipeline>` é compartilhado,
-  então rate-limiter/scan/behavior/offender **não** contam em dobro.
-- **Feedback da fase de resposta (F3.9.1)**: o pipeline roda na fase de
-  request, antes de existir resposta — `HttpData.status` nasce `None` na
-  edge. Detectores que dependem de status (ScanTracker, detectores
-  401/403/404 do BehaviorTracker, `RuleMatch::Status`) seriam cegos para
-  todo tráfego `[http_proxy]`. O proxy então publica o evento **depois** da
-  resposta, com o status real (upstream, ou 403/429/301 da própria edge), e
-  chama `Pipeline::observe_response(ip, path, status, ua)`, que alimenta os
-  trackers com o status (a chamada de request-phase com `None` é no-op, então
-  cada request conta exatamente uma vez) e enfileira os sinais gerados numa
-  fila por-IP (TTL 60s, cap 16) — drenada no **próximo** request do mesmo
-  IP, passando por repetição, correlação, policy e escalada. Uma rajada de
-  paths 404 distintos passa a ser desafiada a partir do ~9º request e chega
-  a Block (BlockTable) pela escalada. Limitação: `RuleMatch::Status` é
-  avaliado na fase de request e segue sem casar para tráfego inline (o
-  ScanTracker cobre o mesmo gap behavioralmente); o middleware embutido
-  (`sentry_middleware`) ainda publica na fase de request — mesmo tratamento
-  é follow-up.
-- **`sentry_middleware` (F3.1)**: o mesmo runtime exposto como middleware
-  axum (`from_fn_with_state(rt, sentry_edge::middleware::handler)`) em modos
-  `Inline` (bloqueia antes do handler) ou `Shadow` (anexa a decisão e
-  segue) — para apps Rust que embutem o Sentry sem proxy hop.
-- **`edge-tcp` (F3.9b)**: listener TCP inline para serviços não-HTTP —
-  verdict no connect (Block/Quarantine fecha a conexão), depois pipe
-  bidirecional para o backend real. Fingerprint SYN não existe em
-  userspace-accept; o pipeline roda com evento `Tcp(Syn)` sintético.
-- **`passive-log` (F3.9d)**: tail de access.log (F1, já entregue).
-- **`passive-mirror`/`passive-tap` (F3.9e/f)**: SPAN/`iptables TEE`/sniffer
-  promíscuo via `sentry-source-tcp` em capture mode (feature `pcap`).
-- **`edge-sidecar` (F3.9c)**: mesmo binário em container sidecar/DaemonSet
+- **`edge-http` (F3.9a, crate `sentry-edge`)**: inline reverse proxy.
+  Startup requires **explicit opt-in** (`mode = "inline"`) **+ backend
+  health check** — an edge in front of a dead backend becomes an outage.
+  Decided events return to the daemon through the same fan-in
+  (`Incoming::Processed`): persistence, actions and AI forks fire exactly
+  once; the `Arc<Pipeline>` is shared, so rate-limiter/scan/behavior/
+  offender **do not** double-count.
+- **Response-phase feedback (F3.9.1)**: the pipeline runs at the request
+  phase, before a response exists — `HttpData.status` is born `None` at
+  the edge. Detectors that depend on status (ScanTracker, the
+  BehaviorTracker 401/403/404 detectors, `RuleMatch::Status`) would be
+  blind for all `[http_proxy]` traffic. The proxy therefore publishes the
+  event **after** the response, with the real status (upstream, or
+  403/429/301 from the edge itself), and calls
+  `Pipeline::observe_response(ip, path, status, ua)`, which feeds the
+  trackers with the status (the request-phase call with `None` is a
+  no-op, so each request counts exactly once) and enqueues the generated
+  signals into a per-IP queue (TTL 60s, cap 16) — drained on the
+  **next** request from the same IP, passing through repetition,
+  correlation, policy and escalation. A burst of distinct 404 paths now
+  gets challenged from around the 9th request and reaches Block
+  (BlockTable) via escalation. Limitation: `RuleMatch::Status` is
+  evaluated at the request phase and still doesn't match for inline
+  traffic (ScanTracker covers the same gap behaviorally); the built-in
+  middleware (`sentry_middleware`) still publishes at the request phase —
+  same treatment is a follow-up.
+- **`sentry_middleware` (F3.1)**: the same runtime exposed as axum
+  middleware (`from_fn_with_state(rt, sentry_edge::middleware::handler)`)
+  in `Inline` mode (blocks before the handler) or `Shadow` mode (attaches
+  the decision and continues) — for Rust apps embedding Sentry without a
+  proxy hop.
+- **`edge-tcp` (F3.9b)**: inline TCP listener for non-HTTP services —
+  verdict at connect (Block/Quarantine closes the connection), then
+  bidirectional pipe to the real backend. SYN fingerprinting doesn't
+  exist in userspace-accept; the pipeline runs with a synthetic
+  `Tcp(Syn)` event.
+- **`passive-log` (F3.9d)**: access.log tail (F1, already shipped).
+- **`passive-mirror`/`passive-tap` (F3.9e/f)**: SPAN/`iptables TEE`/
+  promiscuous sniffer via `sentry-source-tcp` in capture mode (feature
+  `pcap`).
+- **`edge-sidecar` (F3.9c)**: same binary in a sidecar/DaemonSet container
   (`deploy/k8s/edge-sidecar.yaml`).
-- **Páginas de verdict (`sentry-edge/src/pages.rs`)**: os bloqueios e
-  fallbacks de challenge servem uma página HTML única (tema dark do PoW,
-  logo do Sentry embutido como data URI, copy estilo Cloudflare —
-  "403 - Forbidden" / "You are unable to access this website." — e um
-  **Trace ID** rastreável: nas decisões do pipeline é o `event.id`
-  persistido; no fast-path (BlockTable, sem evento) um UUID novo é gerado,
-  exibido na página, logado em `tracing::info!` e devolvido no header
-  `x-sentry-trace-id`). Status codes CF-like: Block/Quarantine,
-  fast-path, challenge falhado e challenge sem PoW → **403**;
-  RateLimit → **429** (`retry-after: 60`); o interstitial PoW também é
-  **403** (CF serve o managed challenge assim; `cache-control: no-store`
-  evita caches), não mais 503.
-- **`challenge_backend` (`[edge]`)**: quem executa o `Challenge` verdict —
-  `sentry` (default) roda o PoW local (F7.8); `cloudflare` delega ao
-  provider CF: o verdict vira regra no Cloudflare via API
-  (`[[action]]` com `provider = "cloudflare"`) e a edge só segura a
-  requisição atual com 403 + `retry-after` até a regra assumir no hop
-  seguinte. As páginas continuam sendo do Sentry — nada do Cloudflare é
-  imitado. Warning no startup se `cloudflare` sem action CF configurada.
-- **Regra de cadeia**: `client → sentry-edge → nginx → app` — o Sentry é a
-  camada de decisão de ameaça; rate-limit/WAF de app do nginx continuam
-  sendo do nginx (complementares, não substitutos).
-- **Critério de escolha**: inline quando o serviço não pode tolerar o
-  ataque chegar na app (RCE/0-day); passive quando a infra não pode mudar
-  de path/SSL ou o objetivo é observabilidade. Default = passive.
+- **Verdict pages (`sentry-edge/src/pages.rs`)**: blocks and challenge
+  fallbacks serve a single HTML page (PoW dark theme, embedded Sentry
+  logo as data URI, Cloudflare-style copy — "403 - Forbidden" / "You are
+  unable to access this website." — plus a **Trace ID** that can be
+  traced: for pipeline decisions it is the persisted `event.id`; on the
+  fast path (BlockTable, no event) a fresh UUID is generated, shown on
+  the page, logged via `tracing::info!` and returned in the
+  `x-sentry-trace-id` header). CF-like status codes: Block/Quarantine,
+  fast-path, failed challenge and challenge without PoW → **403**;
+  RateLimit → **429** (`retry-after: 60`); the PoW interstitial is also
+  **403** (CF serves the managed challenge that way; `cache-control:
+  no-store` prevents caching), no longer 503.
+- **`challenge_backend` (`[edge]`)**: who executes the `Challenge`
+  verdict — `sentry` (default) runs the local PoW (F7.8); `cloudflare`
+  delegates to the CF provider: the verdict becomes a Cloudflare rule via
+  API (`[[action]]` with `provider = "cloudflare"`) and the edge merely
+  holds the current request with 403 + `retry-after` until the rule takes
+  over at the next hop. The pages remain Sentry's — nothing from
+  Cloudflare is imitated. Startup warning if `cloudflare` without a CF
+  action configured.
+- **Chain rule**: `client → sentry-edge → nginx → app` — Sentry is the
+  threat-decision layer; nginx's app-level rate-limit/WAF remain nginx's
+  (complementary, not substitutes).
+- **Choice criterion**: inline when the service cannot tolerate the attack
+  reaching the app (RCE/0-day); passive when the infrastructure cannot
+  change path/SSL or the goal is observability. Default = passive.
 
 ### 8.4 Multi-node / HA (F4.7)
 
-N daemons (ou N pods do mesmo Deployment) compartilham o mesmo Postgres e
-operam como um cluster ativo-ativo:
+N daemons (or N pods of the same Deployment) share the same Postgres and
+operate as an active-active cluster:
 
-- **Dedupe cross-node**: o LRU de dedupe é por-processo — não enxerga
-  eventos processados por outro nó. Cada insert carrega `payload_hash`
-  (mesma chave do dedupe local: IP+método+path para HTTP, IP+hash do raw
-  para os demais). O `INSERT` é condicional: se um nó irmão persistiu o
-  mesmo hash na janela de 10s (igual ao TTL do LRU), o insert é pulado.
-  `events_payload_hash_ts` (índice parcial) mantém o `NOT EXISTS` barato.
-- **Identidade**: `[deployment] instance_id` (default = hostname) vira
-  label do gauge `sentry_instance_info{instance}` para diferenciação em
-  dashboards/alertas.
-- **Estado compartilhado (Postgres/Redis)**: incidentes, offender strikes,
-  rotas aprendidas e rulesets vivem no banco comum — todos os nós enxergam
-  os mesmos incidentes e hot-reload (LISTEN/NOTIFY) é propagado a todos.
-- **Rate-limit**: `backend = "redis"` compartilha a janela entre nós; o
-  backend in-memory é por-node (limite efetivo ≈ N× o configurado).
-- **Limitação documentada**: trackers de scan (`[scan]`) e behavior
-  (`[behavior]`) são por-node — um scanner distribuído entre os nós pode
-  demorar mais para cruzar o limiar em cada nó individual.
-- **Tasks de background idempotentes**: reaper de regras CF (reconcile por
-  `note` com timestamp), learner de rotas (merge determinístico) e refresh
-  de feeds (replace atômico) podem rodar simultaneamente sem corrupção;
-  duplicação transitória de trabalho é aceitável.
-- **Edge/HA**: múltiplos `sentry-edge` atrás de um LB — o verdict é
-  stateless por request (rate-limit compartilhado via Redis; **bloqueios**
-  compartilhados via `ip_state` + NOTIFY `sentry_blocks_changed`, §8.6); o
-  `[server]` HTTP deve ficar atrás do LB também (F4.4 auth por token é
-  stateless; sessões HMAC são válidas em qualquer nó que compartilhe
-  `SENTRY_SESSION_SECRET`).
+- **Cross-node dedupe**: the dedupe LRU is per-process — it cannot see
+  events processed by another node. Each insert carries `payload_hash`
+  (same key as local dedupe: IP+method+path for HTTP, IP+raw hash for the
+  rest). The `INSERT` is conditional: if a sibling node persisted the
+  same hash within the 10s window (same as the LRU TTL), the insert is
+  skipped. `events_payload_hash_ts` (partial index) keeps the `NOT
+  EXISTS` cheap.
+- **Identity**: `[deployment] instance_id` (default = hostname) becomes
+  the label of the `sentry_instance_info{instance}` gauge for
+  differentiation in dashboards/alerts.
+- **Shared state (Postgres/Redis)**: incidents, offender strikes,
+  learned routes and rulesets live in the common database — all nodes see
+  the same incidents and hot-reload (LISTEN/NOTIFY) propagates to all.
+- **Rate-limit**: `backend = "redis"` shares the window across nodes; the
+  in-memory backend is per-node (effective limit ≈ N× configured).
+- **Documented limitation**: scan (`[scan]`) and behavior (`[behavior]`)
+  trackers are per-node — a scanner distributed across nodes may take
+  longer to cross the threshold on each individual node.
+- **Idempotent background tasks**: the CF rule reaper (reconcile by
+  `note` with timestamp), the route learner (deterministic merge) and
+  feed refresh (atomic replace) can run concurrently without corruption;
+  transient duplicated work is acceptable.
+- **Edge/HA**: multiple `sentry-edge` behind an LB — the verdict is
+  stateless per request (rate-limit shared via Redis; **blocks** shared
+  via `ip_state` + NOTIFY `sentry_blocks_changed`, §8.6); the `[server]`
+  HTTP must also sit behind the LB (F4.4 token auth is stateless; HMAC
+  sessions are valid on any node sharing `SENTRY_SESSION_SECRET`).
 
-### 8.5 Correlação scan→ataque cross-IP (F3.10)
+### 8.5 Scan→attack cross-IP correlation (F3.10)
 
-Honeypots observam o padrão "shot calling": um host varre a internet de um IP
-"limpo" e, minutos depois, exploits/brute-force chegam de um **outro** IP do
-mesmo /24, /64 ou ASN — o scanner acha os alvos, o operador (ou um consumidor
-dos dados de scan publicados) bate. Referência: Ken Webster, *There Is No Such
-Thing as a Benign Internet Scanner*.
+Honeypots observe the "shot calling" pattern: a host scans the internet
+from a "clean" IP and, minutes later, exploits/brute-force arrive from
+**another** IP on the same /24, /64 or ASN — the scanner finds the
+targets, the operator (or a consumer of the published scan data) strikes.
+Reference: Ken Webster, *There Is No Such Thing as a Benign Internet
+Scanner*.
 
 - **Tracker** (`crates/sentry-core/src/correlation.rs`):
-  `CorrelationTracker` mantém janelas deslizantes de scans recentes com duas
-  chaves — prefixo de rede (/24 para IPv4, /64 para IPv6) e ASN (`evt.asn`,
-  GeoLite2-ASN; sem MMDB só prefixo correlaciona). História limitada
-  (64 scans/chave, drop-oldest) e `prune()` a cada 60s no daemon, como os
-  demais trackers. Estado em memória, por-node.
-- **Fluxo no pipeline**: em todo evento que passa da fase de regras, sinais
-  de scan (`RandomScan`, `ScanBehavior`, `TcpScanner`) registram o scanner
-  (`record_scan`); se algum sinal de **ataque** dispara (SQLi, XSS,
+  `CorrelationTracker` keeps sliding windows of recent scans under two
+  keys — network prefix (/24 for IPv4, /64 for IPv6) and ASN (`evt.asn`,
+  GeoLite2-ASN; without MMDB only prefix correlates). Limited history
+  (64 scans/key, drop-oldest) and `prune()` every 60s in the daemon,
+  like the other trackers. In-memory state, per-node.
+- **Pipeline flow**: on every event that passes the rules phase, scan
+  signals (`RandomScan`, `ScanBehavior`, `TcpScanner`) register the
+  scanner (`record_scan`); if any **attack** signal fires (SQLi, XSS,
   traversal, LFI, Log4Shell, RCE, SensitivePath, AuthBruteForce,
   SuspiciousLoginSuccess, CredentialStuffing, DirectoryBruteForce,
-  AnomalousPayload, LlmMalicious), `correlate` procura um scan de IP
-  **diferente** no mesmo prefixo (preferido) ou ASN dentro de `window_secs`.
-  Hit → `ScanAttackCorrelation` (peso 20, override
-  `[scorer.weights] scan_attack_correlation`) com detail
+  AnomalousPayload, LlmMalicious), `correlate` looks for a scan from a
+  **different** IP on the same prefix (preferred) or ASN within
+  `window_secs`. Hit → `ScanAttackCorrelation` (weight 20, override
+  `[scorer.weights] scan_attack_correlation`) with detail
   `tcp-syn from 198.51.100.7 (same /24) 42s ago`.
-- **Cross-source**: SYNs capturados pelo source `tcp` (F3.2) entram pela
-  heurística `TcpScanner` e alimentam a mesma janela — um masscan que nunca
-  gera log HTTP ainda correlaciona com o exploit HTTP vizinho que vem
-  depois. Como o tracker recebe o `&Event` inteiro (não só o tuple HTTP),
-  eventos não-HTTP participam.
+- **Cross-source**: SYNs captured by the `tcp` source (F3.2) enter via
+  the `TcpScanner` heuristic and feed the same window — a masscan that
+  never generates an HTTP log still correlates with the neighboring HTTP
+  exploit that comes after. Because the tracker receives the whole
+  `&Event` (not just the HTTP tuple), non-HTTP events participate.
 - **Config**: `[correlation] enabled = true, window_secs = 900`.
-  Métrica: `sentry_correlation_hits_total`.
-- **Taxonomia de scanners** (tiers de reputação, F3.10): `ReputationTier`
-  ganha `Authorized` (scanner contratado — sem sinal; confie via regra DSL
-  `reputation = "authorized"` → Allow) e `Promiscuous` (publica recon para
-  qualquer um — sinal `PromiscuousScanner` peso 10; a data alimenta
-  atacantes). Tiers parseam no DSL, em `[[rules.feeds]] tier = "…"` e em
-  `sentry feeds check`.
-- **Limitações**: estado em memória por-node (mesma limitação dos trackers
-  `[scan]`/`[behavior]`, §8.4); eventos que short-circuitam em regras não
-  passam pelos trackers (um scan bloqueado por regra não registra memória de
-  correlação); correlação é **agravador** — nunca gera verdict sozinho, só
-  soma peso ao ataque que a disparou.
+  Metric: `sentry_correlation_hits_total`.
+- **Scanner taxonomy** (reputation tiers, F3.10): `ReputationTier` gains
+  `Authorized` (contracted scanner — no signal; trust it via the DSL rule
+  `reputation = "authorized"` → Allow) and `Promiscuous` (publishes recon
+  to anyone — `PromiscuousScanner` signal weight 10; the data feeds
+  attackers). Tiers parse in the DSL, in `[[rules.feeds]] tier = "…"` and
+  in `sentry feeds check`.
+- **Limitations**: in-memory per-node state (same limitation as the
+  `[scan]`/`[behavior]` trackers, §8.4); events short-circuited by rules
+  never reach the trackers (a scan blocked by a rule leaves no
+  correlation memory); correlation is an **aggravator** — it never
+  produces a verdict on its own, only adds weight to the attack that
+  triggered it.
 
-### 8.6 Bloqueios persistentes (BlockTable) — enforcement real no inline
+### 8.6 Persistent blocks (BlockTable) — real enforcement inline
 
-Antes do BlockTable, um bloqueio não "grudava": a blocklist action era
-escreva-só (estado inalcançável no registry), o dashboard/CLI gravavam só no
-`ip_state` e nada recarregava — um IP bloqueado voltava a ser proxyado pela
-edge no request seguinte se o pipeline sozinho não re-derivasse Block.
+Before the BlockTable, a block didn't "stick": the blocklist action was
+write-only (state unreachable from the registry), dashboard/CLI wrote only
+to `ip_state` and nothing reloaded — a blocked IP went back to being
+proxied by the edge on the next request if the pipeline alone didn't
+re-derive Block.
 
 - **`BlockTable`** (`crates/sentry-core/src/blocks.rs`):
-  `HashMap<IpAddr, Option<Instant>>` compartilhado (`Arc`) — `None` =
-  permanente (bloqueio de dashboard/CLI sem TTL), `Some(exp)` = TTL.
-  Writers: blocklist action (verdict Block), pre-warm do DB e hot-reload
-  NOTIFY; readers: o fast-path da edge e o guard do mirror.
-- **Fast-path na edge** (`sentry_middleware`, `edge-http`, `edge-tcp`): o IP
-  do cliente resolvido (§8.1) é checado **antes** do pipeline — bloqueado →
-  403 / `shutdown()` imediatos, sem rodar pipeline nem gerar evento (o
-  incidente já existe de quando o bloco foi decidido; evita spam de webhook
-  por request). Contadores: `sentry_edge_block_hits_total` e
-  `sentry_block_table_size`.
-- **Persistência**: vereditos Block do pipeline são espelhados para
-  `ip_state` (`status='blocked'`, `expires_at = now + ttl_secs` da blocklist
-  action, `reason` = label do primeiro sinal) + `NOTIFY
-  sentry_blocks_changed`; o guard `is_blocked` evita regravar o row a cada
-  evento violador. Restart → pre-warm lê `ip_state.blocked(10_000)` com
-  expirados filtrados no Rust.
-- **Sync multi-node**: dashboard/CLI block/unblock e o próprio daemon emitem
-  `NOTIFY sentry_blocks_changed`; cada nó roda um listener que recarrega a
-  tabela do banco (reload atômico) — um bloqueio decidido num nó passa a
-  negar na edge de todos os nós em tempo real.
-- **Cadeia completa**: pipeline Block → tabela + DB + NOTIFY → edge de
-  qualquer nó nega no fast-path; dashboard block → DB + NOTIFY → efeito
-  imediato; `sentry ip unblock` → delete no DB + NOTIFY → tabela recarrega e
-  o IP volta a passar.
+  shared (`Arc`) `HashMap<IpAddr, Option<Instant>>` — `None` =
+  permanent (dashboard/CLI block without TTL), `Some(exp)` = TTL.
+  Writers: blocklist action (Block verdict), DB pre-warm and NOTIFY
+  hot-reload; readers: the edge fast path and the mirror guard.
+- **Edge fast path** (`sentry_middleware`, `edge-http`, `edge-tcp`): the
+  resolved client IP (§8.1) is checked **before** the pipeline — blocked →
+  immediate 403 / `shutdown()`, without running the pipeline or generating
+  an event (the incident already exists from when the block was decided;
+  avoids per-request webhook spam). Counters: `sentry_edge_block_hits_total`
+  and `sentry_block_table_size`.
+- **Persistence**: pipeline Block verdicts are mirrored to
+  `ip_state` (`status='blocked'`, `expires_at = now + ttl_secs` of the
+  blocklist action, `reason` = first signal label) + `NOTIFY
+  sentry_blocks_changed`; the `is_blocked` guard avoids rewriting the row
+  on every violating event. Restart → pre-warm reads `ip_state.blocked(10_000)`
+  with expired rows filtered in Rust.
+- **Multi-node sync**: dashboard/CLI block/unblock and the daemon itself
+  emit `NOTIFY sentry_blocks_changed`; each node runs a listener that
+  reloads the table from the database (atomic reload) — a block decided
+  on one node denies at the edge of all nodes in real time.
+- **Full chain**: pipeline Block → table + DB + NOTIFY → edge of any
+  node denies on the fast path; dashboard block → DB + NOTIFY →
+  immediate effect; `sentry ip unblock` → DB delete + NOTIFY → table
+  reloads and the IP flows again.
 
-### 8.7 IP real com trusted proxies, bans de kernel e report comunitário (F7)
+### 8.7 Real IP with trusted proxies, kernel bans and community reporting (F7)
 
-**Trusted proxies + TRUSTED_IPS (F7.2)** — `[real_ip]`: o parser nginx e a
-edge só honram IPs vindos de header (`CF-Connecting-IP` > `True-Client-IP` >
-`X-Real-IP` > XFF) quando o `$remote_addr`/peer é um **trusted proxy** —
-ranges Cloudflare embutidos (constants + refresh diário de
-cloudflare.com/ips-v4|ips-v6, task `spawn_cloudflare_refresh`) +
-`trusted_proxies` de config. Sem remote_addr no log_format vale o
-comportamento legado (quem escreve o log é o edge). Isso fecha o spoof de
-`CF-Connecting-IP` em tráfego direto-to-origin. `trusted_ips` (o conceito
-`TRUSTED_IPS` do nginx-honeypot — "não se trancar fora") nunca é banido,
-bloqueado ou reportado: short-circuit para `Allow` no `Pipeline::process`,
-guard no fast-path da edge (`is_hard_blocked`), guard final no provider de
-firewall, e reputação `Authorized` no enricher. Estado em
-`TrustSet`/`SharedTrustSet` (`crates/sentry-core/src/trust.rs`). Presets
-embutidos (`trusted_lists.rs`: paypal, stripe, googlebot, bingbot — snapshots
-das fontes oficiais dos vendors) entram no mesmo never-ban quando aprovados
-por nome em `[real_ip] trusted_lists = ["paypal", ...]`; catálogo via
+**Trusted proxies + TRUSTED_IPS (F7.2)** — `[real_ip]`: the nginx parser
+and the edge only honor header-borne IPs (`CF-Connecting-IP` >
+`True-Client-IP` > `X-Real-IP` > XFF) when the `$remote_addr`/peer is a
+**trusted proxy** — embedded Cloudflare ranges (constants + daily refresh
+of cloudflare.com/ips-v4|ips-v6, task `spawn_cloudflare_refresh`) +
+`trusted_proxies` from config. Without remote_addr in the log_format the
+legacy behavior applies (whoever writes the log is the edge). This closes
+`CF-Connecting-IP` spoofing for direct-to-origin traffic. `trusted_ips`
+(the nginx-honeypot `TRUSTED_IPS` concept — "don't lock yourself out")
+is never banned, blocked or reported: short-circuit to `Allow` in
+`Pipeline::process`, guard on the edge fast path (`is_hard_blocked`),
+final guard in the firewall provider, and `Authorized` reputation in the
+enricher. State in `TrustSet`/`SharedTrustSet`
+(`crates/sentry-core/src/trust.rs`). Embedded presets (`trusted_lists.rs`:
+paypal, stripe, googlebot, bingbot — snapshots of the vendors' official
+sources) enter the same never-ban when approved by name in
+`[real_ip] trusted_lists = ["paypal", ...]`; catalog via
 `sentry trusted list`.
 
-**Bans de kernel (F7.3)** — crate `sentry-action-firewall`, provider
-`type = "challenge"`, `provider = "firewall"`: herda o filtro
-Block/Challenge/RateLimit do `ChallengeAction`. Backends com auto-detect
-(cacheado): **nftables** (recomendado — table `sentry` + sets
-`sentry_blocks_v4/_v6` com `flags timeout` + chain input `priority -1` drop;
-ban = 1 mensagem netlink com timeout por elemento, sem reaper),
-**ipset** legacy (`hash:ip timeout` + `iptables -m set`, regra inserida só
-após `-C`) e **firewalld** (ipsets runtime; sem timeout por entrada — a
-expiração fica no reconcile). O DB (`ip_state`) é a fonte da verdade:
-sync no startup (re-seed pós-restart) + reconcile a cada 60s (cobre unblock
-manual multi-node e expiração). Requer root ou `CAP_NET_ADMIN`; probe e
-tamanho dos sets em `sentry firewall status`. Linux-only (fora dele o
-provider é pulado com warning, padrão do braço cloudflare sem token).
+**Kernel bans (F7.3)** — crate `sentry-action-firewall`, provider
+`type = "challenge"`, `provider = "firewall"`: inherits the
+Block/Challenge/RateLimit filter from `ChallengeAction`. Backends with
+auto-detect (cached): **nftables** (recommended — table `sentry` + sets
+`sentry_blocks_v4/_v6` with `flags timeout` + chain input `priority -1` drop;
+ban = 1 netlink message with per-element timeout, no reaper),
+legacy **ipset** (`hash:ip timeout` + `iptables -m set`, rule inserted only
+after `-C`) and **firewalld** (runtime ipsets; no per-entry timeout —
+expiration lives in the reconcile). The DB (`ip_state`) is the source of
+truth: sync at startup (re-seed after restart) + reconcile every 60s
+(covers manual multi-node unblock and expiration). Requires root or
+`CAP_NET_ADMIN`; probe and set sizes in `sentry firewall status`.
+Linux-only (elsewhere the provider is skipped with a warning, like the
+cloudflare arm without a token).
 
-**Report comunitário (F7.4)** — crate `sentry-action-report`, action
-`type = "report"`, `provider = "abuseipdb" | "reportedip"`: mapeia os
-`SignalKind` para as categorias de cada API (SQLi→16, scans→14/61,
-brute force→18, bad bot→19, …; fallback Hacking), dedupe por IP com TTL
-(1 report/IP/janela — quotas diárias), backoff em 429 e circuit breaker de
-5 falhas (soft-disable até restart). Chaves por env (`SENTRY_ABUSEIPDB_KEY`,
-`SENTRY_REPORTEDIP_KEY`); feeds autenticadas via `headers_env`
-(header → env var) — ex.: blacklist do AbuseIPDB como `[[rules.feeds]]`.
+**Community reporting (F7.4)** — crate `sentry-action-report`, action
+`type = "report"`, `provider = "abuseipdb" | "reportedip"`: maps
+`SignalKind` to each API's categories (SQLi→16, scans→14/61,
+brute force→18, bad bot→19, …; Hacking fallback), per-IP dedupe with TTL
+(1 report/IP/window — daily quotas), backoff on 429 and a 5-failure
+circuit breaker (soft-disable until restart). Keys via env
+(`SENTRY_ABUSEIPDB_KEY`, `SENTRY_REPORTEDIP_KEY`); authenticated feeds
+via `headers_env` (header → env var) — e.g.: AbuseIPDB blacklist as a
+`[[rules.feeds]]`.
 
-**Lookup externo da banda cinza (F7.5)** — `[ip_lookup]` +
-`sentry_ai::IpLookupProvider` (AbuseIPDB `/check`): fork assíncrono
-(espelha `AiFork`/`LlmFork`, roda **depois** deles) que consulta IPs com
-score local ≥ `trigger_above` (ou portando um sinal de `on_signals`) mas
-verdict ≠ Block; o `abuseConfidenceScore` vira o sinal
-`ExternalReputation` com peso escalado (25% ≈ +10 … 100% ≈ +40) re-entrando
-por `rescore_from` (só eleva). Cache LRU por IP com TTL + quota
-`max_per_hour` (rolling hour). IPs confiáveis nunca são consultados.
+**Gray-zone external lookup (F7.5)** — `[ip_lookup]` +
+`sentry_ai::IpLookupProvider` (AbuseIPDB `/check`): async AI fork
+(mirrors `AiFork`/`LlmFork`, runs **after** them) that queries IPs with
+local score ≥ `trigger_above` (or carrying a signal from `on_signals`)
+but verdict ≠ Block; the `abuseConfidenceScore` becomes the
+`ExternalReputation` signal with scaled weight (25% ≈ +10 … 100% ≈ +40)
+re-entering via `rescore_from` (only raises). Per-IP LRU cache with TTL +
+`max_per_hour` quota (rolling hour). Trusted IPs are never queried.
 
-**Datasets e listas compartilhadas (F7.1/F7.6)** —
-`crates/sentry-core/src/lists.rs` é a fonte única dos padrões de path
-sensível (pack `sensitive_paths` + heurística `SensitivePath` + literais do
-prefilter Aho-Corasick derivam da mesma tabela — impossível dessincronizar);
-inclui os probes de CVE do honey.conf (Laravel `_ignition`, PHPUnit
-`eval-stdin`, Exchange Autodiscover/ECP, MobileIron, Telerik, GPON,
-Fortinet, D-Link). Pack `honeypot_paths` (shadow default) para os padrões
-largos demais para enforce (`.aspx`, `cgi-bin`, `node_modules`, dotfiles).
-Pack `host_allowlist` (off; `params.domains`) bloqueia Host header fora da
-allowlist (inclusive requests sem Host — scan por IP direto); o parser
-nginx agora popula `HttpData.host`. Datasets: `[[rules.feeds]]` com
-`kind = "user_agent" | "path"` compila listas uma-por-linha em uma regra
-sintética de alternation literal (o crate regex acelera com Aho-Corasick
-internamente); `action` default `log`. Params de packs são achatados para
-`<pack>__<param>` no daemon (corrigindo o acesso de `country_blocklist` aos
-próprios countries). Roadmap F7.7: datasets DB-backed com import CLI e
-prefilter dinâmico (§23.3).
+**Datasets and shared lists (F7.1/F7.6)** —
+`crates/sentry-core/src/lists.rs` is the single source of truth for
+sensitive-path patterns (pack `sensitive_paths` + `SensitivePath`
+heuristic + Aho-Corasick prefilter literals all derive from the same
+table — impossible to desync); includes the honey.conf CVE probes
+(Laravel `_ignition`, PHPUnit `eval-stdin`, Exchange
+Autodiscover/ECP, MobileIron, Telerik, GPON, Fortinet, D-Link). Pack
+`honeypot_paths` (shadow default) for patterns too broad to enforce
+(`.aspx`, `cgi-bin`, `node_modules`, dotfiles). Pack `host_allowlist`
+(off; `params.domains`) blocks Host headers outside the allowlist
+(including requests with no Host — direct IP scanning); the nginx
+parser now populates `HttpData.host`. Datasets: `[[rules.feeds]]` with
+`kind = "user_agent" | "path"` compiles one-per-line lists into a
+synthetic literal-alternation rule (the regex crate speeds it up with
+Aho-Corasick internally); `action` default `log`. Pack params are
+flattened to `<pack>__<param>` in the daemon (fixing `country_blocklist`'s
+access to its own countries). Roadmap F7.7: DB-backed datasets with CLI
+import and dynamic prefilter (BACKLOG.md §5.3).
 
-**Verificação de bots via rDNS (F7.10)** — `[bot_verification]`
-(opt-in, `enabled = false`): UAs que alegam ser crawler verificado
-(Googlebot, bingbot, Slurp, Baiduspider, YandexBot) passam pelo método
-oficial dos engines — o PTR do IP tem de terminar nos domínios do engine
+**Bot verification via rDNS (F7.10)** — `[bot_verification]`
+(opt-in, `enabled = false`): UAs claiming to be verified crawlers
+(Googlebot, bingbot, Slurp, Baiduspider, YandexBot) go through the
+engines' official method — the IP's PTR must end in the engine's domains
 (`googlebot.com`/`google.com`, `search.msn.com`, `yahoo.com`,
-`crawl.baidu.com`, `yandex.com|net|ru`) **e** a resolução direta do
-hostname tem de conter o IP de origem (mata spoof de PTR). DNS entra
-injetado via trait `BotDnsResolver` (`crates/sentry-cli/src/botdns.rs`
-com hickory-resolver; mock nos testes) e roda **fora do hot path**: o
-pipeline só lê o cache `BotVerifier` (`crates/sentry-core/src/
-botverify.rs`; TTL 1h verificado / 10 min falha; miss marca `Unknown` no
-evento e enfileira `(ip, engine)` para o worker em background — pendente
-não concede bypass nem sinal). Claim verificado → bypass do JS challenge
-na edge; claim falsificado → sinal `SpoofedBot` (peso 35, override em
-`[scorer.weights] spoofed_bot`; no LevelMap default vira Challenge);
-outage de DNS → `Unknown` (nunca marca bot verdadeiro como spoof — erro
-é distinto de resposta vazia via `DnsOutcome`). Com a verificação ligada,
-o pack `crawlers_good` divide-se em `crawlers_good_verified`
-(exige a condição DSL `bot_verified = "true"` — allowlist verified-only;
-a condição também aceita `false`/`spoofed` e engine: `bot_verified =
-google`) e `crawlers_good_unverified_ok` (UAs sem verificação possível
-mantêm o allow por UA). Diagnóstico: `sentry bots check <ip> --ua
-"Googlebot/2.1"`. Métrica `sentry_bot_verifications_total{result=
+`crawl.baidu.com`, `yandex.com|net|ru`) **and** the forward resolution of
+the hostname must contain the source IP (kills PTR spoofing). DNS enters
+injected via the `BotDnsResolver` trait (`crates/sentry-cli/src/botdns.rs`
+with hickory-resolver; mock in tests) and runs **outside the hot path**:
+the pipeline only reads the `BotVerifier` cache (`crates/sentry-core/src/
+botverify.rs`; TTL 1h verified / 10 min failure; miss marks `Unknown` on
+the event and enqueues `(ip, engine)` for the background worker — pending
+grants neither bypass nor signal). Verified claim → JS challenge bypass
+at the edge; spoofed claim → `SpoofedBot` signal (weight 35, override in
+`[scorer.weights] spoofed_bot`; in the default LevelMap it becomes
+Challenge); DNS outage → `Unknown` (never marks a genuine bot as spoofed —
+an error is distinct from an empty answer via `DnsOutcome`). With
+verification on, the `crawlers_good` pack splits into
+`crawlers_good_verified` (requires the DSL condition
+`bot_verified = "true"` — verified-only allowlist; the condition also
+accepts `false`/`spoofed` and engine: `bot_verified = google`) and
+`crawlers_good_unverified_ok` (UAs without possible verification keep
+the UA allow). Diagnostic: `sentry bots check <ip> --ua
+"Googlebot/2.1"`. Metric `sentry_bot_verifications_total{result=
 verified|spoofed|error}`.
 
-**JS challenge nativo na edge + provider nginx (F7.11)** — duas
-topologias para o verdict `Challenge` (`EdgeMode::JsChallenge` já
-existia no vocabulário; agora tem execução):
-(1) **Edge inline** (`[edge.challenge]`, opt-in; ativa em
-`[deployment] mode = "inline"`): interstitial proof-of-work SHA-256 sem
-estado, no estilo do módulo nginx js_challenge —
-`challenge_id = SHA-256(secret || ip || bucket)`; o browser procura um
-nonce com `SHA-256(challenge_id || ":" || nonce)` com `difficulty` bits
-zero à esquerda (default 16, clamp 8..=28; WebCrypto, resolve em <1 s),
-seta o cookie `sentry_ch=<bucket>:<nonce>` e dá reload. A edge valida
-recomputando o PoW — stateless, multi-node com o mesmo
-`secret_env` (`SENTRY_EDGE_CHALLENGE_SECRET`, obrigatório quando
-`enabled`, mínimo 16 bytes); bucket default 3600 s com graça do bucket
-anterior; resposta 403 + `retry-after: 3` + `cache-control: no-store`
-(status Cloudflare; era 503 até F8.1),
-`Secure` no cookie quando há HTTPS (`X-Forwarded-Proto`). Clientes sem
-JS (curl, bots burros) ficam presos no interstitial (403); bots
-verificados (F7.10)
-passam direto (`ChallengeGate::Pass`, métrica `bot_bypass`);
-`Block`/`RateLimit` continuam 403/429 — PoW nunca destrava block hard.
-Página embutida (`CHALLENGE_HTML`), tema escuro, zero CDN. Middleware e
-reverse proxy compartilham `EdgeRuntime::challenge_gate`; cookies agora
-populam `HttpData.cookies`. Métrica
+**Native JS challenge at the edge + nginx provider (F7.11)** — two
+topologies for the `Challenge` verdict (`EdgeMode::JsChallenge` already
+existed in the vocabulary; now it has execution):
+(1) **Inline edge** (`[edge.challenge]`, opt-in; active in
+`[deployment] mode = "inline"`): stateless SHA-256 proof-of-work
+interstitial, in the style of the nginx js_challenge module —
+`challenge_id = SHA-256(secret || ip || bucket)`; the browser searches
+for a nonce with `SHA-256(challenge_id || ":" || nonce)` with `difficulty`
+leading zero bits (default 16, clamp 8..=28; WebCrypto, solves in <1 s),
+sets the cookie `sentry_ch=<bucket>:<nonce>` and reloads. The edge
+validates by recomputing the PoW — stateless, multi-node with the same
+`secret_env` (`SENTRY_EDGE_CHALLENGE_SECRET`, required when
+`enabled`, minimum 16 bytes); default bucket 3600 s with grace from the
+previous bucket; response 403 + `retry-after: 3` + `cache-control: no-store`
+(Cloudflare status; was 503 until F8.1),
+`Secure` on the cookie when HTTPS is present (`X-Forwarded-Proto`).
+Clients without JS (curl, dumb bots) stay stuck at the interstitial
+(403); verified bots (F7.10)
+pass straight through (`ChallengeGate::Pass`, metric `bot_bypass`);
+`Block`/`RateLimit` remain 403/429 — PoW never unlocks a hard block.
+Embedded page (`CHALLENGE_HTML`), dark theme, zero CDN. Middleware and
+reverse proxy share `EdgeRuntime::challenge_gate`; cookies now populate
+`HttpData.cookies`. Metric
 `sentry_edge_challenge_total{result=served|passed|bot_bypass|delegated|
-failed}`. Com `[edge] challenge_backend = "cloudflare"` o gate não roda
-PoW local: o verdict vira regra CF via API e a edge responde a página
-de espera 403 (`pages::delegated_challenge_page`); cookie inválido
-continua terminal 403 (`pages::challenge_failed_page`, com Trace ID).
-(2) **Provider nginx** (crate `sentry-action-nginx`,
-`type = "challenge"`, `provider = "nginx"`; entrega o F6.2): gera
-includes com escrita atômica (tmp+rename) em `conf_dir` —
-`sentry-deny.conf` (`deny <ip>;` para Block; `rate_limit_deny` opt-in
-para RateLimit), `sentry-challenge.conf` (geo map
-`$sentry_challenge_ip` para Challenge) e `sentry-challenge-if.conf`
-(snippet de server: `if ($sentry_challenge_ip) { js_challenge on; }` +
-`sentry-bots.conf` opcional com `bot_verifier on;`) — para os módulos
-getpagespeed (`nginx-module-js-challenge`, `nginx-module-bot-verifier`
-+ Redis) no host. Stamps `# sentry:<ts>:<ttl>` (mesma convenção do note
-do Cloudflare), worker com reload com debounce ≥1/s e `nginx -t` antes
-(`validate = true`, reload quebrado é pulado, nunca aplicado), IPv6 por
-CIDR (`ipv6_prefix`, host bits mascarados), deny entries reconciliadas
-com o `ip_state` no startup e a cada 60 s (entries de challenge são
-efêmeras), guard never-ban (`[real_ip] trusted_ips` nunca entra em
-include). Topologias suportadas: passivo + provider nginx
-(co-localizado, honeypot), edge inline nativa (F7.11.1) ou Cloudflare —
-as três compartilham o mesmo verdict/pipeline e o bypass de bot
-verificado.
+failed}`. With `[edge] challenge_backend = "cloudflare"` the gate does
+not run local PoW: the verdict becomes a CF rule via API and the edge
+answers the 403 waiting page (`pages::delegated_challenge_page`); an
+invalid cookie remains terminal 403 (`pages::challenge_failed_page`,
+with Trace ID).
+(2) **Nginx provider** (crate `sentry-action-nginx`,
+`type = "challenge"`, `provider = "nginx"`; delivers F6.2): generates
+includes with atomic writes (tmp+rename) into `conf_dir` —
+`sentry-deny.conf` (`deny <ip>;` for Block; `rate_limit_deny` opt-in
+for RateLimit), `sentry-challenge.conf` (geo map
+`$sentry_challenge_ip` for Challenge) and `sentry-challenge-if.conf`
+(server snippet: `if ($sentry_challenge_ip) { js_challenge on; }` +
+optional `sentry-bots.conf` with `bot_verifier on;`) — for the
+getpagespeed modules (`nginx-module-js-challenge`,
+`nginx-module-bot-verifier` + Redis) on the host. Stamps
+`# sentry:<ts>:<ttl>` (same convention as the Cloudflare note), worker
+with debounced reload ≥1/s and `nginx -t` before it
+(`validate = true`, a broken reload is skipped, never applied), IPv6 by
+CIDR (`ipv6_prefix`, host bits masked), deny entries reconciled
+against `ip_state` at startup and every 60 s (challenge entries are
+ephemeral), never-ban guard (`[real_ip] trusted_ips` never enters an
+include). Supported topologies: passive + nginx provider
+(co-located, honeypot), native inline edge (F7.11.1) or Cloudflare —
+all three share the same verdict/pipeline and the verified-bot
+bypass.
 
 ---
 
-### 8.8 Edge TLS — monitoramento SSL/443 inline (F8)
+### 8.8 Edge TLS — inline SSL/443 monitoring (F8)
 
-No modo `inline` a edge passa a manter **dois listeners** no mesmo processo
-e pipeline: o HTTP plain (`[edge] listen`, default `0.0.0.0:80`) e o HTTPS
-(`[edge] tls_listen`, default `0.0.0.0:443`), habilitado quando
-`tls_cert`+`tls_key` estão configurados e o binário foi compilado com
-`--features sentry-cli/edge-tls`. Ambos os portos são **monitorados e
-enforçados**: block table nega IP em qualquer um deles; a block table é
-consultada *antes* do handshake TLS (o IP bloqueado só vê a conexão cair,
-sem handshake, sem evento).
+In `inline` mode the edge keeps **two listeners** in the same process
+and pipeline: plain HTTP (`[edge] listen`, default `0.0.0.0:80`) and
+HTTPS (`[edge] tls_listen`, default `0.0.0.0:443`), enabled when
+`tls_cert`+`tls_key` are configured and the binary was built with
+`--features sentry-cli/edge-tls`. Both ports are **monitored and
+enforced**: the block table denies IPs on either of them; the block table
+is consulted *before* the TLS handshake (a blocked IP only sees the
+connection drop — no handshake, no event).
 
-**Terminação + telemetria (F8.1)** — o acceptor TLS (`sentry-edge/src/tls.rs`)
-faz peek do ClientHello *antes* do handshake rustls (os bytes lidos são
-realimentados via `PrefixedStream`, o handshake vê os mesmos octetos),
-extrai SNI/JA3/JA4 e só então roda o handshake (tokio-rustls, provider
-ring, ALPN `http/1.1`, timeout 5s anti-slowloris). Após o handshake os
-requests decryptados entram no **mesmo router** do proxy plain
-(hyper-util auto-builder), com `ConnectInfo<SocketAddr>` e
-`x-forwarded-proto: https` injetados por conexão — o handler de proxy e o
-cookie do challenge ( atributo `Secure`) veem o IP real e o scheme correto.
-Cert/config inválidos sem a feature = erro de startup (nunca mais "caiu
-silenciosamente para HTTP plain"). `tls_redirect_https = true` responde 301
-no listener plain **depois** do pipeline — tráfego na porta 80 continua
-sendo pontuado e bloqueado. `listen = ""` desliga o listener plain
-(HTTPS-only).
+**Termination + telemetry (F8.1)** — the TLS acceptor
+(`sentry-edge/src/tls.rs`) peeks the ClientHello *before* the rustls
+handshake (the bytes read are fed back via `PrefixedStream`, the
+handshake sees the same octets), extracts SNI/JA3/JA4 and only then runs
+the handshake (tokio-rustls, ring provider, ALPN `http/1.1`, 5s
+anti-slowloris timeout). After the handshake, decrypted requests enter
+the **same router** as the plain proxy (hyper-util auto-builder), with
+`ConnectInfo<SocketAddr>` and `x-forwarded-proto: https` injected per
+connection — the proxy handler and the challenge cookie (`Secure`
+attribute) see the real IP and the correct scheme. Invalid cert/config
+without the feature = startup error (no more "silently falling back to
+plain HTTP"). `tls_redirect_https = true` answers 301 on the plain
+listener **after** the pipeline — traffic on port 80 keeps being scored
+and blocked. `listen = ""` turns the plain listener off (HTTPS-only).
 
-**Monitoramento da camada SSL (F8.2)** — cada handshake emitido gera um
-evento `TlsHandshake` (`SourceKind::EdgeTls`) com
-`TlsData { sni, ja3, ja4, cipher, version, alpn }` no mesmo pipeline
-(regras → reputação → scorer → policy; heurísticas HTTP devolvem vazio
-para variante TLS). `ja3` é o MD5 canônico (ordem de wire); `ja4` segue a
-especificação pública FoxIO (versão ofertada mais alta, marcador SNI
-`d/i/n`, contagens de ciphers/extensions — SNI e ALPN excluídos, ALPN
-tag, SHA-256 truncado das listas ordenadas). O parser vive em
-`sentry-edge/src/clienthello.rs` (puro, sem I/O, testado contra ClientHellos
-sintetizados de Chrome/curl/OpenSSL e hellos fragmentados em múltiplos
-records). Condições DSL novas: `tls_ja3 = "…"`, `tls_ja4 = "…"`,
-`tls_sni = "…"`. Com `[edge] tls_allowed_hosts` configurado, handshake com
-SNI ausente/desconhecido ganha o sinal `TlsSniMismatch` (peso 20, via
-`rescore_from` — nunca rebaixa, never-ban respeitado): assinatura de
-scanner sondando a porta 443 por IP (comportamento honeypot). Veredito
-Block/Quarantine pós-handshake derruba a conexão inteira.
+**SSL-layer monitoring (F8.2)** — every emitted handshake generates a
+`TlsHandshake` event (`SourceKind::EdgeTls`) with
+`TlsData { sni, ja3, ja4, cipher, version, alpn }` into the same
+pipeline (rules → reputation → scorer → policy; HTTP heuristics return
+empty for the TLS variant). `ja3` is the canonical MD5 (wire order);
+`ja4` follows the public FoxIO specification (highest offered version,
+SNI marker `d/i/n`, cipher/extension counts — SNI and ALPN excluded,
+ALPN tag, truncated SHA-256 of the sorted lists). The parser lives in
+`sentry-edge/src/clienthello.rs` (pure, no I/O, tested against
+ClientHellos synthesized from Chrome/curl/OpenSSL and hellos fragmented
+across multiple records). New DSL conditions: `tls_ja3 = "…"`,
+`tls_ja4 = "…"`, `tls_sni = "…"`. With `[edge] tls_allowed_hosts`
+configured, a handshake with missing/unknown SNI gets the
+`TlsSniMismatch` signal (weight 20, via `rescore_from` — never lowers,
+never-ban respected): the signature of a scanner probing port 443 by IP
+(honeypot behavior). A Block/Quarantine verdict post-handshake tears
+down the whole connection.
 
-**Observabilidade** — `sentry_edge_tls_handshakes_total{version}`,
-`sentry_edge_tls_handshake_failures_total` (records malformados, hellos
-truncados, handshakes falhos/expirados),
+**Observability** — `sentry_edge_tls_handshakes_total{version}`,
+`sentry_edge_tls_handshake_failures_total` (malformed records, truncated
+hellos, failed/expired handshakes),
 `sentry_edge_tls_sni_mismatch_total`,
-`sentry_edge_tls_cert_not_after` (gauge unix-ts do notAfter do PEM,
-recomputado diariamente, warn < 14 dias). O `/api/events` (eventlog)
-carrega `tls: {sni, ja3, ja4, version, cipher, alpn}` com key-set estável
-(null quando não-TLS) e `host = sni`.
+`sentry_edge_tls_cert_not_after` (unix-ts gauge of the PEM's notAfter,
+recomputed daily, warn < 14 days). The `/api/events` (eventlog) carries
+`tls: {sni, ja3, ja4, version, cipher, alpn}` with a stable key-set
+(null when non-TLS) and `host = sni`.
 
-## 9. Detecção de Rotas Válidas
+## 9. Detection of Valid Routes
 
-1. **Discovery controlado**: o usuário fornece rotas válidas via config (allowlist) **ou** o Sentry aprende em modo `learn` (período de baseline sem ataques).
-2. Estrutura: trie de paths com métodos permitidos + parâmetros esperados.
-3. Sinais derivados:
-   - Rota inexistente → +pontos (scan/directory brute-force).
-   - Muitos 404 do mesmo IP em janela → scan behavior.
-   - Hits em paths sensíveis (`/.env`, `/wp-admin`, `/api/admin`) mesmo inexistentes → peso alto.
-4. Saída: relatório `sentry routes` mostrando rotas conhecidas vs. tentadas.
+1. **Controlled discovery**: the user provides valid routes via config (allowlist) **or** Sentry learns in `learn` mode (baseline period without attacks).
+2. Structure: trie of paths with allowed methods + expected parameters.
+3. Derived signals:
+   - Nonexistent route → +points (scan/directory brute-force).
+   - Many 404s from the same IP in a window → scan behavior.
+   - Hits on sensitive paths (`/.env`, `/wp-admin`, `/api/admin`) even if nonexistent → high weight.
+4. Output: `sentry routes` report showing known vs. attempted routes.
 
 ---
 
 ## 10. Rules Engine — Blacklist/Allowlist (WAF-style)
 
-O Sentry tem um **motor de regras determinístico** que roda **antes** das heurísticas e da IA — é o "fast path". Inspirado nas Custom Rules / WAF da Cloudflare: cada regra é um _match_ + _action_, avaliada em ordem de prioridade, com **short-circuit**. Regras são a primeira linha de defesa (bloqueio instantâneo de VPNs, crawlers, ASNs, países) e também a fonte de **allowlists** (IPs/ASNs confiáveis que bypassam todo o scoring).
+Sentry has a **deterministic rules engine** that runs **before**
+heuristics and AI — it is the "fast path". Inspired by Cloudflare Custom
+Rules / WAF: each rule is a _match_ + _action_, evaluated in priority
+order, with **short-circuit**. Rules are the first line of defense
+(instant blocking of VPNs, crawlers, ASNs, countries) and also the
+source of **allowlists** (trusted IPs/ASNs that bypass all scoring).
 
-### 10.1 Modelo
+### 10.1 Model
 
 ```rust
 // sentry-core/src/rules.rs
 pub struct Rule {
     pub id: RuleId,
     pub name: String,
-    pub priority: i32,              // menor = avalia primeiro
+    pub priority: i32,              // lower = evaluated first
     pub enabled: bool,
-    pub match_: RuleMatch,          // condição (combinável com AND/OR)
+    pub match_: RuleMatch,          // condition (combinable with AND/OR)
     pub action: RuleAction,
-    pub ttl: Option<Duration>,      // regras dinâmicas expiram (ex: block temporário)
+    pub ttl: Option<Duration>,      // dynamic rules expire (e.g. temporary block)
     pub source: RuleSource,         // Config | Db | CloudflareSync | AutoLearned
-    pub tags: Vec<String>,          // ex: "default", "vpn", "crawler"
+    pub tags: Vec<String>,          // e.g. "default", "vpn", "crawler"
 }
 
 pub enum RuleAction {
-    Allow,                          // bypassa scoring + AI (allowlist absoluta)
+    Allow,                          // bypasses scoring + AI (absolute allowlist)
     Block,
     Challenge,                      // Cloudflare managed/js challenge
     RateLimit { req_per_sec: u32, window: Duration },
-    Log,                            // só registra, não age (modo shadow)
-    Tag(String),                    // anota o evento, continua pipeline
+    Log,                            // records only, doesn't act (shadow mode)
+    Tag(String),                    // annotates the event, continues pipeline
 }
 
-// Expressões combináveis — mesma ideia de matchers da CF
+// Combinable expressions — same idea as CF matchers
 pub enum RuleMatch {
-    Ip(IpMatcher),                 // IP exato | CIDR | range
+    Ip(IpMatcher),                 // exact IP | CIDR | range
     Asn(u32),
     Country(IsoCode),
-    Path(PathMatcher),             // exato | glob | regex
+    Path(PathMatcher),             // exact | glob | regex
     Method(HttpMethod),
     Header { name: String, op: StrOp },
     UserAgent(StrOp),
     Query(StrOp),
-    Body(StrOp),                   // quando disponível
+    Body(StrOp),                   // when available
     Protocol(ProtocolKind),        // Http | Tcp | Tls...
     TlsFingerprint { ja3: Option<String>, ja4: Option<String> },
     Reputation(ReputationTier),    // Clean | Suspicious | Malicious | Datacenter | Vpn | Tor
-    Status(u16),                   // ex: status == 404
+    Status(u16),                   // e.g. status == 404
     Rate { count: u32, per: Duration, scope: RateScope },
-    Time { window: TimeWindow },   // só ativa em horário comercial etc.
+    Time { window: TimeWindow },   // only active during business hours etc.
     All(Vec<RuleMatch>),           // AND
     Any(Vec<RuleMatch>),           // OR
     Not(Box<RuleMatch>),
@@ -903,68 +884,72 @@ pub enum IpMatcher { Single(IpAddr), Cidr(IpCidr), Range { from: IpAddr, to: IpA
 pub enum StrOp { Equals(String), Contains(String), Regex(Regex), StartsWith(String), In(Vec<String>) }
 ```
 
-### 10.2 Precedência no pipeline
+### 10.2 Pipeline precedence
 
 ```mermaid
 flowchart LR
-    EVT[Evento normalizado] --> R{Rules Engine<br/>avalia em prioridade}
+    EVT[Normalized event] --> R{Rules Engine<br/>evaluates by priority}
     R -->|Allow rule hit| BY[Allow + bypass scoring/AI]
-    R -->|Block/Challenge/RateLimit hit| ACT[Executa Action<br/>+ short-circuit]
-    R -->|Log/Tag hit| AN[Anota + continua]
-    R -->|nenhuma regra| HEUR[Heurísticas → IA → Scorer]
-    BY --> PERSIST[Persistir]
+    R -->|Block/Challenge/RateLimit hit| ACT[Execute Action<br/>+ short-circuit]
+    R -->|Log/Tag hit| AN[Annotate + continue]
+    R -->|no rule| HEUR[Heuristics → AI → Scorer]
+    BY --> PERSIST[Persist]
     ACT --> PERSIST
     AN --> HEUR
     HEUR --> PERSIST
 ```
 
-Ordem: **Allowlist** (trust absoluto) > **Blocklist explícita** > **Reputation/VPN/Tor defaults** > **Crawler/UA defaults** > **path sensíveis** > (cai para heurísticas+IA). Allowlist é o _escape hatch_ para evitar falso-positivo em IPs próprios (healthchecks, monitoring, CI).
+Order: **Allowlist** (absolute trust) > **Explicit blocklist** >
+**Reputation/VPN/Tor defaults** > **Crawler/UA defaults** > **sensitive
+paths** > (falls through to heuristics+AI). Allowlist is the _escape
+hatch_ to avoid false positives on your own IPs (healthchecks,
+monitoring, CI).
 
-### 10.3 Default Rule Packs (pré-configurados, ligar/desligar por config)
+### 10.3 Default Rule Packs (preconfigured, toggle via config)
 
-Packs shipados com o Sentry, ativáveis com uma linha. Cada pack é um conjunto de regras com `tags` para fácil inspeção/edição via CLI.
+Packs shipped with Sentry, activatable with one line. Each pack is a set of rules with `tags` for easy inspection/editing via CLI.
 
-| Pack                | Default      | O que faz                                                                                                                                       |
+| Pack                | Default      | What it does                                                                                                                                    |
 | ------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `vpn_proxy`         | on           | Block/Challenge IPs classificados como VPN/proxy (reputation = Vpn/Proxy)                                                                       |
-| `tor`               | on           | Block exit nodes Tor (reputation = Tor)                                                                                                         |
-| `datacenter_abuse`  | on           | Challenge ASNs de datacenter fora de allowlist (DigitalOcean, OVH, Hetzner, etc. — alvos de bots)                                               |
-| `crawlers_bad`      | on           | Block UAs de scanners/ferramentas de ataque: `sqlmap`, `nikto`, `nmap`, `masscan`, `zgrab`, `curl/8.*` suspeito, `python-requests` sem contexto |
-| `crawlers_good`     | off          | **Allow** bots legítimos (Googlebot, Bingbot, etc.) — verificação via reverse-DNS conforme spec do Google                                       |
-| `empty_ua`          | on           | Challenge/block requisições sem User-Agent (raro em tráfego legítimo)                                                                           |
-| `sensitive_paths`   | on (enforce) | **Block** hits em arquivos/dirs sensíveis por default (ver §10.3.1 para lista completa)                                                         |
-| `country_blocklist` | off          | Block países não atendidos (configura lista ISO)                                                                                                |
-| `country_allowlist` | off          | Allow só países da lista (mais restritivo, modo opt-in)                                                                                         |
-| `http_anomaly`      | on           | Block métodos raros não usados (`TRACE`, `CONNECT`), HTTP/0.9, headers malformados                                                              |
-| `rate_scan`         | on           | Rate-limit/Block IP com >N 404 em janela (directory brute-force)                                                                                |
+| `vpn_proxy`         | on           | Block/Challenge IPs classified as VPN/proxy (reputation = Vpn/Proxy)                                                                             |
+| `tor`               | on           | Block Tor exit nodes (reputation = Tor)                                                                                                          |
+| `datacenter_abuse`  | on           | Challenge datacenter ASNs outside the allowlist (DigitalOcean, OVH, Hetzner, etc. — bot targets)                                                 |
+| `crawlers_bad`      | on           | Block scanner/attack-tool UAs: `sqlmap`, `nikto`, `nmap`, `masscan`, `zgrab`, suspicious `curl/8.*`, `python-requests` without context           |
+| `crawlers_good`     | off          | **Allow** legitimate bots (Googlebot, Bingbot, etc.) — verification via reverse-DNS per Google's spec                                             |
+| `empty_ua`          | on           | Challenge/block requests without User-Agent (rare in legitimate traffic)                                                                         |
+| `sensitive_paths`   | on (enforce) | **Block** hits on sensitive files/dirs by default (see §10.3.1 for the full list)                                                                |
+| `country_blocklist` | off          | Block non-served countries (configures an ISO list)                                                                                              |
+| `country_allowlist` | off          | Allow only listed countries (more restrictive, opt-in mode)                                                                                      |
+| `http_anomaly`      | on           | Block unused rare methods (`TRACE`, `CONNECT`), HTTP/0.9, malformed headers                                                                      |
+| `rate_scan`         | on           | Rate-limit/Block IPs with >N 404s in a window (directory brute-force)                                                                            |
 
-**Semântica de default `on`**: packs vêm ativos mas em modo `Log` ou `Challenge` (não `Block` direto) no primeiro deploy — modo _shadow_ para validar antes de endurecer. Usuário promove para `Block` após confirmar zero falso-positivo. Controlado por `mode = "shadow" | "enforce"` por pack. **Exceção**: `sensitive_paths` já vem em `enforce` por default (acesso a `.env`/`.git` é sempre malicioso).
+**Default `on` semantics**: packs ship active but in `Log` or `Challenge` mode (not straight `Block`) on first deploy — _shadow_ mode to validate before hardening. The user promotes to `Block` after confirming zero false-positives. Controlled by `mode = "shadow" | "enforce"` per pack. **Exception**: `sensitive_paths` ships in `enforce` by default (access to `.env`/`.git` is always malicious).
 
-### 10.3.1 Pack `sensitive_paths` — lista completa (default enforce)
+### 10.3.1 Pack `sensitive_paths` — full list (default enforce)
 
-Arquivos e diretórios cujo acesso é **sempre bloqueado** por default. Cobertura dividida em categorias; cada entrada é uma regra `path regex` → `Block`. A lista é extensível via config/DB.
+Files and directories whose access is **always blocked** by default. Coverage split into categories; each entry is a `path regex` → `Block` rule. The list is extensible via config/DB.
 
-> **F7.1 — fonte única de verdade**: os padrões efetivamente compilados
-> vivem em `crates/sentry-core/src/lists.rs` (`SENSITIVE_PATHS`) — pack,
-> heurística `SensitivePath` e as literais do prefilter Aho-Corasick
-> derivam todos da mesma tabela (com teste estrutural + corpus por ramo).
-> Além das categorias abaixo, a lista embute os probes de CVE do
-> [nginx-honeypot](https://github.com/dvershinin/nginx-honeypot)
+> **F7.1 — single source of truth**: the patterns actually compiled live
+> in `crates/sentry-core/src/lists.rs` (`SENSITIVE_PATHS`) — pack,
+> `SensitivePath` heuristic and the Aho-Corasick prefilter literals all
+> derive from the same table (with a structural test + per-branch
+> corpus). Beyond the categories below, the list embeds the CVE probes
+> from [nginx-honeypot](https://github.com/dvershinin/nginx-honeypot)
 > (`honey.conf`): Laravel `_ignition/execute-solution`, PHPUnit
 > `eval-stdin.php`, Exchange `Autodiscover/Autodiscover.xml` + `/ecp/
 > Current/exporttool`, MobileIron `/mifs/.;/services/LogService`, ManageEngine
 > `/RestAPI/LogonCustomization`, Telerik `WebResource.axd`, GPON
-> `/GponForm/diag_Form`, Fortinet `/remote/fgt_lang`, D-Link `/HNAP1` e
-> `/wp-includes/*.php`. Os padrões largos demais para enforce (`.aspx`,
-> `cgi-bin`, `node_modules`, `/actuator/health`, qualquer dotfile) ficam no
-> pack `honeypot_paths` (shadow por padrão).
+> `/GponForm/diag_Form`, Fortinet `/remote/fgt_lang`, D-Link `/HNAP1` and
+> `/wp-includes/*.php`. Patterns too broad to enforce (`.aspx`,
+> `cgi-bin`, `node_modules`, `/actuator/health`, any dotfile) live in the
+> `honeypot_paths` pack (shadow by default).
 
-**Credenciais & configuração:**
+**Credentials & configuration:**
 
 ```
 \.env(\.local|\.production|\.development)?$      # .env, .env.local, ...
 \.env\.[a-z]+$                                    # qualquer variante .env.*
-config\.(php|json|yml|yaml|ini|conf)              # configs de app
+config\.(php|json|yml|yaml|ini|conf)              # app configs
 secrets\.(json|yml|yaml)
 credentials\.(json|csv)
 \.htpasswd
@@ -974,7 +959,7 @@ settings\.php                                     # Drupal
 configuration\.php                                # Joomla
 ```
 
-**SCM & metadata de diretório:**
+**SCM & directory metadata:**
 
 ```
 /\.git/                                           # .git/, HEAD, config, index
@@ -986,7 +971,7 @@ configuration\.php                                # Joomla
 /\.dockerignore
 ```
 
-**Cloud & infraestrutura:**
+**Cloud & infrastructure:**
 
 ```
 /\.aws/                                           # credentials, config
@@ -994,38 +979,38 @@ configuration\.php                                # Joomla
 /\.gcp/
 /\.azure/
 /\.kube/                                          # kubeconfig
-/\.docker/                                        # config.json com tokens de registry
+/\.docker/                                        # config.json with registry tokens
 /\.terraform(\.tfstate)?
 ```
 
-**Arquivos de build & artefatos:**
+**Build files & artifacts:**
 
 ```
-/(package-lock\.json|yarn\.lock|composer\.lock)   # opcional: info de versão p/ recon
-/(docker-compose\.yml|docker-compose\.yaml)       # expõe topologia de serviços
+/(package-lock\.json|yarn\.lock|composer\.lock)   # optional: version info for recon
+/(docker-compose\.yml|docker-compose\.yaml)       # exposes service topology
 /(Dockerfile|Puppetfile|Vagrantfile)
-/\.npmrc                                          # tokens npm
-/\.pypirc                                         # tokens pypi
-/\.netrc                                          # creds HTTP
+/\.npmrc                                          # npm tokens
+/\.pypirc                                         # pypi tokens
+/\.netrc                                          # HTTP creds
 ```
 
-**Painéis admin & ferramentas conhecidas:**
+**Admin panels & known tools:**
 
 ```
 /(wp-admin|wp-login\.php)                         # WordPress
 /(phpmyadmin|pma|phpMyAdmin)                      # phpMyAdmin
 /(adminer|adminer\.php)
-/(wp-content/uploads/phpmailer)                   # exploit comum
+/(wp-content/uploads/phpmailer)                   # common exploit
 /manager/                                         # Tomcat manager
 /server-status                                    # Apache mod_status
 /server-info
 /nginx-status
 /fpm-status
-/actuator(/env|/heapdump|/threaddump)?            # Spring Boot actuator sensível
-/health(/.*)?                                     # opcional (pode ser legit)
+/actuator(/env|/heapdump|/threaddump)?            # sensitive Spring Boot actuator
+/health(/.*)?                                     # optional (may be legitimate)
 ```
 
-**Backup & dump:**
+**Backups & dumps:**
 
 ```
 /\.(sql|bak|backup|old|swp|tmp|orig|save|copy)$
@@ -1033,37 +1018,37 @@ configuration\.php                                # Joomla
 /www\.(zip|tar|gz|rar|7z)                         # full-site dumps
 ```
 
-**Sistema & expostos perigosos:**
+**System & dangerous exposures:**
 
 ```
-/\.well-known/security\.txt$        # ALLOW (legítimo — RFC 9116) → allowlist explícita
+/\.well-known/security\.txt$        # ALLOW (legitimate — RFC 9116) → explicit allowlist
 /\.DS_Store
 /Thumbs\.db
 /(etc/passwd|etc/shadow)             # path traversal via decode
 /(proc/self/environ|proc/self/fd/.*)
 ```
 
-**Implementação técnica:**
+**Technical implementation:**
 
-- Cada categoria é um _sub-pack_ toggleável individualmente (`sentry rules packs list` mostra estado granular).
-- A allowlist interna **sempre** permite `/.well-known/security.txt` (RFC 9116 — documento público de divulgação responsável) mesmo com o pack ativo.
-- Match case-insensitive (`.ENV` == `.env`) para evitar bypass trivial.
-- Considera encodings: `%2e` (`.`), `%2f` (`/`), `..;/` (path traversal smuggling), double-encoding — normalização pré-match.
-- Rotas explicitamente allowlistadas pelo usuário (`[[rules.custom]] action = "allow"`) têm prioridade sobre o pack, permitindo expor `/admin/` se a app realmente precisar.
+- Each category is an individually toggleable _sub-pack_ (`sentry rules packs list` shows granular state).
+- The internal allowlist **always** allows `/.well-known/security.txt` (RFC 9116 — public responsible-disclosure document) even with the pack active.
+- Case-insensitive matching (`.ENV` == `.env`) to avoid trivial bypass.
+- Considers encodings: `%2e` (`.`), `%2f` (`/`), `..;/` (path traversal smuggling), double-encoding — normalization pre-match.
+- Routes explicitly allowlisted by the user (`[[rules.custom]] action = "allow"`) take priority over the pack, allowing `/admin/` to be exposed if the app really needs it.
 
-**Por que `enforce` e não `shadow` desde o início**: acessos a `.git/`, `.env`, `.ssh/` são estatisticamente 100% maliciosos em apps web (não há motivo legítimo para um browser acessar isso). O custo de um falso-positivo aqui é nulo vs. o risco de vazar credenciais.
+**Why `enforce` and not `shadow` from the start**: accesses to `.git/`, `.env`, `.ssh/` are statistically 100% malicious in web apps (there is no legitimate reason for a browser to fetch them). The cost of a false positive here is null vs. the risk of leaking credentials.
 
-### 10.4 Fontes de regras
+### 10.4 Rule sources
 
-1. **Config (`sentry.toml`)** — regras estáticas, versionadas com o app.
-2. **Postgres (`rules` table)** — regras dinâmicas criadas via CLI/dashboard, hot-reload sem reiniciar.
-3. **Cloudflare sync** — importa Custom Rules/WAF da CF como regras locais (espelho) para decisão local em modo inline futuro.
-4. **Auto-learned** — IPs confirmados como maliciosos pelo decisor viram regra dinâmica `Block` com TTL (feedback loop).
-5. **Reputation feeds** (F3.7, implementado) — blocklists públicas (Tor exit nodes, Spamhaus DROP, FireHOL, …) sincronizadas pela crate `sentry-reputation` (`refresh_hours`, guarda SSRF no fetch, cap de 10 MB). Entradas viram **enriquecimento** (`Event.reputation`) consultado por `RuleMatch::Reputation` e pelos packs `tor`/`vpn_proxy`; uma feed com `action` configurada gera uma regra sintética tagada `feed:<name>`.
+1. **Config (`sentry.toml`)** — static rules, versioned with the app.
+2. **Postgres (`rules` table)** — dynamic rules created via CLI/dashboard, hot-reload without restarting.
+3. **Cloudflare sync** — imports CF Custom Rules/WAF as local (mirror) rules for local decision in future inline mode.
+4. **Auto-learned** — IPs confirmed malicious by the decider become dynamic `Block` rules with TTL (feedback loop).
+5. **Reputation feeds** (F3.7, implemented) — public blocklists (Tor exit nodes, Spamhaus DROP, FireHOL, …) synced by the `sentry-reputation` crate (`refresh_hours`, SSRF guard on fetch, 10 MB cap). Entries become **enrichment** (`Event.reputation`) consulted by `RuleMatch::Reputation` and by the `tor`/`vpn_proxy` packs; a feed with `action` configured generates a synthetic rule tagged `feed:<name>`.
 
-Hot-reload: o daemon observa a tabela `rules` (Postgres `LISTEN/NOTIFY`) e atualiza um `Arc<RwLock<RuleSet>>` em memória sem restart. Avaliação é indexada por IP-hash/ASN/country para não iterar todas as regras por evento.
+Hot-reload: the daemon watches the `rules` table (Postgres `LISTEN/NOTIFY`) and updates an in-memory `Arc<RwLock<RuleSet>>` without restart. Evaluation is indexed by IP-hash/ASN/country to avoid iterating all rules per event.
 
-### 10.5 CLI — gestão de regras
+### 10.5 CLI — rule management
 
 ```
 sentry rules list [--tag vpn] [--enabled] [--source db|config|feed]
@@ -1077,13 +1062,13 @@ sentry rules block-asn <asn>
 sentry rules enable <id>
 sentry rules disable <id>
 sentry rules delete <id>
-sentry feeds list                   # feeds configuradas (nome/tier/refresh)
-sentry feeds refresh                # busca todas uma vez e mostra entradas
-sentry feeds check <ip>             # consulta um IP contra as feeds
-sentry rules packs list                # mostra packs e estado (shadow/enforce/off)
+sentry feeds list                   # configured feeds (name/tier/refresh)
+sentry feeds refresh                # fetch all once and show entries
+sentry feeds check <ip>             # query an IP against the feeds
+sentry rules packs list                # show packs and state (shadow/enforce/off)
 sentry rules packs enable vpn_proxy --mode enforce
 sentry rules packs disable crawlers_good
-sentry rules test <ip>                 # simula: quais regras bateriam neste IP agora
+sentry rules test <ip>                 # simulate: which rules would hit this IP now
 sentry rules test --path /admin --ua "sqlmap/1.0" --ip 1.2.3.4
 ```
 
@@ -1091,7 +1076,7 @@ sentry rules test --path /admin --ua "sqlmap/1.0" --ip 1.2.3.4
 
 ```toml
 [rules]
-# packs default — ligar/desligar e modo por pack
+# default packs — toggle and per-pack mode
 [[rules.pack]]
 name = "vpn_proxy"
 mode  = "shadow"          # shadow | enforce | off
@@ -1106,18 +1091,18 @@ mode  = "enforce"
 
 [[rules.pack]]
 name = "crawlers_good"
-mode  = "enforce"         # allow Googlebot etc.
+mode  = "enforce"         # allows Googlebot etc.
 
 [[rules.pack]]
 name = "sensitive_paths"
-mode  = "enforce"         # default: bloqueia .env, .git, .ssh, etc. (ver §10.3.1)
+mode  = "enforce"         # default: blocks .env, .git, .ssh, etc. (see §10.3.1)
 
 [[rules.pack]]
 name = "country_blocklist"
 mode  = "enforce"
 countries = ["RU","CN","KP"]   # ISO codes
 
-# regras estáticas inline (além das do DB)
+# static inline rules (on top of DB rules)
 [[rules.custom]]
 name = "allow internal monitoring"
 priority = 1
@@ -1140,43 +1125,43 @@ refresh_hours = 24
 action = "block"
 ```
 
-> **DSL de `match`**: mini-linguagem declarativa para config/CLI (`ip=`, `asn=`, `country=`, `path=`, `path regex=`, `ua=`, `header.X=`, `method=`, `protocol=`, `reputation=`, `time=`, combináveis com `AND`/`OR`/`NOT` e parênteses). Parseada para `RuleMatch` em runtime. Mesma sintaxe da CLI `--match` e do `rules test`.
+> **`match` DSL**: a small declarative language for config/CLI (`ip=`, `asn=`, `country=`, `path=`, `path regex=`, `ua=`, `header.X=`, `method=`, `protocol=`, `reputation=`, `time=`, combinable with `AND`/`OR`/`NOT` and parentheses). Parsed into `RuleMatch` at runtime. Same syntax as the CLI `--match` and `rules test`.
 
 ```mermaid
 flowchart TB
-    E[Evento] --> L0{Heurística rápida}
-    L0 -->|benigno claro| OK[Allow rápido]
-    L0 -->|malicioso claro| BLK[Block rápido]
-    L0 -->|incerto| L1[Embeddings + modelo ONNX]
-    L1 --> L2{Confiança > threshold?}
-    L2 -->|sim| DEC[Usar verdict IA]
-    L2 -->|não| L3[LLM opcional - prompt enxuto]
+    E[Event] --> L0{Fast heuristic}
+    L0 -->|clearly benign| OK[Fast Allow]
+    L0 -->|clearly malicious| BLK[Fast Block]
+    L0 -->|uncertain| L1[Embeddings + ONNX model]
+    L1 --> L2{Confidence > threshold?}
+    L2 -->|yes| DEC[Use AI verdict]
+    L2 -->|no| L3[Optional LLM - lean prompt]
     L3 --> DEC
 ```
 
-- **Camada 0 — Heurísticas** (sempre roda, ~µs): regex de SQLi/XSS/path traversal, allowlist de ASN, reputation IP local.
-- **Camada 1 — Modelo ONNX local**: classificador treinado em payloads maliciosos (SQLi, XSS, RCE, log4shell). Treinamento offline, modelo versionado em `models/`.
-- **Camada 2 — LLM sob demanda** (opcional, custo alto): só para eventos Medium sem verdict claro; prompt curto com path+headers+payload truncado. Resposta estruturada via JSON schema.
-- **Retreinamento**: pipeline offline consome incidentes confirmados → novo modelo → `sentry model reload`.
+- **Layer 0 — Heuristics** (always runs, ~µs): SQLi/XSS/path traversal regexes, ASN allowlist, local IP reputation.
+- **Layer 1 — Local ONNX model**: classifier trained on malicious payloads (SQLi, XSS, RCE, log4shell). Offline training, model versioned in `models/`.
+- **Layer 2 — On-demand LLM** (optional, high cost): only for Medium events with no clear verdict; short prompt with path+headers+truncated payload. Structured response via JSON schema.
+- **Retraining**: offline pipeline consumes confirmed incidents → new model → `sentry model reload`.
 
-### 10.1 Abstração de LLM — trait `LlmProvider`
+### 10.1 LLM abstraction — trait `LlmProvider`
 
-O Sentry é **provider-agnostic**: nunca chama uma API de LLM diretamente, sempre via trait. Isso permite trocar modelo/provider sem mudar código — só config. O adapter **OpenRouter** é o recomendado como default porque um único endpoint roteia para qualquer modelo (Claude, GPT, Gemini, Qwen, Llama, DeepSeek...), útil para experimentar custo×qualidade.
+Sentry is **provider-agnostic**: it never calls an LLM API directly, always via the trait. This allows swapping model/provider without code changes — config only. The **OpenRouter** adapter is recommended as default because a single endpoint routes to any model (Claude, GPT, Gemini, Qwen, Llama, DeepSeek...), useful for experimenting with cost×quality.
 
 ```rust
 // sentry-ai/src/llm.rs
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &'static str;            // "openrouter" | "ollama" | "openai" | "anthropic"...
-    fn model_id(&self) -> &str;                // ex: "anthropic/claude-3.5-sonnet"
+    fn model_id(&self) -> &str;                // e.g. "anthropic/claude-3.5-sonnet"
     async fn classify(&self, req: ClassifyRequest) -> anyhow::Result<ClassifyResponse>;
     async fn explain(&self, req: ExplainRequest) -> anyhow::Result<String>;
 }
 
 pub struct ClassifyRequest {
-    pub protocol: ProtocolData,    // funciona p/ Http, Tcp, etc.
-    pub context: String,           // resumo truncado: path, headers-chave, payload preview
-    pub schema: JsonSchema,        // resposta estruturada obrigatória
+    pub protocol: ProtocolData,    // works for Http, Tcp, etc.
+    pub context: String,           // truncated summary: path, key headers, payload preview
+    pub schema: JsonSchema,        // mandatory structured response
 }
 pub struct ClassifyResponse {
     pub verdict: Verdict,
@@ -1185,78 +1170,78 @@ pub struct ClassifyResponse {
     pub confidence: f32,           // 0.0–1.0
 }
 
-// Adapters (cada um em seu módulo/feature):
+// Adapters (each in its own module/feature):
 // - OpenRouterProvider  -> POST https://openrouter.ai/api/v1/chat/completions
 // -                       header: Authorization: Bearer $SENTRY_LLM_KEY
 // -                       body: { model, messages, response_format: json_schema }
-// - OllamaProvider      -> http://localhost:11434/api/chat (local, sem chave)
+// - OllamaProvider      -> http://localhost:11434/api/chat (local, keyless)
 // - OpenAiProvider      -> api.openai.com (async-openai)
 // - AnthropicProvider   -> api.anthropic.com (messages API)
-// - MockProvider        -> para testes determinísticos
+// - MockProvider        -> for deterministic tests
 ```
 
-**Seleção por config**: `llm_provider = "openrouter"`, `llm_model = "anthropic/claude-3.5-sonnet"`. Trocar para Ollama = mudar 2 linhas. Cache de verdicts por hash do payload evita re-chamar o LLM para payloads idênticos em janela curta.
+**Selection via config**: `llm_provider = "openrouter"`, `llm_model = "anthropic/claude-3.5-sonnet"`. Switching to Ollama = changing 2 lines. Caching verdicts by payload hash avoids re-calling the LLM for identical payloads in a short window.
 
 ---
 
 ## 11. CLI — Interface
 
 ```
-sentry                          # inicia o monitor (daemon foreground)
-sentry daemon start|stop|status # modo service (opcional)
-sentry tail                     # live tail de eventos + risk colorido
+sentry                          # starts the monitor (foreground daemon)
+sentry daemon start|stop|status # service mode (optional)
+sentry tail                     # live tail of events + colored risk
 sentry tail --only High,Critical
-sentry incidents list           # lista incidentes
+sentry incidents list           # lists incidents
 sentry incidents show <id>
-sentry ip info <ip>             # histórico, score, ASN, geo
+sentry ip info <ip>             # history, score, ASN, geo
 sentry ip block <ip> [--ttl 24h]
 sentry ip unblock <ip>
-sentry routes list              # rotas conhecidas
-sentry routes learn             # modo baseline
-sentry report --from 24h        # relatório agregado
+sentry routes list              # known routes
+sentry routes learn             # baseline mode
+sentry report --from 24h        # aggregated report
 sentry report --export json|csv
 sentry config validate
 sentry config show
-sentry model status             # versão do modelo, acc
+sentry model status             # model version, acc
 sentry model reload
-sentry test detect "<payload>"  # roda pipeline em string isolada
-sentry cloudflare status        # sincroniza estado
-sentry cloudflare pull          # importa logs existentes
+sentry test detect "<payload>"  # runs the pipeline on an isolated string
+sentry cloudflare status        # syncs state
+sentry cloudflare pull          # imports existing logs
 ```
 
-### 11.1 Interface interativa TUI (`ratatui`)
+### 11.1 Interactive TUI (`ratatui`)
 
-A CLI tem **dois modos de `tail`**:
+The CLI has **two `tail` modes**:
 
-- `sentry tail` (ou `sentry tail --tui`) → abre **TUI interativa fullscreen** com `ratatui` + `crossterm`. Modo default quando o terminal é TTY.
-- `sentry tail --stream` → modo **não-interativo**, uma linha por evento (JSON ou texto colorido). Ideal para pipe (`| jq`, `| grep`), logs estruturados ou redirecionamento. Ativado automaticamente quando stdin/stdout não é TTY (detecção via `std::io::IsTerminal`).
+- `sentry tail` (or `sentry tail --tui`) → opens a **fullscreen interactive TUI** with `ratatui` + `crossterm`. Default mode when the terminal is a TTY.
+- `sentry tail --stream` → **non-interactive** mode, one line per event (JSON or colored text). Ideal for pipes (`| jq`, `| grep`), structured logs or redirection. Automatically activated when stdin/stdout is not a TTY (detected via `std::io::IsTerminal`).
 
-**TUI fullscreen** — layout de 3 zonas:
+**Fullscreen TUI** — 3-zone layout:
 
 ```
 ┌──────────────────────── Sentry — live ────────────────────────┐
 │ req/s 412 ▁▂▃▅▇▆▄▂   Info 9.8k  Low 142  Med 31  High 7  Crit 1│  ← header/sparkline
 ├────────────────────────────────────────────────────────────────┤
-│ CRIT 1.2.3.4   POST /api/login   SQLi:' OR 1=1--               │  ← stream colorido
-│ HIGH 5.6.7.8   GET  /.env         UnknownRoute+sensitive        │     (scroll, filtro)
+│ CRIT 1.2.3.4   POST /api/login   SQLi:' OR 1=1--               │  ← colored stream
+│ HIGH 5.6.7.8   GET  /.env         UnknownRoute+sensitive        │     (scroll, filter)
 │ MED  9.0.1.2   GET  /wp-admin     ScanBehavior (12x404/60s)     │
 │ ...                                                            │
 ├────────────────────────────────────────────────────────────────┤
-│ Top IPs suspeitos        │ Top paths atacados   │ ASN/Geo      │  ← rodapé agregado
-│ 1.2.3.4    18  CRIT      │ /admin     22        │ AS1234  41%  │
-│ 5.6.7.8    11  HIGH      │ /.env      9         │ Tor     3%   │
+│ Top suspicious IPs        │ Top attacked paths   │ ASN/Geo      │  ← aggregate footer
+│ 1.2.3.4    18  CRIT       │ /admin     22        │ AS1234  41%  │
+│ 5.6.7.8    11  HIGH       │ /.env      9         │ Tor     3%   │
 └────────────────────────────────────────────────────────────────┘
- [f]iltrar [b]loquear [c]hallenge [i]nfo IP [r]otas [q]sair
+ [f]ilter [b]lock [c]hallenge [i]p info [r]outes [q]uit
 ```
 
-- **Interatividade**: navegar com setas/`j`/`k`, Enter abre detalhe do evento (headers, payload, signals, verdict IA), `b` bloqueia IP selecionado (pede confirmação), `c` dispara challenge Cloudflare, `i` mostra histórico completo do IP, `f` abre filtro (por level/IP/path/ASN), `r` abre painel de rotas, `/` busca textual.
-- **Render responsivo**: redimensionamento de terminal suportado; alterna colunas do rodapé conforme largura.
-- **Modo pausa**: `Space` congela o stream para inspecionar sem perder eventos (bufferizado).
-- **Themes**: `--theme dark|light|mono` (acessibilidade / terminais sem cor).
+- **Interactivity**: navigate with arrows/`j`/`k`, Enter opens event details (headers, payload, signals, AI verdict), `b` blocks the selected IP (asks for confirmation), `c` triggers a Cloudflare challenge, `i` shows the IP's full history, `f` opens a filter (by level/IP/path/ASN), `r` opens the routes panel, `/` text search.
+- **Responsive render**: terminal resizing supported; footer columns switch with width.
+- **Pause mode**: `Space` freezes the stream to inspect without losing events (buffered).
+- **Themes**: `--theme dark|light|mono` (accessibility / colorless terminals).
 
 ---
 
-## 12. Configuração (`sentry.toml`)
+## 12. Configuration (`sentry.toml`)
 
 ```toml
 [core]
@@ -1305,50 +1290,50 @@ url = "https://discord.com/api/webhooks/..."
 on_levels = ["High","Critical"]
 
 [[action]]
-type = "log"   # sempre
+type = "log"   # always
 ```
 
 ---
 
-## 13. Estrutura de Crates (workspace)
+## 13. Crate Structure (workspace)
 
 ```
 sentry/
 ├── Cargo.toml                    # workspace
 ├── crates/
 │   ├── sentry-core/              # lib: Event, traits, pipeline, scoring
-│   ├── sentry-source-nginx/      # plugin Source: nginx log tail
-│   ├── sentry-source-http/       # plugin Source: middleware proxy (futuro)
-│   ├── sentry-source-tcp/        # plugin Source: pcap (futuro)
-│   ├── sentry-source-cloudflare/ # plugin Source: pull logs CF
+│   ├── sentry-source-nginx/      # Source plugin: nginx log tail
+│   ├── sentry-source-http/       # Source plugin: proxy middleware (future)
+│   ├── sentry-source-tcp/        # Source plugin: pcap (future)
+│   ├── sentry-source-cloudflare/ # Source plugin: CF log pull
 │   ├── sentry-ai/                # ONNX + LLM provider trait
-│   ├── sentry-action-cloudflare/ # plugin Action
-│   ├── sentry-action-webhook/    # plugin Action
-│   ├── sentry-action-blocklist/  # plugin Action
+│   ├── sentry-action-cloudflare/ # Action plugin
+│   ├── sentry-action-webhook/    # Action plugin
+│   ├── sentry-action-blocklist/  # Action plugin
 │   ├── sentry-storage/           # sqlx SQLite/Postgres
 │   ├── sentry-geo/               # maxminddb wrapper
-│   └── sentry-cli/               # binário: clap + ratatui + entrypoint
-├── models/                       # modelos ONNX versionados
+│   └── sentry-cli/               # binary: clap + ratatui + entrypoint
+├── models/                       # versioned ONNX models
 ├── config/sentry.example.toml
 ├── tests/                        # integration tests
 └── docs/
     ├── ARCHITECTURE.md
-    ├── THREAT_MODELS.md          # catálogo de payloads/sinais
-    └── PLUGIN_DEV.md             # como criar um plugin
+    ├── THREAT_MODELS.md          # payload/signal catalog
+    └── PLUGIN_DEV.md             # how to create a plugin
 ```
 
 ---
 
-## 14. Fluxograma do Ciclo de Vida do Daemon
+## 14. Daemon Lifecycle Flowchart
 
 ```mermaid
 stateDiagram-v2
     [*] --> LoadingConfig
     LoadingConfig --> ValidatingConfig
     ValidatingConfig --> StartingSources: ok
-    ValidatingConfig --> [*]: erro fatal
+    ValidatingConfig --> [*]: fatal error
     StartingSources --> Streaming
-    Streaming --> Analyzing: evento bruto
+    Streaming --> Analyzing: raw event
     Analyzing --> Deciding
     Deciding --> ExecutingActions: verdict != Allow
     Deciding --> Streaming: Allow
@@ -1360,97 +1345,64 @@ stateDiagram-v2
 
 ---
 
-## 16. Modelo de Risco — Pesos Iniciais (referência)
+## 16. Risk Model — Initial Weights (reference)
 
-| Sinal                                             | Peso | Acumula? |                        |
-| ------------------------------------------------- | ---- | -------- | ---------------------- |
-| SQLi (regex)                                      | 60   | não      |                        |
-| XSS (regex)                                       | 45   | não      |                        |
-| Path traversal (`../`, `%2e`)                     | 40   | sim      |                        |
-| Log4Shell (`${jndi:`)                             | 80   | não      |                        |
-| RCE/cmd injection                                 | 70   | não      |                        |
-| Rota inexistente                                  | 8    | sim      |                        |
-| >10 404/IP em 60s (`ScanBehavior`, `[scan]`)      | 35   | sim      |                        |
-| User-agent vazio/suspeito                         | 10   | sim      |                        |
-| Random-filename scan (`RandomScan`, `[scan]`)     | 25   | sim      | ≥8 paths 4xx distintos/IP em 60s |
-| Tor exit node                                     | 15   | —        |                        |
-| IP em reputation feed                             | 50   | —        | feed com tier `malicious`; `KnownBadIp` |
-| VPN/proxy/datacenter (feed)                       | 20   | —        | `VpnProxy`, tier `vpn`/`datacenter` |
-| Scanner promíscuo (feed tier `promiscuous`)       | 10   | —        | `PromiscuousScanner`; scanner que publica recon p/ qualquer um (F3.10) |
-| Scan→ataque cross-IP (`ScanAttackCorrelation`)    | 20   | sim      | `[correlation]`; scan de outro IP no mesmo /24, /64 ou ASN < `window_secs` (F3.10) |
-| Login bem-sucedido pós-brute-force                | 45   | não      | `SuspiciousLoginSuccess`, `[behavior] suspicious_success_min_failures` |
-| Anomalia ONNX (`AnomalousPayload`, `[ai]`)        | 25   | não      | threshold default 0.70; peso via `[scorer.weights] anomalous_payload` |
-| Acesso a path sensível                            | 30   | sim      |                        |
+| Signal                                            | Weight | Cumulative? |                        |
+| ------------------------------------------------- | ------ | ----------- | ---------------------- |
+| SQLi (regex)                                      | 60     | no          |                        |
+| XSS (regex)                                       | 45     | no          |                        |
+| Path traversal (`../`, `%2e`)                     | 40     | yes         |                        |
+| Log4Shell (`${jndi:`)                             | 80     | no          |                        |
+| RCE/cmd injection                                 | 70     | no          |                        |
+| Nonexistent route                                 | 8      | yes         |                        |
+| >10 404s/IP in 60s (`ScanBehavior`, `[scan]`)     | 35     | yes         |                        |
+| Empty/suspicious user-agent                       | 10     | yes         |                        |
+| Random-filename scan (`RandomScan`, `[scan]`)     | 25     | yes         | ≥8 distinct 4xx paths/IP in 60s |
+| Tor exit node                                     | 15     | —           |                        |
+| IP on a reputation feed                           | 50     | —           | feed with `malicious` tier; `KnownBadIp` |
+| VPN/proxy/datacenter (feed)                       | 20     | —           | `VpnProxy`, `vpn`/`datacenter` tier |
+| Promiscuous scanner (feed tier `promiscuous`)     | 10     | —           | `PromiscuousScanner`; scanner publishing recon to anyone (F3.10) |
+| Scan→attack cross-IP (`ScanAttackCorrelation`)    | 20     | yes         | `[correlation]`; scan from another IP on the same /24, /64 or ASN < `window_secs` (F3.10) |
+| Successful login post-brute-force                 | 45     | no          | `SuspiciousLoginSuccess`, `[behavior] suspicious_success_min_failures` |
+| ONNX anomaly (`AnomalousPayload`, `[ai]`)         | 25     | no          | default threshold 0.70; weight via `[scorer.weights] anomalous_payload` |
+| Sensitive path access                             | 30     | yes         |                        |
 
-Pesos combinam (soma com cap 100), com bônus para repetição em janela. **Tudo ajustável em config.**
-
----
-
-## 17. Decisões Abertas (a validar)
-
-1. **Inline vs. read-only na F1**: recomendado **read-only** (sem risco de quebrar produção); inline só na F3.
-2. **LLM default**: recomendado **Ollama local** (sem custo, sem vazamento de dados). OpenAI opt-in.
-3. **Modelo ONNX v1**: treinar do zero ou fine-tunar em dataset público (CSIC-2010, HTTP DATASET CSIC)?
-4. **Storage default**: SQLite (zero-config) → Postgres quando >1 nó.
-5. **TUI vs. CLI puro**: manter **ambos** — `tail --tui` abre painel, `tail --stream` apenas linhas (pipe-friendly).
-6. **Geolookup**: MMDB local (MaxMind GeoLite2, gratuito c/ licença) — baixar automaticamente no `sentry init`.
+Weights combine (sum with cap 100), with a bonus for repetition in a window. **All adjustable in config.**
 
 ---
 
-## 18. Roadmap Visual
+## 17. Open Decisions (to be validated)
 
-```mermaid
-gantt
-    title Sentry — Roadmap (estimativa indicativa)
-    dateFormat  YYYY-MM-DD
-    axisFormat  %d/%m
-    section Fundação
-    Workspace + core        :f0a, 2026-01-01, 7d
-    Traits + config         :f0b, after f0a, 7d
-    CI multi-OS             :f0c, after f0b, 5d
-    section F1 — Nginx MVP
-    Source nginx + ingestor :f1a, after f0c, 10d
-    Storage + heurísticas   :f1b, after f1a, 10d
-    Scorer + pipeline       :f1c, after f1b, 7d
-    CLI + TUI               :f1d, after f1c, 10d
-    Testes + fixtures       :f1e, after f1d, 5d
-    section F2 — CF + IA
-    ONNX model v1           :f2a, after f1e, 12d
-    Action Cloudflare       :f2b, after f1e, 8d
-    Decisor + rate limit    :f2c, after f2b, 7d
-    Webhooks                :f2d, after f2c, 5d
-    section F3 — Multi-source
-    HTTP middleware source  :f3a, after f2d, 10d
-    TCP capture             :f3b, after f3a, 12d
-    Syslog + CF logs        :f3c, after f3a, 8d
-    LLM provider            :f3d, after f3b, 10d
-    Behavior detection      :f3e, after f3d, 8d
-    section F4 — Op + Dashboard
-    Service mode            :f4a, after f3e, 5d
-    Backend HTTP            :f4b, after f4a, 10d
-    Dashboard               :f4c, after f4b, 20d
-```
+1. **Inline vs. read-only in F1**: recommended **read-only** (no risk of breaking production); inline only in F3.
+2. **Default LLM**: recommended **local Ollama** (no cost, no data leakage). OpenAI opt-in.
+3. **ONNX model v1**: train from scratch or fine-tune on a public dataset (CSIC-2010, HTTP DATASET CSIC)?
+4. **Default storage**: SQLite (zero-config) → Postgres when >1 node.
+5. **TUI vs. plain CLI**: keep **both** — `tail --tui` opens the panel, `tail --stream` prints lines only (pipe-friendly).
+6. **Geolookup**: local MMDB (MaxMind GeoLite2, free with license) — downloaded automatically in `sentry init`.
 
 ---
 
-## 19. Critérios de "Pronto" por Fase
+## 18. Roadmap and Backlog
 
-- **F1**: ao apontar para `access.log` real, `sentry tail` mostra eventos coloridos por risco, identifica SQLi/XSS em payloads, marca rotas inexistentes, persiste tudo em SQLite, exporta relatório JSON. Throughput ≥ 5k req/s sem backlog.
-- **F2**: evento High dispara challenge no Cloudflare em < 2s; modelo ONNX classifica payloads com F1 ≥ 0.9 em dataset de teste; webhook entrega alerta com contexto.
-- **F3**: múltiplas fontes ativas simultaneamente; LLM só acionado em < 2% dos eventos (custo controlado); detecção de brute-force em janela de 5 min.
-- **F4**: dashboard mostra eventos live, permite ack/block, histórico de 30 dias sem degradação.
+The visual roadmap, per-phase done criteria, the `sentry auto` backlog and the
+upcoming roadmap (advanced F5, F6 integrations, remaining F7 datasets) live in
+[`BACKLOG.md`](./BACKLOG.md).
 
 ---
 
-## 20. `sentry auto` — Detecção de Framework e Geração Automática de Regras
+## 19. `sentry auto` — Framework Detection and Automatic Rule Generation
 
-Subprojeto que torna o Sentry "zero-config" para apps comuns: ao rodar `sentry auto` na raiz de um site/projeto, o Sentry **detecta o framework/stack** e **gera regras, rotas conhecidas e packs recomendados** sob medida. Em vez de partir de uma config genérica, o Sentry entende o que está rodando e protege o que importa.
+Subproject that makes Sentry "zero-config" for common apps: running
+`sentry auto` at the root of a site/project, Sentry **detects the
+framework/stack** and **generates tailored rules, known routes and
+recommended packs**. Instead of starting from a generic config, Sentry
+understands what is running and protects what matters.
 
-### 20.1 Fluxo
+### 20.1 Flow
 
 ```mermaid
 flowchart TB
-    ROOT[Raiz do projeto] --> SCAN{Scanner de arquivos}
+    ROOT[Project root] --> SCAN{File scanner}
     SCAN -->|composer.json| WP[WordPress? Laravel?]
     SCAN -->|package.json| NODE[Next.js? Express?]
     SCAN -->|requirements.txt| PY[Django? Flask?]
@@ -1467,38 +1419,38 @@ flowchart TB
     DOCK --> DETECT
     NGINX --> DETECT
     IIS --> DETECT
-    DETECT --> GEN[Gerar regras + rotas + packs]
+    DETECT --> GEN[Generate rules + routes + packs]
     GEN --> OUT[sentry.auto.toml]
-    OUT --> MERGE[Merge com sentry.toml do usuário]
+    OUT --> MERGE[Merge with user's sentry.toml]
     MERGE --> RUN[sentry run]
 ```
 
-### 20.2 Perfis de Framework (`FrameworkProfile`)
+### 20.2 Framework Profiles (`FrameworkProfile`)
 
-Cada perfil é um "preset" que conhece a estrutura do framework e gera regras específicas. Perfis são **plugins** (`sentry-profile-*`) que registram um detector e um gerador de regras.
+Each profile is a "preset" that knows the framework's structure and generates specific rules. Profiles are **plugins** (`sentry-profile-*`) that register a detector and a rule generator.
 
-| Framework      | Detecção (sinais)                                  | Regras geradas                                                                                                                            |
+| Framework      | Detection (signals)                                | Generated rules                                                                                                                           |
 | -------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | **WordPress**  | `wp-config.php`, `wp-login.php`, `wp-admin/`       | Block `wp-login.php` brute-force rate-limit, allowlist `/wp-admin/admin-ajax.php`, protect `wp-content/uploads`, block `xmlrpc.php` abuse |
-| **Laravel**    | `artisan`, `composer.json` com `laravel/framework` | Protect `/.env`, block `storage/logs`, allowlist `/storage/app/public`, rate-limit `/login`                                               |
-| **Next.js**    | `next.config.js`, `package.json` com `next`        | Allowlist `/_next/static/*` (CDN assets), protect `/api/admin/*`, block `/.next/`                                                         |
+| **Laravel**    | `artisan`, `composer.json` with `laravel/framework`| Protect `/.env`, block `storage/logs`, allowlist `/storage/app/public`, rate-limit `/login`                                               |
+| **Next.js**    | `next.config.js`, `package.json` with `next`       | Allowlist `/_next/static/*` (CDN assets), protect `/api/admin/*`, block `/.next/`                                                         |
 | **Django**     | `manage.py`, `wsgi.py`, `settings.py`              | Protect `settings.py`, block `admin/` brute-force, allowlist `/static/`                                                                   |
-| **Flask**      | `requirements.txt` com `flask`, `app.py`           | Detect rotas via `@app.route` (AST scan), proteger `/.env`                                                                                |
-| **Rails**      | `Gemfile` com `rails`, `config/routes.rb`          | Parse `routes.rb` para rotas válidas, protect `/admin/*`                                                                                  |
-| **Express**    | `package.json` com `express`                       | Detect rotas via AST de `app.js`/`routes/`                                                                                                |
-| **ASP.NET**    | `*.csproj` com `Microsoft.AspNetCore`              | Protect `web.config`, allowlist `/wwwroot/*`                                                                                              |
-| **Nginx conf** | `nginx.conf` ou `sites-enabled/*`                  | Parse `location` blocks → rotas conhecidas exatas                                                                                         |
-| **Docker**     | `docker-compose.yml`, `Dockerfile`                 | Detect portas expostas, serviços internos, gerar monitor de cada porta                                                                    |
+| **Flask**      | `requirements.txt` with `flask`, `app.py`          | Detect routes via `@app.route` (AST scan), protect `/.env`                                                                                |
+| **Rails**      | `Gemfile` with `rails`, `config/routes.rb`         | Parse `routes.rb` for valid routes, protect `/admin/*`                                                                                    |
+| **Express**    | `package.json` with `express`                      | Detect routes via AST of `app.js`/`routes/`                                                                                               |
+| **ASP.NET**    | `*.csproj` with `Microsoft.AspNetCore`             | Protect `web.config`, allowlist `/wwwroot/*`                                                                                              |
+| **Nginx conf** | `nginx.conf` or `sites-enabled/*`                  | Parse `location` blocks → exact known routes                                                                                              |
+| **Docker**     | `docker-compose.yml`, `Dockerfile`                 | Detect exposed ports, internal services, generate a monitor per port                                                                      |
 
-### 20.3 Detecção (Scanner)
+### 20.3 Detection (Scanner)
 
-O scanner lê a raiz do projeto e identifica o(s) framework(s) por:
+The scanner reads the project root and identifies the framework(s) via:
 
-1. **Arquivos-âncora**: `wp-config.php` → WordPress, `artisan` → Laravel, `manage.py` → Django.
-2. **Manifestos**: `composer.json` (PHP), `package.json` (Node), `requirements.txt`/`pyproject.toml` (Python), `Gemfile` (Ruby), `*.csproj` (.NET).
-3. **AST parsing** (opcional, profundo): parse de `routes.rb` (Rails), `urls.py` (Django), `app.js` (Express) para extrair rotas **exatas** — não só padrões.
-4. **Config de servidor**: `nginx.conf` parse → `location` blocks viram rotas conhecidas.
-5. **Múltiplos frameworks**: se detectar mais de um (ex: nginx + WordPress), combina perfis.
+1. **Anchor files**: `wp-config.php` → WordPress, `artisan` → Laravel, `manage.py` → Django.
+2. **Manifests**: `composer.json` (PHP), `package.json` (Node), `requirements.txt`/`pyproject.toml` (Python), `Gemfile` (Ruby), `*.csproj` (.NET).
+3. **AST parsing** (optional, deep): parse `routes.rb` (Rails), `urls.py` (Django), `app.js` (Express) to extract **exact** routes — not just patterns.
+4. **Server config**: `nginx.conf` parse → `location` blocks become known routes.
+5. **Multiple frameworks**: if more than one is detected (e.g. nginx + WordPress), profiles are combined.
 
 ```rust
 // sentry-auto/src/detect.rs
@@ -1510,48 +1462,48 @@ pub trait FrameworkDetector: Send + Sync {
 pub struct FrameworkProfile {
     pub framework: String,
     pub version: Option<String>,
-    pub routes: Vec<RouteDef>,       // rotas exatas detectadas
-    pub sensitive_paths: Vec<String>, // específicas do framework
-    pub admin_paths: Vec<String>,
+    pub routes: Vec<RouteDef>,       // exact detected routes
+    pub sensitive_paths: Vec<String>, // framework-specific
+    pub admin_paths: Vec<String],
     pub recommended_packs: Vec<String>,
     pub recommended_rules: Vec<RuleDef>,
 }
 ```
 
-### 20.4 Geração de Regras
+### 20.4 Rule Generation
 
-A partir do `FrameworkProfile`, o gerador produz:
+From the `FrameworkProfile`, the generator produces:
 
-1. **Rotas conhecidas** (`[[routes.known]]`): para o validador de rotas — 404 em rota não-listada vira sinal `UnknownRoute`.
-2. **Regras específicas**:
-   - WordPress: `wp-login.php` rate-limit (5 tentativas/min), `xmlrpc.php` block por default.
-   - Laravel: `storage/logs` block, `.env` block (já no pack `sensitive_paths` mas reforçado).
+1. **Known routes** (`[[routes.known]]`): for the route validator — a 404 on an unlisted route becomes an `UnknownRoute` signal.
+2. **Framework-specific rules**:
+   - WordPress: `wp-login.php` rate-limit (5 attempts/min), `xmlrpc.php` block by default.
+   - Laravel: `storage/logs` block, `.env` block (already in `sensitive_paths` pack but reinforced).
    - Django: `admin/login/` rate-limit.
-3. **Allowlists inteligentes**: assets estáticos (`/static/`, `/_next/static/`, `/wp-content/uploads/`) não devem disparar rate-limit mesmo em alto volume.
-4. **Packs recomendados**: ativa `sensitive_paths` em enforce, `crawlers_bad` em enforce, `rate_scan` em enforce para paths admin.
+3. **Smart allowlists**: static assets (`/static/`, `/_next/static/`, `/wp-content/uploads/`) must not trigger rate-limit even at high volume.
+4. **Recommended packs**: enables `sensitive_paths` in enforce, `crawlers_bad` in enforce, `rate_scan` in enforce for admin paths.
 
 ### 20.5 CLI
 
 ```
-sentry auto                    # detecta framework na cwd, gera sentry.auto.toml
-sentry auto --root /var/www    # especifica raiz do projeto
-sentry auto --merge            # merge com sentry.toml existente
-sentry auto --dry-run          # só mostra o que detectaria, não escreve
-sentry auto --profile wordpress # forçar um perfil (skip detecção)
-sentry auto --deep             # AST scan de rotas (lento, preciso)
-sentry auto list-profiles      # lista perfis suportados
+sentry auto                    # detects the framework in cwd, generates sentry.auto.toml
+sentry auto --root /var/www    # specifies the project root
+sentry auto --merge            # merges with existing sentry.toml
+sentry auto --dry-run          # only shows what it would detect, doesn't write
+sentry auto --profile wordpress # force a profile (skip detection)
+sentry auto --deep             # AST route scan (slow, accurate)
+sentry auto list-profiles      # lists supported profiles
 ```
 
-**Saída**: `sentry.auto.toml` (ou merge em `sentry.toml`) contendo rotas + regras + packs. O usuário revisa, ajusta, e pronto. O `sentry run` carrega ambos.
+**Output**: `sentry.auto.toml` (or merged into `sentry.toml`) containing routes + rules + packs. The user reviews, adjusts, and done. `sentry run` loads both.
 
-### 20.6 Arquitetura do subprojeto
+### 20.6 Subproject architecture
 
 ```
 crates/
-├── sentry-auto/                # crate do `auto` command
+├── sentry-auto/                # crate for the `auto` command
 │   ├── src/
 │   │   ├── lib.rs               # FrameworkDetector trait, FrameworkProfile
-│   │   ├── detect.rs            # scanner de arquivos
+│   │   ├── detect.rs            # file scanner
 │   │   ├── generate.rs          # profile → rules/routes config
 │   │   └── profiles/
 │   │       ├── wordpress.rs
@@ -1561,16 +1513,16 @@ crates/
 │   │       ├── rails.rs
 │   │       ├── express.rs
 │   │       ├── aspnet.rs
-│   │       └── nginx.rs         # parse de nginx.conf
-│   └── tests/                   # fixtures de projetos reais por framework
-└── sentry-cli/                 # adiciona `sentry auto` subcommand
+│   │       └── nginx.rs         # nginx.conf parser
+│   └── tests/                   # fixtures of real projects per framework
+└── sentry-cli/                 # adds the `sentry auto` subcommand
 ```
 
-### 20.7 Detecção de rotas via AST (modo `--deep`)
+### 20.7 Route detection via AST (`--deep` mode)
 
-Para frameworks onde as rotas estão no código (Rails, Django, Express, Flask), o `--deep` faz **AST parsing** com `syn` (Rust não — preciso de parsers específicos):
+For frameworks where routes live in code (Rails, Django, Express, Flask), `--deep` does **AST parsing** with `syn` (not Rust — needs language-specific parsers):
 
-| Framework | Arquivo            | Parser                   |
+| Framework | File               | Parser                   |
 | --------- | ------------------ | ------------------------ |
 | Rails     | `config/routes.rb` | `tree-sitter-ruby`       |
 | Django    | `urls.py`          | `tree-sitter-python`     |
@@ -1578,230 +1530,89 @@ Para frameworks onde as rotas estão no código (Rails, Django, Express, Flask),
 | Flask     | `app.py`           | `tree-sitter-python`     |
 | Laravel   | `routes/web.php`   | `tree-sitter-php`        |
 
-`tree-sitter` é a escolha: parsers incrementais rápidos, multi-linguagem, uma única crate `tree-sitter` com bindings. Extrair `@app.route("/foo")` ou `get "/bar"` → `RouteDef { path: "/foo", methods: ["GET"] }`.
+`tree-sitter` is the choice: fast incremental parsers, multi-language, a single `tree-sitter` crate with bindings. Extracting `@app.route("/foo")` or `get "/bar"` → `RouteDef { path: "/foo", methods: ["GET"] }`.
 
-### 20.8 Backlog (subprojeto auto)
+## 22. Performance (F5 — practical part, delivered)
 
-- [ ] **A.1** `sentry-auto` crate skeleton + `FrameworkDetector` trait
-- [ ] **A.2** Scanner de arquivos-âncora + manifestos (composer, package.json, etc.)
-- [ ] **A.3** Perfil **WordPress**: wp-config detection, wp-login rate-limit, xmlrpc block, wp-admin allowlist
-- [ ] **A.4** Perfil **Laravel**: artisan detection, .env/storage protect, routes/web.php parse (PHP AST)
-- [ ] **A.5** Perfil **Django**: manage.py detection, admin/ rate-limit, urls.py parse (Python AST)
-- [ ] **A.6** Perfil **Next.js**: next.config.js, `/_next/static` allowlist, `/api/*` routes
-- [ ] **A.7** Perfil **Rails**: routes.rb parse (Ruby AST), admin protect
-- [ ] **A.8** Perfil **Express**: app.js/routes/ parse (JS AST)
-- [ ] **A.9** Perfil **nginx.conf**: parse `location` blocks → rotas conhecidas
-- [ ] **A.10** Gerador: profile → `sentry.auto.toml` (rotas + regras + packs)
-- [ ] **A.11** `sentry auto` CLI: `--root`, `--dry-run`, `--merge`, `--profile`, `--deep`
-- [ ] **A.12** `tree-sitter` integration para AST scan (deep mode)
-- [ ] **A.13** Fixtures de testes: 1 projeto real por framework (em `tests/fixtures/`)
-- [ ] **A.14** Merge inteligente: preserva regras custom do usuário, só adiciona
-
-> **Fase**: F1.x (pode rodar em paralelo ao MVP nginx — o `auto` gera config que o `run` consome).
-
----
-
-## 21. Próximos Passos Imediatos
-
-1. Validar este plano (revisar decisões abertas da seção 17).
-2. `cargo new --lib` do workspace + crates skeleton. ✅ (F0 concluído)
-3. Implementar F1.1 (source nginx) — é o gancho de valor mais rápido.
-4. Iniciar `sentry-auto` em paralelo (A.1–A.3) para WordPress como primeiro perfil.
-
-## 22. Performance (F5 — parte prática, entregue)
-
-Benchmarks criterion em `crates/sentry-core/benches/perf.rs`
-(`cargo bench -p sentry-core`; 5 cenários, sample 40, 3 s). Ambiente:
+Criterion benchmarks in `crates/sentry-core/benches/perf.rs`
+(`cargo bench -p sentry-core`; 5 scenarios, 40 samples, 3 s). Environment:
 Windows 11, MSVC, stable-x86_64, release (codegen-units=1, thin LTO).
 
-| Benchmark (1 evento) | Antes | Depois | Ganho |
+| Benchmark (1 event) | Before | After | Gain |
 | --- | --- | --- | --- |
-| heuristics/clean | 1,90 µs | 0,48 µs | 4,0× |
-| heuristics/attack | 2,94 µs | 1,59 µs | 1,8× |
-| rules/clean | **3,37 ms** | 2,47 µs | **~1 360×** |
-| pipeline/clean (end-to-end) | **3,49 ms** | 4,36 µs | **~800×** |
-| pipeline/attack (end-to-end) | 3,27 ms | 5,79 µs | ~565× |
+| heuristics/clean | 1.90 µs | 0.48 µs | 4.0× |
+| heuristics/attack | 2.94 µs | 1.59 µs | 1.8× |
+| rules/clean | **3.37 ms** | 2.47 µs | **~1,360×** |
+| pipeline/clean (end-to-end) | **3.49 ms** | 4.36 µs | **~800×** |
+| pipeline/attack (end-to-end) | 3.27 ms | 5.79 µs | ~565× |
 
-Onde o tempo estava e o que mudou:
+Where the time was and what changed:
 
-1. **Regex compilada por regra por evento** (`rules.rs`): era o gargalo
-   dominante — cada `Path regex`/`Header regex` recompilava o `Regex`
-   (centenas de µs cada) a evento. Agora `REGEX_CACHE` global
-   (`HashMap<String, Option<Arc<Regex>>>`, `LazyLock`) compila uma vez por
-   padrão por processo; padrões inválidos também são cacheados (não
-   re-parseiam por evento). Input é sempre config/DB — nunca dado do
-   atacante —, então o cache é limitado pelo tamanho do ruleset.
-2. **`IpNet`/IP parseado por regra por evento**: `IP_CACHE` com a mesma
-   forma (`IpSpec` = Net | Single | Range) para os packs densos em CIDR
+1. **Regex compiled per rule per event** (`rules.rs`): this was the dominant
+   bottleneck — each `Path regex`/`Header regex` recompiled the `Regex`
+   (hundreds of µs each) per event. Now a global `REGEX_CACHE`
+   (`HashMap<String, Option<Arc<Regex>>>`, `LazyLock`) compiles once per
+   pattern per process; invalid patterns are cached too (no re-parsing per
+   event). Input is always config/DB — never attacker data — so the cache
+   is bounded by the ruleset size.
+2. **`IpNet`/IP parsed per rule per event**: `IP_CACHE` with the same
+   shape (`IpSpec` = Net | Single | Range) for the CIDR-dense packs
    (vpn_proxy, tor, country_blocklist).
-3. **`url_decode` por condição de path**: o path era decodificado para cada
-   regra com `Path`; agora é decodificado **uma vez por avaliação**
-   (`EvalCtx.decoded_path`) e compartilhado pela árvore `All`/`Any`/`Not`.
-4. **Heurísticas — prefilter Aho-Corasick** (`heuristics.rs`): um único
-   autômato (SIMD via memchr, `ascii_case_insensitive`) sobre ~90 tokens
-   literais necessários das 8 famílias de regex roda **uma passada** por
-   evento sobre path+query decodificados, UA, referer e headers; famílias
-   sem trigger presente não executam regex. Em tráfego limpo, zero regex.
-   `find_overlapping_iter` é obrigatório: triggers de famílias diferentes
-   se sobrepõem (`/.` × `../`) e a semântica non-overlapping faria o
-   primeiro trigger matar o bit da outra família (coberto por testes de
-   equivalência gated×ungated + proptest de literalidade dos triggers).
-5. **Decode-once nas heurísticas**: path/query eram URL-decodificados por
-   detector (até 6× por evento); agora `DecodedHttp` é construído uma vez
-   e compartilhado via trait `Heuristic::analyze(evt, text)`.
-6. **Trackers com história limitada** (`RepetitionTracker`,
-   `BehaviorTracker` auth/wordlist): janelas por IP cresciam sem teto —
-   um bruteforcer sustentado tornava cada evento O(janela inteira) e
-   realocava HashSet por evento (amplificação exatamente quando sob
-   ataque). Caps: repetição 128 entradas/IP, auth/wordlist 64 hits/IP
-   (mesmo padrão do `max_hits` do `ScanTracker`).
-7. **Dedupe sem alocação** (`daemon.rs`): chave do LRU virou `u64`
-   (`dedup_hash`, streaming no hasher — sem `String` intermediário);
-   sweep de expirados no máximo 1×/TTL em vez de `retain` por evento
-   (que era O(n) no tamanho do cache a cada evento). O mesmo hash serve
-   de `payload_hash` para o dedupe cross-node (F4.7).
-8. **Ingest em lote** (`daemon.rs`): `recv_many(64)` no fan-in drena até
-   64 eventos prontos por wakeup (trickle load = semântica de `recv`).
+3. **`url_decode` per path condition**: the path was decoded for each rule
+   with `Path`; now it's decoded **once per evaluation**
+   (`EvalCtx.decoded_path`) and shared across the `All`/`Any`/`Not` tree.
+4. **Heuristics — Aho-Corasick prefilter** (`heuristics.rs`): a single
+   automaton (SIMD via memchr, `ascii_case_insensitive`) over ~90 literal
+   tokens required by the 8 regex families runs **one pass** per event
+   over decoded path+query, UA, referer and headers; families whose
+   trigger is absent never execute regex. On clean traffic, zero regex.
+   `find_overlapping_iter` is mandatory: triggers from different families
+   overlap (`/.` × `../`) and non-overlapping semantics would make the
+   first trigger kill the other family's bit (covered by gated×ungated
+   equivalence tests + a proptest for trigger literalness).
+5. **Decode-once in heuristics**: path/query were URL-decoded per detector
+   (up to 6× per event); now `DecodedHttp` is built once and shared via
+   the `Heuristic::analyze(evt, text)` trait.
+6. **Trackers with bounded history** (`RepetitionTracker`,
+   `BehaviorTracker` auth/wordlist): per-IP windows grew without bound —
+   a sustained bruteforcer made every event O(entire window) and
+   reallocated a HashSet per event (amplifying exactly when under
+   attack). Caps: repetition 128 entries/IP, auth/wordlist 64 hits/IP
+   (same pattern as `ScanTracker`'s `max_hits`).
+7. **Allocation-free dedupe** (`daemon.rs`): the LRU key became `u64`
+   (`dedup_hash`, streaming into the hasher — no intermediate `String`);
+   sweep of expired entries at most 1×/TTL instead of `retain` per event
+   (which was O(n) in cache size on every event). The same hash serves as
+   `payload_hash` for cross-node dedupe (F4.7).
+8. **Batched ingest** (`daemon.rs`): `recv_many(64)` on the fan-in drains
+   up to 64 ready events per wakeup (trickle load = `recv` semantics).
 
-Limites honestos: números de microbenchmark (cache quente, 1 IP sintético);
-throughput real é dominado por I/O do source e latência do Postgres. Os
-trackers scan/behavior/repetition permanecem por-IP em memória — a escala
-multi-node não muda isso (ver §8.4).
+Honest limits: microbenchmark numbers (warm cache, 1 synthetic IP); real
+throughput is dominated by source I/O and Postgres latency. The
+scan/behavior/repetition trackers remain per-IP in memory — multi-node
+scale doesn't change that (see §8.4).
 
-## 23. Roadmap — F5 Performance Engineering (avançada) e F6 Integrações de Firewall/Plataforma
+## 24. F9 — Protocol Schemas (`sentry-protocol`) — protocol description DSL
 
-> Performance é critério de design de primeira classe. A F5 prática (§22)
-> entregou o hot-path userspace otimizado; esta seção planeja a próxima
-> escala (kernel-bypass) e as integrações com plataformas de firewall
-> existentes, seguindo o padrão de provider que o projeto já tem
-> (`ChallengeProvider` + `build_challenge_action` — novos providers de edge
-> não mudam regras, `ActionKind` nem o filtro de verdict).
+> Describe custom protocols (non-standard ports, game servers, binary
+> services) in YAML and validate frames with confidence — faster than
+> regex on the default path. The format uses JSON Schema as its mental
+> core (types/constraints) but is its own DSL oriented to binary and
+> textual wire formats; reading macros are **defined per protocol** in
+> the schema itself (the crate ships only universal atoms).
 
-### 23.1 F5 — Performance Engineering (avançada)
+### 24.1 Schema format (`*.protocol.yaml`)
 
-Objetivo: sustentar **≥ 100k eventos/s por nó** em Linux, mantendo o
-userspace atual como fallback portável. Pré-requisito: benchmarks da §22
-como baseline de regressão (`cargo bench` no CI, budget por cenário).
-
-- **[ ] F5.1 — Budgets de regressão no CI**: `critest`/comparação de
-  baseline; falha o pipeline se `pipeline/clean` regredir > 20%.
-- **[ ] F5.2 — eBPF/aya (spike Linux)**: observação passiva via kprobe/
-  tracepoint (conexões, SYNs, drops) anexada ao mesmo fan-in como uma
-  `Source`; ring buffer `aya::BpfRingBuf` → `ProtocolData::Tcp`/eventos
-  sintéticos. Sem bloqueio; feature `ebpf` (não-compilável no Windows —
-  CI Linux-only com `bpf-linker`).
-- **[ ] F5.3 — io_uring para sources**: tail de log e sockets TCP via
-  `io-uring` (feature `uring`): menos syscalls por evento no ingest de
-  alta taxa; fallback tokio quando a feature está off.
-- **[ ] F5.4 — AF_XDP kernel-bypass**: captura de pacotes com zero-copy
-  ( feature `xdp`, Linux): UMEM frames → ring buffers de usuário →
-  `sentry-source-tcp` em modo de alta performance. Alvo: linha de 1M pps
-  por nó em EVH. Requer NUMA-aware ring buffers e pinning de cores.
-- **[ ] F5.5 — Ring buffers NUMA-aware no fan-in**: substituir o canal
-  tokio por SPSC/MPSC ring buffer crossbeam sem alocação no produtor,
-  com pinning por NUMA node quando `--enable-numa`.
-- **[ ] F5.6 — Avaliação honesta de kernel module**: protótipo de módulo
-  Linux (C) que marca/drops na hook netfilter com decisão consultando
-  um map compartilhado com o daemon. Critério de go/no-go: o eBPF (F5.2/
-  F5.4) não alcançar o alvo OU necessidade de inspeção que eBPF não
-  permite (estado complexo > 512 bytes por pacote). Trade-offs aceitos:
-  risco de kernel panic, manutenção por versão de kernel, distribuição
-  fora de crates.io — só vale se eBPF comprovar limite.
-- **[ ] F5.7 — SIMD explícito onde o ecossistema não cobre**: ingest de
-  syslog multi-linha e normalização de payload com `std::simd`
-  (nightly-gated atrás de feature) ou crates `memchr`/`aho-corasick`
-  adicionais; sem `unsafe`.
-
-### 23.2 F6 — Integrações de firewall/plataforma
-
-Objetivo: o Sentry decide, a plataforma existente executa — cada provider
-segue o trait `ChallengeProvider` (`apply(ip, verdict, opts)`) e entra no
-`match` de `build_challenge_action` sem tocar em regras/pipeline.
-
-- **[x] F6.1 — Provider OPNsense/pfSense** (entregue pela F8, §8.8): crate
-  `sentry-action-opnsense` (`provider = "opnsense" | "pfsense"`). OPNsense:
-  REST `/api/firewall/alias_util/add|delete/<table>` com key/secret via env
-  (`api_key_env`/`api_secret_env`); pfSense: `pfctl -t <table> -T add` no
-  host (sem shell, args posicionais). TTL em mapa de expiração em memória +
-  reaper 30s (a plataforma não tem TTL por entrada); guard never-ban antes
-  de qualquer chamada; `Challenge`/`RateLimit` são logados como unenforced
-  (a plataforma só conhece drop/reject). Wire no
-  `build_challenge_action` sem reconcile daemon-side.
-- **[x] F6.2 — Provider nginx** (entregue pelo F7.11, §8.7): gerador de
-  include deny-list (`deny <ip>;` em `sentry-deny.conf` incluído do
-  `http`/`server` block) + reload (`nginx -s reload`) com debounce
-  (≥ 1 reload/s) e `nginx -t` antes (`validate = true`); TTL por bloco
-  gerado com carimbo de tempo (`# sentry:<ts>:<ttl>`). Modo desafio: geo
-  map `$sentry_challenge_ip` + `if` → `js_challenge on` (módulo
-  getpagespeed no host) em vez de njs. Requer co-locação — topologias
-  documentadas em §8.7 (F7.11).
-- **[ ] F6.3 — HAProxy maps**: `sentry_blocks.map` com `src` como key +
-  `http-request deny` — mesmo ciclo gerador/reload do F6.2.
-- **[ ] F6.4 — Export Suricata/fast.log + EVE**: Espelho de eventos como
-  `fast.log` (formato Snort/Suricata) consumível por ferramentas
-  existentes; complementa o CEF/LEEF da F4.6.
-- **[ ] F6.5 — GUI/empacotamento OPNsense**: plugin oficial (PHP/XML do
-  OPNsense) embutindo `sentry` como serviço — só depois de F6.1 estável.
-
-Critérios de "pronto" da F5/F6:
-- F5: benchmark de regressão no CI verde por 2 semanas; spike eBPF
-  entregando eventos no fan-in em VM Linux; decisão documentada de
-  AF_XDP vs kernel module.
-- F6: um provider de firewall E2E (block → edge real → expira) com
-  testes de contrato + fixture; doc de deploy por plataforma.
-
-### 23.3 F7 — Roadmap restante (datasets completos)
-
-F7.1–F7.6 estão entregues (§8.7), assim como F7.10 (verificação de bots
-via rDNS) e F7.11 (JS challenge na edge inline + provider nginx). Restante:
-
-- **[x] F7.7 — Datasets DB-backed** (entregue pela F8; fecha o F7.9 na
-  prática): tabelas `datasets`/`dataset_entries` + `DatasetRepo` (upsert/
-  list/entries/set_enabled/delete, cada mutação emite NOTIFY
-  `sentry_datasets_changed`); `FeedKind::Ja3` + `RuleMatch::Ja3In`
-  (HashSet, case-insensitive) para listas de fingerprint TLS; CLI
-  `sentry datasets list|import|enable|disable|delete|fetch` (import aceita
-  arquivo ou URL, dedup + cap `MAX_DATASET_ENTRIES`, `--dry-run`); prefilter
-  dinâmico — `PREFILTER`/`SENSITIVE_PATH_RE`/`BAD_CRAWLER_RE` são
-  `ArcSwap` e `heuristics::reload_dataset_lists` reconstrói os três com os
-  literais de datasets `user_agent`/`path` habilitados (UA → gate CRAWLER,
-  path → gate SENSITIVE); o daemon aplica no startup e hot-reloada na
-  NOTIFY (regras sintéticas `dataset:<name>` trocadas atomicamente via
-  `RuleSet::replace_by_prefix`, nunca tocando nas demais); regra:
-  `FeedConfig.action` do dataset vira o veredito (`log` default).
-  Limitação documentada: datasets só alimentam regras + prefilter — os
-  detectores de heurística continuam com os literais builtin (a equivalência
-  gated×ungated e os proptests de cobertura dependem deles).
-- **[ ] F7.8 — ReportedIP check/lookup**: estender `IpLookupProvider` com
-  o ReportedIP (hoje só AbuseIPDB `/check`); mapear severity 1-10 das 63
-  categorias para o peso do sinal.
-- **[x] F7.9 — CLI de datasets** (entregue junto com o F7.7):
-  `sentry datasets list` mostra kind/entries/enabled/source_url;
-  `import --kind user_agent|path|ja3 --name <n> [--action <a>] [--dry-run]`
-  aceita arquivo ou URL; `enable/disable/delete` notificam o mesmo canal;
-  `fetch` re-busca os datasets com `source_url` e re-publica contagens.
-
-## 24. F9 — Protocol Schemas (`sentry-protocol`) — DSL de descrição de protocolos
-
-> Descrever protocolos customizados (portas não padrão, game servers,
-> serviços binários) em YAML e validar os frames com confiança — mais
-> rápido que regex no caminho default. O formato usa JSON Schema como
-> núcleo mental (tipos/constraints) mas é uma DSL própria orientada a
-> wire formats binários e textuais; macros de leitura são **definidas por
-> protocolo** no próprio schema (a crate shipa só átomos universais).
-
-### 24.1 Formato do schema (`*.protocol.yaml`)
-
-- `transport`: `protocol: tcp|udp|ws`, `ports`, `flags` de socket.
-- `mode`: `shadow` (default — só sinaliza) | `enforce` (host fecha a
-  conexão na 1ª violação).
-- `on_message.run`: pipeline de átomos por frame — `check_len!`
-  (framing length-prefixed com args offset/size/endian/counts/max) e
-  `parse_header!` (produz a variável de dispatch, default `header`);
-  pipe `|` é sugar de lista.
-- `types`: macros de leitura customizadas por protocolo, duas formas:
-  - sugar one-liner: `LPStr: {prefix: u16, decode: utf8, max_len: 4096}`;
-  - body de steps (mini-máquina de registradores):
+- `transport`: `protocol: tcp|udp|ws`, `ports`, socket `flags`.
+- `mode`: `shadow` (default — signals only) | `enforce` (the host closes
+  the connection on the 1st violation).
+- `on_message.run`: atom pipeline per frame — `check_len!`
+  (length-prefixed framing with offset/size/endian/counts/max args) and
+  `parse_header!` (produces the dispatch variable, default `header`);
+  the `|` pipe is list sugar.
+- `types`: reading macros customized per protocol, two forms:
+  - one-liner sugar: `LPStr: {prefix: u16, decode: utf8, max_len: 4096}`;
+  - step body (mini register machine):
 
     ```yaml
     VLInt:
@@ -1819,162 +1630,162 @@ via rDNS) e F7.11 (JS challenge na edge inline + provider nginx). Restante:
         - return acc
     ```
 
-    Atribuição aceita **expressão infix** (ops palavra `and/or/xor/shl/
-    shr/add/sub/mul/not` com sugar simbólico `& | ^ << >> + - *`, unário
-    `-`, precedência C-like) ou chamada de átomo de I/O
-    (`read`/`decode`/`peek`). `while` exige bound provável em
-    compile-time — constante ou `min!(expr, cap)`; as iterações
-    clampeiam ao cap. `if <expr>:` executa o bloco quando ≠ 0 (branch
-    só-para-frente; `return` dentro de `if` funciona). Checagens são
-    statement macros do body — `check_mask!(reg, bits, value)`,
+    Assignment accepts an **infix expression** (word ops `and/or/xor/shl/
+    shr/add/sub/mul/not` with symbolic sugar `& | ^ << >> + - *`, unary
+    `-`, C-like precedence) or an I/O atom call
+    (`read`/`decode`/`peek`). `while` requires a bound provable at
+    compile-time — constant or `min!(expr, cap)`; iterations
+    clamp to the cap. `if <expr>:` runs the block when ≠ 0 (forward-only
+    branch; `return` inside `if` works). Checks are
+    body statement macros — `check_mask!(reg, bits, value)`,
     `check_range!(reg, min, max)`, `check_len!(reg, min, max)`
-    (namespace separado dos átomos do `run:`). Registradores não podem
-    usar palavras reservadas (operadores/átomos). Compila por inlining
-    para a mesma tabela de instruções (custo runtime zero vs macro
-    nativa). Integers VL-style radam aqui.
-- `policies`: severidade nomeada (`default` obrigatório; `weight`,
-  `on_repeat {count, window, escalate}`); violações citam a policy pelo
-  nome (`sentry_protocol_violations_total{schema, policy}`).
-- `messages`: dispatch **obrigatório** por mapa `when` (variável de
-  macro → escalar; lista = OR; união dos `when` = allowlist implícito;
-  overlap = erro de carga), `after: [msg]` (pré-condição de sequência,
-  era "gate"), `keepalive: true|{cadence, rate_limit}` (reseta TTL,
-  flood vira violação), `validate` one-liners por campo:
-  `campo: TIPO >n <n len>n len<n regex '…' b64 b64url hex alnum digits
-  printable in 'a','b' not_in <dataset> req` (em valores numéricos
-  `>n/<n` são valor; em strings/bytes são tamanho).
+    (separate namespace from the `run:` atoms). Registers cannot
+    use reserved words (operators/atoms). Compiles by inlining
+    into the same instruction table (zero runtime cost vs native
+    macro). VL-style integers are read here.
+- `policies`: named severity (`default` required; `weight`,
+  `on_repeat {count, window, escalate}`); violations cite the policy by
+  name (`sentry_protocol_violations_total{schema, policy}`).
+- `messages`: dispatch **mandatory** via the `when` map (macro variable
+  → scalar; list = OR; union of the `when`s = implicit allowlist;
+  overlap = load error), `after: [msg]` (sequence precondition,
+  formerly "gate"), `keepalive: true|{cadence, rate_limit}` (resets TTL,
+  flood becomes a violation), per-field `validate` one-liners:
+  `field: TYPE >n <n len>n len<n regex '…' b64 b64url hex alnum digits
+  printable in 'a','b' not_in <dataset> req` (in numeric values
+  `>n/<n` compare the value; in strings/bytes the length).
 
-### 24.2 Runtime: compilado + VM (tabela de instruções)
+### 24.2 Runtime: compiled + VM (instruction table)
 
-- Schema carregado 1×, compilado para `Compiled { protocols, by_port }`;
-  cada mensagem vira um programa linear `Vec<Instr>` executado por um
-  loop estreito com cursor de bytes e registers `[Value; 16]` — sem
-  regex no caminho default (o op `regex` só roda no campo que o
-  declarou, `Arc<Regex>` compilada no load; a crate é linear-time).
-- `ProtocolEngine` = `ArcSwap<Compiled>`: hot-reload é um swap de
-  ponteiro, sem downtime; `ConnectionState` por conexão (sem locks):
-  set de mensagens vistas (`after`), timers de keepalive, contadores de
-  `on_repeat` para escalação.
-- **SIMD (feature `simd`)**: scan de terminador via `memchr` e
-  validação UTF-8 via `simdutf8`; fallbacks escalares quando off.
-- Compilação com guardas de DoS: ≤16 registradores, ≤512 instruções por
-  mensagem, `while` com cap provável em compile-time (`if` compila para
-  branch só-para-frente — programas sempre terminam), aninhamento ≤8
-  (schemas são compartilháveis).
+- Schema loaded once, compiled to `Compiled { protocols, by_port }`;
+  each message becomes a linear `Vec<Instr>` program executed by a
+  tight loop with a byte cursor and registers `[Value; 16]` — no
+  regex on the default path (the `regex` op only runs on the field that
+  declared it, `Arc<Regex>` compiled at load; the crate is linear-time).
+- `ProtocolEngine` = `ArcSwap<Compiled>`: hot-reload is a pointer
+  swap, no downtime; `ConnectionState` per connection (no locks):
+  seen-message set (`after`), keepalive timers, `on_repeat`
+  counters for escalation.
+- **SIMD (feature `simd`)**: terminator scan via `memchr` and
+  UTF-8 validation via `simdutf8`; scalar fallbacks when off.
+- Compilation with DoS guards: ≤16 registers, ≤512 instructions per
+  message, `while` with a cap provable at compile-time (`if` compiles to
+  a forward-only branch — programs always terminate), nesting ≤8
+  (schemas are shareable).
 
-### 24.3 Integração
+### 24.3 Integration
 
-- Edge-tcp: após o sticky-block, se um schema guarda a porta local e
-  declara framing, o client→server passa por pump validado (frame
-  splitado pelo `check_len!`, validado, e encaminhado); `enforce`
-  fecha na violação, `shadow` encaminha e sinaliza (1 evento por
-  conexão via `rescore_from` + `SignalKind::ProtocolViolation`,
-  weight = weight da policy, `escalated` dobra).
-- Hot-reload: watcher `notify` v6 (debounce 500ms, coalescendo eventos)
-  + rescan full por fingerprint (mtime+size) + safety poll 60s; compile
-  falho mantém o set anterior (all-or-nothing).
+- Edge-tcp: after the sticky-block, if a schema guards the local port and
+  declares framing, client→server goes through a validated pump (frame
+  split by `check_len!`, validated, and forwarded); `enforce`
+  closes on violation, `shadow` forwards and signals (1 event per
+  connection via `rescore_from` + `SignalKind::ProtocolViolation`,
+  weight = the policy weight, `escalated` doubles it).
+- Hot-reload: `notify` v6 watcher (500ms debounce, coalescing events)
+  + full rescan by fingerprint (mtime+size) + 60s safety poll; a failed
+  compile keeps the previous set (all-or-nothing).
 - CLI: `sentry protocol validate|list|check <schema> --hex <bytes>`;
-  `config validate` compila os schemas quando `[protocol] enabled`.
-- Métricas: `sentry_protocol_violations_total{schema, policy}`,
+  `config validate` compiles the schemas when `[protocol] enabled`.
+- Metrics: `sentry_protocol_violations_total{schema, policy}`,
   `sentry_protocol_frames_total{schema}`; `sentry_signal_kinds_total`
-  ganha `protocol_violation` de graça.
+  gains `protocol_violation` for free.
 
-### 24.4 Números (§22, Win11/MSVC/release, fixtures `game-relay`)
+### 24.4 Numbers (§22, Win11/MSVC/release, `game-relay` fixtures)
 
-| Bench | Tempo |
+| Bench | Time |
 | --- | --- |
-| `protocol/frame_sso` (VM compilada) | ~0,74 µs |
-| `regex/frame_sso_baseline` (validação 100% regex equivalente) | ~24,6 µs (**~33×**) |
-| `protocol/dispatch_unknown_header` | ~0,50 µs |
-| `protocol/stream_100_frames` | ~66 µs (~0,66 µs/frame) |
+| `protocol/frame_sso` (compiled VM) | ~0.74 µs |
+| `regex/frame_sso_baseline` (100% equivalent regex validation) | ~24.6 µs (**~33×**) |
+| `protocol/dispatch_unknown_header` | ~0.50 µs |
+| `protocol/stream_100_frames` | ~66 µs (~0.66 µs/frame) |
 | `compile_game_schema` (one-time) | ~190 µs |
-| `simd_vs_scalar/read_until` (4 KiB) | memchr 27 ns vs escalar 1,22 µs (**~45×**) |
-| `simd_vs_scalar/utf8_validate` (4 KiB) | simdutf8 32 ns vs std 75 ns (~2,3×) |
+| `simd_vs_scalar/read_until` (4 KiB) | memchr 27 ns vs scalar 1.22 µs (**~45×**) |
+| `simd_vs_scalar/utf8_validate` (4 KiB) | simdutf8 32 ns vs std 75 ns (~2.3×) |
 
-Critério ≥5× vs regex baseline: superado (~33×). Limitações v1: apenas
-a direção client→server; UDP/WS declarados no formato mas o pump
-validado hoje cobre edge-tcp (ws/udp ficam para §23.x); sem branch
-condicional no corpo de macros (decisão de design — auditabilidade).
+The ≥5× criterion vs the regex baseline: met (~33×). v1 limitations: only
+the client→server direction; UDP/WS declared in the format but the
+validated pump currently covers edge-tcp (ws/udp left for BACKLOG.md §5); no conditional
+branch in the macro body (design decision — auditability).
 
-## 25. F10 — Inspeção de uploads e corpo de requisição (inline edge)
+## 25. F10 — Upload and request-body inspection (inline edge)
 
-> Até F9 o pipeline enxergava path/query/headers/TLS — o **corpo** da
-> requisição era capturado (`[edge] body_capture_kb`) mas nunca analisado
-> (só a condição DSL `body`). O F10 faz a edge inline inspecionar uploads
-> (multipart), formulários (urlencoded) e corpos JSON: SQLi/XSS/injection
-> em filenames e campos, imagens poliglotas, executáveis disfarçados e
-> flood de volume — tudo byte-level, sem ML e sem AV externo, decidido
-> **antes** do upstream receber o request.
+> Until F9 the pipeline saw path/query/headers/TLS — the request
+> **body** was captured (`[edge] body_capture_kb`) but never analyzed
+> (only the `body` DSL condition). F10 makes the inline edge inspect
+> uploads (multipart), forms (urlencoded) and JSON bodies: SQLi/XSS/injection
+> in filenames and fields, polyglot images, disguised executables and
+> volume flood — all byte-level, no ML and no external AV, decided
+> **before** the upstream receives the request.
 
-### 25.1 Escopo e limites
+### 25.1 Scope and limits
 
-- **Só inline** (`[deployment] mode = "inline"`): fontes passivas (tail de
-  access.log, syslog, CF Logs) não carregam corpo — `[uploads] enabled`
-  fora do inline loga um warning no startup e é no-op.
-- **Captura ≠ inspeção**: o pipeline analisa o prefixo `inspect_kb` do
-  corpo, mas `HttpData.body` (persistência) continua obedecendo
-  `body_capture_kb` — restaurado após o `process` no proxy e no
-  middleware. Com `body_capture_kb = 0` (default) nada do corpo persiste.
-- **Memória**: enquanto `[uploads]` está ativo, o cap de inspeção É o cap
-  do corpo (corpo maior = 413, checado por content-length antes de
-  bufferar); o teto de memória passa a ser ~requisições concorrentes ×
+- **Inline only** (`[deployment] mode = "inline"`): passive sources
+  (access.log tail, syslog, CF Logs) carry no body — `[uploads] enabled`
+  outside inline logs a warning at startup and is a no-op.
+- **Capture ≠ inspection**: the pipeline analyzes the `inspect_kb` prefix of the
+  body, but `HttpData.body` (persistence) still obeys
+  `body_capture_kb` — restored after `process` in the proxy and the
+  middleware. With `body_capture_kb = 0` (default) nothing of the body persists.
+- **Memory**: while `[uploads]` is active, the inspection cap IS the body
+  cap (larger body = 413, checked by content-length before
+  buffering); the memory ceiling becomes ~concurrent requests ×
   `inspect_kb` (default 4 MiB).
-- **Não-goals**: `features.rs` do sentry-ai intocado (paridade treino/
-  inferência do ONNX commitado); sem ClamAV/AV externo; sem ML de visão;
-  `serde_json` não entra no core (JSON é scanned como texto).
+- **Non-goals**: `features.rs` of sentry-ai untouched (training/
+  inference parity with the committed ONNX); no ClamAV/external AV; no vision ML;
+  `serde_json` does not enter the core (JSON is scanned as text).
 
-### 25.2 Camadas (todas em `sentry-core`, puras)
+### 25.2 Layers (all in `sentry-core`, pure)
 
-1. **Parser** (`multipart.rs`): `parse_multipart` RFC 7578 (CRLF-tolerante,
-   `filename*` RFC 5987, aninhado rejeitado, cap de partes),
+1. **Parser** (`multipart.rs`): `parse_multipart` RFC 7578 (CRLF-tolerant,
+   `filename*` RFC 5987, nesting rejected, part cap),
    `parse_urlencoded`, `looks_like_json`, `is_scannable_text`.
-2. **Classificação** (`uploads.rs`): `sniff_kind` por magic bytes
+2. **Classification** (`uploads.rs`): `sniff_kind` by magic bytes
    (PNG/JPEG/GIF/WebP/BMP → Image; ZIP/gzip/bzip2 → Archive; PDF; MZ/ELF/
-   Mach-O/shebang → Executable; texto decodificável → Text).
-3. **Poliglotas** (`hidden_payload_markers`): marcadores executáveis
+   Mach-O/shebang → Executable; decodable text → Text).
+3. **Polyglots** (`hidden_payload_markers`): executable markers
    (`<?php`, `<script`, `system(`, `shell_exec(`, `eval(base64_decode`,
-   `/etc/passwd`, …) no head (8 KiB) e tail (4 KiB) de partes
-   Image/Archive/Pdf — texto (SVG/HTML) é coberto pelo content scan
-   (sem dupla contagem de sinal).
-4. **Heurísticas** (`heuristics.rs`, `gate_bit() = None` — early-return
-   sem corpo; o prefilter Aho-Corasick u8 fica intocado):
-   - `UploadFilename` — regexes de attack-text no filename (decodificado)
-     + `\0`/`../` + extensão bloqueada (inclusive dupla: `shell.php.jpg`).
-   - `UploadContent` — as mesmas regexes sobre partes textuais (campos de
-     formulário, SVG/HTML/JSON), valores urlencoded e corpo JSON (quando
-     `[uploads] scan_json`); cap 512 KiB/parte.
-   - `UploadImage` — mismatch declarado×real (imagem que é ZIP/EXE/PDF),
-     executável puro, poliglota; cobre também uploads binários diretos
-     (PUT/POST `image/*`|`octet-stream` sem multipart).
-5. **Volume** (`UploadTracker`): janela deslizante por-IP de arquivos e
-   bytes (`[uploads.flood]`) → `UploadFlood`; prune 60 s no daemon.
+   `/etc/passwd`, …) in the head (8 KiB) and tail (4 KiB) of
+   Image/Archive/Pdf parts — text (SVG/HTML) is covered by the content scan
+   (no signal double-counting).
+4. **Heuristics** (`heuristics.rs`, `gate_bit() = None` — early-return
+   without body; the Aho-Corasick u8 prefilter stays untouched):
+   - `UploadFilename` — attack-text regexes on the (decoded) filename
+     + `\0`/`../` + blocked extension (including double: `shell.php.jpg`).
+   - `UploadContent` — the same regexes over textual parts (form
+     fields, SVG/HTML/JSON), urlencoded values and JSON body (when
+     `[uploads] scan_json`); 512 KiB/part cap.
+   - `UploadImage` — declared×real mismatch (an image that is ZIP/EXE/PDF),
+     pure executable, polyglot; also covers direct binary uploads
+     (PUT/POST `image/*`|`octet-stream` without multipart).
+5. **Volume** (`UploadTracker`): per-IP sliding window of files and
+   bytes (`[uploads.flood]`) → `UploadFlood`; 60 s prune in the daemon.
 
-### 25.3 Sinais e pesos
+### 25.3 Signals and weights
 
-| Sinal | Peso default | Disparo |
+| Signal | Default weight | Trigger |
 | --- | --- | --- |
-| `upload_type_mismatch` | 30 | magic bytes ≠ content-type/extensão declarada (imagem que é ZIP/EXE/PDF) |
-| `upload_polyglot` | 60 | payload executável escondido em imagem/arquivo/PDF |
-| `upload_executable` | 50 | MZ/ELF/shebang ou extensão bloqueada (`blocked_extensions`) |
-| `upload_flood` | 25 | `[uploads.flood]` arquivos/MiB por IP na janela |
+| `upload_type_mismatch` | 30 | magic bytes ≠ declared content-type/extension (an image that is ZIP/EXE/PDF) |
+| `upload_polyglot` | 60 | executable payload hidden in image/archive/PDF |
+| `upload_executable` | 50 | MZ/ELF/shebang or blocked extension (`blocked_extensions`) |
+| `upload_flood` | 25 | `[uploads.flood]` files/MiB per IP in the window |
 
-Injeção em filename/campo/corpo **reemite** os sinais existentes
-(`sql_injection`, `xss`, `log4shell`, `rce`, `lfi`, `path_traversal`) com
-os mesmos pesos e `detail` prefixado (`upload filename …`, `form field …`,
-`json body`) — dashboards, `[scorer.weights]` e escalada funcionam sem
-mudança. Em `mode = "shadow"` (default) **todo sinal de origem-upload nasce
-com peso 0**: detecta, loga e metriciza, mas não bloqueia; `enforce`
-aplica os pesos plenos e o veredito sai antes do proxy.
+Injection in filename/field/body **re-emits** the existing signals
+(`sql_injection`, `xss`, `log4shell`, `rce`, `lfi`, `path_traversal`) with
+the same weights and a prefixed `detail` (`upload filename …`, `form field …`,
+`json body`) — dashboards, `[scorer.weights]` and escalation work without
+changes. In `mode = "shadow"` (default) **every upload-origin signal is born
+with weight 0**: detects, logs and metricizes, but does not block; `enforce`
+applies the full weights and the verdict comes before the proxy.
 
-### 25.4 Config e operação
+### 25.4 Config and operation
 
 ```toml
 [uploads]
-enabled = false            # opt-in; warning fora de inline
+enabled = false            # opt-in; warning outside inline
 mode = "shadow"            # shadow | enforce
-inspect_kb = 4096          # cap de inspeção/request (também o limite de 413)
-max_files = 16             # partes multipart por request
-scan_json = true           # scan textual de corpos JSON
+inspect_kb = 4096          # inspection cap/request (also the 413 limit)
+max_files = 16             # multipart parts per request
+scan_json = true           # textual scan of JSON bodies
 blocked_extensions = ["php", "phtml", "jsp", "asp", "aspx", "exe", …]
 [uploads.flood]
 window_secs = 60
@@ -1983,9 +1794,9 @@ max_total_mb = 50
 ```
 
 - DSL: `upload_filename contains ".php"` (`RuleMatch::UploadFilename`) —
-  compõe com as demais condições (ex. restringir a `/api/upload`).
-- Evento: `HttpData.uploads` (metadados only: `field_name`, `filename`,
-  `content_type`, `size`, `kind`); eventlog expõe `uploads` com key-set
-  estável (`null` quando ausente).
-- Métricas: `sentry_edge_uploads_inspected_total`; os sinais entram em
-  `sentry_signal_kinds_total` de graça.
+  composes with the other conditions (e.g. restrict to `/api/upload`).
+- Event: `HttpData.uploads` (metadata only: `field_name`, `filename`,
+  `content_type`, `size`, `kind`); the eventlog exposes `uploads` with a stable
+  key-set (`null` when absent).
+- Metrics: `sentry_edge_uploads_inspected_total`; the signals enter
+  `sentry_signal_kinds_total` for free.

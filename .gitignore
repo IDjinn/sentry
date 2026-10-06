@@ -11,3 +11,8 @@ dataset.csv
 # Honeypot deploy: local-only files
 !deploy/honeypot/sentry.toml
 deploy/honeypot/certs/
+
+# Local agent/tooling state (never commit)
+/.zcode/
+/.mimosa/
+/todo.md
