@@ -38,6 +38,12 @@ pub enum Command {
         /// Force non-interactive stream mode.
         #[arg(long)]
         stream: bool,
+        /// TUI color theme (`dark`, `light` or `mono`).
+        #[arg(long)]
+        theme: Option<String>,
+        /// Emit one JSON object per event (with `--stream`).
+        #[arg(long)]
+        json: bool,
     },
     /// Manage incidents.
     Incidents {

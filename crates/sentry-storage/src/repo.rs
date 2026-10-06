@@ -213,6 +213,28 @@ impl EventRepo {
         Ok(rows)
     }
 
+    /// Fetch recent events for a single client IP (newest first).
+    ///
+    /// Backs the per-IP info panel in the tail TUI.
+    pub async fn recent_for_ip(&self, ip: IpAddr, limit: i64) -> Result<Vec<EventRow>> {
+        let rows = sqlx::query_as::<_, EventRow>(
+            r#"SELECT id, timestamp, source, host(client_ip) AS client_ip,
+                      client_port, server_port, asn, country,
+                      protocol, risk_score, risk_level, verdict, signals, raw,
+                      duration_ms, process_us
+               FROM events
+               WHERE client_ip = $1::inet
+               ORDER BY timestamp DESC
+               LIMIT $2"#,
+        )
+        .bind(ip.to_string())
+        .bind(limit)
+        .fetch_all(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(rows)
+    }
+
     /// Fetch all events since a given timestamp (oldest first).
     ///
     /// Used by the background route learner to scan a sliding window.

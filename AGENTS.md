@@ -192,7 +192,19 @@ não em runtime.
   - ✅ CLI subcommands completos (incidents, ip, routes, rules, report, config,
     model, cloudflare, test, auto) — handlers em `cmd.rs`
   - ✅ TUI `ratatui` standalone (lê eventos recentes do Postgres, scrollável,
-    atalhos j/k/Space/g/G/q/Esc)
+    atalhos j/k/Space/g/G/q/Esc) — estendida: layout de 3 zonas do
+    `ARCHITECTURE.md` §11.1 (header com sparkline req/s + contadores por
+    level, rodapé agregado Top IPs/Top paths/ASN-Geo, responsivo), filtro
+    textual (`f`/`/`) + `--only High,Critical` + `--theme dark|light|mono`,
+    popup de detalhe do evento (Enter, sinais com peso/detail, protocolo
+    JSON), info de IP (`i`: strikes/is_blocked/incidente/últimos eventos via
+    `EventRepo::recent_for_ip`), rotas (`r`), pausa com contador de backlog
+    (Space) e ações: `b` block / `u` unblock via `ip_state` + NOTIFY
+    `sentry_blocks_changed` (com guard never-ban de `[real_ip]`) e `c`
+    managed challenge no Cloudflare (`build_cf_provider`). Modo
+    `--stream` implementado (era stub): uma linha por evento, texto colorido
+    ou `--json` (JSONL), auto-ativado fora de TTY, 16 testes novos em
+    `tui/{agg,theme,stream}.rs`
   - ✅ Fixtures + snapshot tests (11 fixtures nginx, 11 snapshots insta)
   - ✅ CI GitHub Actions (fmt, clippy, test matrix 3 OS, storage com Postgres)
   - ✅ Config example completo (`[geo]`, `[[routes.known]]`, `[scorer]`)
@@ -395,10 +407,10 @@ não em runtime.
     alocação no hit com sweep 1×/TTL, ingest em lote `recv_many(64)`.
     Pipeline end-to-end: 3,49 ms → 4,36 µs/evento (~800×). Números e
     metodologia em `ARCHITECTURE.md` §22
-  - ⏸️ F5 avançada (roadmap `ARCHITECTURE.md` §23.1): budgets de
+  - ⏸️ F5 avançada (roadmap `BACKLOG.md` §5.1): budgets de
     regressão no CI, eBPF/aya, io_uring, AF_XDP kernel-bypass, ring
     buffers NUMA, avaliação de kernel module, SIMD explícito
-- **F6** (roadmap `ARCHITECTURE.md` §23.2): Integrações de
+- **F6** (roadmap `BACKLOG.md` §5.2): Integrações de
   firewall/plataforma — providers OPNsense/pfSense (alias tables),
   nginx (deny-list + reload), HAProxy maps, export Suricata/fast.log;
   todos via trait `ChallengeProvider` (sem mudar regras/pipeline)
@@ -486,7 +498,7 @@ não em runtime.
     (regras `dataset:<name>` substituídas via `RuleSet::replace_by_prefix`);
     CLI `sentry datasets list|import|enable|disable|delete|fetch` (import
     aceita arquivo ou URL; fetch re-busca os `source_url`; `--dry-run`)
-  - ⏸️ F7.8 ReportedIP check (roadmap `ARCHITECTURE.md` §23.3)
+  - ⏸️ F7.8 ReportedIP check (roadmap `BACKLOG.md` §5.3)
 
 ## F8 (concluída): Monitoramento SSL/443 inline — terminação TLS +
 telemetria de handshake + provider de appliance
@@ -660,7 +672,7 @@ telemetria de handshake + provider de appliance
     upload_filename contains ".php"` → Block) — 1 teste round-trip +
     match
 
-Backlog detalhado em `ARCHITECTURE.md` §23 (§24 para o F9, §25 para o F10).
+Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues).
 
 ### Status atual (verificação contínua)
 
@@ -700,15 +712,14 @@ cargo test --all
 4. Verifique que não há `println!` de debug sobrando (use `tracing`)
 5. Não commitar segredos nem arquivos `target/`
 
-## 11. Notas do ambiente (Windows)
+## 11. Notas de ambiente
 
-- Toolchain ativo: `stable-x86_64-pc-windows-msvc` (rustup default)
-- MSVC Build Tools 2022 instalados em
-  `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`
-- `link.exe` do MSVC está disponível; o `link.exe` do Git em
-  `C:\Program Files\Git\usr\bin\` pode conflitar — o rustup prioriza o MSVC.
+- Windows: use a toolchain MSVC (`stable-x86_64-pc-windows-msvc`); o
+  `link.exe` do MSVC tem prioridade sobre o do Git.
 - Postgres para testes locais: rodar via `deploy/docker/docker-compose.yml`
   (serviço `postgres`) ou instalar localmente.
+- Nunca commitar caminhos ou credenciais da máquina local (`.zcode/`,
+  `.mimosa/` e `todo.md` estão no `.gitignore`).
 
 ## 12. Documentação (Fumadocs)
 

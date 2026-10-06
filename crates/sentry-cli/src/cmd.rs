@@ -20,13 +20,37 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
             let cfg = require_config(&cfg)?;
             crate::server::run(cfg).await?;
         }
-        Command::Tail { stream, .. } => {
-            if stream {
-                tail_stream().await?;
-            } else {
-                crate::tui::run(cfg.as_ref())
+        Command::Tail {
+            only,
+            tui,
+            stream,
+            theme,
+            json,
+        } => {
+            let only = only
+                .map(|s| crate::tui::agg::parse_only(&s))
+                .unwrap_or_default();
+            let theme = match theme.as_deref() {
+                None => Default::default(),
+                Some(s) => match crate::tui::theme::ThemeName::parse(s) {
+                    Some(t) => t,
+                    None => {
+                        color_eyre::eyre::bail!("--theme aceita dark|light|mono (recebido {s:?})")
+                    }
+                },
+            };
+            let interactive =
+                tui || (!stream && std::io::IsTerminal::is_terminal(&std::io::stdout()));
+            if interactive {
+                crate::tui::run(cfg.as_ref(), crate::tui::TailOptions { only, theme })
                     .await
                     .map_err(color_eyre::Report::from)?;
+            } else {
+                crate::tui::stream::run(
+                    cfg.as_ref(),
+                    crate::tui::stream::StreamOptions { only, json },
+                )
+                .await?;
             }
         }
         Command::Incidents { action } => match action {
@@ -1340,7 +1364,8 @@ fn tier_label(tier: sentry_core::ReputationTier) -> &'static str {
 /// Build a Cloudflare provider from env vars (`SENTRY_CF_TOKEN`,
 /// `SENTRY_CF_ZONE`; optionally `SENTRY_CF_ACCOUNT` and
 /// `SENTRY_CF_IPV6_PREFIX` for the IP List mode).
-fn build_cf_provider() -> color_eyre::Result<sentry_action_cloudflare::CloudflareProvider> {
+pub(crate) fn build_cf_provider() -> color_eyre::Result<sentry_action_cloudflare::CloudflareProvider>
+{
     let token = std::env::var("SENTRY_CF_TOKEN")
         .map_err(|_| color_eyre::eyre::eyre!("SENTRY_CF_TOKEN env var not set"))?;
     let zone = std::env::var("SENTRY_CF_ZONE")
@@ -1883,12 +1908,5 @@ fn test_payload(payload: &str, path: &str, method: &str) -> color_eyre::Result<(
     }
     println!("└────────────────────────────────────────────────────────");
 
-    Ok(())
-}
-
-/// Stream events to stdout, one per line.
-async fn tail_stream() -> color_eyre::Result<()> {
-    println!("tail stream — connect to a running daemon (F2).");
-    println!("For now, use `sentry run` to process events live.");
     Ok(())
 }
