@@ -35,7 +35,9 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 Some(s) => match crate::tui::theme::ThemeName::parse(s) {
                     Some(t) => t,
                     None => {
-                        color_eyre::eyre::bail!("--theme aceita dark|light|mono (recebido {s:?})")
+                        return Err(color_eyre::eyre::eyre!(
+                            "--theme aceita dark|light|mono (recebido {s:?})"
+                        ))
                     }
                 },
             };
