@@ -73,16 +73,6 @@ pub const PRESETS: &[FeedPreset] = &[
         description: "Commercial VPN exit ranges (Joe12387/open-source-vpn-ip-lists: mullvad, nordvpn, …)",
         feeds: VPN_PROVIDER_FEEDS,
     },
-    FeedPreset {
-        name: "anti_vpn",
-        description: "Datacenter/VPN aggregate (THEzombiePL/Anti-VPN-List: FireHOL anonymous, X4BNet, Nullified ASN)",
-        feeds: &[FeedPresetFeed {
-            name: "anti_vpn",
-            url: "https://raw.githubusercontent.com/THEzombiePL/Anti-VPN-List/main/malicious-ips.txt",
-            tier: "datacenter",
-            refresh_hours: 6,
-        }],
-    },
 ];
 
 const VPN_PROVIDER_FEEDS: &[FeedPresetFeed] = &[

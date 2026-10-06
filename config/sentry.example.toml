@@ -304,7 +304,6 @@ action = "challenge"
 #   firehol_level1       — known-bad aggregate (Spamhaus DROP, DShield, …)
 #   proxy_list           — open proxies (mmpx12/proxy-list)
 #   open_source_vpn_ips  — commercial VPN exits (mullvad, nordvpn, …)
-#   anti_vpn             — datacenter/VPN aggregate (Anti-VPN-List)
 #
 # [rules]
 # feed_presets = ["firehol_level1", "tor_exit"]
