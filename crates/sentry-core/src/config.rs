@@ -485,6 +485,20 @@ pub struct RealIpConfig {
     /// join the never-ban set with the same guarantees as `trusted_ips`.
     #[serde(default)]
     pub trusted_lists: Vec<String>,
+    /// Whitelist: allow everything, never ban/block/report. Merged with
+    /// `trusted_ips`/`trusted_lists` into the same never-ban set.
+    #[serde(default)]
+    pub whitelist: Vec<String>,
+    /// Blacklist: deny immediately — the pipeline short-circuits to `Block`
+    /// (sticky via the block table, kernel bans, edge actions) before any
+    /// detector runs.
+    #[serde(default)]
+    pub blacklist: Vec<String>,
+    /// Shadow: traffic is fully processed — logged, scored, heuristics/
+    /// rules/AI/LLM all run — but the verdict is capped so the IP is never
+    /// banned or blocked (`Block`/`Quarantine` downgrade to `Challenge`).
+    #[serde(default)]
+    pub shadow: Vec<String>,
     /// Cloudflare ranges refresh interval in seconds (0 disables refresh;
     /// the bundled constants stay in effect).
     #[serde(default = "default_real_ip_refresh")]
@@ -498,6 +512,9 @@ impl Default for RealIpConfig {
             cloudflare: default_real_ip_cloudflare(),
             trusted_ips: Vec::new(),
             trusted_lists: Vec::new(),
+            whitelist: Vec::new(),
+            blacklist: Vec::new(),
+            shadow: Vec::new(),
             refresh_secs: default_real_ip_refresh(),
         }
     }

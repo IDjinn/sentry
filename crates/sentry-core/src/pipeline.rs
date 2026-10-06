@@ -487,6 +487,30 @@ impl Pipeline {
             }
         }
 
+        // Blacklisted IPs (`[real_ip] blacklist`) are denied before any
+        // detector runs — the inverse of the trusted guard.
+        if let Some(trust) = &self.trust {
+            if trust.is_blacklisted(evt.client_ip) {
+                let analysis = AnalysisResult {
+                    risk_score: 100,
+                    risk_level: RiskLevel::Critical,
+                    signals: Vec::new(),
+                    verdict: Verdict::Block,
+                };
+                return ProcessedEvent {
+                    event: evt.clone(),
+                    analysis: analysis.clone(),
+                    decision: Decision {
+                        analysis,
+                        action: Verdict::Block,
+                        override_reason: Some("blacklisted ip".into()),
+                        log_level: None,
+                    },
+                    rule_hit: None,
+                };
+            }
+        }
+
         // Bot verification (F7.7): annotate claimed-crawler UAs before rule
         // evaluation so `bot_verified` conditions (verified-only allowlists)
         // see the cached outcome. The event is cloned only when enabled.
@@ -540,12 +564,15 @@ impl Pipeline {
                     override_reason: Some(format!("rule '{}' short-circuited", rule.id)),
                     log_level: rule.log_level,
                 };
-                return ProcessedEvent {
-                    event: evt.clone(),
-                    analysis: result,
-                    decision: self.apply_escalation(evt, decision),
-                    rule_hit: Some(rule.id.clone()),
-                };
+                return self.cap_shadow(
+                    evt.client_ip,
+                    ProcessedEvent {
+                        event: evt.clone(),
+                        analysis: result,
+                        decision: self.apply_escalation(evt, decision),
+                        rule_hit: Some(rule.id.clone()),
+                    },
+                );
             }
         }
         drop(ruleset);
@@ -672,12 +699,15 @@ impl Pipeline {
             log_level: None,
         };
 
-        ProcessedEvent {
-            event: evt.clone(),
-            analysis,
-            decision: self.apply_escalation(evt, decision),
-            rule_hit: None,
-        }
+        self.cap_shadow(
+            evt.client_ip,
+            ProcessedEvent {
+                event: evt.clone(),
+                analysis,
+                decision: self.apply_escalation(evt, decision),
+                rule_hit: None,
+            },
+        )
     }
 
     /// Feed the response phase of an inline-edge request into the stateful
@@ -736,6 +766,21 @@ impl Pipeline {
             queued.retain(|(ts, _)| now.duration_since(*ts) < PENDING_TTL);
             !queued.is_empty()
         });
+    }
+
+    /// Shadow-list cap (F7.2 `[real_ip] shadow`): the IP is fully analyzed
+    /// and logged, but never banned or blocked — `Block`/`Quarantine`
+    /// downgrade to `Challenge`.
+    fn cap_shadow(&self, ip: IpAddr, mut pe: ProcessedEvent) -> ProcessedEvent {
+        if let Some(trust) = &self.trust {
+            if trust.is_shadow(ip)
+                && matches!(pe.decision.action, Verdict::Block | Verdict::Quarantine)
+            {
+                pe.decision.action = Verdict::Challenge;
+                pe.decision.override_reason = Some("shadow ip (no ban)".into());
+            }
+        }
+        pe
     }
 
     /// Record a strike for a non-Allow decision and escalate the verdict if
@@ -992,12 +1037,15 @@ impl Pipeline {
                 }
             }
         }
-        ProcessedEvent {
-            event: base.event.clone(),
-            analysis,
-            decision,
-            rule_hit: base.rule_hit.clone(),
-        }
+        self.cap_shadow(
+            base.event.client_ip,
+            ProcessedEvent {
+                event: base.event.clone(),
+                analysis,
+                decision,
+                rule_hit: base.rule_hit.clone(),
+            },
+        )
     }
 }
 
@@ -1906,5 +1954,64 @@ mod tests {
             .as_deref()
             .is_some_and(|reason| reason.starts_with("offender escalation")));
         assert_eq!(offender.read().unwrap().strikes(ip), 2);
+    }
+
+    #[test]
+    fn blacklisted_ip_short_circuits_to_block() {
+        let mut rc = crate::config::RealIpConfig::default();
+        rc.blacklist = vec!["1.2.3.0/24".into()];
+        let p = pipeline().with_trust(crate::trust::SharedTrustSet::new(
+            crate::trust::TrustSet::from_config(&rc).unwrap(),
+        ));
+        let r = p.process(&http_evt("/admin/.env"));
+        assert_eq!(r.decision.action, Verdict::Block);
+        assert_eq!(
+            r.decision.override_reason.as_deref(),
+            Some("blacklisted ip")
+        );
+        assert_eq!(r.analysis.risk_score, 100);
+    }
+
+    #[test]
+    fn shadow_ip_is_analyzed_but_never_blocked() {
+        let mut rc = crate::config::RealIpConfig::default();
+        rc.shadow = vec!["1.2.3.0/24".into()];
+        let p = pipeline().with_trust(crate::trust::SharedTrustSet::new(
+            crate::trust::TrustSet::from_config(&rc).unwrap(),
+        ));
+
+        let base = p.process(&http_evt("/api/users"));
+        assert_eq!(base.decision.action, Verdict::Allow);
+
+        let extra = vec![Signal {
+            kind: SignalKind::AnomalousPayload,
+            weight: 90,
+            detail: None,
+        }];
+        let r = p.rescore_from(&base, extra);
+        // Signals were fully analyzed (Critical band) but the ban is capped
+        // to a challenge.
+        assert!(
+            r.analysis.risk_score >= 90,
+            "score was {}",
+            r.analysis.risk_score
+        );
+        assert_eq!(r.analysis.risk_level, RiskLevel::Critical);
+        assert_eq!(r.decision.action, Verdict::Challenge);
+        assert_eq!(
+            r.decision.override_reason.as_deref(),
+            Some("shadow ip (no ban)")
+        );
+    }
+
+    #[test]
+    fn non_shadow_ip_still_blocks_normally() {
+        let extra = vec![Signal {
+            kind: SignalKind::AnomalousPayload,
+            weight: 90,
+            detail: None,
+        }];
+        let r = pipeline().rescore_from(&pipeline().process(&http_evt("/api/users")), extra);
+        assert_eq!(r.decision.action, Verdict::Block);
     }
 }

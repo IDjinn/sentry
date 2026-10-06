@@ -418,6 +418,10 @@ impl EdgeRuntime {
             if trust.is_never_ban(ip) {
                 return false;
             }
+            if trust.is_blacklisted(ip) {
+                tracing::debug!(ip = %ip, "edge fast-path: blacklisted ip denied before pipeline");
+                return true;
+            }
         }
         let Some(table) = &self.block_table else {
             return false;

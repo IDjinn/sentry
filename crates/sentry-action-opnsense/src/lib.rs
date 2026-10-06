@@ -339,6 +339,9 @@ mod tests {
             cloudflare: false,
             trusted_ips: vec!["198.51.100.7".to_string()],
             trusted_lists: Vec::new(),
+            whitelist: Vec::new(),
+            blacklist: Vec::new(),
+            shadow: Vec::new(),
             refresh_secs: 0,
         })
         .expect("valid config");

@@ -396,6 +396,17 @@ action = "challenge"
 # 403s, firewall/nginx refuse to ban. Presets: paypal, stripe, googlebot,
 # bingbot (see `sentry trusted list`).
 # trusted_lists = ["paypal", "stripe", "googlebot"]
+# Whitelist: allow everything, never ban/block/report. Merged into the same
+# never-ban set as trusted_ips/trusted_lists.
+# whitelist = ["198.51.100.0/24"]
+# Blacklist: deny immediately — the pipeline short-circuits to Block before
+# any detector runs (sticky block table, kernel bans, edge fast-path 403).
+# blacklist = ["192.0.2.66", "203.0.113.0/24"]
+# Shadow: fully analyzed and logged — heuristics, rules, AI/LLM all run —
+# but the verdict is capped so the IP is never banned or blocked
+# (Block/Quarantine downgrade to Challenge). Useful for watching a
+# suspected range without risking false-positive bans.
+# shadow = ["198.18.0.0/15"]
 # refresh_secs = 86400
 
 # On-demand external IP reputation (F7.5): gray-band IPs — local score

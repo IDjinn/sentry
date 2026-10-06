@@ -91,11 +91,13 @@ pub fn cloudflare_ranges() -> Vec<IpNet> {
     nets
 }
 
-/// Trusted-proxy + never-ban membership.
+/// Trusted-proxy + never-ban + blacklist + shadow membership.
 #[derive(Debug, Clone, Default)]
 pub struct TrustSet {
     proxies: Vec<IpNet>,
     never_ban: Vec<IpNet>,
+    blacklist: Vec<IpNet>,
+    shadow: Vec<IpNet>,
 }
 
 impl TrustSet {
@@ -126,6 +128,15 @@ impl TrustSet {
             })?;
             ts.never_ban.extend(nets);
         }
+        for entry in cfg.trusted_ips.iter().chain(&cfg.whitelist) {
+            ts.never_ban.push(parse_net(entry)?);
+        }
+        for entry in &cfg.blacklist {
+            ts.blacklist.push(parse_net(entry)?);
+        }
+        for entry in &cfg.shadow {
+            ts.shadow.push(parse_net(entry)?);
+        }
         Ok(ts)
     }
 
@@ -144,9 +155,23 @@ impl TrustSet {
         self.never_ban.iter().any(|n| n.contains(&ip))
     }
 
-    /// Whether neither set has entries.
+    /// Whether `ip` is blacklisted: denied before any detector runs.
+    pub fn is_blacklisted(&self, ip: IpAddr) -> bool {
+        self.blacklist.iter().any(|n| n.contains(&ip))
+    }
+
+    /// Whether `ip` is shadow-listed: fully analyzed and logged, but its
+    /// verdict is capped so it is never banned or blocked.
+    pub fn is_shadow(&self, ip: IpAddr) -> bool {
+        self.shadow.iter().any(|n| n.contains(&ip))
+    }
+
+    /// Whether no list has entries.
     pub fn is_empty(&self) -> bool {
-        self.proxies.is_empty() && self.never_ban.is_empty()
+        self.proxies.is_empty()
+            && self.never_ban.is_empty()
+            && self.blacklist.is_empty()
+            && self.shadow.is_empty()
     }
 
     /// Number of trusted-proxy ranges.
@@ -181,6 +206,16 @@ impl SharedTrustSet {
         self.0.read().unwrap().is_never_ban(ip)
     }
 
+    /// Whether `ip` is blacklisted: denied before any detector runs.
+    pub fn is_blacklisted(&self, ip: IpAddr) -> bool {
+        self.0.read().unwrap().is_blacklisted(ip)
+    }
+
+    /// Whether `ip` is shadow-listed: fully analyzed but never banned.
+    pub fn is_shadow(&self, ip: IpAddr) -> bool {
+        self.0.read().unwrap().is_shadow(ip)
+    }
+
     /// Whether neither set has entries.
     pub fn is_empty(&self) -> bool {
         self.0.read().unwrap().is_empty()
@@ -202,6 +237,9 @@ mod tests {
             cloudflare,
             trusted_ips: never.iter().map(|s| s.to_string()).collect(),
             trusted_lists: Vec::new(),
+            whitelist: Vec::new(),
+            blacklist: Vec::new(),
+            shadow: Vec::new(),
             refresh_secs: 0,
         }
     }
@@ -265,6 +303,42 @@ mod tests {
         c.trusted_lists = vec!["bogus".into()];
         let err = TrustSet::from_config(&c).unwrap_err();
         assert!(err.contains("unknown trusted list"), "{err}");
+    }
+
+    #[test]
+    fn whitelist_joins_never_ban() {
+        let mut c = cfg(&[], &[], false);
+        c.whitelist = vec!["198.51.100.0/24".into()];
+        let ts = TrustSet::from_config(&c).unwrap();
+        assert!(ts.is_never_ban("198.51.100.7".parse().unwrap()));
+        assert!(!ts.is_never_ban("198.51.101.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn blacklist_and_shadow_membership() {
+        let mut c = cfg(&[], &[], false);
+        c.blacklist = vec!["192.0.2.66".into(), "203.0.113.0/24".into()];
+        c.shadow = vec!["198.18.0.0/15".into()];
+        let ts = TrustSet::from_config(&c).unwrap();
+        assert!(ts.is_blacklisted("192.0.2.66".parse().unwrap()));
+        assert!(ts.is_blacklisted("203.0.113.9".parse().unwrap()));
+        assert!(!ts.is_blacklisted("8.8.8.8".parse().unwrap()));
+        assert!(ts.is_shadow("198.19.255.1".parse().unwrap()));
+        assert!(!ts.is_shadow("8.8.8.8".parse().unwrap()));
+        assert!(!ts.is_never_ban("8.8.8.8".parse().unwrap()));
+
+        c.blacklist = vec!["bad".into()];
+        assert!(TrustSet::from_config(&c).is_err());
+    }
+
+    #[test]
+    fn whitelist_wins_over_blacklist() {
+        let mut c = cfg(&[], &[], false);
+        c.blacklist = vec!["192.0.2.0/24".into()];
+        c.whitelist = vec!["192.0.2.1".into()];
+        let ts = TrustSet::from_config(&c).unwrap();
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        assert!(ts.is_never_ban(ip) && ts.is_blacklisted(ip));
     }
 
     #[test]
