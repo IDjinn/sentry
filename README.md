@@ -15,73 +15,120 @@ patterns — combining fast rules (zero known false positives) with AI for the
 unknown. All in a single Rust binary, running locally, never shipping your
 logs to a third party.
 
-## Stack
-
-| Layer        | Technology                                         |
-| ------------ | -------------------------------------------------- |
-| Language     | Rust 2021 (MSRV 1.80)                             |
-| Async        | tokio                                             |
-| CLI / TUI    | clap (derive) + ratatui + crossterm               |
-| Storage      | Postgres (sqlx)                                   |
-| Config       | figment (TOML + env overlay, `SENTRY_` prefix)    |
-| AI           | ort (ONNX, local) + `LlmProvider` trait           |
-| Edge actions | `ChallengeProvider` trait (Cloudflare, …)         |
-| Geo/ASN      | maxminddb (GeoLite2)                              |
-
-## Architecture
-
-```
-Sources (plugins)  →  Pipeline  →  Actions (plugins)
-  nginx access.log     rules engine      local blocklist
-  tcp capture          heuristics        Cloudflare challenge
-  syslog               AI (ONNX/LLM)     webhook (Discord/Slack)
-                       geo/ASN enrich    log + persist
-```
+## How it works
 
 Every source and action is a plugin behind the `Source` and `Action` traits.
-The core (`sentry-core`) is pure: it defines contracts, no heavy I/O. See
-[`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design, or browse the
-live docs at **https://sentry.lucas-romero.com**.
+The core (`sentry-core`) is pure: it defines contracts, no heavy I/O.
 
-## Documentation
+```mermaid
+flowchart LR
+    subgraph sources["Sources (plugins)"]
+        NGINX["nginx access.log"]
+        SYSLOG["syslog"]
+        CF["Cloudflare Logs"]
+        TCP["TCP capture"]
+        EDGE["Edge inline proxy"]
+    end
 
-Full docs live in a separate repo (`IDjinn/sentry-docs`), mounted as a
-submodule under [`docs/`](./docs) and deployed to Vercel at
+    subgraph pipeline["Pipeline"]
+        FAST["Rules engine (fast path)<br/>Allow > Block/Challenge/RateLimit > Log/Tag"]
+        HEUR["Heuristics<br/>SQLi · XSS · traversal · uploads · bot verify"]
+        AI["AI (ONNX + LLM, async forks)<br/>only raises the score"]
+        SCORE["Scorer + Decider<br/>geo/ASN · behavior · scan · correlation"]
+        ESC["Escalation + policy<br/>repeat offenders get strike"]
+    end
+
+    subgraph actions["Actions (plugins)"]
+        BLOCK["Blocklist / kernel firewall"]
+        CHAL["Edge challenge<br/>Cloudflare · JS PoW · nginx"]
+        WH["Webhook alerts"]
+        LOG["Log + Postgres + SIEM"]
+    end
+
+    sources --> FAST
+    FAST -- "verdict" --> ESC
+    FAST -- "no rule hit" --> HEUR --> SCORE --> AI --> SCORE
+    SCORE -- "verdict" --> ESC
+    ESC --> actions
+```
+
+1. **Sources** ingest events — log tailing, syslog, Cloudflare Logs API, raw
+   TCP capture, or the built-in inline reverse proxy (which sees traffic
+   before it reaches your service and can block it in-path).
+2. **Rules engine** is the fast path (~µs): DSL-defined packs
+   (`sensitive_paths`, `vpn_proxy`, `tor`, rate-scan, …) short-circuit with
+   `Allow` / `Block` / `Challenge` / `RateLimit`, or annotate and fall
+   through.
+3. **Heuristics** run on URL-decoded text with an Aho-Corasick prefilter —
+   encoded payloads don't bypass them. Uploads and request bodies are
+   inspected for SQLi/XSS in filenames/fields, polyglot images, and
+   disguised executables.
+4. **AI** (local ONNX model, optional LLM via OpenRouter/Ollama) runs as an
+   async fork on gray-zone traffic and can only **raise** the score.
+5. **Scorer + decider** combine signal weights, geo/ASN, reputation feeds
+   (Tor/Spamhaus), behavioral trackers (brute force, scanning), cross-IP
+   correlation, and repeat-offender escalation into a final verdict.
+6. **Actions** enforce it: local blocklist shared across nodes, kernel-level
+   bans (nftables/ipset/firewalld, OPNsense), CDN/WAF challenges,
+   webhooks, SIEM export — with a shared `BlockTable` so a block on one node
+   denies at the edge of all of them.
+
+Full design, phase-by-phase backlog, and performance numbers:
+[`ARCHITECTURE.md`](./ARCHITECTURE.md). Live docs:
 **https://sentry.lucas-romero.com**.
 
-- **Languages**: Portuguese (source) at `/pt`, English translation at `/en`.
-- **Built with**: [Fumadocs](https://fumadocs.vercel.app) + Next.js 16 + Tailwind v4.
-- **Diagram support**: Mermaid (native plugin).
+## Deployment modes
 
-### Read locally
+| Mode | How it sees traffic | Enforcement |
+| --- | --- | --- |
+| `passive` (default) | Tails logs / receives events | Cloudflare API, firewalls, webhooks |
+| `inline` | Built-in reverse proxy in front of your service (HTTP + optional TLS 443) | 403/429/challenge page in-path, before the backend |
+
+## Quick start
+
+### Docker
 
 ```bash
 git clone --recurse-submodules <this-repo>
-cd docs
-bun install
-bun run dev   # http://localhost:3000 -> redirects to /pt
+cd sentry
+docker compose -f deploy/docker/docker-compose.yml up -d
 ```
 
-To update docs without cloning the main repo:
+Secrets go in env vars, never in committed config:
+
 ```bash
-git clone git@github.com:IDjinn/sentry-docs.git
-cd sentry-docs && bun install && bun run dev
+export SENTRY_STORAGE__POSTGRES__URL=postgres://sentry:secret@db/sentry
+export SENTRY_CF_TOKEN=xxx        # Cloudflare API token (optional)
+export SENTRY_CF_ZONE=yyy         # Cloudflare zone ID (optional)
+export SENTRY_LLM_KEY=zzz         # OpenRouter key (optional)
 ```
 
-### Update the submodule pointer
+### Build from source
 
-After changes are merged into `sentry-docs`:
-```bash
-git -C docs pull origin main
-git add docs
-git commit -m "docs: bump sentry-docs"
-```
+See [BUILD.md](./BUILD.md) for requirements, optional features, and
+development workflow.
 
-### Logo
+### Configuration
 
-The project logo `sentry.png` at the repo root is the source of truth. A
-copy is committed in `sentry-docs/public/sentry.png` — update it there
-when the root PNG changes.
+`config/sentry.example.toml` documents every section (`[edge]`, `[rules]`,
+`[action]`, `[ai]`, `[uploads]`, …). Any TOML field can be overridden via
+env: `SENTRY_<SECTION>__<KEY>` (e.g. `SENTRY_EDGE__LISTEN`).
+
+**Production rollout**: start rule packs in `shadow` (log only), watch the
+logs, then switch to `enforce`.
+
+## Extending
+
+- **New source**: crate depending only on `sentry-core`, implementing the
+  `Source` trait — wire it in `daemon.rs`.
+- **New edge action** (AWS WAF, Fastly, Bunny, …): implement
+  `ChallengeProvider` in a new crate + one match arm in
+  `daemon::build_challenge_action`. Config stays
+  `type = "challenge"`, `provider = "<name>"` — no changes to rules or
+  verdict filtering.
+- **New protocol schema** for non-HTTP ports: a TOML DSL under
+  `[protocol]` (`sentry protocol validate`) — compiled to a sandboxed VM,
+  hot-reloaded live.
 
 ## Workspace
 
@@ -98,76 +145,31 @@ crates/
 └── sentry-cli/                # binary: clap + ratatui + daemon
 ```
 
-## Quick start
+## Documentation
 
-### Docker (recommended for production)
+Full docs live in a separate repo (`IDjinn/sentry-docs`), mounted as a
+submodule under [`docs/`](./docs) and deployed at
+**https://sentry.lucas-romero.com** (Portuguese at `/pt`, English at `/en`;
+Fumadocs + Next.js 16 + Tailwind v4, Mermaid support).
 
-```bash
-docker compose -f deploy/docker/docker-compose.yml up -d
-```
-
-Secrets go in env vars, never in config:
-
-```bash
-export SENTRY_CF_TOKEN=xxx        # Cloudflare API token (optional)
-export SENTRY_CF_ZONE=yyy         # Cloudflare zone ID (optional)
-export SENTRY_LLM_KEY=zzz         # OpenRouter key (optional)
-export SENTRY_STORAGE__POSTGRES__URL=postgres://sentry:secret@db/sentry
-```
-
-### Local build (development)
+Read locally:
 
 ```bash
-cargo build --release
-./target/debug/sentry config validate
-./target/debug/sentry run
+cd docs
+bun install
+bun run dev   # http://localhost:3000 -> /pt
 ```
 
-### Configuration
-
-Copy `config/sentry.example.toml` → `sentry.toml` and edit. The env overlay
-(`SENTRY_<SECTION>__<KEY>`) overrides any TOML field.
-
-## Rules and packs
-
-The rules engine runs **before** heuristics and AI (fast path). Precedence
-order: `Allow` > `Block`/`Challenge`/`RateLimit` > `Log`/`Tag` > falls
-through to heuristics + AI.
-
-Default packs: `vpn_proxy`, `tor`, `crawlers_bad`, `crawlers_good`,
-`sensitive_paths`, `country_blocklist`, `http_anomaly`, `rate_scan`. Each
-pack runs in `shadow` (log only), `enforce` (act), or `off`.
-
-**For production rollout**: start with everything in `shadow` and watch the
-logs before switching to `enforce`.
-
-## Edge actions (provider-agnostic)
-
-Edge actions (block / challenge / rate-limit at a CDN/WAF) are
-provider-agnostic via the `ChallengeProvider` trait, mirroring the
-`LlmProvider` pattern. Config uses the canonical form:
-
-```toml
-[[action]]
-type = "challenge"
-provider = "cloudflare"        # extensible: aws_waf, fastly, ...
-[action.options]
-mode = "managed_challenge"     # block | js_challenge | managed_challenge | rate_limit
-ttl_secs = 86400
-```
-
-The legacy `type = "cloudflare"` alias is kept for backward compatibility.
-Adding a new edge provider = implement `ChallengeProvider` in a new crate +
-one match arm in `daemon::build_challenge_action` — no changes to
-`ActionKind`, rules, or verdict filtering.
-
-## Tests
+After changes merge into `sentry-docs`, bump the pointer:
 
 ```bash
-cargo test --all
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
+git -C docs pull origin main
+git add docs
+git commit -m "docs: bump sentry-docs"
 ```
+
+The logo `sentry.png` at the repo root is the source of truth; a copy lives
+in `sentry-docs/public/sentry.png`.
 
 ## License
 
