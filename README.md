@@ -58,9 +58,57 @@ flowchart TD
    webhooks, SIEM export — with a shared `BlockTable` so a block on one node
    denies at the edge of all of them.
 
+## Where Sentry sits in the network
+
+Each layer is an independent barrier — a threat that slips one still hits the
+next. The two deployment modes put Sentry in different places relative to
+those barriers:
+
+```mermaid
+flowchart LR
+    subgraph passive["Passive mode (default)"]
+        direction TB
+        P1["Internet"] --> P2["Cloudflare<br/><b>L7</b> · challenge/block"]
+        P2 --> P3["Kernel firewall<br/><b>L3/L4</b> · nftables / ipset"]
+        P3 --> P4["Your service<br/><i>nginx · ssh · etc</i>"]
+
+        MON["Sentry pipeline"]
+        P4 -.->|"logs / syslog"| MON
+        MON -.->|"challenge"| P2
+        MON -.->|"bans"| P3
+    end
+
+    subgraph inline["Inline mode — Sentry edge"]
+        direction TB
+        I1["Internet"] --> I2["Kernel firewall<br/><b>L3/L4</b> · BlockTable bans"]
+        I2 --> SEDGE
+
+        subgraph SEDGE["Sentry edge (in-path)"]
+            direction TB
+            S1["TLS + edge-tcp<br/><b>L4/L6</b> · JA3/JA4 · SNI · port 443"]
+            S2["Reverse proxy<br/><b>L7</b> · rules · heuristics · uploads · PoW"]
+            S1 --> S2
+        end
+
+        SEDGE --> I5["Your service<br/><i>nginx · ssh · etc</i>"]
+    end
+
+    passive ~~~ inline
+```
+
+- **Passive mode** (default): Sentry never touches the traffic. It ingests
+  logs/syslog and enforces out-of-band via providers — Cloudflare API at the
+  CDN edge (L7), kernel firewall bans (L3/L4), nginx includes, webhooks.
+- **Inline mode** (`[deployment] mode = "inline"`): traffic flows *through*
+  Sentry — TLS termination and JA3/JA4 fingerprinting at L4/L6, the full
+  pipeline at L7, with a `BlockTable` fast-path denying known-bad IPs before
+  the pipeline even runs.
+- Both modes compose: the CDN challenge filters first (cheapest to serve),
+  kernel bans stop everything below HTTP, and the inline proxy catches what
+  reaches your host.
+
 Full design, phase-by-phase backlog, and performance numbers:
-[`ARCHITECTURE.md`](./ARCHITECTURE.md). Live docs:
-**https://sentry.lucas-romero.com**.
+[`ARCHITECTURE.md`](./ARCHITECTURE.md). Also available as [live docs](https://sentry.lucas-romero.com).
 
 ## Deployment modes
 
@@ -133,9 +181,9 @@ crates/
 ## Documentation
 
 Full docs live in a separate repo (`IDjinn/sentry-docs`), mounted as a
-submodule under [`docs/`](./docs) and deployed at
-**https://sentry.lucas-romero.com** (Portuguese at `/pt`, English at `/en`;
-Fumadocs + Next.js 16 + Tailwind v4, Mermaid support).
+submodule under [`docs/`](./docs) and deployed online
+([live docs](https://sentry.lucas-romero.com)) — Portuguese at `/pt`,
+English at `/en`; Fumadocs + Next.js 16 + Tailwind v4, Mermaid support.
 
 Read locally:
 
