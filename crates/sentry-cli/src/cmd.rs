@@ -1263,7 +1263,6 @@ fn list_feeds(cfg: &SentryConfig) {
     let feeds: Vec<_> = cfg.rules.feeds.iter().filter(|f| f.enabled).collect();
     if feeds.is_empty() {
         println!("No reputation feeds configured (see [rules.feeds] in sentry.example.toml).");
-        return;
     }
     println!(
         "{:<14} {:<11} {:<11} {:<9} {:<8} URL",
@@ -1284,6 +1283,19 @@ fn list_feeds(cfg: &SentryConfig) {
             refresh,
             action,
             f.url
+        );
+    }
+
+    println!("\nBuilt-in presets (enable with [rules] feed_presets = [\"…\"]):");
+    println!("{:<22} {:<8} {:<7} DESCRIPTION", "NAME", "FEEDS", "ACTIVE");
+    for p in sentry_core::feed_presets::PRESETS {
+        let active = cfg.rules.feed_presets.iter().any(|n| n == p.name);
+        println!(
+            "{:<22} {:<8} {:<7} {}",
+            p.name,
+            p.feeds.len(),
+            if active { "yes" } else { "-" },
+            p.description
         );
     }
 }

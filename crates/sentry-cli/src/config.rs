@@ -36,9 +36,13 @@ pub fn load(path: Option<&Path>) -> color_eyre::Result<SentryConfig> {
     // Env overlay: SENTRY_STORAGE__POSTGRES__URL=...
     let figment = deep_merge_env(figment, Env::prefixed("SENTRY_").split("__"))?;
 
-    let cfg: SentryConfig = figment
+    let mut cfg: SentryConfig = figment
         .extract()
         .map_err(|e| color_eyre::eyre::eyre!("config load error: {}", e))?;
+
+    for unknown in cfg.resolve_feed_presets() {
+        eprintln!("warning: unknown feed preset `{unknown}` (see `sentry feeds list`)");
+    }
 
     Ok(cfg)
 }

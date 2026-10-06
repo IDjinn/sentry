@@ -296,6 +296,19 @@ action = "challenge"
 # untrusted input: http/https only, loopback/private/reserved hosts are
 # rejected. Manage with `sentry feeds list | refresh | check <ip>`.
 #
+# Built-in presets: enable curated public blocklists by name instead of
+# hand-writing the [[rules.feeds]] entries. Preset feeds BLOCK by default —
+# enable one only if you accept banning those ranges (e.g. VPN users).
+#
+#   tor_exit             — Tor exit nodes (check.torproject.org)
+#   firehol_level1       — known-bad aggregate (Spamhaus DROP, DShield, …)
+#   proxy_list           — open proxies (mmpx12/proxy-list)
+#   open_source_vpn_ips  — commercial VPN exits (mullvad, nordvpn, …)
+#   anti_vpn             — datacenter/VPN aggregate (Anti-VPN-List)
+#
+# [rules]
+# feed_presets = ["firehol_level1", "tor_exit"]
+#
 # [[rules.feeds]]
 # name = "tor_exit"
 # url  = "https://check.torproject.org/exit-addresses"

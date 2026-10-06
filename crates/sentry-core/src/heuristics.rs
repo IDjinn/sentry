@@ -1208,8 +1208,10 @@ mod tests {
     use crate::uploads::UploadsScan;
 
     fn upload_engine(mode_enforce: bool) -> HeuristicEngine {
-        let mut cfg = UploadsConfig::default();
-        cfg.enabled = true;
+        let mut cfg = UploadsConfig {
+            enabled: true,
+            ..UploadsConfig::default()
+        };
         if mode_enforce {
             cfg.mode = crate::config::UploadMode::Enforce;
         }

@@ -835,6 +835,15 @@ impl PostureConfig {
     }
 }
 
+impl SentryConfig {
+    /// Expand `[rules] feed_presets` into `rules.feeds` (idempotent; a
+    /// user-defined feed with the same name wins). Returns preset names
+    /// that match nothing — callers should warn.
+    pub fn resolve_feed_presets(&mut self) -> Vec<String> {
+        crate::feed_presets::expand(&mut self.rules.feeds, &self.rules.feed_presets)
+    }
+}
+
 fn default_posture_enabled() -> bool {
     true
 }
@@ -1525,6 +1534,12 @@ pub struct RulesConfig {
     /// Reputation feeds to sync.
     #[serde(default)]
     pub feeds: Vec<FeedConfig>,
+    /// Built-in feed presets to enable by name (`tor_exit`,
+    /// `firehol_level1`, `proxy_list`, `open_source_vpn_ips`, `anti_vpn`).
+    /// Expanded into `feeds` at load time — a user-defined feed with the
+    /// same name wins. Preset feeds block by default.
+    #[serde(default)]
+    pub feed_presets: Vec<String>,
 }
 
 /// A default rule pack entry.

@@ -20,6 +20,7 @@ pub mod config;
 pub mod correlation;
 pub mod error;
 pub mod event;
+pub mod feed_presets;
 pub mod heuristics;
 pub mod lists;
 pub mod multipart;
