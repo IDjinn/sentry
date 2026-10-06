@@ -21,35 +21,20 @@ Every source and action is a plugin behind the `Source` and `Action` traits.
 The core (`sentry-core`) is pure: it defines contracts, no heavy I/O.
 
 ```mermaid
-flowchart LR
-    subgraph sources["Sources (plugins)"]
-        NGINX["nginx access.log"]
-        SYSLOG["syslog"]
-        CF["Cloudflare Logs"]
-        TCP["TCP capture"]
-        EDGE["Edge inline proxy"]
-    end
+flowchart TD
+    S["<b>Sources</b><br/>nginx · syslog · Cloudflare · TCP · edge proxy"]
+    R["<b>Rules engine</b> (fast path, ~µs)<br/>Allow › Block/Challenge/RateLimit › Log/Tag"]
+    H["<b>Heuristics</b><br/>SQLi · XSS · traversal · uploads · bot verify"]
+    A["<b>AI fork</b> (ONNX + LLM)<br/>only raises the score"]
+    SC["<b>Scorer + Decider</b><br/>geo/ASN · behavior · scan · correlation · escalation"]
+    E["<b>Actions</b><br/>blocklist · firewall · CF challenge · webhook · SIEM"]
 
-    subgraph pipeline["Pipeline"]
-        FAST["Rules engine (fast path)<br/>Allow > Block/Challenge/RateLimit > Log/Tag"]
-        HEUR["Heuristics<br/>SQLi · XSS · traversal · uploads · bot verify"]
-        AI["AI (ONNX + LLM, async forks)<br/>only raises the score"]
-        SCORE["Scorer + Decider<br/>geo/ASN · behavior · scan · correlation"]
-        ESC["Escalation + policy<br/>repeat offenders get strike"]
-    end
-
-    subgraph actions["Actions (plugins)"]
-        BLOCK["Blocklist / kernel firewall"]
-        CHAL["Edge challenge<br/>Cloudflare · JS PoW · nginx"]
-        WH["Webhook alerts"]
-        LOG["Log + Postgres + SIEM"]
-    end
-
-    sources --> FAST
-    FAST -- "verdict" --> ESC
-    FAST -- "no rule hit" --> HEUR --> SCORE --> AI --> SCORE
-    SCORE -- "verdict" --> ESC
-    ESC --> actions
+    S --> R
+    R -- verdict --> E
+    R -- no rule hit --> H
+    H --> SC
+    SC <-- "gray-zone only" --> A
+    SC -- verdict --> E
 ```
 
 1. **Sources** ingest events — log tailing, syslog, Cloudflare Logs API, raw
