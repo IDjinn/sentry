@@ -603,6 +603,24 @@ window_secs = 60
 max_uploads = 30             # files per IP in the window (0 = off)
 max_total_mb = 50            # total MiB per IP in the window
 
+# ── Web security posture advisories (F11) ────────────────────────────────
+# Inline-edge only: origin responses are checked for missing/weak security
+# headers — CSP (incl. "not restrictive" like PageSpeed), HSTS, COOP, frame
+# protection (XFO/frame-ancestors), Trusted Types, nosniff, referrer policy.
+# Findings ride the events as weight-0 signals, count on
+# sentry_posture_findings_total{check,host} and show up in
+# `sentry posture`. Advisory only: nothing is ever blocked or rewritten,
+# and [scorer.weights] cannot override that. Startup also warns about the
+# site-level checklist (no TLS cert, no HTTP→HTTPS redirect). Header
+# injection (enforce) is roadmap — an auto-generated CSP breaks pages.
+[posture]
+enabled = true
+mode = "shadow"              # shadow (report only) | enforce (reserved, rejected at load)
+dedupe_ttl_secs = 3600       # re-report a finding per host after this idle period
+hsts_min_max_age = 31536000  # HSTS max-age below this counts as weak
+# checks = ["csp", "hsts", "coop", "clickjacking", "trusted_types", "nosniff", "referrer_policy"]
+# hosts = []                  # restrict to these Host values (empty = any, capped at 64)
+
 # ── Actions ──────────────────────────────────────────────────────────────
 # blocklist: feeds the shared block table on Block verdicts; the daemon
 # mirrors the same blocks to ip_state (dashboard-visible, restart-safe).

@@ -1800,3 +1800,93 @@ max_total_mb = 50
   key-set (`null` when absent).
 - Metrics: `sentry_edge_uploads_inspected_total`; the signals enter
   `sentry_signal_kinds_total` for free.
+
+## 26. F11 — Web security posture advisories (inline edge)
+
+> Browser security checklists (PageSpeed/Lighthouse "assurance & security")
+> grade the *site*, not any single visitor: CSP effectiveness, HSTS, COOP,
+> frame protection, Trusted Types, HTTPS. Since F3.9 the inline edge sits in
+> front of the origin and sees every response — the natural place to compute
+> the same grades continuously. F11 turns those observations into
+> **advisories**: weight-0 signals on the events that observed the response,
+> startup warnings for the site-level HTTPS items, and a `sentry posture`
+> report. Nothing is ever blocked, rewritten or re-scored: the findings
+> describe the protected origin, so enforcement against the visitor would be
+> both wrong and useless. Header injection (`mode = "enforce"`) is
+> deliberately roadmap (BACKLOG.md §5.4) — an auto-generated CSP without
+> per-site knowledge (domains, nonces, framing needs) breaks pages.
+
+### 26.1 Scope and limits
+
+- **Inline edge only** (`[deployment] mode = "inline"`): passive sources
+  (log tails) never see response headers. `[posture] enabled` outside inline
+  logs a startup warning and stays silent.
+- Only **upstream responses** are graded: `serve_allow` marks proxied
+  responses with an internal `UpstreamServed` extension, so edge-generated
+  pages (403/429/challenge/301) and upstream 5xx never produce findings.
+- **Shadow always**: the signal weight is pinned to 0 in
+  `Pipeline::weight_for`/`weight_for_signal` — even a
+  `[scorer.weights] posture_advisory` override cannot turn it into
+  enforcement.
+- Forge-proofing: findings are keyed by the request's `Host` header, so the
+  tracker caps distinct hosts (64) and `[posture] hosts` can pin the
+  allowlist; the `host` metric label inherits the same cap.
+
+### 26.2 Layers
+
+1. **Checks** (`sentry-core/src/posture.rs`, pure): `inspect_response`
+   grades a `(name, value)` header map — no `http` crate dependency, fully
+   unit-tested (present/absent/weak per check).
+2. **Dedup** (`PostureTracker`): one advisory per (host, check) per
+   `[posture] dedupe_ttl_secs` (default 1 h), internally locked, pruned by
+   the daemon's 60 s task.
+3. **Edge hook** (`proxy.rs`): after the status is stamped and before the
+   decided event is published, findings become
+   `Signal { kind: posture_advisory, weight: 0, detail: "<check>: …" }`
+   appended to `analysis.signals` — the verdict stands.
+4. **Startup advisories** (`daemon.rs`): no `[edge] tls_cert` → "site is
+   served over plain HTTP"; TLS configured with
+   `tls_redirect_https = false` → "HTTP traffic is not redirected";
+   `[posture] mode = "enforce"` → config load error (not implemented).
+
+### 26.3 Checks and signals
+
+Single signal kind, per-check detail and metric label:
+
+| Check id | Fires when | Detail example |
+| --- | --- | --- |
+| `csp` | header missing, or no `script-src`/`default-src`, or `'unsafe-inline'` in the effective source list | `csp: not restrictive (unsafe-inline in script-src)` |
+| `hsts` | TLS connection only: header missing, unparsable or `max-age` < `hsts_min_max_age` | `hsts: max-age 86400 below 31536000` |
+| `coop` | `cross-origin-opener-policy` missing or `unsafe-none` | `coop: missing cross-origin-opener-policy` |
+| `clickjacking` | no `X-Frame-Options` (DENY/SAMEORIGIN) and no CSP `frame-ancestors` (or `frame-ancestors *`) | `clickjacking: no x-frame-options or csp frame-ancestors` |
+| `trusted_types` | CSP without `require-trusted-types-for 'script'` | `trusted_types: csp has no require-trusted-types-for 'script'` |
+| `nosniff` | `x-content-type-options` missing or ≠ `nosniff` | `nosniff: missing x-content-type-options` |
+| `referrer_policy` | `referrer-policy` missing, `unsafe-url` or `no-referrer-when-downgrade` | `referrer_policy: unsafe referrer-policy (unsafe-url)` |
+
+`SignalKind::PostureAdvisory`, `POSTURE_ADVISORY_WEIGHT = 0`. Config
+`checks = [...]` selects the enabled ids (empty = all).
+
+### 26.4 Config and operation
+
+```toml
+[posture]
+enabled = true             # advisory only; zero enforcement impact
+mode = "shadow"            # shadow | enforce (reserved — rejected at load)
+dedupe_ttl_secs = 3600     # re-report per host after this idle period
+hsts_min_max_age = 31536000
+# checks = ["csp", "hsts", "coop", "clickjacking", "trusted_types", "nosniff", "referrer_policy"]
+# hosts = []               # empty = any host (capped at 64)
+```
+
+- CLI: `sentry posture [--from 24h]` — part 1 grades the local config
+  (HTTPS + redirect checklist), part 2 aggregates the persisted advisories
+  from Postgres (host × detail, via a `jsonb_array_elements(signals)` query)
+  with a remediation hint per line. No migration: `signals`/`protocol` are
+  already JSONB.
+- Metrics: `sentry_posture_findings_total{check, host}`; the signal kind
+  also enters `sentry_signal_kinds_total` and the eventlog `signals` list
+  for free.
+- TUI: `posture_advisory` renders as `Posture (+0)` with the detail in the
+  event popup.
+- Webhook: unaffected by design — weight-0 never raises a level, so
+  advisories never fire actions.

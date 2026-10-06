@@ -129,6 +129,7 @@ fn signal_label(k: sentry_core::SignalKind) -> &'static str {
         UploadPolyglot => "upload_polyglot",
         UploadExecutable => "upload_executable",
         UploadFlood => "upload_flood",
+        PostureAdvisory => "posture_advisory",
         RuleHit => "rule_hit",
         Custom => "custom",
     }

@@ -120,6 +120,13 @@ pub enum Command {
         #[arg(long)]
         unknown_paths: bool,
     },
+    /// Web security posture report (F11): missing/weak security headers
+    /// observed on the protected site's responses, plus the HTTPS checklist.
+    Posture {
+        /// Look-back window for observed advisories (e.g. `24h`, `7d`).
+        #[arg(long, default_value = "24h")]
+        from: String,
+    },
     /// Export raw events for SIEM consumption (F4.6).
     Export {
         /// Look-back window (e.g. `24h`, `7d`).

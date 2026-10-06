@@ -805,6 +805,11 @@ impl Pipeline {
     /// Weight for a signal kind: config override if set, else the signal's
     /// own weight (looked up among `signals`, since kinds may repeat).
     fn weight_for(&self, kind: SignalKind, signals: &[Signal]) -> u8 {
+        if kind == SignalKind::PostureAdvisory {
+            // F11 invariant: posture advisories describe the site, never the
+            // visitor — no config override may turn them into enforcement.
+            return crate::analysis::POSTURE_ADVISORY_WEIGHT;
+        }
         let key = match kind {
             SignalKind::SqlInjection => "sql_injection",
             SignalKind::Xss => "xss",
@@ -840,6 +845,7 @@ impl Pipeline {
             SignalKind::UploadPolyglot => "upload_polyglot",
             SignalKind::UploadExecutable => "upload_executable",
             SignalKind::UploadFlood => "upload_flood",
+            SignalKind::PostureAdvisory => "posture_advisory",
             SignalKind::RuleHit => "rule_hit",
             SignalKind::Custom => "custom",
         };
@@ -855,6 +861,9 @@ impl Pipeline {
     /// Weight for a concrete signal: config override if set, else the
     /// signal's own weight.
     fn weight_for_signal(&self, s: &Signal) -> u8 {
+        if s.kind == SignalKind::PostureAdvisory {
+            return crate::analysis::POSTURE_ADVISORY_WEIGHT;
+        }
         let key = match s.kind {
             SignalKind::SqlInjection => "sql_injection",
             SignalKind::Xss => "xss",
@@ -890,6 +899,7 @@ impl Pipeline {
             SignalKind::UploadPolyglot => "upload_polyglot",
             SignalKind::UploadExecutable => "upload_executable",
             SignalKind::UploadFlood => "upload_flood",
+            SignalKind::PostureAdvisory => "posture_advisory",
             SignalKind::RuleHit => "rule_hit",
             SignalKind::Custom => "custom",
         };

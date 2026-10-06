@@ -52,6 +52,9 @@ cargo build --release --features sentry-cli/edge-tls
 # Datasets DB-backed (F7.7) — requer storage.postgres
 ./target/debug/sentry datasets --help
 
+# Postura de segurança web (F11): advisories de headers + checklist HTTPS
+./target/debug/sentry posture [--from 24h]
+
 # Docker
 docker build -t sentry .
 docker compose -f deploy/docker/docker-compose.yml up
@@ -672,7 +675,46 @@ telemetria de handshake + provider de appliance
     upload_filename contains ".php"` → Block) — 1 teste round-trip +
     match
 
-Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues).
+# F11 (concluída): Postura de segurança web — advisories de headers na edge
+# inline (shadow por padrão, nunca bloqueia)
+  - ✅ F11.1 Checks (`sentry-core/src/posture.rs`, puro):
+    `inspect_response` avalia o header map da resposta do upstream —
+    `csp` (ausente ou fora do modo restrito: sem script-src/default-src ou
+    com `'unsafe-inline'`, espelhando o PageSpeed), `hsts` (ausente/
+    inparsável/max-age < `hsts_min_max_age`; só em conexão TLS),
+    `coop` (ausente ou `unsafe-none`), `clickjacking` (sem XFO
+    DENY/SAMEORIGIN nem CSP `frame-ancestors`), `trusted_types` (CSP sem
+    `require-trusted-types-for 'script'`), `nosniff`, `referrer_policy`
+    (ausente ou unsafe) — todos desligáveis via `[posture] checks`
+  - ✅ F11.2 Sinal `SignalKind::PostureAdvisory` com peso travado em 0 nos
+    dois matches de `Pipeline::weight_for`/`weight_for_signal` — nem
+    override de `[scorer.weights]` transforma advisory em enforce; findings
+    descrevem o site protegido, nunca o visitante
+  - ✅ F11.3 Dedupe `PostureTracker` por (host, check) com TTL
+    (`dedupe_ttl_secs`, default 1 h), cap de 64 hosts (Host header
+    falsificado não infla a tabela/métrica), allowlist `[posture] hosts`;
+    prune na tarefa 60s do daemon
+  - ✅ F11.4 Edge (`proxy.rs`): `serve_allow` marca respostas do upstream
+    com extension `UpstreamServed` — páginas geradas pela edge
+    (403/429/challenge/301) e 5xx nunca são avaliadas; findings anexados a
+    `processed.analysis.signals` (weight 0, verdict intacto) antes do
+    publish; métrica `sentry_posture_findings_total{check, host}`
+  - ✅ F11.5 Advisories de config no startup (`daemon.rs`): inline sem
+    `[edge] tls_cert` → warn "site em HTTP puro"; TLS com
+    `tls_redirect_https = false` → warn "HTTP não redirecionado";
+    `[posture] enabled` fora de inline → warn de inércia;
+    `mode = "enforce"` → erro de carga (injeção de headers é roadmap
+    BACKLOG.md §5.4 — CSP automática quebra páginas); `config validate`
+    rejeita enforce e avisa sobre ids desconhecidos em `checks`
+  - ✅ F11.6 CLI `sentry posture [--from 24h]`: parte 1 = checklist de
+    config (TLS/redirect); parte 2 = agregação do Postgres via
+    `EventRepo::posture_findings` (`jsonb_array_elements(signals)` filtrando
+    `posture_advisory`, group by host+detail — sem migration) com dica de
+    remediação por linha; TUI: label `Posture`; eventlog/`signals` e
+    `sentry_signal_kinds_total` de graça; webhook inerte por design
+    (weight-0 nunca sobe level)
+
+Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4).
 
 ### Status atual (verificação contínua)
 
@@ -681,7 +723,7 @@ Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 552+ testes passando sem features (554 com
+# Resultado esperado: 603+ testes passando sem features (605 com
 # --features sentry-cli/onnx — os 2 testes de inferência ONNX)
 ```
 

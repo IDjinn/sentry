@@ -806,6 +806,74 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 }
             }
         }
+        Command::Posture { from } => {
+            let cfg = require_config(&cfg)?;
+            let since = chrono::Utc::now()
+                - parse_duration(&from)
+                    .map_err(|e| color_eyre::eyre::eyre!("invalid --from: {e}"))?;
+
+            // Part 1: configuration checklist — the site-level items browser
+            // security checklists (PageSpeed/Lighthouse) flag.
+            println!("Web security posture (F11) — configuration:");
+            if !cfg.deployment.is_inline() {
+                println!(
+                    "  [!] [deployment] mode is not \"inline\" — origin responses are \
+                     never observed, so advisory checks stay silent"
+                );
+            }
+            let tls = cfg.edge.tls_cert.is_some() && cfg.edge.tls_key.is_some();
+            match tls {
+                true if cfg.edge.tls_redirect_https => {
+                    println!("  [x] HTTPS configured; HTTP traffic is redirected to HTTPS");
+                }
+                true => {
+                    println!(
+                        "  [!] HTTP traffic is NOT redirected to HTTPS \
+                         ([edge] tls_redirect_https = false)"
+                    );
+                }
+                false => {
+                    println!(
+                        "  [!] no TLS configured — the site is served over plain HTTP \
+                         (browsers flag \"not using HTTPS\")"
+                    );
+                }
+            }
+            println!(
+                "  [{}] posture advisories {} (mode = {})",
+                if cfg.posture.enabled { 'x' } else { '!' },
+                if cfg.posture.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                cfg.posture.mode.as_str()
+            );
+
+            // Part 2: advisories observed on origin responses (shadow signals
+            // persisted with the events).
+            let repo = connect_storage(cfg).await?;
+            let rows = repo
+                .events()
+                .posture_findings(since)
+                .await
+                .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
+            println!("\nObserved advisories (since {since}, window {from}):");
+            if rows.is_empty() {
+                println!("  (none — either the site is hardened, posture is disabled, or no inline traffic yet)");
+                return Ok(());
+            }
+            let mut current_host = String::new();
+            for (host, detail, n) in &rows {
+                if host != &current_host {
+                    println!("  {host}:");
+                    current_host = host.clone();
+                }
+                let check = detail.split(": ").next().unwrap_or(detail);
+                println!("    [!] {detail}  (x{n})");
+                println!("      -> {}", posture_advice(check));
+            }
+        }
         Command::Config { action } => match action {
             ConfigCmd::Validate => {
                 let cfg = require_config(&cfg)?;
@@ -844,7 +912,30 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                         }
                     }
                 }
+                if cfg.posture.mode.is_enforce() {
+                    color_eyre::eyre::bail!(
+                        "config INVALID: [posture] mode = \"enforce\" is not implemented \
+                         yet — header injection without per-site knowledge would break \
+                         pages; use \"shadow\" (roadmap: BACKLOG.md §5.4)"
+                    );
+                }
+                let unknown = cfg.posture.unknown_checks();
+                if !unknown.is_empty() {
+                    eprintln!(
+                        "warning: unknown [posture] checks ids: {}",
+                        unknown.join(", ")
+                    );
+                }
                 println!("config OK");
+                println!(
+                    "  posture:   {} (mode = {})",
+                    if cfg.posture.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    cfg.posture.mode.as_str()
+                );
                 println!("  sources:   {}", cfg.sources.len());
                 println!("  actions:   {}", cfg.actions.len());
                 println!("  routes:    {}", cfg.routes.known.len());
@@ -1132,6 +1223,28 @@ fn require_config(cfg: &Option<SentryConfig>) -> color_eyre::Result<&SentryConfi
     cfg.as_ref().ok_or_else(|| {
         color_eyre::eyre::eyre!("config required — pass --config or create sentry.toml")
     })
+}
+
+/// PageSpeed-style remediation hint for a posture check id.
+fn posture_advice(check: &str) -> &'static str {
+    match check {
+        "csp" => {
+            "Serve a Content-Security-Policy with script-src/default-src and no 'unsafe-inline'."
+        }
+        "hsts" => "Send Strict-Transport-Security with max-age >= 31536000 on HTTPS responses.",
+        "coop" => "Send Cross-Origin-Opener-Policy: same-origin to isolate your origin.",
+        "clickjacking" => {
+            "Send X-Frame-Options: DENY (or SAMEORIGIN) or a CSP frame-ancestors directive."
+        }
+        "trusted_types" => {
+            "Add require-trusted-types-for 'script' to the CSP to shut down DOM XSS sinks."
+        }
+        "nosniff" => "Send X-Content-Type-Options: nosniff to prevent MIME sniffing.",
+        "referrer_policy" => {
+            "Send an explicit Referrer-Policy (e.g. strict-origin-when-cross-origin)."
+        }
+        _ => "Review the response security headers.",
+    }
 }
 
 async fn connect_storage(cfg: &SentryConfig) -> color_eyre::Result<sentry_storage::Repo> {

@@ -397,6 +397,27 @@ impl EventRepo {
         Ok(rows)
     }
 
+    /// Web security posture advisories (F11) since `since`, aggregated by
+    /// host and signal `detail` (`"<check>: <explanation>"`).
+    pub async fn posture_findings(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<(String, String, i64)>> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            r#"SELECT protocol->>'host' AS host, s->>'detail' AS detail, COUNT(*)::bigint AS n
+               FROM events, jsonb_array_elements(signals) AS s
+               WHERE timestamp >= $1
+                 AND s->>'kind' = 'posture_advisory'
+               GROUP BY host, detail
+               ORDER BY host, n DESC"#,
+        )
+        .bind(since)
+        .fetch_all(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(rows)
+    }
+
     /// Count events by verdict since `since`.
     pub async fn count_by_verdict_since(&self, since: DateTime<Utc>) -> Result<Vec<(String, i64)>> {
         let rows: Vec<(String, i64)> = sqlx::query_as(

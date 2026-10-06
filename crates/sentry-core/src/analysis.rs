@@ -179,6 +179,11 @@ pub enum SignalKind {
     /// One IP pushed an abnormal number of uploads (count or total bytes)
     /// through the inline edge within the flood window (F10).
     UploadFlood,
+    /// Origin response missing or weak web security headers (F11): CSP,
+    /// HSTS, COOP, frame protection, Trusted Types, nosniff, referrer
+    /// policy. Describes the protected site, not the visitor — advisory
+    /// only, weight is always 0.
+    PostureAdvisory,
     /// A custom rule matched (the rule id is carried in `detail`).
     RuleHit,
     /// Any other signal not yet cataloged.
@@ -200,6 +205,11 @@ pub const UPLOAD_POLYGLOT_WEIGHT: u8 = 60;
 pub const UPLOAD_EXECUTABLE_WEIGHT: u8 = 50;
 /// Default weight for [`SignalKind::UploadFlood`] (F10).
 pub const UPLOAD_FLOOD_WEIGHT: u8 = 25;
+
+/// Weight for [`SignalKind::PostureAdvisory`] (F11) — always 0: advisories
+/// describe the protected site's missing security headers and must never
+/// re-score the visitor.
+pub const POSTURE_ADVISORY_WEIGHT: u8 = 0;
 
 /// What the pipeline decided to do with the event.
 ///

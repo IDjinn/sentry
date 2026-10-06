@@ -27,6 +27,7 @@ pub mod offender;
 pub mod packs;
 pub mod pipeline;
 pub mod policy;
+pub mod posture;
 pub mod ratelimit;
 pub mod registry;
 pub mod reputation;
@@ -54,10 +55,10 @@ pub use config::{
     ActionConfig, ActionKind, AiConfig, AuthTokenConfig, AuthUserConfig, BehaviorConfig,
     BotVerificationConfig, CoreConfig, CorrelationConfig, DeploymentConfig, EdgeChallengeConfig,
     EdgeConfig, EscalationConfig, FeedConfig, FeedKind, GeoConfig, IpLookupConfig, LlmConfig,
-    MetricsConfig, PolicyConfig, PolicyOverrideConfig, PostgresConfig, RateLimitConfig,
-    RealIpConfig, RouteDefConfig, RouteLearnerConfig, RoutesConfig, RuleDefConfig, RulePackConfig,
-    RulesConfig, ScanConfig, ScorerConfig, SentryConfig, ServerAuthConfig, ServerConfig,
-    SourceConfig, StorageConfig, UploadFloodConfig, UploadMode, UploadsConfig,
+    MetricsConfig, PolicyConfig, PolicyOverrideConfig, PostgresConfig, PostureConfig, PostureMode,
+    RateLimitConfig, RealIpConfig, RouteDefConfig, RouteLearnerConfig, RoutesConfig, RuleDefConfig,
+    RulePackConfig, RulesConfig, ScanConfig, ScorerConfig, SentryConfig, ServerAuthConfig,
+    ServerConfig, SourceConfig, StorageConfig, UploadFloodConfig, UploadMode, UploadsConfig,
 };
 pub use correlation::CorrelationTracker;
 pub use error::{CoreError, Result};
@@ -71,6 +72,7 @@ pub use offender::OffenderTracker;
 pub use packs::{build_default_ruleset, PackMode};
 pub use pipeline::{Pipeline, ProcessedEvent, RouteDef, RouteLike, RouteValidator};
 pub use policy::VerdictPolicy;
+pub use posture::{PostureFinding, PostureScan, PostureTracker};
 pub use ratelimit::{InMemoryRateLimiter, RateLimitBackend};
 pub use registry::{Registry, RegistryBuilder};
 pub use reputation::{

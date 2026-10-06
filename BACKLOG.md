@@ -189,3 +189,22 @@ via rDNS) e F7.11 (JS challenge na edge inline + provider nginx). Restante:
   aceita arquivo ou URL; `enable/disable/delete` notificam o mesmo canal;
   `fetch` re-busca os datasets com `source_url` e re-publica contagens.
 
+
+### 5.4 F11 — Postura de segurança web (advisories; roadmap de enforce)
+
+F11 (§26 do ARCHITECTURE.md) está entregue no modo **shadow**: checks de
+headers (csp/hsts/coop/clickjacking/trusted_types/nosniff/referrer_policy),
+dedupe por host+check com TTL, sinais weight-0 imunes a `[scorer.weights]`,
+warns de startup para HTTPS/redirect, métrica
+`sentry_posture_findings_total{check,host}` e CLI `sentry posture`. Restante:
+
+- **[ ] F11.1 — Enforce (injeção de headers)**: a edge injeta na resposta os
+  headers ausentes/habilitados (HSTS só em TLS; **CSP nunca** — sem
+  conhecimento dos domínios/nonces/regras do site, injeção automática quebra
+  páginas). Valores por `[posture.inject]`, opt-in por check.
+- **[ ] F11.2 — Painel de postura no dashboard**: `/api/posture` +
+  seção na SPA (checklist ✓/✗ por host, hoje só via `sentry posture`).
+- **[ ] F11.3 — Cookie flags** (`Secure`/`HttpOnly`/`SameSite` em
+  `Set-Cookie` de sessão) como check adicional.
+- **[ ] F11.4 — Permissions-Policy** e avaliações de `object-src 'none'` /
+  `base-uri` na eficácia da CSP (paridade completa com o Lighthouse).

@@ -32,6 +32,7 @@ pub struct Metrics {
     pub correlation_hits: prometheus::Counter,
     pub edge_block_hits: prometheus::Counter,
     pub edge_uploads_inspected: prometheus::Counter,
+    pub posture_findings: prometheus::CounterVec,
     pub bot_verifications: prometheus::CounterVec,
     pub edge_challenge: prometheus::CounterVec,
     pub edge_tls_handshakes: prometheus::CounterVec,
@@ -90,6 +91,16 @@ impl Metrics {
             "sentry_edge_uploads_inspected_total",
             "Requests whose body went through upload inspection (F10) — \
              multipart parts parsed and upload heuristics fed.",
+        )
+        .unwrap();
+        let posture_findings = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sentry_posture_findings_total",
+                "Web security posture advisories observed on origin responses \
+                 (missing/weak CSP, HSTS, COOP, frame protection, Trusted \
+                 Types, nosniff, referrer policy) — F11, advisory only.",
+            ),
+            &["check", "host"],
         )
         .unwrap();
         let bot_verifications = prometheus::CounterVec::new(
@@ -303,6 +314,10 @@ impl Metrics {
             .register(Box::new(edge_tls_cert_not_after.clone()))
             .ok();
         registry
+            .register(Box::new(posture_findings.clone()))
+            .map_err(|e| warn!(error = %e, "register posture findings"))
+            .ok();
+        registry
             .register(Box::new(signals.clone()))
             .map_err(|e| warn!(error = %e, "register signals"))
             .ok();
@@ -348,6 +363,7 @@ impl Metrics {
             correlation_hits,
             edge_block_hits,
             edge_uploads_inspected,
+            posture_findings,
             bot_verifications,
             edge_challenge,
             edge_tls_handshakes,

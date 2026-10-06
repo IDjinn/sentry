@@ -83,6 +83,12 @@ const HOP_BY_HOP: &[&str] = &[
     "content-length",
 ];
 
+/// Marks a response that actually came from the upstream backend, so the
+/// F11 posture check only grades origin headers — edge-generated pages
+/// (block/challenge/rate-limit/redirect) never carry the marker.
+#[derive(Debug, Clone)]
+struct UpstreamServed;
+
 /// Verify the upstream answers before the edge starts accepting traffic.
 ///
 /// Inline mode is an explicit opt-in precisely because a dead backend turns
@@ -452,6 +458,34 @@ async fn proxy_inspected(
     runtime
         .pipeline()
         .observe_response(client_ip, &path, status, ua.as_deref());
+
+    // Posture advisories (F11): grade only upstream responses (edge pages
+    // and redirects are not the site's headers) on successful statuses, and
+    // attach weight-0 signals — advisory only, the verdict stands.
+    if resp.extensions().get::<UpstreamServed>().is_some() && status < 500 {
+        if let (Some(tracker), Some(host)) = (
+            runtime.posture(),
+            processed.event.http().and_then(|h| h.host.clone()),
+        ) {
+            let header_pairs = resp
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str(), s)));
+            let findings = tracker.observe(&host, header_pairs, is_tls);
+            if !findings.is_empty() {
+                if let Some(counter) = runtime.posture_findings() {
+                    for f in &findings {
+                        counter.with_label_values(&[f.check, &host]).inc();
+                    }
+                }
+                processed
+                    .analysis
+                    .signals
+                    .extend(findings.iter().map(|f| f.to_signal()));
+            }
+        }
+    }
+
     if let Err(e) = decided.try_send(processed) {
         warn!(error = %e, "failed to publish decided event");
     }
@@ -521,7 +555,7 @@ async fn serve_allow(
         Ok(resp) => {
             let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
                 .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-            let mut out = Response::builder().status(status);
+            let mut out = Response::builder().status(status).extension(UpstreamServed);
             for (k, v) in resp.headers().iter() {
                 let name = k.as_str();
                 if HOP_BY_HOP.contains(&name) {
@@ -912,6 +946,205 @@ mod tests {
             sentry_core::ProtocolData::Http(h) => assert_eq!(h.status, Some(404)),
             other => panic!("expected http event, got {other:?}"),
         }
+    }
+
+    // ── Web security posture advisories (F11) ────────────────────────────
+
+    /// Upstream answering 200 with no security headers at all.
+    async fn spawn_bare_upstream() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().fallback(|| async { (axum::http::StatusCode::OK, "ok") });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// Upstream answering 200 with a fully hardened header set.
+    async fn spawn_hardened_upstream() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let headers = [
+            (
+                axum::http::HeaderName::from_static("content-security-policy"),
+                "default-src 'self'; script-src 'self'; require-trusted-types-for 'script'",
+            ),
+            (
+                axum::http::HeaderName::from_static("strict-transport-security"),
+                "max-age=31536000",
+            ),
+            (
+                axum::http::HeaderName::from_static("cross-origin-opener-policy"),
+                "same-origin",
+            ),
+            (
+                axum::http::HeaderName::from_static("x-frame-options"),
+                "DENY",
+            ),
+            (
+                axum::http::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            ),
+            (
+                axum::http::HeaderName::from_static("referrer-policy"),
+                "no-referrer",
+            ),
+        ];
+        let app = Router::new().fallback(|| async move { (axum::http::StatusCode::OK, headers) });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    fn posture_signals(pe: &sentry_core::ProcessedEvent) -> Vec<&sentry_core::Signal> {
+        pe.analysis
+            .signals
+            .iter()
+            .filter(|s| s.kind == sentry_core::SignalKind::PostureAdvisory)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn bare_upstream_attaches_weight_zero_posture_advisories_once() {
+        let upstream = spawn_bare_upstream().await;
+        let tracker = std::sync::Arc::new(sentry_core::posture::PostureTracker::new(
+            sentry_core::posture::PostureScan::default(),
+        ));
+        let counter = prometheus::CounterVec::new(
+            prometheus::Opts::new("sentry_posture_findings_total", "test"),
+            &["check", "host"],
+        )
+        .unwrap();
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0)
+            .with_posture(tracker)
+            .with_posture_findings(counter.clone());
+        let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: format!("http://{upstream}"),
+                decided: dec_tx,
+                redirect_https: false,
+            });
+        let req = || {
+            axum::http::Request::builder()
+                .uri("/")
+                .header("host", "example.com")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        let resp = app.clone().oneshot(req()).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let pe = dec_rx.try_recv().expect("decided event 1");
+        let sigs = posture_signals(&pe);
+        assert!(!sigs.is_empty(), "first request carries advisories");
+        assert!(sigs.iter().all(|s| s.weight == 0), "advisories are shadow");
+        let non_posture: u8 = pe
+            .analysis
+            .signals
+            .iter()
+            .filter(|s| s.kind != sentry_core::SignalKind::PostureAdvisory)
+            .map(|s| s.weight)
+            .sum();
+        assert_eq!(
+            pe.analysis.risk_score, non_posture,
+            "posture adds nothing to the score"
+        );
+        let csp_hits = counter
+            .get_metric_with_label_values(&["csp", "example.com"])
+            .unwrap()
+            .get();
+        assert!(csp_hits >= 1.0, "check-level metric incremented");
+
+        let _ = app.oneshot(req()).await.unwrap();
+        let pe2 = dec_rx.try_recv().expect("decided event 2");
+        assert!(
+            posture_signals(&pe2).is_empty(),
+            "deduplicated within the TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn hardened_upstream_emits_no_posture_advisories() {
+        let upstream = spawn_hardened_upstream().await;
+        let tracker = std::sync::Arc::new(sentry_core::posture::PostureTracker::new(
+            sentry_core::posture::PostureScan::default(),
+        ));
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0).with_posture(tracker);
+        let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: format!("http://{upstream}"),
+                decided: dec_tx,
+                redirect_https: false,
+            });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .header("host", "example.com")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let pe = dec_rx.try_recv().expect("decided event");
+        assert!(posture_signals(&pe).is_empty(), "hardened site is clean");
+    }
+
+    #[tokio::test]
+    async fn edge_generated_redirect_is_not_graded_for_posture() {
+        let tracker = std::sync::Arc::new(sentry_core::posture::PostureTracker::new(
+            sentry_core::posture::PostureScan::default(),
+        ));
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0).with_posture(tracker);
+        let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: "http://127.0.0.1:9".to_string(),
+                decided: dec_tx,
+                redirect_https: true,
+            });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .header("host", "example.com")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::MOVED_PERMANENTLY);
+        let pe = dec_rx.try_recv().expect("redirect is monitored");
+        assert!(
+            posture_signals(&pe).is_empty(),
+            "edge-generated 301 has no origin headers to grade"
+        );
     }
 
     #[tokio::test]

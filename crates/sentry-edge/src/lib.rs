@@ -112,6 +112,8 @@ pub struct EdgeRuntime {
     protocol_metrics: Option<crate::protocol::ProtocolMetrics>,
     uploads: Option<UploadsInspection>,
     uploads_inspected: Option<prometheus::Counter>,
+    posture: Option<Arc<sentry_core::posture::PostureTracker>>,
+    posture_findings: Option<prometheus::CounterVec>,
 }
 
 impl EdgeRuntime {
@@ -138,6 +140,8 @@ impl EdgeRuntime {
             protocol_metrics: None,
             uploads: None,
             uploads_inspected: None,
+            posture: None,
+            posture_findings: None,
         }
     }
 
@@ -159,6 +163,30 @@ impl EdgeRuntime {
     pub fn with_uploads_inspected(mut self, counter: prometheus::Counter) -> Self {
         self.uploads_inspected = Some(counter);
         self
+    }
+
+    /// Arm web security posture advisories (F11): origin responses are
+    /// checked for missing/weak security headers and the findings ride the
+    /// event as weight-0 `PostureAdvisory` signals. Advisory only — shadow.
+    pub fn with_posture(mut self, tracker: Arc<sentry_core::posture::PostureTracker>) -> Self {
+        self.posture = Some(tracker);
+        self
+    }
+
+    /// Posture tracker, when armed.
+    pub fn posture(&self) -> Option<&Arc<sentry_core::posture::PostureTracker>> {
+        self.posture.as_ref()
+    }
+
+    /// `sentry_posture_findings_total{check, host}` counter.
+    pub fn with_posture_findings(mut self, counter: prometheus::CounterVec) -> Self {
+        self.posture_findings = Some(counter);
+        self
+    }
+
+    /// Posture findings counter, when attached.
+    pub fn posture_findings(&self) -> Option<&prometheus::CounterVec> {
+        self.posture_findings.as_ref()
     }
 
     /// Effective request-body buffering cap (bytes): the base capture cap

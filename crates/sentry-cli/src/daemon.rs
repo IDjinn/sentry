@@ -437,6 +437,34 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         );
     }
 
+    // Web security posture advisories (F11): shadow-only header inspection
+    // of origin responses. `enforce` is reserved for header injection
+    // (roadmap) and is rejected here so the config never lies.
+    if cfg.posture.mode.is_enforce() {
+        return Err(color_eyre::eyre::eyre!(
+            "[posture] mode = \"enforce\" is not implemented yet — header \
+             injection without per-site knowledge would break pages; use \
+             \"shadow\" (roadmap: BACKLOG.md §5.4)"
+        ));
+    }
+    if cfg.posture.enabled {
+        for id in cfg.posture.unknown_checks() {
+            warn!(check = %id, "unknown [posture] checks id — ignoring");
+        }
+        if !cfg.deployment.is_inline() {
+            warn!(
+                "[posture] enabled but [deployment] mode is not \"inline\" — \
+                 origin responses never reach passive sources, so no security \
+                 header is ever observed; advisory checks stay silent"
+            );
+        }
+    }
+    let posture_tracker = cfg.posture.enabled.then(|| {
+        Arc::new(sentry_core::posture::PostureTracker::new(
+            sentry_core::posture::PostureScan::from_config(&cfg.posture),
+        ))
+    });
+
     // Cross-IP scan→attack correlation (F3.10 shot-calling pattern).
     let correlation_tracker = cfg.correlation.enabled.then(|| {
         Arc::new(std::sync::RwLock::new(
@@ -635,6 +663,17 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             loop {
                 interval.tick().await;
                 t.write().unwrap().prune();
+            }
+        });
+    }
+    if let Some(ref t) = posture_tracker {
+        let t = Arc::clone(t);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                t.prune();
             }
         });
     }
@@ -900,6 +939,25 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 ));
             }
         };
+        // Site-level posture advisories (F11): these two warn about exactly
+        // what browser security checklists flag on the protected origin.
+        match &tls_cfg {
+            None => {
+                warn!(
+                    "[edge] no tls_cert configured — the site is served over plain \
+                     HTTP and browsers flag it as \"not using HTTPS\"; see [edge] \
+                     tls_cert/tls_key (F8)"
+                );
+            }
+            Some(tls) if !tls.redirect_https => {
+                warn!(
+                    "[edge] tls_redirect_https = false — HTTP traffic is not \
+                     redirected to HTTPS; browsers report \"HTTP traffic is not \
+                     redirected\" and first visits stay cleartext"
+                );
+            }
+            Some(_) => {}
+        }
         let proxy_cfg = sentry_edge::proxy::EdgeProxyConfig {
             listen: cfg.edge.listen.clone(),
             upstream: cfg.edge.upstream.clone(),
@@ -941,6 +999,18 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                     max_files: cfg.uploads.max_files.clamp(1, 256),
                 })
                 .with_uploads_inspected(metrics.edge_uploads_inspected.clone())
+        } else {
+            runtime
+        };
+        let runtime = if let Some(ref tracker) = posture_tracker {
+            info!(
+                mode = cfg.posture.mode.as_str(),
+                ttl_secs = cfg.posture.dedupe_ttl_secs,
+                "web security posture advisories enabled (F11, shadow)"
+            );
+            runtime
+                .with_posture(Arc::clone(tracker))
+                .with_posture_findings(metrics.posture_findings.clone())
         } else {
             runtime
         };

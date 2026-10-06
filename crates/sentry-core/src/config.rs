@@ -85,6 +85,9 @@ pub struct SentryConfig {
     /// Request-body/upload inspection (F10, inline edge only).
     #[serde(default)]
     pub uploads: UploadsConfig,
+    /// Web security posture advisories (F11, inline edge only).
+    #[serde(default)]
+    pub posture: PostureConfig,
     /// Event sources.
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
@@ -774,6 +777,101 @@ fn default_uploads_flood_max_uploads() -> u32 {
 }
 fn default_uploads_flood_max_total_mb() -> u32 {
     50
+}
+
+/// Web security posture advisories (F11): the inline edge inspects origin
+/// response headers and reports missing/weak security headers (CSP, HSTS,
+/// COOP, frame protection, Trusted Types, nosniff, referrer policy) as
+/// weight-0 signals, startup warnings and a `sentry posture` report.
+///
+/// Advisory only — findings describe the protected site, never the visitor,
+/// and never change a score or verdict. Header injection (`enforce`) is
+/// deliberately roadmap: an auto-generated CSP would break pages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostureConfig {
+    /// Enable posture advisories (on by default; zero enforcement impact).
+    #[serde(default = "default_posture_enabled")]
+    pub enabled: bool,
+    /// `shadow` (report only) or `enforce` (reserved for header injection —
+    /// roadmap; loading `enforce` is rejected for now).
+    #[serde(default)]
+    pub mode: PostureMode,
+    /// A finding is re-reported for the same host after this idle period.
+    #[serde(default = "default_posture_dedupe_ttl_secs")]
+    pub dedupe_ttl_secs: u64,
+    /// HSTS `max-age` below which the header counts as weak.
+    #[serde(default = "default_posture_hsts_min_max_age")]
+    pub hsts_min_max_age: u64,
+    /// Enabled check ids (empty = all): `csp`, `hsts`, `coop`, `clickjacking`,
+    /// `trusted_types`, `nosniff`, `referrer_policy`.
+    #[serde(default)]
+    pub checks: Vec<String>,
+    /// Restrict advisories to these hosts (empty = any, capped at 64 hosts).
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+impl Default for PostureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_posture_enabled(),
+            mode: PostureMode::default(),
+            dedupe_ttl_secs: default_posture_dedupe_ttl_secs(),
+            hsts_min_max_age: default_posture_hsts_min_max_age(),
+            checks: Vec::new(),
+            hosts: Vec::new(),
+        }
+    }
+}
+
+impl PostureConfig {
+    /// Check ids in `checks` that Sentry does not know (daemon warning).
+    pub fn unknown_checks(&self) -> Vec<String> {
+        self.checks
+            .iter()
+            .filter(|c| crate::posture::known_check(c).is_none())
+            .cloned()
+            .collect()
+    }
+}
+
+fn default_posture_enabled() -> bool {
+    true
+}
+fn default_posture_dedupe_ttl_secs() -> u64 {
+    3600
+}
+fn default_posture_hsts_min_max_age() -> u64 {
+    31_536_000
+}
+
+/// Enforcement posture of security-header advisories (F11). Only `shadow`
+/// exists today: `enforce` (injecting missing headers at the edge) is
+/// roadmap because an auto-generated CSP breaks sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PostureMode {
+    /// Report only: findings become weight-0 signals, warnings and report
+    /// rows — responses are never modified.
+    #[default]
+    Shadow,
+    /// Reserved for header injection (roadmap); rejected at load for now.
+    Enforce,
+}
+
+impl PostureMode {
+    /// Whether `[posture] mode = "enforce"`.
+    pub fn is_enforce(self) -> bool {
+        self == Self::Enforce
+    }
+
+    /// Lowercase stable name used in logs and config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+            Self::Enforce => "enforce",
+        }
+    }
 }
 
 /// Behavioral attack detection over per-IP sliding windows (F3.8).
@@ -1745,6 +1843,37 @@ mod tests {
         assert_eq!(parsed.blocked_extensions, vec!["php", "jsp"]);
 
         let err = toml::from_str::<UploadsConfig>("mode = \"block\"");
+        assert!(err.is_err(), "typos must fail at config-load time");
+    }
+
+    #[test]
+    fn posture_default_is_shadow_and_on() {
+        let c = PostureConfig::default();
+        assert!(c.enabled, "advisories inform by default");
+        assert_eq!(c.mode, PostureMode::Shadow);
+        assert_eq!(c.dedupe_ttl_secs, 3600);
+        assert_eq!(c.hsts_min_max_age, 31_536_000);
+        assert!(c.checks.is_empty(), "empty = all checks");
+        assert!(c.hosts.is_empty());
+        assert!(c.unknown_checks().is_empty());
+        assert_eq!(c.unknown_checks(), Vec::<String>::new());
+
+        let parsed: PostureConfig = toml::from_str(
+            r#"
+            enabled = true
+            checks = ["csp", "hsts", "bogus_check"]
+            hosts = ["Example.com"]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(parsed.unknown_checks(), vec!["bogus_check".to_string()]);
+        let scan = crate::posture::PostureScan::from_config(&parsed);
+        assert!(scan.checks.contains("csp"));
+        assert!(scan.checks.contains("hsts"));
+        assert!(!scan.checks.contains("coop"), "explicit list replaces all");
+        assert!(scan.hosts.contains("example.com"));
+
+        let err = toml::from_str::<PostureConfig>("mode = \"block\"");
         assert!(err.is_err(), "typos must fail at config-load time");
     }
 }
