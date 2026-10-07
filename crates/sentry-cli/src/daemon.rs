@@ -6,7 +6,9 @@
 //! 3. Optionally connects to Postgres (storage + hot-reload)
 //! 4. Starts all sources (concurrent event streams)
 //! 5. Merges streams into one channel (fan-in)
-//! 6. For each event: enrich (geo) → dedupe → pipeline → persist → actions
+//! 6. For each event: enrich (geo) → dedupe → pipeline → persist → inline
+//!    containment actions; deferred (network-bound) actions go to
+//!    post-processing workers
 //! 7. Prints colored events to stdout and logs decisions
 
 use notify::Watcher;
@@ -25,7 +27,8 @@ use sentry_core::pipeline::{Pipeline, RouteValidator};
 use sentry_core::ratelimit::{InMemoryRateLimiter, RateLimitBackend};
 use sentry_core::registry::RegistryBuilder;
 use sentry_core::rules::{shared, RuleSet, SharedRuleSet};
-use sentry_core::{RiskLevel, RuleLogLevel, Signal};
+use sentry_core::throttle::DropLogThrottle;
+use sentry_core::{ActionDispatch, RiskLevel, RuleLogLevel, Signal};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -878,8 +881,10 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         let geo_clone = geo.as_ref().map(Arc::clone);
         let reputation_clone = reputation.as_ref().map(Arc::clone);
         let trust_clone = shared_trust.clone();
+        let metrics_clone = metrics.clone();
         tokio::spawn(async move {
             info!(source = source.name(), "starting source");
+            let mut throttle = DropLogThrottle::new();
             match source.stream().await {
                 Ok(mut rx) => {
                     while let Some(raw) = rx.recv().await {
@@ -894,8 +899,25 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                         if let Some(ref r) = reputation_clone {
                             r.enrich(&mut evt);
                         }
-                        if tx.try_send(Incoming::Raw(Box::new(evt))).is_err() {
-                            warn!(source = source.name(), "event channel full, dropping event");
+                        match tx.try_send(Incoming::Raw(Box::new(evt))) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                metrics_clone
+                                    .events_dropped
+                                    .with_label_values(&[source.name()])
+                                    .inc();
+                                if let Some(count) = throttle.record(Instant::now()) {
+                                    warn!(
+                                        source = source.name(),
+                                        dropped = count,
+                                        "event channel full, dropped events in the last 5s"
+                                    );
+                                }
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                warn!(source = source.name(), "fan-in closed, stopping forwarder");
+                                break;
+                            }
                         }
                     }
                     info!(source = source.name(), "source stream ended");
@@ -1078,10 +1100,25 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             }
         });
         let pump_tx = event_tx.clone();
+        let pump_metrics = metrics.clone();
         tokio::spawn(async move {
+            let mut throttle = DropLogThrottle::new();
             while let Some(pe) = dec_rx.recv().await {
-                if pump_tx.try_send(Incoming::Processed(Box::new(pe))).is_err() {
-                    warn!("event channel full, dropping edge event");
+                match pump_tx.try_send(Incoming::Processed(Box::new(pe))) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        pump_metrics
+                            .events_dropped
+                            .with_label_values(&["edge"])
+                            .inc();
+                        if let Some(count) = throttle.record(Instant::now()) {
+                            warn!(
+                                dropped = count,
+                                "event channel full, dropped edge events in the last 5s"
+                            );
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
         });
@@ -1156,13 +1193,25 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 }
             });
             let tcp_pump_tx = event_tx.clone();
+            let tcp_pump_metrics = metrics.clone();
             tokio::spawn(async move {
+                let mut throttle = DropLogThrottle::new();
                 while let Some(pe) = tcp_dec_rx.recv().await {
-                    if tcp_pump_tx
-                        .try_send(Incoming::Processed(Box::new(pe)))
-                        .is_err()
-                    {
-                        warn!("event channel full, dropping edge-tcp event");
+                    match tcp_pump_tx.try_send(Incoming::Processed(Box::new(pe))) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tcp_pump_metrics
+                                .events_dropped
+                                .with_label_values(&["edge-tcp"])
+                                .inc();
+                            if let Some(count) = throttle.record(Instant::now()) {
+                                warn!(
+                                    dropped = count,
+                                    "event channel full, dropped edge-tcp events in the last 5s"
+                                );
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
                     }
                 }
             });
@@ -1221,9 +1270,57 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         });
     }
 
+    // Deferred action dispatch (post-processing): network-bound actions
+    // (Cloudflare/OPNsense/nginx APIs, webhooks, abuse reports) run on
+    // dedicated workers so the ingest hot loop never awaits external I/O.
+    // `action_workers = 1` (default) keeps strict ordering; incident
+    // resolution is serialized across workers regardless, preserving the
+    // one-open-incident-per-IP coalescing (F4.5).
+    let action_buffer = cfg.core.action_buffer.max(256);
+    let action_workers = cfg.core.action_workers.clamp(1, 32);
+    let (deferred_tx, deferred_rx) =
+        mpsc::channel::<Arc<sentry_core::ProcessedEvent>>(action_buffer);
+    {
+        let deferred_rx = Arc::new(tokio::sync::Mutex::new(deferred_rx));
+        let incident_gate = Arc::new(tokio::sync::Mutex::new(()));
+        for _ in 0..action_workers {
+            let rx = Arc::clone(&deferred_rx);
+            let registry = registry.clone();
+            let repo = repo.clone();
+            let metrics = metrics.clone();
+            let gate = Arc::clone(&incident_gate);
+            tokio::spawn(async move {
+                loop {
+                    // Holding the lock across recv hands each queued event to
+                    // exactly one worker; the rest queue on the mutex.
+                    let next = rx.lock().await.recv().await;
+                    let Some(result) = next else { break };
+                    dispatch_deferred(&result, &registry, &repo, &metrics, &gate).await;
+                }
+            });
+        }
+    }
+
+    // Console printing moves off the hot loop too: a blocked terminal can
+    // stall the ingest path for milliseconds per event.
+    let (print_tx, mut print_rx) =
+        mpsc::channel::<(Arc<sentry_core::ProcessedEvent>, Option<Duration>)>(1024);
+    tokio::spawn(async move {
+        while let Some((result, process)) = print_rx.recv().await {
+            print_event(
+                &result.event,
+                &result.analysis.risk_level,
+                &result.analysis.signals,
+                result.decision.log_level,
+                process,
+            );
+        }
+    });
+
     // Batched ingest (F5): `recv_many` drains up to 64 ready events per
     // wakeup, amortizing task/lock overhead under burst; under trickle load
     // it behaves exactly like `recv` (returns as soon as one event arrives).
+    let mut deferred_throttle = DropLogThrottle::new();
     let mut batch: Vec<Incoming> = Vec::with_capacity(64);
     loop {
         let n = event_rx.recv_many(&mut batch, 64).await;
@@ -1279,19 +1376,28 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 }
             }
 
-            print_event(
-                &result.event,
-                &result.analysis.risk_level,
-                &result.analysis.signals,
-                result.decision.log_level,
-                (!from_edge).then_some(duration),
-            );
+            // From here the event is shared with the deferred lanes (console
+            // printer, persistence spawn, post-processing workers) — an Arc
+            // instead of a deep clone per consumer.
+            let result = Arc::new(result);
+
+            if print_tx
+                .try_send((Arc::clone(&result), (!from_edge).then_some(duration)))
+                .is_err()
+            {
+                if let Some(count) = deferred_throttle.record(Instant::now()) {
+                    warn!(
+                        dropped = count,
+                        "console backlog full, dropping event lines"
+                    );
+                }
+            }
 
             if let Some(ref repo) = repo {
                 let signals_json =
                     serde_json::to_value(&result.analysis.signals).unwrap_or_default();
                 let repo = Arc::clone(repo);
-                let result_clone = result.clone();
+                let result_clone = Arc::clone(&result);
                 tokio::spawn(async move {
                     let events = repo.events();
                     if let Err(e) = events
@@ -1350,21 +1456,46 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 }
             }
 
+            // Two-lane dispatch: local containment (blocklist, log, kernel
+            // firewall) runs inline so a hostile request is contained with
+            // zero queueing latency — inline actions receive an empty
+            // ActionContext because the hot loop never awaits on storage.
+            // Network side effects are handed to the post-processing
+            // workers; when their queue fills under overload, actions are
+            // shed (counted) — the event itself is still persisted above.
+            let mut needs_deferred = false;
             for action in registry.actions() {
-                if action.applies_to(&result.decision) {
-                    metrics
-                        .actions
-                        .with_label_values(&[action.name(), verdict_str(result.decision.action)])
-                        .inc();
-                    let ctx = incident_context(&repo, &result).await;
-                    let action_start = Instant::now();
-                    let executed = action
-                        .execute_with_context(&result.event, &result.decision, &ctx)
-                        .await;
-                    metrics.record_action_dispatch(action.name(), action_start.elapsed());
-                    if let Err(e) = executed {
-                        warn!(action = action.name(), error = %e, "action failed");
-                    }
+                if !action.applies_to(&result.decision) {
+                    continue;
+                }
+                if action.dispatch() == ActionDispatch::Deferred {
+                    needs_deferred = true;
+                    continue;
+                }
+                metrics
+                    .actions
+                    .with_label_values(&[action.name(), verdict_str(result.decision.action)])
+                    .inc();
+                let action_start = Instant::now();
+                let executed = action
+                    .execute_with_context(
+                        &result.event,
+                        &result.decision,
+                        &sentry_core::ActionContext::default(),
+                    )
+                    .await;
+                metrics.record_action_dispatch(action.name(), action_start.elapsed());
+                if let Err(e) = executed {
+                    warn!(action = action.name(), error = %e, "action failed");
+                }
+            }
+            if needs_deferred && deferred_tx.try_send(Arc::clone(&result)).is_err() {
+                metrics.action_queue_drops.inc();
+                if let Some(count) = deferred_throttle.record(Instant::now()) {
+                    warn!(
+                        dropped = count,
+                        "deferred action queue full, shedding actions"
+                    );
                 }
             }
 
@@ -1394,7 +1525,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             if let Some(ref ai) = ai_fork {
                 if !ai.is_inline() && ai.should_run(&result) {
                     ai.spawn_fork(
-                        result.clone(),
+                        (*result).clone(),
                         Arc::clone(&pipeline),
                         registry.clone(),
                         repo.clone(),
@@ -1407,7 +1538,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             if let Some(ref llm) = llm_fork {
                 if llm.should_run(&result) {
                     llm.spawn_fork(
-                        result.clone(),
+                        (*result).clone(),
                         Arc::clone(&pipeline),
                         registry.clone(),
                         repo.clone(),
@@ -1421,7 +1552,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             if let Some(ref lookup) = ip_lookup_fork {
                 if lookup.should_run(&result) {
                     lookup.spawn_fork(
-                        result.clone(),
+                        (*result).clone(),
                         Arc::clone(&pipeline),
                         registry.clone(),
                         repo.clone(),
@@ -1649,6 +1780,41 @@ async fn incident_context(
         Err(e) => warn!(error = %e, "failed to look up open incident"),
     }
     ctx
+}
+
+/// Run every deferred action that applies to `result` — the post-processing
+/// worker body. Incident resolution is serialized through `gate` so parallel
+/// workers keep the one-open-incident-per-IP coalescing; the context is
+/// computed lazily, once per event (previously once per action).
+async fn dispatch_deferred(
+    result: &sentry_core::ProcessedEvent,
+    registry: &sentry_core::registry::Registry,
+    repo: &Option<Arc<sentry_storage::Repo>>,
+    metrics: &crate::metrics::Metrics,
+    gate: &tokio::sync::Mutex<()>,
+) {
+    let mut ctx: Option<sentry_core::ActionContext> = None;
+    for action in registry.actions() {
+        if action.dispatch() != ActionDispatch::Deferred || !action.applies_to(&result.decision) {
+            continue;
+        }
+        metrics
+            .actions
+            .with_label_values(&[action.name(), verdict_str(result.decision.action)])
+            .inc();
+        if ctx.is_none() {
+            let _guard = gate.lock().await;
+            ctx = Some(incident_context(repo, result).await);
+        }
+        let action_start = Instant::now();
+        if let Err(e) = action
+            .execute_with_context(&result.event, &result.decision, ctx.as_ref().unwrap())
+            .await
+        {
+            warn!(action = action.name(), error = %e, "action failed");
+        }
+        metrics.record_action_dispatch(action.name(), action_start.elapsed());
+    }
 }
 
 /// Cached model verdict keyed by payload hash: (inserted_at, signals).
@@ -2707,6 +2873,30 @@ fn fmt_duration(d: Duration) -> String {
     }
 }
 
+/// Resolve the dispatch lane for one `[[action]]` config entry.
+///
+/// Defaults by kind/provider — local containment (blocklist, log, kernel
+/// firewall) runs inline in the ingest hot loop; network side effects
+/// (Cloudflare/nginx/OPNsense APIs, webhooks, abuse reports) defer to the
+/// post-processing workers. An explicit `dispatch = "inline"|"deferred"` in
+/// the config always wins.
+fn resolve_dispatch(
+    act: &sentry_core::config::ActionConfig,
+    provider: Option<&str>,
+) -> ActionDispatch {
+    let default = match act.kind {
+        ActionKind::Blocklist | ActionKind::Log => ActionDispatch::Inline,
+        ActionKind::Cloudflare
+        | ActionKind::Webhook
+        | ActionKind::Report
+        | ActionKind::Challenge => match provider {
+            Some("firewall") => ActionDispatch::Inline,
+            _ => ActionDispatch::Deferred,
+        },
+    };
+    act.dispatch.unwrap_or(default)
+}
+
 /// Build the plugin registry from config.
 ///
 /// Returns the registry plus, when configured, handles to the concrete
@@ -2830,12 +3020,19 @@ fn build_registry(
                     .unwrap_or_default();
                 let payload_cap = parse_ttl_secs(&src.options, 8192) as usize;
                 let flow_cap = parse_ttl_secs(&src.options, 65_536) as usize;
+                let channel_buffer = src
+                    .options
+                    .get("channel_buffer")
+                    .and_then(|v| v.as_integer())
+                    .map(|v| v.max(64) as usize)
+                    .unwrap_or(sentry_source_tcp::DEFAULT_CHANNEL_BUFFER);
                 let ts =
                     sentry_source_tcp::TcpCaptureSource::new(sentry_source_tcp::TcpSourceConfig {
                         interface,
                         ports,
                         payload_cap,
                         flow_cap,
+                        channel_buffer,
                     })?;
                 builder.register_source(ts);
             }
@@ -2854,10 +3051,13 @@ fn build_registry(
             ActionKind::Log => log_requested = true,
             ActionKind::Blocklist => {
                 let ttl = Duration::from_secs(blocklist_ttl_secs(cfg));
-                builder.register_action(sentry_action_blocklist::BlocklistAction::new(
-                    sentry_action_blocklist::BlocklistActionConfig { ttl },
-                    block_table.clone(),
-                ));
+                builder.register_action(
+                    sentry_action_blocklist::BlocklistAction::new(
+                        sentry_action_blocklist::BlocklistActionConfig { ttl },
+                        block_table.clone(),
+                    )
+                    .with_dispatch(resolve_dispatch(act, None)),
+                );
             }
             ActionKind::Report => {
                 // Community abuse-database reporting (F7.4): `provider` picks
@@ -2900,16 +3100,19 @@ fn build_registry(
                     .get("endpoint")
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
-                builder.register_action(sentry_action_report::ReportAction::new(
-                    sentry_action_report::ReportActionConfig {
-                        provider,
-                        key,
-                        min_verdict,
-                        dedupe_ttl: Duration::from_secs(dedupe_hours * 3600),
-                        timeout: Duration::from_secs(timeout),
-                        endpoint,
-                    },
-                ));
+                builder.register_action(
+                    sentry_action_report::ReportAction::new(
+                        sentry_action_report::ReportActionConfig {
+                            provider,
+                            key,
+                            min_verdict,
+                            dedupe_ttl: Duration::from_secs(dedupe_hours * 3600),
+                            timeout: Duration::from_secs(timeout),
+                            endpoint,
+                        },
+                    )
+                    .with_dispatch(resolve_dispatch(act, None)),
+                );
             }
             ActionKind::Webhook => {
                 // The target URL is a credential for hosted chat webhooks
@@ -2962,17 +3165,25 @@ fn build_registry(
                     .ok()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty());
-                builder.register_action(sentry_action_webhook::WebhookAction::new(
-                    sentry_action_webhook::WebhookActionConfig {
-                        url,
-                        on_levels,
-                        timeout: Duration::from_secs(timeout),
-                        secret,
-                    },
-                ));
+                builder.register_action(
+                    sentry_action_webhook::WebhookAction::new(
+                        sentry_action_webhook::WebhookActionConfig {
+                            url,
+                            on_levels,
+                            timeout: Duration::from_secs(timeout),
+                            secret,
+                        },
+                    )
+                    .with_dispatch(resolve_dispatch(act, None)),
+                );
             }
             ActionKind::Cloudflare => {
-                if let Some(built) = build_challenge_action("cloudflare", &act.options, trust)? {
+                if let Some(built) = build_challenge_action(
+                    "cloudflare",
+                    &act.options,
+                    trust,
+                    resolve_dispatch(act, Some("cloudflare")),
+                )? {
                     if cf_provider.is_none() {
                         cf_provider = built.provider;
                     }
@@ -2988,7 +3199,12 @@ fn build_registry(
                         "challenge action requires `provider` (e.g. provider = \"cloudflare\")"
                     )
                 })?;
-                if let Some(built) = build_challenge_action(provider, &act.options, trust)? {
+                if let Some(built) = build_challenge_action(
+                    provider,
+                    &act.options,
+                    trust,
+                    resolve_dispatch(act, Some(provider)),
+                )? {
                     if cf_provider.is_none() {
                         cf_provider = built.provider;
                     }
@@ -3111,6 +3327,7 @@ fn build_challenge_action(
     provider_name: &str,
     options: &HashMap<String, toml::Value>,
     trust: &sentry_core::SharedTrustSet,
+    dispatch: ActionDispatch,
 ) -> color_eyre::Result<Option<ChallengeActionWithProvider>> {
     let ttl = Duration::from_secs(parse_ttl_secs(options, 86400));
     let mode = parse_edge_mode(options);
@@ -3285,7 +3502,7 @@ fn build_challenge_action(
     };
 
     Ok(Some(ChallengeActionWithProvider {
-        action: ChallengeAction::new(provider, opts),
+        action: ChallengeAction::new(provider, opts).with_dispatch(dispatch),
         provider: cf_concrete,
         firewall: fw_concrete,
         nginx: nginx_concrete,
@@ -3495,6 +3712,11 @@ struct LogAction;
 impl sentry_core::Action for LogAction {
     fn name(&self) -> &'static str {
         "log"
+    }
+
+    fn dispatch(&self) -> ActionDispatch {
+        // A tracing line is local and instant — hot-path work.
+        ActionDispatch::Inline
     }
 
     fn applies_to(&self, _decision: &sentry_core::Decision) -> bool {

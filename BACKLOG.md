@@ -119,6 +119,14 @@ como baseline de regressão (`cargo bench` no CI, budget por cenário).
   syslog multi-linha e normalização de payload com `std::simd`
   (nightly-gated atrás de feature) ou crates `memchr`/`aho-corasick`
   adicionais; sem `unsafe`.
+- **[ ] F5.8 — Agregação de SYN por IP/janela no source TCP**: um
+  `RawEvent` por segmento capturado satura qualquer buffer em flood
+  line-rate — os drops de canal aparecem em
+  `sentry_events_dropped_total{source="tcp"}` mesmo com o hot path em µs
+  (o throttle de log já evita o spam de `error!`). Agregar SYNs
+  consecutivos do mesmo IP numa janela curta (ex.: 1 evento/IP/100ms com
+  contagem de SYNs + primeiro fingerprint) reduz a taxa de eventos para o
+  número de scanners, não de pacotes.
 
 ### 5.2 F6 — Integrações de firewall/plataforma
 

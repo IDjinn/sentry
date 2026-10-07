@@ -29,6 +29,8 @@ pub struct Metrics {
     pub events_processed: prometheus::Counter,
     pub events_blocked: prometheus::Counter,
     pub dedupe_drops: prometheus::Counter,
+    pub events_dropped: prometheus::CounterVec,
+    pub action_queue_drops: prometheus::Counter,
     pub correlation_hits: prometheus::Counter,
     pub edge_block_hits: prometheus::Counter,
     pub edge_uploads_inspected: prometheus::Counter,
@@ -73,6 +75,20 @@ impl Metrics {
         let dedupe_drops = prometheus::Counter::new(
             "sentry_dedupe_drops_total",
             "Events dropped by the deduplication cache.",
+        )
+        .unwrap();
+        let events_dropped = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sentry_events_dropped_total",
+                "Events dropped because a channel was full, by source.",
+            ),
+            &["source"],
+        )
+        .unwrap();
+        let action_queue_drops = prometheus::Counter::new(
+            "sentry_action_queue_drops_total",
+            "Deferred actions shed because the post-processing queue was \
+             full (the events themselves are still persisted and counted).",
         )
         .unwrap();
         let correlation_hits = prometheus::Counter::new(
@@ -280,12 +296,17 @@ impl Metrics {
             &events_processed,
             &events_blocked,
             &dedupe_drops,
+            &action_queue_drops,
             &correlation_hits,
             &edge_block_hits,
             &edge_uploads_inspected,
         ] {
             registry.register(Box::new(m.clone())).ok();
         }
+        registry
+            .register(Box::new(events_dropped.clone()))
+            .map_err(|e| warn!(error = %e, "register events dropped"))
+            .ok();
         registry.register(Box::new(block_table_size.clone())).ok();
         registry
             .register(Box::new(bot_verifications.clone()))
@@ -360,6 +381,8 @@ impl Metrics {
             events_processed,
             events_blocked,
             dedupe_drops,
+            events_dropped,
+            action_queue_drops,
             correlation_hits,
             edge_block_hits,
             edge_uploads_inspected,
@@ -587,6 +610,16 @@ mod tests {
     fn route_unknown_path_is_404() {
         let resp = route(&Metrics::new(), &EventLog::new(), &"/nope".parse().unwrap());
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn drop_counters_are_exposed() {
+        let m = Metrics::new();
+        m.events_dropped.with_label_values(&["tcp"]).inc();
+        m.action_queue_drops.inc();
+        let text = String::from_utf8(m.gather()).unwrap();
+        assert!(text.contains("sentry_events_dropped_total{source=\"tcp\"}"));
+        assert!(text.contains("sentry_action_queue_drops_total"));
     }
 
     #[test]

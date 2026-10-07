@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::action::Action;
+use crate::action::{Action, ActionDispatch};
 use crate::analysis::{Decision, Verdict};
 use crate::error::Result;
 use crate::event::Event;
@@ -114,12 +114,29 @@ pub trait ChallengeProvider: Send + Sync {
 pub struct ChallengeAction {
     provider: Arc<dyn ChallengeProvider>,
     opts: EdgeOptions,
+    dispatch: ActionDispatch,
 }
 
 impl ChallengeAction {
     /// Create a new challenge action wrapping a provider.
+    ///
+    /// Defaults to [`ActionDispatch::Deferred`] (API providers wait on
+    /// external I/O); local providers like the kernel firewall should use
+    /// [`with_dispatch`](ChallengeAction::with_dispatch).
     pub fn new(provider: Arc<dyn ChallengeProvider>, opts: EdgeOptions) -> Self {
-        Self { provider, opts }
+        Self {
+            provider,
+            opts,
+            dispatch: ActionDispatch::default(),
+        }
+    }
+
+    /// Override where the daemon runs this action relative to the ingest
+    /// hot path.
+    #[must_use]
+    pub fn with_dispatch(mut self, dispatch: ActionDispatch) -> Self {
+        self.dispatch = dispatch;
+        self
     }
 }
 
@@ -127,6 +144,10 @@ impl ChallengeAction {
 impl Action for ChallengeAction {
     fn name(&self) -> &'static str {
         self.provider.name()
+    }
+
+    fn dispatch(&self) -> ActionDispatch {
+        self.dispatch
     }
 
     fn applies_to(&self, decision: &Decision) -> bool {
@@ -274,5 +295,17 @@ mod tests {
             assert_eq!(EdgeMode::parse(m.as_str()), Some(m));
         }
         assert_eq!(EdgeMode::parse("bogus"), None);
+    }
+
+    #[test]
+    fn challenge_defaults_to_deferred_and_overrides() {
+        let opts = EdgeOptions {
+            ttl: Duration::from_secs(60),
+            mode: None,
+        };
+        let action = ChallengeAction::new(Arc::new(MockProvider::new()), opts);
+        assert_eq!(action.dispatch(), ActionDispatch::Deferred);
+        let action = action.with_dispatch(ActionDispatch::Inline);
+        assert_eq!(action.dispatch(), ActionDispatch::Inline);
     }
 }

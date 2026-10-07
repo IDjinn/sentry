@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use sentry_core::action::{Action, ActionContext};
+use sentry_core::action::{Action, ActionContext, ActionDispatch};
 use sentry_core::analysis::{Decision, Signal, Verdict};
 use sentry_core::error::Result;
 use sentry_core::event::Event;
@@ -245,6 +245,7 @@ pub fn reportedip_categories(signals: &[Signal]) -> Vec<u32> {
 pub struct ReportAction {
     cfg: ReportActionConfig,
     http: reqwest::Client,
+    dispatch: ActionDispatch,
     /// Last report instant per IP (dedupe window).
     seen: Mutex<HashMap<IpAddr, Instant>>,
     /// Backoff flag after an HTTP 429.
@@ -256,12 +257,16 @@ pub struct ReportAction {
 impl ReportAction {
     /// Create the action; an empty key leaves the action inert (it logs a
     /// single warning on first use instead of failing the daemon).
+    ///
+    /// Defaults to [`ActionDispatch::Deferred`]: reports wait on external
+    /// I/O and belong on the post-processing workers.
     pub fn new(cfg: ReportActionConfig) -> Self {
         let http = reqwest::Client::builder()
             .timeout(cfg.timeout)
             .build()
             .expect("reqwest client");
         Self {
+            dispatch: ActionDispatch::default(),
             cfg,
             http,
             seen: Mutex::new(HashMap::new()),
@@ -269,6 +274,14 @@ impl ReportAction {
             consecutive_failures: AtomicU32::new(0),
             disabled: AtomicBool::new(false),
         }
+    }
+
+    /// Override where the daemon runs this action relative to the ingest
+    /// hot path.
+    #[must_use]
+    pub fn with_dispatch(mut self, dispatch: ActionDispatch) -> Self {
+        self.dispatch = dispatch;
+        self
     }
 
     /// Whether quota/dedupe/circuit state currently allows a report for `ip`.
@@ -381,6 +394,10 @@ fn verdict_rank(verdict: Verdict) -> u8 {
 impl Action for ReportAction {
     fn name(&self) -> &'static str {
         "report"
+    }
+
+    fn dispatch(&self) -> ActionDispatch {
+        self.dispatch
     }
 
     fn applies_to(&self, decision: &Decision) -> bool {

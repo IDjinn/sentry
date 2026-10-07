@@ -682,9 +682,11 @@ mod tests {
     // ── Upload inspection (F10) ──────────────────────────────────────────
 
     fn upload_cfg(enforce: bool, inspect_kb: usize) -> sentry_core::config::UploadsConfig {
-        let mut cfg = sentry_core::config::UploadsConfig::default();
-        cfg.enabled = true;
-        cfg.inspect_kb = inspect_kb;
+        let mut cfg = sentry_core::config::UploadsConfig {
+            enabled: true,
+            inspect_kb,
+            ..Default::default()
+        };
         if enforce {
             cfg.mode = sentry_core::config::UploadMode::Enforce;
         }
@@ -743,7 +745,7 @@ mod tests {
         let cfg = upload_cfg(true, 1024);
         let runtime = crate::EdgeRuntime::new(upload_pipeline(&cfg), None, 0).with_uploads(
             crate::UploadsInspection {
-                inspect_bytes: (cfg.inspect_kb as usize) * 1024,
+                inspect_bytes: cfg.inspect_kb * 1024,
                 max_files: 16,
             },
         );
@@ -790,7 +792,7 @@ mod tests {
         let cfg = upload_cfg(true, 1024);
         let runtime = crate::EdgeRuntime::new(upload_pipeline(&cfg), None, 0).with_uploads(
             crate::UploadsInspection {
-                inspect_bytes: (cfg.inspect_kb as usize) * 1024,
+                inspect_bytes: cfg.inspect_kb * 1024,
                 max_files: 16,
             },
         );
@@ -829,7 +831,7 @@ mod tests {
         let cfg = upload_cfg(false, 1024);
         let runtime = crate::EdgeRuntime::new(upload_pipeline(&cfg), None, 0).with_uploads(
             crate::UploadsInspection {
-                inspect_bytes: (cfg.inspect_kb as usize) * 1024,
+                inspect_bytes: cfg.inspect_kb * 1024,
                 max_files: 16,
             },
         );
@@ -893,7 +895,7 @@ mod tests {
         let counter = prometheus::Counter::new("uploads_inspected_test", "test").unwrap();
         let runtime = crate::EdgeRuntime::new(upload_pipeline(&cfg), None, 0)
             .with_uploads(crate::UploadsInspection {
-                inspect_bytes: (cfg.inspect_kb as usize) * 1024,
+                inspect_bytes: cfg.inspect_kb * 1024,
                 max_files: 16,
             })
             .with_uploads_inspected(counter.clone());

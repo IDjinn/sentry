@@ -73,18 +73,18 @@ fn game_full_session_flow() {
 
     let ticket = b"GAME-tester-3324";
     let sso = game_frame(400, &game_string(ticket));
-    let info = engine.feed(&proto, &mut state, &sso).unwrap();
+    let info = engine.feed(proto, &mut state, &sso).unwrap();
     assert_eq!(&*info.message, "sso_ticket_event");
 
     let mut chat_payload = game_string(b"Hello, world");
     chat_payload.extend(game_string(b"smile"));
     chat_payload.extend(vlint(7));
     let chat = game_frame(2064, &chat_payload);
-    let info = engine.feed(&proto, &mut state, &chat).unwrap();
+    let info = engine.feed(proto, &mut state, &chat).unwrap();
     assert_eq!(&*info.message, "chat_event");
 
     let ping = game_frame(4096, &game_string(b""));
-    let info = engine.feed(&proto, &mut state, &ping).unwrap();
+    let info = engine.feed(proto, &mut state, &ping).unwrap();
     assert_eq!(&*info.message, "ping_event");
     assert!(info.keepalive);
     assert!(state.last_keepalive().is_some());
@@ -99,19 +99,19 @@ fn game_unknown_header_and_flood() {
     let mut state = ConnectionState::new();
 
     let errs = engine
-        .feed(&proto, &mut state, &game_frame(7777, &[]))
+        .feed(proto, &mut state, &game_frame(7777, &[]))
         .unwrap_err();
     assert_eq!(&*errs[0].policy, "unknown_header");
 
     let empty_string = game_string(b"");
     let ping = game_frame(4096, &empty_string);
     for _ in 0..3 {
-        let r = engine.feed(&proto, &mut state, &ping);
+        let r = engine.feed(proto, &mut state, &ping);
         match r {
             Ok(_) | Err(_) => {}
         }
     }
-    let errs = engine.feed(&proto, &mut state, &ping).unwrap_err();
+    let errs = engine.feed(proto, &mut state, &ping).unwrap_err();
     assert!(
         errs.iter().any(|v| v.reason.contains("keepalive flood")),
         "expected flood violation, got {errs:?}"

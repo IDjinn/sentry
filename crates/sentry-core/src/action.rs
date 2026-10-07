@@ -7,10 +7,50 @@
 //! after policy has been applied.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::analysis::Decision;
 use crate::error::Result;
 use crate::event::Event;
+
+/// Where an action executes relative to the daemon's ingest hot path.
+///
+/// The hot loop must stay near-instant, so only local containment runs
+/// inline; anything that performs external I/O is handed to the
+/// post-processing workers. Under overload the deferred queue fills first,
+/// shedding actions — never events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActionDispatch {
+    /// Run in the ingest hot loop. Reserved for fast, local containment
+    /// (block table, kernel firewall, log lines); actions here receive an
+    /// empty [`ActionContext`] because the loop never awaits on storage.
+    Inline,
+    /// Run on the post-processing workers (API providers, webhooks, abuse
+    /// reports). This is the safe default for network-bound actions.
+    #[default]
+    Deferred,
+}
+
+impl ActionDispatch {
+    /// Lowercase stable name used in config and logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Deferred => "deferred",
+        }
+    }
+
+    /// Parse from a config string. Returns `None` on unknown values so the
+    /// caller can emit a precise error.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "inline" => Some(Self::Inline),
+            "deferred" => Some(Self::Deferred),
+            _ => None,
+        }
+    }
+}
 
 /// Extra dispatch context handed to actions alongside the decision.
 ///
@@ -67,5 +107,45 @@ pub trait Action: Send + Sync {
     /// for non-`Allow` verdicts; override to filter.
     fn applies_to(&self, decision: &Decision) -> bool {
         decision.action != crate::analysis::Verdict::Allow
+    }
+
+    /// Where this action executes relative to the ingest hot path.
+    ///
+    /// Defaults to [`ActionDispatch::Deferred`] — the safe choice for
+    /// network-bound side effects. Local-containment implementations
+    /// override to [`ActionDispatch::Inline`] so a malicious request is
+    /// contained with zero queueing latency.
+    fn dispatch(&self) -> ActionDispatch {
+        ActionDispatch::Deferred
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_defaults_to_deferred() {
+        assert_eq!(ActionDispatch::default(), ActionDispatch::Deferred);
+    }
+
+    #[test]
+    fn dispatch_parses_round_trip() {
+        for d in [ActionDispatch::Inline, ActionDispatch::Deferred] {
+            assert_eq!(ActionDispatch::parse(d.as_str()), Some(d));
+        }
+        assert_eq!(ActionDispatch::parse("bogus"), None);
+    }
+
+    #[test]
+    fn dispatch_serde_round_trip() {
+        assert_eq!(
+            serde_json::from_str::<ActionDispatch>("\"inline\"").unwrap(),
+            ActionDispatch::Inline
+        );
+        assert_eq!(
+            serde_json::to_string(&ActionDispatch::Deferred).unwrap(),
+            "\"deferred\""
+        );
     }
 }

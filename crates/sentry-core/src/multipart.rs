@@ -351,7 +351,10 @@ mod tests {
     const BOUNDARY: &str = "----sentryform";
     const CT: &str = "multipart/form-data; boundary=----sentryform";
 
-    fn body(parts: &[(&str, Option<&str>, Option<&str>, &[u8])]) -> Vec<u8> {
+    /// `(name, filename, content-type, content)` for one form part.
+    type PartSpec<'a> = (&'a str, Option<&'a str>, Option<&'a str>, &'a [u8]);
+
+    fn body(parts: &[PartSpec<'_>]) -> Vec<u8> {
         let mut out = Vec::new();
         for (name, filename, ct, content) in parts {
             let disp = match filename {

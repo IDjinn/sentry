@@ -378,8 +378,10 @@ mod tests {
     // ── Upload inspection (F10) ──────────────────────────────────────────
 
     fn upload_runtime(mode: MiddlewareMode, enforce: bool) -> EdgeRuntime {
-        let mut cfg = sentry_core::config::UploadsConfig::default();
-        cfg.enabled = true;
+        let mut cfg = sentry_core::config::UploadsConfig {
+            enabled: true,
+            ..Default::default()
+        };
         if enforce {
             cfg.mode = sentry_core::config::UploadMode::Enforce;
         }

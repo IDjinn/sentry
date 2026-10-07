@@ -7,6 +7,14 @@
 [core]
 data_dir = "/var/lib/sentry"
 channel_buffer = 4096
+# Post-processing lane (hot path keeps only local containment inline):
+# network-bound actions (Cloudflare/OPNsense/nginx APIs, webhooks, abuse
+# reports) run on `action_workers` background workers consuming a queue of
+# `action_buffer` events. Under overload the queue fills first, shedding
+# ACTIONS — events are still persisted and counted. workers = 1 keeps
+# strict action ordering.
+action_buffer = 4096
+action_workers = 1
 
 # ── Storage ──────────────────────────────────────────────────────────────
 [storage.postgres]
@@ -496,6 +504,7 @@ format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_byt
 # ports = "80,443,8443" # destination-port filter; empty = all
 # payload_cap = 8192    # reassembled bytes kept per flow
 # flow_cap = 65536      # max tracked flows (FIFO eviction)
+# channel_buffer = 1024 # event queue between capture loop and daemon; raise under high PPS
 
 # ── Web dashboard / JSON API (`sentry serve`) ──────────────────────────────
 # Separate process from the daemon; requires Postgres.
@@ -634,11 +643,18 @@ hsts_min_max_age = 31536000  # HSTS max-age below this counts as weak
 # hosts = []                  # restrict to these Host values (empty = any, capped at 64)
 
 # ── Actions ──────────────────────────────────────────────────────────────
+# Every action runs either inline in the ingest hot loop (local containment,
+# zero queueing latency) or on the post-processing workers (external I/O).
+# Defaults: blocklist / log / provider "firewall" → inline; cloudflare /
+# nginx / opnsense / pfsense / webhook / report → deferred. Override per
+# action with `dispatch = "inline" | "deferred"`. Deferred actions receive
+# the incident context; inline actions run without awaiting storage.
 # blocklist: feeds the shared block table on Block verdicts; the daemon
 # mirrors the same blocks to ip_state (dashboard-visible, restart-safe).
 # This TTL governs pipeline blocks end to end.
 [[action]]
 type = "blocklist"
+dispatch = "inline"            # default for blocklist; shown for discovery
 [action.options]
 ttl_secs = 86400
 

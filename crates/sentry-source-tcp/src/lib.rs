@@ -18,4 +18,4 @@ mod reassembler;
 mod source;
 
 pub use reassembler::{stream_id, FlowObservation, FlowState, FlowTable};
-pub use source::{TcpCaptureSource, TcpSourceConfig};
+pub use source::{TcpCaptureSource, TcpSourceConfig, DEFAULT_CHANNEL_BUFFER};

@@ -391,10 +391,15 @@ mod tests {
 
     #[test]
     fn flood_thresholds_fire_and_reset() {
-        let mut cfg = UploadsConfig::default();
-        cfg.mode = crate::config::UploadMode::Enforce;
-        cfg.flood.max_uploads = 3;
-        cfg.flood.max_total_mb = 1;
+        let cfg = UploadsConfig {
+            mode: crate::config::UploadMode::Enforce,
+            flood: crate::config::UploadFloodConfig {
+                max_uploads: 3,
+                max_total_mb: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let mut t = UploadTracker::from_config(&cfg);
 
         assert!(t.record(ip(), &[upload(100)]).is_empty());
@@ -407,7 +412,7 @@ mod tests {
         // Bytes threshold on its own window.
         let other = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 99));
         let big = upload(600 * 1024);
-        assert!(t.record(other, &[big.clone()]).is_empty());
+        assert!(t.record(other, std::slice::from_ref(&big)).is_empty());
         let sigs = t.record(other, &[big]);
         assert!(sigs
             .iter()

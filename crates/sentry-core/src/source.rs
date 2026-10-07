@@ -6,11 +6,14 @@
 //! with geo/asn and promotes them to full [`Event`](crate::event::Event)s.
 
 use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::error::Result;
 use crate::event::RawEvent;
+use crate::throttle::DropLogThrottle;
 
 /// A plugin that observes accesses and emits raw events.
 ///
@@ -47,19 +50,75 @@ pub fn event_channel(buffer: usize) -> (mpsc::Sender<RawEvent>, mpsc::Receiver<R
     mpsc::channel(buffer)
 }
 
+/// Per-source drop-log throttles, so a flood collapses into one aggregated
+/// log line per window instead of one line per dropped event.
+static DROP_THROTTLES: LazyLock<Mutex<HashMap<&'static str, DropLogThrottle>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Wrapper that logs and converts a send error into a `CoreError`.
 ///
 /// Sources call this when pushing events to fail loudly instead of silently
-/// dropping on a closed channel.
+/// dropping on a closed channel. Channel-full drops are logged with a
+/// per-source throttle (first drop immediately, then one aggregated line per
+/// [`DropLogThrottle::DEFAULT_WINDOW`]); a closed channel always logs.
 pub fn send_or_log(tx: &mpsc::Sender<RawEvent>, evt: RawEvent, source_name: &'static str) {
     use mpsc::error::TrySendError;
     match tx.try_send(evt) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
-            error!(source = source_name, "event channel full, dropping event");
+            let mut throttles = DROP_THROTTLES.lock().unwrap();
+            let throttle = throttles.entry(source_name).or_default();
+            if let Some(count) = throttle.record(std::time::Instant::now()) {
+                if count > 1 {
+                    error!(
+                        source = source_name,
+                        dropped = count,
+                        "event channel full, dropped events in the last 5s"
+                    );
+                } else {
+                    error!(source = source_name, "event channel full, dropping event");
+                }
+            }
         }
         Err(TrySendError::Closed(_)) => {
             error!(source = source_name, "event channel closed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::{ProtocolData, RawData, SourceKind, Transport};
+
+    fn sample_event() -> RawEvent {
+        RawEvent {
+            source: SourceKind::Tcp,
+            timestamp: chrono::Utc::now(),
+            transport: Transport::Tcp,
+            client_ip: None,
+            client_port: None,
+            server_port: None,
+            bytes_in: None,
+            bytes_out: None,
+            duration_ms: None,
+            raw: None,
+            protocol: ProtocolData::Raw(RawData::default()),
+        }
+    }
+
+    #[test]
+    fn event_channel_returns_bounded_pair() {
+        let (tx, rx) = event_channel(4);
+        assert_eq!(rx.capacity(), 4);
+        assert!(tx.try_send(sample_event()).is_ok());
+        assert_eq!(rx.capacity(), 3);
+    }
+
+    #[tokio::test]
+    async fn send_or_log_succeeds_into_open_channel() {
+        let (tx, mut rx) = event_channel(1);
+        send_or_log(&tx, sample_event(), "tcp");
+        assert!(rx.recv().await.is_some());
     }
 }

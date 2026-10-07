@@ -37,11 +37,12 @@ pub mod rules;
 pub mod scan;
 pub mod source;
 pub mod tcpfp;
+pub mod throttle;
 pub mod trust;
 pub mod trusted_lists;
 pub mod uploads;
 
-pub use action::{Action, ActionContext};
+pub use action::{Action, ActionContext, ActionDispatch};
 pub use analysis::{
     AnalysisResult, Decision, RiskLevel, RuleLogLevel, Signal, SignalKind, Verdict,
 };
@@ -86,6 +87,7 @@ pub use rules::{
 };
 pub use scan::ScanTracker;
 pub use source::Source;
+pub use throttle::DropLogThrottle;
 pub use trust::{SharedTrustSet, TrustSet};
 pub use trusted_lists::{matching_presets, preset, PRESETS};
 pub use uploads::{UploadTracker, UploadsScan};

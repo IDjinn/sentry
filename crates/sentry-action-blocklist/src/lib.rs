@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use sentry_core::action::Action;
+use sentry_core::action::{Action, ActionDispatch};
 use sentry_core::analysis::Verdict;
 use sentry_core::error::Result;
 use sentry_core::event::Event;
@@ -30,12 +30,28 @@ pub struct BlocklistActionConfig {
 pub struct BlocklistAction {
     cfg: BlocklistActionConfig,
     table: Arc<BlockTable>,
+    dispatch: ActionDispatch,
 }
 
 impl BlocklistAction {
     /// Create a new blocklist action writing into `table`.
+    ///
+    /// Defaults to [`ActionDispatch::Inline`]: this is local containment and
+    /// belongs in the ingest hot path.
     pub fn new(cfg: BlocklistActionConfig, table: Arc<BlockTable>) -> Self {
-        Self { cfg, table }
+        Self {
+            cfg,
+            table,
+            dispatch: ActionDispatch::Inline,
+        }
+    }
+
+    /// Override where the daemon runs this action relative to the ingest
+    /// hot path.
+    #[must_use]
+    pub fn with_dispatch(mut self, dispatch: ActionDispatch) -> Self {
+        self.dispatch = dispatch;
+        self
     }
 }
 
@@ -43,6 +59,10 @@ impl BlocklistAction {
 impl Action for BlocklistAction {
     fn name(&self) -> &'static str {
         "blocklist"
+    }
+
+    fn dispatch(&self) -> ActionDispatch {
+        self.dispatch
     }
 
     fn applies_to(&self, decision: &sentry_core::analysis::Decision) -> bool {

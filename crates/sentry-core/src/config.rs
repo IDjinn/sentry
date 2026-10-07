@@ -105,6 +105,15 @@ pub struct CoreConfig {
     /// Event channel buffer size.
     #[serde(default = "default_channel_buffer")]
     pub channel_buffer: usize,
+    /// Capacity of the deferred action queue (post-processing workers).
+    /// Under overload this queue fills first, shedding actions — never
+    /// events.
+    #[serde(default = "default_action_buffer")]
+    pub action_buffer: usize,
+    /// Parallel workers executing deferred (network-bound) actions.
+    /// `1` preserves strict action ordering and tight incident coalescing.
+    #[serde(default = "default_action_workers")]
+    pub action_workers: usize,
 }
 
 impl Default for CoreConfig {
@@ -112,6 +121,8 @@ impl Default for CoreConfig {
         Self {
             data_dir: default_data_dir(),
             channel_buffer: default_channel_buffer(),
+            action_buffer: default_action_buffer(),
+            action_workers: default_action_workers(),
         }
     }
 }
@@ -122,6 +133,14 @@ fn default_data_dir() -> PathBuf {
 
 fn default_channel_buffer() -> usize {
     4096
+}
+
+fn default_action_buffer() -> usize {
+    4096
+}
+
+fn default_action_workers() -> usize {
+    1
 }
 
 /// Storage backend selection.
@@ -1707,6 +1726,13 @@ pub struct ActionConfig {
     /// variant each time — see [`ChallengeProvider`](crate::challenge::ChallengeProvider).
     #[serde(default)]
     pub provider: Option<String>,
+    /// Where this action runs relative to the ingest hot path
+    /// (`"inline"` | `"deferred"`). When unset, each action uses its natural
+    /// default: local containment (blocklist, log, kernel firewall) runs
+    /// inline; network side effects (Cloudflare/nginx/OPNsense APIs,
+    /// webhooks, abuse reports) defer to the post-processing workers.
+    #[serde(default)]
+    pub dispatch: Option<crate::action::ActionDispatch>,
     /// Arbitrary plugin-specific fields.
     #[serde(default)]
     pub options: HashMap<String, toml::Value>,
@@ -1830,6 +1856,32 @@ mod tests {
 
         let err = toml::from_str::<EdgeConfig>("challenge_backend = \"bunny\"");
         assert!(err.is_err(), "typos must fail at config-load time");
+    }
+
+    #[test]
+    fn core_defaults_include_post_processing_lane() {
+        let c = CoreConfig::default();
+        assert_eq!(c.action_buffer, 4096);
+        assert_eq!(c.action_workers, 1);
+        let parsed: CoreConfig = toml::from_str("channel_buffer = 8192").unwrap();
+        assert_eq!(parsed.channel_buffer, 8192);
+        assert_eq!(parsed.action_buffer, 4096);
+        assert_eq!(parsed.action_workers, 1);
+    }
+
+    #[test]
+    fn action_dispatch_option_parses_from_toml() {
+        let parsed: ActionConfig =
+            toml::from_str("type = \"webhook\"\ndispatch = \"inline\"").unwrap();
+        assert_eq!(parsed.dispatch, Some(crate::action::ActionDispatch::Inline));
+
+        let parsed: ActionConfig = toml::from_str("type = \"log\"").unwrap();
+        assert_eq!(parsed.dispatch, None);
+
+        assert!(
+            toml::from_str::<ActionConfig>("type = \"log\"\ndispatch = \"fast\"").is_err(),
+            "typos must fail at config-load time"
+        );
     }
 
     #[test]

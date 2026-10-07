@@ -1110,7 +1110,7 @@ mod tests {
         )
     }
 
-    fn text_of(e: &Event) -> DecodedHttp {
+    fn text_of(e: &Event) -> DecodedHttp<'_> {
         e.http().map(DecodedHttp::of).unwrap_or_default()
     }
 
@@ -1373,10 +1373,12 @@ mod tests {
             .analyze(&e)
             .iter()
             .any(|s| s.kind == SignalKind::SqlInjection));
-        let mut cfg = UploadsConfig::default();
-        cfg.enabled = true;
-        cfg.mode = crate::config::UploadMode::Enforce;
-        cfg.scan_json = false;
+        let cfg = UploadsConfig {
+            enabled: true,
+            mode: crate::config::UploadMode::Enforce,
+            scan_json: false,
+            ..Default::default()
+        };
         let engine =
             HeuristicEngine::with_defaults().with_uploads_scan(UploadsScan::from_config(&cfg));
         assert!(
@@ -1444,7 +1446,7 @@ mod proptests {
         )
     }
 
-    fn text_of(e: &Event) -> DecodedHttp {
+    fn text_of(e: &Event) -> DecodedHttp<'_> {
         e.http().map(DecodedHttp::of).unwrap_or_default()
     }
 

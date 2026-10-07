@@ -1887,9 +1887,14 @@ mod tests {
 
     #[test]
     fn upload_flood_signal_flows_through_pipeline() {
-        let mut cfg = crate::config::UploadsConfig::default();
-        cfg.enabled = true;
-        cfg.flood.max_uploads = 2;
+        let cfg = crate::config::UploadsConfig {
+            enabled: true,
+            flood: crate::config::UploadFloodConfig {
+                max_uploads: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let upload_tracker = Arc::new(RwLock::new(crate::uploads::UploadTracker::from_config(
             &cfg,
         )));
@@ -1968,8 +1973,10 @@ mod tests {
 
     #[test]
     fn blacklisted_ip_short_circuits_to_block() {
-        let mut rc = crate::config::RealIpConfig::default();
-        rc.blacklist = vec!["1.2.3.0/24".into()];
+        let rc = crate::config::RealIpConfig {
+            blacklist: vec!["1.2.3.0/24".into()],
+            ..Default::default()
+        };
         let p = pipeline().with_trust(crate::trust::SharedTrustSet::new(
             crate::trust::TrustSet::from_config(&rc).unwrap(),
         ));
@@ -1984,8 +1991,10 @@ mod tests {
 
     #[test]
     fn shadow_ip_is_analyzed_but_never_blocked() {
-        let mut rc = crate::config::RealIpConfig::default();
-        rc.shadow = vec!["1.2.3.0/24".into()];
+        let rc = crate::config::RealIpConfig {
+            shadow: vec!["1.2.3.0/24".into()],
+            ..Default::default()
+        };
         let p = pipeline().with_trust(crate::trust::SharedTrustSet::new(
             crate::trust::TrustSet::from_config(&rc).unwrap(),
         ));

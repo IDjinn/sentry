@@ -410,6 +410,22 @@ não em runtime.
     alocação no hit com sweep 1×/TTL, ingest em lote `recv_many(64)`.
     Pipeline end-to-end: 3,49 ms → 4,36 µs/evento (~800×). Números e
     metodologia em `ARCHITECTURE.md` §22
+  - ✅ F5 hot path de duas lanes — o loop de ingest nunca espera I/O
+    externo: actions de contenção local (blocklist/log/firewall) rodam
+    inline; actions de rede (cloudflare/nginx/opnsense/webhook/report)
+    vão para workers postergados (`[core] action_buffer`/`action_workers`,
+    1 worker = ordem estrita; `incident_context` serializado por mutex e
+    computado 1×/evento em vez de 1×/action). Sob overload a fila de
+    actions enche primeiro — sheds **actions**, nunca eventos
+    (`sentry_action_queue_drops_total`); drops de canal de fonte viram
+    `sentry_events_dropped_total{source}` + log agregado por
+    `DropLogThrottle` (5s) em vez de 1 `error!` por evento;
+    `print_event` sai do hot path (printer task); evento compartilhado
+    como `Arc<ProcessedEvent>` (printer + persistência + fila sem deep
+    clone); override por action com `[[action]] dispatch =
+    "inline"|"deferred"` (`ActionDispatch` na trait `Action`); source TCP
+    com `channel_buffer` configurável. Flood line-rate de SYN continua
+    saturando qualquer buffer — roadmap `BACKLOG.md` §5.1 F5.8
   - ⏸️ F5 avançada (roadmap `BACKLOG.md` §5.1): budgets de
     regressão no CI, eBPF/aya, io_uring, AF_XDP kernel-bypass, ring
     buffers NUMA, avaliação de kernel module, SIMD explícito

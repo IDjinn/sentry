@@ -33,7 +33,13 @@ pub struct TcpSourceConfig {
     pub payload_cap: usize,
     /// Max simultaneously tracked flows (default 65_536).
     pub flow_cap: usize,
+    /// Event channel capacity between the capture loop and the daemon
+    /// (default 1024). Raise under high-PPS capture.
+    pub channel_buffer: usize,
 }
+
+/// Default event channel capacity for the capture loop.
+pub const DEFAULT_CHANNEL_BUFFER: usize = 1024;
 
 impl Default for TcpSourceConfig {
     fn default() -> Self {
@@ -42,6 +48,7 @@ impl Default for TcpSourceConfig {
             ports: Vec::new(),
             payload_cap: crate::reassembler::DEFAULT_PAYLOAD_CAP,
             flow_cap: 65_536,
+            channel_buffer: DEFAULT_CHANNEL_BUFFER,
         }
     }
 }
@@ -194,7 +201,7 @@ impl Source for TcpCaptureSource {
                 }
             };
 
-            let (tx, chan_rx) = event_channel(1024);
+            let (tx, chan_rx) = event_channel(self.cfg.channel_buffer.max(64));
             let cfg = self.cfg.clone();
             let flows = Arc::clone(&self.flows);
             tokio::task::spawn_blocking(move || loop {
@@ -264,6 +271,7 @@ mod tests {
         let cfg = TcpSourceConfig::default();
         assert_eq!(cfg.payload_cap, 8 * 1024);
         assert_eq!(cfg.flow_cap, 65_536);
+        assert_eq!(cfg.channel_buffer, DEFAULT_CHANNEL_BUFFER);
         assert!(cfg.ports.is_empty());
     }
 }

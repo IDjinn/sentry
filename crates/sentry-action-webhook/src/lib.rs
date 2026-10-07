@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
-use sentry_core::action::{Action, ActionContext};
+use sentry_core::action::{Action, ActionContext, ActionDispatch};
 use sentry_core::analysis::{RiskLevel, Verdict};
 use sentry_core::error::Result;
 use sentry_core::event::Event;
@@ -47,16 +47,32 @@ pub struct WebhookActionConfig {
 pub struct WebhookAction {
     cfg: WebhookActionConfig,
     http: reqwest::Client,
+    dispatch: ActionDispatch,
 }
 
 impl WebhookAction {
     /// Create a new webhook action.
+    ///
+    /// Defaults to [`ActionDispatch::Deferred`]: the POST waits on external
+    /// I/O and belongs on the post-processing workers.
     pub fn new(cfg: WebhookActionConfig) -> Self {
         let http = reqwest::Client::builder()
             .timeout(cfg.timeout)
             .build()
             .expect("reqwest client");
-        Self { cfg, http }
+        Self {
+            cfg,
+            http,
+            dispatch: ActionDispatch::default(),
+        }
+    }
+
+    /// Override where the daemon runs this action relative to the ingest
+    /// hot path.
+    #[must_use]
+    pub fn with_dispatch(mut self, dispatch: ActionDispatch) -> Self {
+        self.dispatch = dispatch;
+        self
     }
 
     fn sign(&self, body: &str) -> Option<String> {
@@ -176,6 +192,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 impl Action for WebhookAction {
     fn name(&self) -> &'static str {
         "webhook"
+    }
+
+    fn dispatch(&self) -> ActionDispatch {
+        self.dispatch
     }
 
     fn applies_to(&self, decision: &sentry_core::analysis::Decision) -> bool {
