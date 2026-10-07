@@ -313,6 +313,7 @@ mod tests {
                 log_level: None,
             },
             rule_hit: None,
+            process_us: None,
         }
     }
 
@@ -413,6 +414,7 @@ mod tests {
                 log_level: None,
             },
             rule_hit: None,
+            process_us: None,
         });
         assert_eq!(keys(&http), keys(&raw));
         let v = serde_json::to_value(&raw).unwrap();
@@ -469,6 +471,7 @@ mod tests {
                 log_level: None,
             },
             rule_hit: None,
+            process_us: None,
         };
         let s = EventSummary::from_processed(&pe);
         let uploads = s.uploads.as_ref().unwrap();
@@ -529,6 +532,7 @@ mod tests {
                     alpn: Some("h2".into()),
                 }),
             ),
+            process_us: None,
             analysis: AnalysisResult::default(),
             decision: Decision {
                 analysis: AnalysisResult::default(),
@@ -571,6 +575,7 @@ mod tests {
                 log_level: None,
             },
             rule_hit: None,
+            process_us: None,
         };
         let s = EventSummary::from_processed(&pe);
         assert_eq!(s.path.as_ref().unwrap().chars().count(), 256);

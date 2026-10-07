@@ -454,8 +454,13 @@ impl EdgeRuntime {
 
     /// Run the pipeline on an already-built event (enrich → process).
     pub fn process(&self, mut evt: Event) -> sentry_core::ProcessedEvent {
+        let start = std::time::Instant::now();
         self.enrich(&mut evt);
-        self.pipeline.process(&evt)
+        let mut processed = self.pipeline.process(&evt);
+        // Inline overhead is part of the contract: the console line for edge
+        // events shows it even when the pipeline itself costs microseconds.
+        processed.process_us = Some(start.elapsed().as_micros() as u64);
+        processed
     }
 
     /// Fast-path check: whether `ip` must be denied before the pipeline runs.

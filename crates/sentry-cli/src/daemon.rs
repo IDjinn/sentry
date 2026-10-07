@@ -1592,16 +1592,25 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 }
             }
 
-            if telemetry
-                && print_tx
-                    .try_send((Arc::clone(&result), (!from_edge).then_some(duration)))
+            if telemetry {
+                // Raw sources: the ingest loop measured the pipeline inline.
+                // Edge events: the overhead was measured at the edge and
+                // travels on the event, so every inline line shows a timing.
+                let console_process = if from_edge {
+                    result.process_us.map(Duration::from_micros)
+                } else {
+                    Some(duration)
+                };
+                if print_tx
+                    .try_send((Arc::clone(&result), console_process))
                     .is_err()
-            {
-                if let Some(count) = deferred_throttle.record(Instant::now()) {
-                    warn!(
-                        dropped = count,
-                        "console backlog full, dropping event lines"
-                    );
+                {
+                    if let Some(count) = deferred_throttle.record(Instant::now()) {
+                        warn!(
+                            dropped = count,
+                            "console backlog full, dropping event lines"
+                        );
+                    }
                 }
             }
 
@@ -3073,7 +3082,7 @@ fn print_event(
         timing.push_str(&format!(" {ms}ms"));
     }
     if let Some(d) = process {
-        timing.push_str(&format!(" ({})", fmt_duration(d)));
+        timing.push_str(&format!(" (sentry {})", fmt_duration(d)));
     }
 
     let line = format!(
@@ -4163,6 +4172,7 @@ mod tests {
             },
             analysis,
             rule_hit: None,
+            process_us: None,
         }
     }
 

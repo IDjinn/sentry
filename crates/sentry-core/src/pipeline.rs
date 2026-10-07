@@ -340,6 +340,10 @@ pub struct ProcessedEvent {
     pub decision: Decision,
     /// Whether a rule short-circuited (bypassed heuristics+AI).
     pub rule_hit: Option<String>,
+    /// Sentry processing overhead (enrichment + pipeline) in microseconds,
+    /// set by inline paths (`EdgeRuntime::process`); `None` for raw sources,
+    /// where the daemon measures the ingest loop instead.
+    pub process_us: Option<u64>,
 }
 
 impl Pipeline {
@@ -483,6 +487,7 @@ impl Pipeline {
                         log_level: None,
                     },
                     rule_hit: None,
+                    process_us: None,
                 };
             }
         }
@@ -507,6 +512,7 @@ impl Pipeline {
                         log_level: None,
                     },
                     rule_hit: None,
+                    process_us: None,
                 };
             }
         }
@@ -571,6 +577,7 @@ impl Pipeline {
                         analysis: result,
                         decision: self.apply_escalation(evt, decision),
                         rule_hit: Some(rule.id.clone()),
+                        process_us: None,
                     },
                 );
             }
@@ -706,6 +713,7 @@ impl Pipeline {
                 analysis,
                 decision: self.apply_escalation(evt, decision),
                 rule_hit: None,
+                process_us: None,
             },
         )
     }
@@ -977,6 +985,7 @@ impl Pipeline {
             analysis,
             decision,
             rule_hit: None,
+            process_us: None,
         }
     }
 
@@ -1054,6 +1063,7 @@ impl Pipeline {
                 analysis,
                 decision,
                 rule_hit: base.rule_hit.clone(),
+                process_us: base.process_us,
             },
         )
     }

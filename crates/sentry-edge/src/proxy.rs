@@ -491,6 +491,13 @@ async fn proxy_inspected(
         }
     }
 
+    // Total inline request duration (request received → response ready to
+    // send) — the edge analogue of nginx `$request_time`, shown on the
+    // console line next to the pipeline overhead (`process_us`).
+    if processed.event.duration_ms.is_none() {
+        processed.event.duration_ms = Some(start.elapsed().as_millis() as u64);
+    }
+
     if let Err(e) = decided.try_send(processed) {
         warn!(error = %e, "failed to publish decided event");
     }

@@ -390,6 +390,7 @@ mod tests {
                 log_level: None,
             },
             rule_hit: None,
+            process_us: None,
         }
     }
 
