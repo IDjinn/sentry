@@ -236,13 +236,18 @@ async fn proxy_handler_inner(
     // While upload inspection is armed, the inspection cap IS the body cap:
     // bodies beyond it are refused outright (413), and the buffered bytes are
     // what the heuristics analyze. The declared length is checked before any
-    // buffering; chunked bodies hit the cap inside `to_bytes`.
+    // buffering; chunked bodies hit the cap inside `to_bytes`. Under
+    // overload pressure the inspection path is skipped (cheap mode) and the
+    // legacy forward buffering runs instead — `inspect_body` is gated too.
     let declared_len = parts
         .headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok());
-    if let Some(insp) = runtime.uploads_inspection() {
+    if let Some(insp) = runtime
+        .uploads_inspection()
+        .filter(|_| !runtime.overloaded())
+    {
         if declared_len.is_some_and(|len| len > insp.inspect_bytes) {
             return (
                 axum::http::StatusCode::PAYLOAD_TOO_LARGE,

@@ -88,6 +88,11 @@ pub struct SentryConfig {
     /// Web security posture advisories (F11, inline edge only).
     #[serde(default)]
     pub posture: PostureConfig,
+    /// Overload response: measured pressure → tiered degradation of
+    /// telemetry (persistence/eventlog/print). Detection and containment
+    /// never degrade.
+    #[serde(default)]
+    pub overload: OverloadConfig,
     /// Event sources.
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
@@ -114,6 +119,16 @@ pub struct CoreConfig {
     /// `1` preserves strict action ordering and tight incident coalescing.
     #[serde(default = "default_action_workers")]
     pub action_workers: usize,
+    /// Capacity of the bounded persistence queue. The persist worker drains
+    /// it in batches (one multi-row INSERT per batch); when it fills under
+    /// overload, low-priority events are shed while security events fall
+    /// back to direct writes.
+    #[serde(default = "default_persist_buffer")]
+    pub persist_buffer: usize,
+    /// Ingest dedupe window in seconds: identical (ip, method, path) events
+    /// within the window are dropped before the pipeline.
+    #[serde(default = "default_dedupe_ttl_secs")]
+    pub dedupe_ttl_secs: u64,
 }
 
 impl Default for CoreConfig {
@@ -123,6 +138,8 @@ impl Default for CoreConfig {
             channel_buffer: default_channel_buffer(),
             action_buffer: default_action_buffer(),
             action_workers: default_action_workers(),
+            persist_buffer: default_persist_buffer(),
+            dedupe_ttl_secs: default_dedupe_ttl_secs(),
         }
     }
 }
@@ -141,6 +158,107 @@ fn default_action_buffer() -> usize {
 
 fn default_action_workers() -> usize {
     1
+}
+
+fn default_persist_buffer() -> usize {
+    2048
+}
+
+fn default_dedupe_ttl_secs() -> u64 {
+    10
+}
+
+/// Overload response settings: measured pressure (queue occupancy, Postgres
+/// write latency) switches the daemon into tiered degradation — telemetry
+/// (persistence, eventlog, console print, benign forks) yields first.
+/// Detection (pipeline) and containment (block table, actions) never yield.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverloadConfig {
+    /// Master switch for pressure detection and the degradation tiers.
+    #[serde(default = "default_overload_enabled")]
+    pub enabled: bool,
+    /// Fan-in/action/persist queue occupancy (0.0-1.0) that turns pressure
+    /// on.
+    #[serde(default = "default_queue_pressure")]
+    pub queue_pressure: f64,
+    /// Occupancy below which pressure turns off again (hysteresis).
+    #[serde(default = "default_release_pressure")]
+    pub release_pressure: f64,
+    /// Seconds the release condition must hold before pressure clears.
+    #[serde(default = "default_release_secs")]
+    pub release_secs: u64,
+    /// Postgres INSERT latency EMA (ms) that turns pressure on by itself —
+    /// catches a slow/saturated database even when the queues are calm.
+    #[serde(default = "default_pg_insert_budget_ms")]
+    pub pg_insert_budget_ms: u64,
+    /// Fraction (0.0-1.0) of low-priority events (Allow, below High) kept
+    /// while under pressure — deterministic per source IP, so an IP is
+    /// either consistently in or consistently out of the sample.
+    #[serde(default = "default_sample_keep")]
+    pub sample_keep: f64,
+    /// Collapse repeated benign requests (Allow, GET, no signals) per
+    /// (ip, path) into the first hit of each window; repeats are counted in
+    /// `sentry_coalesced_requests_total` instead of persisted/printed.
+    #[serde(default = "default_coalesce_benign")]
+    pub coalesce_benign: bool,
+    /// Window for benign coalescing.
+    #[serde(default = "default_coalesce_window_secs")]
+    pub coalesce_window_secs: u64,
+    /// Max tracked (ip, path) buckets; oldest bucket is evicted beyond it.
+    #[serde(default = "default_coalesce_cap")]
+    pub coalesce_cap: usize,
+}
+
+impl Default for OverloadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_overload_enabled(),
+            queue_pressure: default_queue_pressure(),
+            release_pressure: default_release_pressure(),
+            release_secs: default_release_secs(),
+            pg_insert_budget_ms: default_pg_insert_budget_ms(),
+            sample_keep: default_sample_keep(),
+            coalesce_benign: default_coalesce_benign(),
+            coalesce_window_secs: default_coalesce_window_secs(),
+            coalesce_cap: default_coalesce_cap(),
+        }
+    }
+}
+
+fn default_overload_enabled() -> bool {
+    true
+}
+
+fn default_queue_pressure() -> f64 {
+    0.8
+}
+
+fn default_release_pressure() -> f64 {
+    0.5
+}
+
+fn default_release_secs() -> u64 {
+    30
+}
+
+fn default_pg_insert_budget_ms() -> u64 {
+    250
+}
+
+fn default_sample_keep() -> f64 {
+    0.1
+}
+
+fn default_coalesce_benign() -> bool {
+    true
+}
+
+fn default_coalesce_window_secs() -> u64 {
+    60
+}
+
+fn default_coalesce_cap() -> usize {
+    4096
 }
 
 /// Storage backend selection.
@@ -1863,10 +1981,35 @@ mod tests {
         let c = CoreConfig::default();
         assert_eq!(c.action_buffer, 4096);
         assert_eq!(c.action_workers, 1);
+        assert_eq!(c.persist_buffer, 2048);
+        assert_eq!(c.dedupe_ttl_secs, 10);
         let parsed: CoreConfig = toml::from_str("channel_buffer = 8192").unwrap();
         assert_eq!(parsed.channel_buffer, 8192);
         assert_eq!(parsed.action_buffer, 4096);
         assert_eq!(parsed.action_workers, 1);
+        assert_eq!(parsed.persist_buffer, 2048);
+        assert_eq!(parsed.dedupe_ttl_secs, 10);
+    }
+
+    #[test]
+    fn overload_defaults_are_safe_and_parse() {
+        let c = OverloadConfig::default();
+        assert!(c.enabled);
+        assert!((c.queue_pressure - 0.8).abs() < f64::EPSILON);
+        assert!((c.release_pressure - 0.5).abs() < f64::EPSILON);
+        assert_eq!(c.release_secs, 30);
+        assert_eq!(c.pg_insert_budget_ms, 250);
+        assert!((c.sample_keep - 0.1).abs() < f64::EPSILON);
+        assert!(c.coalesce_benign);
+        assert_eq!(c.coalesce_window_secs, 60);
+        assert_eq!(c.coalesce_cap, 4096);
+
+        let parsed: OverloadConfig = toml::from_str("sample_keep = 0.5").unwrap();
+        assert!((parsed.sample_keep - 0.5).abs() < f64::EPSILON);
+        assert!((parsed.queue_pressure - 0.8).abs() < f64::EPSILON);
+
+        let full: SentryConfig = toml::from_str("[overload]\ncoalesce_benign = false").unwrap();
+        assert!(!full.overload.coalesce_benign);
     }
 
     #[test]

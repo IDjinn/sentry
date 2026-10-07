@@ -424,8 +424,29 @@ não em runtime.
     como `Arc<ProcessedEvent>` (printer + persistência + fila sem deep
     clone); override por action com `[[action]] dispatch =
     "inline"|"deferred"` (`ActionDispatch` na trait `Action`); source TCP
-    com `channel_buffer` configurável. Flood line-rate de SYN continua
-    saturando qualquer buffer — roadmap `BACKLOG.md` §5.1 F5.8
+    com `channel_buffer` configurável
+  - ✅ F5 overload response — pressão medida → degradação em tiers de
+    **telemetria** (detecção/contenção nunca): lane de persistência em
+    lote (`[core] persist_buffer`, worker com `recv_many` → 1 multi-INSERT
+    por lote via `EventRepo::insert_batch_with_hash`, eventos de
+    segurança caem para escrita direta se a fila enche), monitor 5s de
+    occupancy de filas + Postgres (pool adquirido ≥90% ou EMA de INSERT ≥
+    `pg_insert_budget_ms`, histerese `queue_pressure`/`release_pressure`/
+    `release_secs`) que liga o flag compartilhado `OverloadState` (gauge
+    `sentry_postgres_pressure`, `sentry_queue_occupancy{queue}`,
+    `sentry_persist_duration_seconds`); sob pressão: sampling
+    determinístico por IP (`sample_keep`) só para Allow < High
+    (`sentry_overload_shed_total{tier}` — Block/High sempre 100%),
+    forks AI/LLM de eventos benignos pulados e edge inline entra em
+    cheap mode (pula buffering de inspeção/uploads); coalescência de
+    refreshes benignos (`BenignCoalescer`: Allow GET sem sinais por
+    (ip, path-sem-query) — 1 persistência por janela
+    `coalesce_window_secs`, repetições viram
+    `sentry_coalesced_requests_total{kind="benign"}`) e agregação de SYN
+    por IP/janela no source TCP (`syn_window_ms`, F5.8/BACKLOG §5.1 —
+    rajada vira 1 evento por IP com `TcpData.syn_count`);
+    dedupe de ingest configurável (`[core] dedupe_ttl_secs`, padrão 10s —
+    GETs idênticos de k6 já morrem aqui antes do pipeline)
   - ⏸️ F5 avançada (roadmap `BACKLOG.md` §5.1): budgets de
     regressão no CI, eBPF/aya, io_uring, AF_XDP kernel-bypass, ring
     buffers NUMA, avaliação de kernel module, SIMD explícito
@@ -739,7 +760,7 @@ Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 603+ testes passando sem features (605 com
+# Resultado esperado: 644+ testes passando sem features (646 com
 # --features sentry-cli/onnx — os 2 testes de inferência ONNX)
 ```
 

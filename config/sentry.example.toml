@@ -15,6 +15,13 @@ channel_buffer = 4096
 # strict action ordering.
 action_buffer = 4096
 action_workers = 1
+# Bounded persistence lane: the daemon batches events into one multi-row
+# INSERT per `persist_buffer` slot drained; security events fall back to
+# direct writes when it fills (see [overload]).
+persist_buffer = 2048
+# Ingest dedupe window: identical (ip, method, path) within the window is
+# dropped before the pipeline (k6-style refresh loops mostly die here).
+dedupe_ttl_secs = 10
 
 # ── Storage ──────────────────────────────────────────────────────────────
 [storage.postgres]
@@ -178,6 +185,24 @@ cache_ttl_secs = 300        # result cache keyed by payload hash
 backend = "memory"
 # backend = "redis"
 # redis_url = "redis://127.0.0.1/"
+
+# ── Overload response (measured pressure → tiered degradation) ────────────
+# Detection (pipeline) and containment (block table, actions) NEVER degrade.
+# When measured pressure trips — queue occupancy or slow Postgres writes —
+# only telemetry yields: low-priority events (Allow, below High) are sampled
+# (deterministic per source IP), forks of benign events are skipped, and the
+# inline edge skips body buffering for inspection. Security events (Block/
+# Challenge/RateLimit/Quarantine or High/Critical) are always kept 100%.
+[overload]
+enabled = true              # master switch for pressure detection
+queue_pressure = 0.8        # queue occupancy that turns pressure on
+release_pressure = 0.5      # occupancy that starts the release (hysteresis)
+release_secs = 30           # sustained relief before pressure clears
+pg_insert_budget_ms = 250   # INSERT latency EMA that trips pressure alone
+sample_keep = 0.1           # fraction of low-priority events kept under pressure
+coalesce_benign = true      # collapse repeated benign GETs per (ip, path)
+coalesce_window_secs = 60   # first hit persists; repeats become a counter
+coalesce_cap = 4096         # max tracked (ip, path) buckets
 
 # ── Metrics (Prometheus) + event log for Grafana ──────────────────────────
 # /metrics — Prometheus aggregates (also scraped by the bundled Grafana
@@ -505,6 +530,8 @@ format = '$remote_addr - $remote_user [$time_local] "$request" $status $body_byt
 # payload_cap = 8192    # reassembled bytes kept per flow
 # flow_cap = 65536      # max tracked flows (FIFO eviction)
 # channel_buffer = 1024 # event queue between capture loop and daemon; raise under high PPS
+# syn_window_ms = 100   # per-IP SYN coalescing window (F5.8; 0 = off): a burst
+#                       # becomes one event per IP per window with TcpData.syn_count
 
 # ── Web dashboard / JSON API (`sentry serve`) ──────────────────────────────
 # Separate process from the daemon; requires Postgres.

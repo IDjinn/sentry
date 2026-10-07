@@ -14,8 +14,12 @@
 
 #![forbid(unsafe_code)]
 
+mod aggregate;
 mod reassembler;
 mod source;
 
+pub use aggregate::{SynAggregate, SynAggregator};
 pub use reassembler::{stream_id, FlowObservation, FlowState, FlowTable};
-pub use source::{TcpCaptureSource, TcpSourceConfig, DEFAULT_CHANNEL_BUFFER};
+pub use source::{
+    TcpCaptureSource, TcpSourceConfig, DEFAULT_CHANNEL_BUFFER, DEFAULT_SYN_WINDOW_MS,
+};

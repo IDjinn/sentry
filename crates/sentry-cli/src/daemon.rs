@@ -871,8 +871,12 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     }
 
     // Fan-in: merge all source streams into one channel.
+    // Shared overload flag: the monitor task flips it from measured queue
+    // occupancy and Postgres pressure; the inline edge, ingest loop and
+    // forks read it to degrade telemetry (never detection).
+    let overload_state = sentry_core::OverloadState::new();
     let buffer = cfg.core.channel_buffer.max(256);
-    let (event_tx, mut event_rx) = mpsc::channel::<Incoming>(buffer);
+    let (event_tx, event_rx) = mpsc::channel::<Incoming>(buffer);
 
     // Start each source.
     for source in registry.sources() {
@@ -998,6 +1002,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         .with_block_hits(metrics.edge_block_hits.clone())
         .with_request_duration(metrics.edge_request_duration.clone())
         .with_challenge_metrics(metrics.edge_challenge.clone())
+        .with_overload(overload_state.clone())
         .with_tls_metrics(sentry_edge::TlsMetrics {
             handshakes: metrics.edge_tls_handshakes.clone(),
             failures: metrics.edge_tls_failures.clone(),
@@ -1171,7 +1176,8 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 .with_challenge_backend(cfg.edge.challenge_backend)
                 .with_trust(shared_trust.clone())
                 .with_block_table(Arc::clone(&block_table))
-                .with_block_hits(metrics.edge_block_hits.clone());
+                .with_block_hits(metrics.edge_block_hits.clone())
+                .with_overload(overload_state.clone());
             let tcp_runtime = match &protocol_engine {
                 Some(eng) => {
                     tcp_runtime.with_protocol(Arc::clone(eng), protocol_metrics_handles(&metrics))
@@ -1223,11 +1229,15 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             "inline edge enabled (deployment.mode = inline)"
         );
     }
+    // The overload monitor measures fan-in occupancy from the receiver side
+    // (shared under a mutex) — no sender clone, so the channel still closes
+    // when the last real producer ends and the ingest loop can finish.
+    let event_rx = Arc::new(tokio::sync::Mutex::new(event_rx));
     drop(event_tx);
 
     // Main processing loop.
     info!("pipeline ready, processing events");
-    let mut dedupe = DedupeCache::new(Duration::from_secs(10));
+    let mut dedupe = DedupeCache::new(Duration::from_secs(cfg.core.dedupe_ttl_secs.max(1)));
     let mut processed_count: u64 = 0;
     let mut blocked_count: u64 = 0;
     let mut dropped_dupes: u64 = 0;
@@ -1317,13 +1327,182 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         }
     });
 
+    // Bounded persistence lane (W1): the worker drains the queue in batches
+    // and writes one multi-row INSERT per batch, so 64 events cost one
+    // round-trip instead of 64. Security events that find the queue full
+    // fall back to a direct write; low-priority ones are shed (counted).
+    let persist_buffer = cfg.core.persist_buffer.max(64);
+    let (persist_tx, mut persist_rx) =
+        mpsc::channel::<(Arc<sentry_core::ProcessedEvent>, Option<u64>)>(persist_buffer);
+    let insert_ema_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let repo = repo.clone();
+        let metrics = metrics.clone();
+        let ema = Arc::clone(&insert_ema_us);
+        tokio::spawn(async move {
+            let mut batch: Vec<(Arc<sentry_core::ProcessedEvent>, Option<u64>)> =
+                Vec::with_capacity(64);
+            loop {
+                let n = persist_rx.recv_many(&mut batch, 64).await;
+                if n == 0 {
+                    break;
+                }
+                let Some(ref repo) = repo else {
+                    batch.clear();
+                    continue;
+                };
+                let mut rows = Vec::with_capacity(batch.len());
+                for (result, process_us) in batch.drain(..) {
+                    let signals =
+                        serde_json::to_value(&result.analysis.signals).unwrap_or_default();
+                    rows.push(sentry_storage::EventInsert::from_event(
+                        &result.event,
+                        result.analysis.risk_score,
+                        result.analysis.risk_level,
+                        result.decision.action,
+                        &signals,
+                        Some(dedup_hash(&result.event) as i64),
+                        process_us,
+                    ));
+                }
+                if rows.is_empty() {
+                    continue;
+                }
+                let started = Instant::now();
+                if let Err(e) = repo.events().insert_batch_with_hash(&rows).await {
+                    warn!(error = %e, rows = rows.len(), "failed to persist event batch");
+                }
+                let elapsed_us = started.elapsed().as_micros() as u64;
+                metrics
+                    .persist_duration
+                    .observe(started.elapsed().as_secs_f64());
+                // EMA (α = 1/8) feeding the Postgres-pressure detector.
+                let prev = ema.load(std::sync::atomic::Ordering::Relaxed);
+                let next = if prev == 0 {
+                    elapsed_us
+                } else {
+                    (prev * 7 + elapsed_us) / 8
+                };
+                ema.store(next, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+    }
+
+    // Benign-request coalescing (W3): repeats of an Allow GET with no
+    // signals collapse into a counter instead of persist/print/eventlog.
+    let mut coalescer = cfg.overload.coalesce_benign.then(|| {
+        sentry_core::BenignCoalescer::new(
+            Duration::from_secs(cfg.overload.coalesce_window_secs.max(1)),
+            cfg.overload.coalesce_cap,
+        )
+    });
+
+    // Overload monitor (W2): every 5s, measure queue occupancy and
+    // Postgres pool/insert-latency pressure; flip the shared flag with
+    // hysteresis. Only telemetry yields — never detection or containment.
+    if cfg.overload.enabled {
+        let overload = overload_state.clone();
+        let m = metrics.clone();
+        let fan_in_rx = Arc::clone(&event_rx);
+        let actions_tx = deferred_tx.clone();
+        let persist_tx = persist_tx.clone();
+        let ema = Arc::clone(&insert_ema_us);
+        let repo_pool = repo.as_ref().map(|r| r.pool().clone());
+        let pg_max = cfg.storage.postgres.max_connections as f64;
+        let qp = cfg.overload.queue_pressure.clamp(0.0, 1.0);
+        let rp = cfg.overload.release_pressure.min(qp);
+        let budget_us = cfg.overload.pg_insert_budget_ms * 1_000;
+        let release = Duration::from_secs(cfg.overload.release_secs.max(1));
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.tick().await; // skip the immediate tick
+            let mut is_on = false;
+            let mut relief_since: Option<Instant> = None;
+            let occupancy = |capacity: usize, max: usize| -> f64 {
+                if max == 0 {
+                    0.0
+                } else {
+                    1.0 - (capacity as f64 / max as f64).clamp(0.0, 1.0)
+                }
+            };
+            loop {
+                interval.tick().await;
+                let now = Instant::now();
+
+                let actions_max = actions_tx.max_capacity();
+                let persist_max = persist_tx.max_capacity();
+                let (fan_occ, actions_occ, persist_occ) = {
+                    let fan = fan_in_rx.lock().await;
+                    let fan_max = fan.max_capacity();
+                    (
+                        occupancy(fan.capacity(), fan_max),
+                        occupancy(actions_tx.capacity(), actions_max),
+                        occupancy(persist_tx.capacity(), persist_max),
+                    )
+                };
+                m.queue_occupancy
+                    .with_label_values(&["fan_in"])
+                    .set(fan_occ);
+                m.queue_occupancy
+                    .with_label_values(&["actions"])
+                    .set(actions_occ);
+                m.queue_occupancy
+                    .with_label_values(&["persist"])
+                    .set(persist_occ);
+
+                let mut pg_over = false;
+                if let Some(ref pool) = repo_pool {
+                    let inner = pool.inner();
+                    let total = inner.size() as i64;
+                    let idle = inner.num_idle() as i64;
+                    let acquired = (total - idle).max(0);
+                    m.postgres_pool
+                        .with_label_values(&["acquired"])
+                        .set(acquired as f64);
+                    m.postgres_pool
+                        .with_label_values(&["idle"])
+                        .set(idle as f64);
+                    m.postgres_pool.with_label_values(&["max"]).set(pg_max);
+                    let acquired_ratio = if pg_max > 0.0 {
+                        acquired as f64 / pg_max
+                    } else {
+                        0.0
+                    };
+                    let ema_us = ema.load(std::sync::atomic::Ordering::Relaxed);
+                    pg_over = acquired_ratio >= 0.9 || (budget_us > 0 && ema_us >= budget_us);
+                }
+
+                let max_occ = fan_occ.max(actions_occ).max(persist_occ);
+                let trigger = max_occ >= qp || pg_over;
+                let relief = max_occ <= rp && !pg_over;
+                if trigger {
+                    relief_since = None;
+                    if !is_on {
+                        is_on = true;
+                        overload.set_pressure(true);
+                    }
+                } else if relief && is_on {
+                    let since = relief_since.get_or_insert(now);
+                    if now.duration_since(*since) >= release {
+                        is_on = false;
+                        overload.set_pressure(false);
+                        relief_since = None;
+                    }
+                } else if !relief {
+                    relief_since = None;
+                }
+                m.postgres_pressure.set(f64::from(u8::from(is_on)));
+            }
+        });
+    }
+
     // Batched ingest (F5): `recv_many` drains up to 64 ready events per
     // wakeup, amortizing task/lock overhead under burst; under trickle load
     // it behaves exactly like `recv` (returns as soon as one event arrives).
     let mut deferred_throttle = DropLogThrottle::new();
     let mut batch: Vec<Incoming> = Vec::with_capacity(64);
     loop {
-        let n = event_rx.recv_many(&mut batch, 64).await;
+        let n = event_rx.lock().await.recv_many(&mut batch, 64).await;
         if n == 0 {
             break; // channel closed
         }
@@ -1381,9 +1560,42 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             // instead of a deep clone per consumer.
             let result = Arc::new(result);
 
-            if print_tx
-                .try_send((Arc::clone(&result), (!from_edge).then_some(duration)))
-                .is_err()
+            // Overload response (W2/W3): decide whether this event's
+            // TELEMETRY (persist, eventlog, console) passes. Detection and
+            // containment already ran and are never degraded — security
+            // events (enforcing verdict or High/Critical) always pass;
+            // benign GET repeats collapse into a counter and, under
+            // pressure, low-priority events sample by source IP.
+            let security = sentry_core::overload::must_keep(
+                result.decision.action,
+                result.analysis.risk_level,
+            );
+            let mut telemetry = true;
+            if !security {
+                if let (Some(ref mut co), Some(key)) = (
+                    coalescer.as_mut(),
+                    sentry_core::CoalesceKey::from_event(&result.event),
+                ) {
+                    if sentry_core::overload::benign_refresh(&result) {
+                        if let sentry_core::Coalesced::Repeat(_) = co.admit(key, Instant::now()) {
+                            metrics.coalesced.with_label_values(&["benign"]).inc();
+                            telemetry = false;
+                        }
+                    }
+                }
+                if telemetry && overload_state.under_pressure() {
+                    let keep = cfg.overload.sample_keep.clamp(0.0, 1.0);
+                    if !sentry_core::overload::sample_by_ip(result.event.client_ip, keep) {
+                        metrics.overload_shed.with_label_values(&["persist"]).inc();
+                        telemetry = false;
+                    }
+                }
+            }
+
+            if telemetry
+                && print_tx
+                    .try_send((Arc::clone(&result), (!from_edge).then_some(duration)))
+                    .is_err()
             {
                 if let Some(count) = deferred_throttle.record(Instant::now()) {
                     warn!(
@@ -1393,28 +1605,39 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 }
             }
 
-            if let Some(ref repo) = repo {
-                let signals_json =
-                    serde_json::to_value(&result.analysis.signals).unwrap_or_default();
-                let repo = Arc::clone(repo);
-                let result_clone = Arc::clone(&result);
-                tokio::spawn(async move {
-                    let events = repo.events();
-                    if let Err(e) = events
-                        .insert_with_hash(
-                            &result_clone.event,
-                            result_clone.analysis.risk_score,
-                            result_clone.analysis.risk_level,
-                            result_clone.decision.action,
-                            &signals_json,
-                            Some(dedup_hash(&result_clone.event) as i64),
-                            process_us,
-                        )
-                        .await
-                    {
-                        warn!(error = %e, "failed to persist event");
+            match persist_tx.try_send((Arc::clone(&result), process_us)) {
+                Ok(()) => {}
+                Err(_) if security => {
+                    // Never lose security events to a full persist queue —
+                    // fall back to a direct (unbatched) write.
+                    if let Some(ref repo) = repo {
+                        let repo = Arc::clone(repo);
+                        let result = Arc::clone(&result);
+                        tokio::spawn(async move {
+                            let signals =
+                                serde_json::to_value(&result.analysis.signals).unwrap_or_default();
+                            if let Err(e) = repo
+                                .events()
+                                .insert_with_hash(
+                                    &result.event,
+                                    result.analysis.risk_score,
+                                    result.analysis.risk_level,
+                                    result.decision.action,
+                                    &signals,
+                                    Some(dedup_hash(&result.event) as i64),
+                                    process_us,
+                                )
+                                .await
+                            {
+                                warn!(error = %e, "failed to persist security event");
+                            }
+                        });
                     }
-                });
+                }
+                Err(_) if telemetry => {
+                    metrics.overload_shed.with_label_values(&["persist"]).inc();
+                }
+                Err(_) => {}
             }
 
             // Mirror block verdicts into the block table + Postgres so the
@@ -1513,17 +1736,22 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                     .with_label_values(&[&crate::eventlog::signal_kind_label(&signal.kind)])
                     .inc();
             }
-            event_log.push(crate::eventlog::EventSummary::from_processed_with_timing(
-                &result,
-                (!from_edge).then_some(duration),
-            ));
+            if telemetry {
+                event_log.push(crate::eventlog::EventSummary::from_processed_with_timing(
+                    &result,
+                    (!from_edge).then_some(duration),
+                ));
+            }
             metrics.record_event(result.decision.action, result.analysis.risk_level, duration);
             metrics.record_ingest(start.elapsed());
 
             // Fork AI mode: evaluate off the hot path; a changed verdict updates
-            // the persisted event and re-dispatches actions.
+            // the persisted event and re-dispatches actions. Benign events are
+            // skipped under pressure — forks only ever raise verdicts, and
+            // benign traffic has nothing to raise.
+            let forks_allowed = security || !overload_state.under_pressure();
             if let Some(ref ai) = ai_fork {
-                if !ai.is_inline() && ai.should_run(&result) {
+                if forks_allowed && !ai.is_inline() && ai.should_run(&result) {
                     ai.spawn_fork(
                         (*result).clone(),
                         Arc::clone(&pipeline),
@@ -1536,7 +1764,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             // LLM fork (Layer 2): same contract as the AI fork, but the verdict
             // comes from the configured remote provider.
             if let Some(ref llm) = llm_fork {
-                if llm.should_run(&result) {
+                if forks_allowed && llm.should_run(&result) {
                     llm.spawn_fork(
                         (*result).clone(),
                         Arc::clone(&pipeline),
@@ -3026,6 +3254,12 @@ fn build_registry(
                     .and_then(|v| v.as_integer())
                     .map(|v| v.max(64) as usize)
                     .unwrap_or(sentry_source_tcp::DEFAULT_CHANNEL_BUFFER);
+                let syn_window_ms = src
+                    .options
+                    .get("syn_window_ms")
+                    .and_then(|v| v.as_integer())
+                    .map(|v| v.max(0) as u64)
+                    .unwrap_or(sentry_source_tcp::DEFAULT_SYN_WINDOW_MS);
                 let ts =
                     sentry_source_tcp::TcpCaptureSource::new(sentry_source_tcp::TcpSourceConfig {
                         interface,
@@ -3033,6 +3267,7 @@ fn build_registry(
                         payload_cap,
                         flow_cap,
                         channel_buffer,
+                        syn_window_ms,
                     })?;
                 builder.register_source(ts);
             }

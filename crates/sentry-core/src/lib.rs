@@ -25,6 +25,7 @@ pub mod heuristics;
 pub mod lists;
 pub mod multipart;
 pub mod offender;
+pub mod overload;
 pub mod packs;
 pub mod pipeline;
 pub mod policy;
@@ -57,10 +58,11 @@ pub use config::{
     ActionConfig, ActionKind, AiConfig, AuthTokenConfig, AuthUserConfig, BehaviorConfig,
     BotVerificationConfig, CoreConfig, CorrelationConfig, DeploymentConfig, EdgeChallengeConfig,
     EdgeConfig, EscalationConfig, FeedConfig, FeedKind, GeoConfig, IpLookupConfig, LlmConfig,
-    MetricsConfig, PolicyConfig, PolicyOverrideConfig, PostgresConfig, PostureConfig, PostureMode,
-    RateLimitConfig, RealIpConfig, RouteDefConfig, RouteLearnerConfig, RoutesConfig, RuleDefConfig,
-    RulePackConfig, RulesConfig, ScanConfig, ScorerConfig, SentryConfig, ServerAuthConfig,
-    ServerConfig, SourceConfig, StorageConfig, UploadFloodConfig, UploadMode, UploadsConfig,
+    MetricsConfig, OverloadConfig, PolicyConfig, PolicyOverrideConfig, PostgresConfig,
+    PostureConfig, PostureMode, RateLimitConfig, RealIpConfig, RouteDefConfig, RouteLearnerConfig,
+    RoutesConfig, RuleDefConfig, RulePackConfig, RulesConfig, ScanConfig, ScorerConfig,
+    SentryConfig, ServerAuthConfig, ServerConfig, SourceConfig, StorageConfig, UploadFloodConfig,
+    UploadMode, UploadsConfig,
 };
 pub use correlation::CorrelationTracker;
 pub use error::{CoreError, Result};
@@ -71,6 +73,7 @@ pub use event::{
 };
 pub use heuristics::{Heuristic, HeuristicEngine};
 pub use offender::OffenderTracker;
+pub use overload::{sample_by_ip, BenignCoalescer, CoalesceKey, Coalesced, OverloadState};
 pub use packs::{build_default_ruleset, PackMode};
 pub use pipeline::{Pipeline, ProcessedEvent, RouteDef, RouteLike, RouteValidator};
 pub use policy::VerdictPolicy;

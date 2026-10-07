@@ -6,6 +6,8 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "pcap")]
 use std::time::Duration;
+#[cfg(feature = "pcap")]
+use std::time::Instant;
 
 use async_trait::async_trait;
 use sentry_core::event::RawEvent;
@@ -36,10 +38,17 @@ pub struct TcpSourceConfig {
     /// Event channel capacity between the capture loop and the daemon
     /// (default 1024). Raise under high-PPS capture.
     pub channel_buffer: usize,
+    /// Per-IP SYN coalescing window in ms (F5.8; default 100, 0 = off).
+    /// SYNs from one source IP inside the window collapse into a single
+    /// event carrying `TcpData::syn_count`.
+    pub syn_window_ms: u64,
 }
 
 /// Default event channel capacity for the capture loop.
 pub const DEFAULT_CHANNEL_BUFFER: usize = 1024;
+
+/// Default per-IP SYN coalescing window (ms).
+pub const DEFAULT_SYN_WINDOW_MS: u64 = 100;
 
 impl Default for TcpSourceConfig {
     fn default() -> Self {
@@ -49,6 +58,7 @@ impl Default for TcpSourceConfig {
             payload_cap: crate::reassembler::DEFAULT_PAYLOAD_CAP,
             flow_cap: 65_536,
             channel_buffer: DEFAULT_CHANNEL_BUFFER,
+            syn_window_ms: DEFAULT_SYN_WINDOW_MS,
         }
     }
 }
@@ -204,9 +214,23 @@ impl Source for TcpCaptureSource {
             let (tx, chan_rx) = event_channel(self.cfg.channel_buffer.max(64));
             let cfg = self.cfg.clone();
             let flows = Arc::clone(&self.flows);
+            let mut syn_agg = crate::aggregate::SynAggregator::new(
+                Duration::from_millis(self.cfg.syn_window_ms),
+                8192,
+            );
             tokio::task::spawn_blocking(move || loop {
                 match rx.next() {
                     Ok(packet) => {
+                        if syn_agg.enabled() {
+                            let now = Instant::now();
+                            for (ip, aggregate) in syn_agg.flush_elapsed(now) {
+                                sentry_core::source::send_or_log(
+                                    &tx,
+                                    syn_event(ip, &aggregate),
+                                    "tcp",
+                                );
+                            }
+                        }
                         let Some(seg) = parse_segment(packet) else {
                             continue;
                         };
@@ -220,6 +244,21 @@ impl Source for TcpCaptureSource {
                         };
                         let fingerprint = (observation == FlowObservation::Syn)
                             .then(|| SynFingerprint::from_parts(seg.window, &seg.options).code());
+                        if observation == FlowObservation::Syn && syn_agg.enabled() {
+                            // F5.8: absorb the SYN into its IP bucket; the
+                            // aggregate is emitted when the window rolls.
+                            match syn_agg.observe(seg.src_ip, fingerprint, Instant::now()) {
+                                None => continue,
+                                Some((ip, aggregate)) => {
+                                    sentry_core::source::send_or_log(
+                                        &tx,
+                                        syn_event(ip, &aggregate),
+                                        "tcp",
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         let evt = RawEvent {
                             source: SourceKind::Tcp,
                             timestamp: chrono::Utc::now(),
@@ -237,6 +276,7 @@ impl Source for TcpCaptureSource {
                                 stream_id: Some(id),
                                 stage: state.stage,
                                 fingerprint,
+                                syn_count: None,
                             }),
                         };
                         sentry_core::source::send_or_log(&tx, evt, "tcp");
@@ -249,6 +289,34 @@ impl Source for TcpCaptureSource {
             });
             Ok(chan_rx)
         }
+    }
+}
+
+/// Build the coalesced SYN event for one IP/window (F5.8).
+#[cfg(feature = "pcap")]
+fn syn_event(ip: IpAddr, aggregate: &crate::aggregate::SynAggregate) -> RawEvent {
+    RawEvent {
+        source: SourceKind::Tcp,
+        timestamp: chrono::Utc::now(),
+        transport: Transport::Tcp,
+        client_ip: Some(ip),
+        client_port: None,
+        server_port: None,
+        bytes_in: None,
+        bytes_out: None,
+        duration_ms: None,
+        raw: None,
+        protocol: sentry_core::ProtocolData::Tcp(TcpData {
+            flags: TcpFlags {
+                syn: true,
+                ..Default::default()
+            },
+            payload: None,
+            stream_id: None,
+            stage: sentry_core::event::TcpStage::Syn,
+            fingerprint: aggregate.fingerprint.clone(),
+            syn_count: Some(aggregate.count),
+        }),
     }
 }
 
@@ -272,6 +340,7 @@ mod tests {
         assert_eq!(cfg.payload_cap, 8 * 1024);
         assert_eq!(cfg.flow_cap, 65_536);
         assert_eq!(cfg.channel_buffer, DEFAULT_CHANNEL_BUFFER);
+        assert_eq!(cfg.syn_window_ms, DEFAULT_SYN_WINDOW_MS);
         assert!(cfg.ports.is_empty());
     }
 }

@@ -85,6 +85,84 @@ pub struct EventRepo {
     pool: PgPool,
 }
 
+/// One event prepared for [`EventRepo::insert_batch_with_hash`] — the same
+/// columns as the single-row insert, plus the cross-node `payload_hash`.
+#[derive(Debug, Clone)]
+pub struct EventInsert {
+    /// Event id.
+    pub id: Uuid,
+    /// Timestamp.
+    pub timestamp: DateTime<Utc>,
+    /// Source kind.
+    pub source: String,
+    /// Client IP (text form).
+    pub client_ip: String,
+    /// Client port.
+    pub client_port: Option<i32>,
+    /// Server port.
+    pub server_port: Option<i32>,
+    /// ASN.
+    pub asn: Option<i64>,
+    /// Country code.
+    pub country: Option<String>,
+    /// Protocol data (JSON).
+    pub protocol: serde_json::Value,
+    /// Risk score.
+    pub risk_score: i16,
+    /// Risk level.
+    pub risk_level: String,
+    /// Verdict.
+    pub verdict: String,
+    /// Signals (JSON).
+    pub signals: serde_json::Value,
+    /// Raw original record.
+    pub raw: Option<String>,
+    /// Cross-node dedupe hash (None skips the dedupe guard).
+    pub payload_hash: Option<i64>,
+    /// Observed request duration in ms from the source log.
+    pub duration_ms: Option<i64>,
+    /// Pipeline processing time in microseconds.
+    pub process_us: Option<i64>,
+}
+
+impl EventInsert {
+    /// Prepare one row from a processed event, mirroring the bindings of
+    /// [`EventRepo::insert_with_hash`]. A protocol that fails to serialize
+    /// becomes JSON `null` (the row still persists) — batching must not
+    /// lose events over one bad payload.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_event(
+        evt: &Event,
+        risk_score: u8,
+        risk_level: RiskLevel,
+        verdict: Verdict,
+        signals: &serde_json::Value,
+        payload_hash: Option<i64>,
+        process_us: Option<u64>,
+    ) -> Self {
+        let protocol = serde_json::to_value(&evt.protocol).unwrap_or(serde_json::Value::Null);
+        Self {
+            id: evt.id,
+            timestamp: evt.timestamp,
+            source: evt.source.as_str().to_string(),
+            client_ip: evt.client_ip.to_string(),
+            client_port: evt.client_port.map(|p| p as i32),
+            server_port: evt.server_port.map(|p| p as i32),
+            asn: evt.asn.map(|a| a as i64),
+            country: evt.geo.as_ref().and_then(|g| g.country.clone()),
+            protocol,
+            risk_score: risk_score as i16,
+            risk_level: risk_level_label(risk_level).to_string(),
+            verdict: verdict_label(verdict).to_string(),
+            signals: signals.clone(),
+            raw: evt.raw.clone(),
+            payload_hash,
+            duration_ms: evt.duration_ms.map(|d| d as i64),
+            process_us: process_us.map(|p| p as i64),
+        }
+    }
+}
+
 /// Row representation for event inserts/queries.
 #[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
 pub struct EventRow {
@@ -192,6 +270,101 @@ impl EventRepo {
         .execute(self.pool.inner())
         .await
         .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Max rows per batched INSERT (Postgres param limit is 65535; 64 × 17
+    /// columns stays far below it).
+    pub const MAX_EVENT_BATCH: usize = 64;
+
+    /// Build the multi-row INSERT statement for `n` event rows, preserving
+    /// the per-row cross-node dedupe semantics of [`EventRepo::insert_with_hash`]
+    /// (skip the row when a sibling node persisted the same `payload_hash`
+    /// within the 10-second window).
+    fn batch_insert_sql(n: usize) -> String {
+        let mut values = String::with_capacity(n * 128);
+        for (i, slot) in (0..n).enumerate() {
+            let b = slot * 17 + 1;
+            if i > 0 {
+                values.push_str(", ");
+            }
+            values.push_str(&format!(
+                "(${b}::uuid, ${b1}::timestamptz, ${b2}::text, ${b3}::inet, \
+                 ${b4}::int4, ${b5}::int4, ${b6}::int8, ${b7}::text, ${b8}::jsonb, \
+                 ${b9}::int2, ${b10}::text, ${b11}::text, ${b12}::jsonb, ${b13}::text, \
+                 ${b14}::int8, ${b15}::int8, ${b16}::int8)",
+                b1 = b + 1,
+                b2 = b + 2,
+                b3 = b + 3,
+                b4 = b + 4,
+                b5 = b + 5,
+                b6 = b + 6,
+                b7 = b + 7,
+                b8 = b + 8,
+                b9 = b + 9,
+                b10 = b + 10,
+                b11 = b + 11,
+                b12 = b + 12,
+                b13 = b + 13,
+                b14 = b + 14,
+                b15 = b + 15,
+                b16 = b + 16,
+            ));
+        }
+        format!(
+            r#"INSERT INTO events
+               (id, timestamp, source, client_ip, client_port, server_port,
+                asn, country, protocol, risk_score, risk_level, verdict, signals, raw,
+                payload_hash, duration_ms, process_us)
+               SELECT column1, column2, column3, column4, column5, column6, column7,
+                      column8, column9, column10, column11, column12, column13, column14,
+                      column15, column16, column17
+               FROM (VALUES {values}) AS v
+               WHERE column15 IS NULL
+                  OR NOT EXISTS (
+                      SELECT 1 FROM events
+                      WHERE payload_hash = column15
+                        AND timestamp > now() - interval '10 seconds'
+                  )
+               ON CONFLICT (id) DO NOTHING"#
+        )
+    }
+
+    /// Insert a batch of events in one round-trip.
+    ///
+    /// Same skip semantics as [`EventRepo::insert_with_hash`], applied per
+    /// row; chunks beyond [`EventRepo::MAX_EVENT_BATCH`] run as separate
+    /// statements. Under overload the daemon routes telemetry through here
+    /// so 64 events cost one INSERT instead of 64.
+    pub async fn insert_batch_with_hash(&self, rows: &[EventInsert]) -> Result<()> {
+        for chunk in rows.chunks(Self::MAX_EVENT_BATCH) {
+            let sql = Self::batch_insert_sql(chunk.len());
+            let mut query = sqlx::query(&sql);
+            for row in chunk {
+                query = query
+                    .bind(row.id)
+                    .bind(row.timestamp)
+                    .bind(row.source.as_str())
+                    .bind(row.client_ip.as_str())
+                    .bind(row.client_port)
+                    .bind(row.server_port)
+                    .bind(row.asn)
+                    .bind(row.country.as_deref())
+                    .bind(row.protocol.clone())
+                    .bind(row.risk_score)
+                    .bind(row.risk_level.as_str())
+                    .bind(row.verdict.as_str())
+                    .bind(row.signals.clone())
+                    .bind(row.raw.as_deref())
+                    .bind(row.payload_hash)
+                    .bind(row.duration_ms)
+                    .bind(row.process_us);
+            }
+            query
+                .execute(self.pool.inner())
+                .await
+                .map_err(|e| StorageError::Query(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -1187,5 +1360,38 @@ impl DatasetRepo {
             .await
             .map(|_| ())
             .map_err(|e| StorageError::Query(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_insert_sql_single_row_matches_single_insert_shape() {
+        let sql = EventRepo::batch_insert_sql(1);
+        assert!(sql.contains("INSERT INTO events"));
+        assert!(sql.contains("($1::uuid, $2::timestamptz, $3::text, $4::inet"));
+        assert!(sql.contains("$15::int8, $16::int8, $17::int8"));
+        assert!(sql.contains("WHERE column15 IS NULL"));
+        assert!(sql.contains("ON CONFLICT (id) DO NOTHING"));
+    }
+
+    #[test]
+    fn batch_insert_sql_offsets_params_per_row() {
+        let sql = EventRepo::batch_insert_sql(3);
+        assert_eq!(sql.matches("::uuid").count(), 3);
+        assert!(sql.contains("$18::uuid"));
+        assert!(sql.contains("$34::int8"));
+        // One dedupe guard over the whole VALUES set.
+        assert_eq!(sql.matches("NOT EXISTS").count(), 1);
+    }
+
+    #[test]
+    fn batch_insert_sql_max_batch_stays_under_pg_param_limit() {
+        let sql = EventRepo::batch_insert_sql(EventRepo::MAX_EVENT_BATCH);
+        let last = EventRepo::MAX_EVENT_BATCH * 17;
+        assert!(sql.contains(&format!("${last}::int8")));
+        assert!(last <= 65_535);
     }
 }

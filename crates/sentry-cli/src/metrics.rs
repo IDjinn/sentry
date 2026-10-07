@@ -31,6 +31,12 @@ pub struct Metrics {
     pub dedupe_drops: prometheus::Counter,
     pub events_dropped: prometheus::CounterVec,
     pub action_queue_drops: prometheus::Counter,
+    pub queue_occupancy: prometheus::GaugeVec,
+    pub postgres_pressure: prometheus::Gauge,
+    pub postgres_pool: prometheus::GaugeVec,
+    pub persist_duration: prometheus::Histogram,
+    pub overload_shed: prometheus::CounterVec,
+    pub coalesced: prometheus::CounterVec,
     pub correlation_hits: prometheus::Counter,
     pub edge_block_hits: prometheus::Counter,
     pub edge_uploads_inspected: prometheus::Counter,
@@ -89,6 +95,58 @@ impl Metrics {
             "sentry_action_queue_drops_total",
             "Deferred actions shed because the post-processing queue was \
              full (the events themselves are still persisted and counted).",
+        )
+        .unwrap();
+        let queue_occupancy = prometheus::GaugeVec::new(
+            prometheus::Opts::new(
+                "sentry_queue_occupancy",
+                "Filled fraction (0-1) of each internal queue: fan_in, \
+                 actions, persist — the overload pressure inputs.",
+            ),
+            &["queue"],
+        )
+        .unwrap();
+        let postgres_pressure = prometheus::Gauge::new(
+            "sentry_postgres_pressure",
+            "1 while Postgres write latency or pool saturation trips the \
+             overload pressure, 0 otherwise (hysteresis in [overload]).",
+        )
+        .unwrap();
+        let postgres_pool = prometheus::GaugeVec::new(
+            prometheus::Opts::new(
+                "sentry_postgres_pool_connections",
+                "Postgres pool connections by state: acquired | idle | max.",
+            ),
+            &["state"],
+        )
+        .unwrap();
+        let persist_duration = prometheus::Histogram::with_opts(
+            prometheus::HistogramOpts::new(
+                "sentry_persist_duration_seconds",
+                "Duration of one batched event persistence round-trip.",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+            ]),
+        )
+        .unwrap();
+        let overload_shed = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sentry_overload_shed_total",
+                "Low-priority telemetry dropped by the overload response, \
+                 by tier (persist | eventlog | print) — security events are \
+                 never shed.",
+            ),
+            &["tier"],
+        )
+        .unwrap();
+        let coalesced = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sentry_coalesced_requests_total",
+                "Repeated requests collapsed by coalescing instead of being \
+                 persisted individually, by kind (benign | tcp_syn).",
+            ),
+            &["kind"],
         )
         .unwrap();
         let correlation_hits = prometheus::Counter::new(
@@ -303,9 +361,29 @@ impl Metrics {
         ] {
             registry.register(Box::new(m.clone())).ok();
         }
+        for m in [&queue_occupancy, &postgres_pool] {
+            registry
+                .register(Box::new(m.clone()))
+                .map_err(|e| warn!(error = %e, "register gauge vec"))
+                .ok();
+        }
+        for m in [&overload_shed, &coalesced] {
+            registry
+                .register(Box::new(m.clone()))
+                .map_err(|e| warn!(error = %e, "register counter vec"))
+                .ok();
+        }
+        registry
+            .register(Box::new(postgres_pressure.clone()))
+            .map_err(|e| warn!(error = %e, "register postgres pressure"))
+            .ok();
         registry
             .register(Box::new(events_dropped.clone()))
             .map_err(|e| warn!(error = %e, "register events dropped"))
+            .ok();
+        registry
+            .register(Box::new(persist_duration.clone()))
+            .map_err(|e| warn!(error = %e, "register persist duration"))
             .ok();
         registry.register(Box::new(block_table_size.clone())).ok();
         registry
@@ -383,6 +461,12 @@ impl Metrics {
             dedupe_drops,
             events_dropped,
             action_queue_drops,
+            queue_occupancy,
+            postgres_pressure,
+            postgres_pool,
+            persist_duration,
+            overload_shed,
+            coalesced,
             correlation_hits,
             edge_block_hits,
             edge_uploads_inspected,
@@ -617,9 +701,21 @@ mod tests {
         let m = Metrics::new();
         m.events_dropped.with_label_values(&["tcp"]).inc();
         m.action_queue_drops.inc();
+        m.queue_occupancy.with_label_values(&["persist"]).set(0.42);
+        m.postgres_pressure.set(1.0);
+        m.postgres_pool.with_label_values(&["acquired"]).set(3.0);
+        m.persist_duration.observe(0.012);
+        m.overload_shed.with_label_values(&["persist"]).inc();
+        m.coalesced.with_label_values(&["benign"]).inc();
         let text = String::from_utf8(m.gather()).unwrap();
         assert!(text.contains("sentry_events_dropped_total{source=\"tcp\"}"));
         assert!(text.contains("sentry_action_queue_drops_total"));
+        assert!(text.contains("sentry_queue_occupancy{queue=\"persist\"} 0.42"));
+        assert!(text.contains("sentry_postgres_pressure 1"));
+        assert!(text.contains("sentry_postgres_pool_connections{state=\"acquired\"} 3"));
+        assert!(text.contains("sentry_persist_duration_seconds_bucket"));
+        assert!(text.contains("sentry_overload_shed_total{tier=\"persist\"}"));
+        assert!(text.contains("sentry_coalesced_requests_total{kind=\"benign\"}"));
     }
 
     #[test]

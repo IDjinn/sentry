@@ -112,6 +112,7 @@ pub struct EdgeRuntime {
     protocol_metrics: Option<crate::protocol::ProtocolMetrics>,
     uploads: Option<UploadsInspection>,
     uploads_inspected: Option<prometheus::Counter>,
+    overload: Option<sentry_core::OverloadState>,
     posture: Option<Arc<sentry_core::posture::PostureTracker>>,
     posture_findings: Option<prometheus::CounterVec>,
 }
@@ -140,9 +141,26 @@ impl EdgeRuntime {
             protocol_metrics: None,
             uploads: None,
             uploads_inspected: None,
+            overload: None,
             posture: None,
             posture_findings: None,
         }
+    }
+
+    /// Share the daemon's overload state: while pressure is on, expensive
+    /// request-path work (body buffering for inspection, upload parsing)
+    /// is skipped. Detection (pipeline, block table, challenge) always
+    /// runs.
+    pub fn with_overload(mut self, state: sentry_core::OverloadState) -> Self {
+        self.overload = Some(state);
+        self
+    }
+
+    /// True when the shared overload flag reports pressure.
+    pub fn overloaded(&self) -> bool {
+        self.overload
+            .as_ref()
+            .is_some_and(sentry_core::OverloadState::under_pressure)
     }
 
     /// Arm request-body inspection (F10): bodies are buffered up to the
@@ -213,6 +231,10 @@ impl EdgeRuntime {
         content_type: Option<&str>,
         body: &[u8],
     ) -> (Option<Vec<sentry_core::event::UploadInfo>>, Option<Vec<u8>>) {
+        if self.overloaded() {
+            // Cheap mode: skip multipart parsing + sniffing under pressure.
+            return (None, None);
+        }
         let Some(insp) = self.uploads else {
             return (None, None);
         };
@@ -535,5 +557,38 @@ mod tests {
             real_client_ip(&h, peer),
             "203.0.113.6".parse::<IpAddr>().unwrap()
         );
+    }
+
+    fn test_runtime() -> EdgeRuntime {
+        EdgeRuntime::new(
+            Arc::new(sentry_core::Pipeline::new(
+                sentry_core::RuleSet::default(),
+                sentry_core::RouteValidator::new(vec![]),
+            )),
+            None,
+            0,
+        )
+    }
+
+    #[test]
+    fn overload_gate_skips_body_inspection() {
+        let state = sentry_core::OverloadState::new();
+        let runtime = test_runtime()
+            .with_uploads(UploadsInspection {
+                inspect_bytes: 64 * 1024,
+                max_files: 8,
+            })
+            .with_overload(state.clone());
+        assert!(!runtime.overloaded());
+
+        let body = b"--x\r\ncontent-disposition: form-data; name=\"f\"; filename=\"a.png\"\r\n\r\nPNG\r\n--x--\r\n";
+        let (meta, _) = runtime.inspect_body(Some("multipart/form-data; boundary=x"), body);
+        assert!(meta.is_some(), "inspection runs at normal pressure");
+
+        state.set_pressure(true);
+        assert!(runtime.overloaded());
+        let (meta, analysis) = runtime.inspect_body(Some("multipart/form-data; boundary=x"), body);
+        assert!(meta.is_none(), "inspection skipped under pressure");
+        assert!(analysis.is_none());
     }
 }

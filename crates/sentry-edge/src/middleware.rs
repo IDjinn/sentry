@@ -77,9 +77,11 @@ async fn handler_inner(
 
     // Buffer the body up to the capture cap — raised to the inspection cap
     // when uploads are enabled (F10). 0 = don't buffer (unless inspection).
+    // Under overload pressure the raise is skipped (cheap mode): bodies
+    // still buffer to the capture cap because the handler needs them back.
     let cap = match runtime.uploads_inspection() {
-        Some(insp) => runtime.body_cap().max(insp.inspect_bytes),
-        None => runtime.body_cap(),
+        Some(insp) if !runtime.overloaded() => runtime.body_cap().max(insp.inspect_bytes),
+        _ => runtime.body_cap(),
     };
     let (buffered, body) = if cap > 0 {
         match axum::body::to_bytes(body, cap).await {

@@ -488,6 +488,11 @@ pub struct TcpData {
     /// masscan/zmap/nmap signatures by the `tcp_scanner` heuristic.
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// Number of SYNs coalesced into this event by the capture's per-IP
+    /// window (F5.8); `None` = single observation. Keeps flood bursts at
+    /// one event per source IP per window instead of one per packet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syn_count: Option<u32>,
 }
 
 /// Observed TCP flags.
