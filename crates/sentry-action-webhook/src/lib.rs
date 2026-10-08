@@ -114,7 +114,10 @@ fn discord_payload(
         .analysis
         .signals
         .iter()
-        .map(|s| format!("{:?}", s.kind))
+        .map(|s| match &s.detail {
+            Some(d) => format!("{:?} ({})", s.kind, d),
+            None => format!("{:?}", s.kind),
+        })
         .collect::<Vec<_>>()
         .join(", ");
     // Discord caps each field value at 1024 chars.
@@ -222,7 +225,18 @@ impl Action for WebhookAction {
                 "risk_score": decision.analysis.risk_score,
                 "risk_level": format!("{:?}", decision.analysis.risk_level).to_lowercase(),
                 "verdict": format!("{:?}", decision.action).to_lowercase(),
-                "signals": decision.analysis.signals.iter().map(|s| &s.kind).collect::<Vec<_>>(),
+                "signals": decision
+                    .analysis
+                    .signals
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "kind": format!("{:?}", s.kind),
+                            "weight": s.weight,
+                            "detail": s.detail,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
                 "path": evt.http().map(|h| h.path.as_str()),
                 "ack_url": ctx
                     .incident_id
@@ -376,6 +390,23 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("incident"));
+    }
+
+    #[test]
+    fn discord_payload_includes_signal_detail() {
+        let evt = sample_event();
+        let mut decision = critical_decision(Verdict::Block);
+        decision.analysis.signals[0].detail = Some("sensitive_paths".into());
+        let payload = discord_payload(&evt, &decision, &sample_ctx(None));
+        let signals = payload["embeds"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "Signals")
+            .unwrap()["value"]
+            .as_str()
+            .unwrap();
+        assert_eq!(signals, "PathTraversal (sensitive_paths)");
     }
 
     #[test]
