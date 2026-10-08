@@ -48,6 +48,10 @@ pub struct EdgeProxyConfig {
     pub upstream_connect_timeout_secs: u64,
     /// Idle keepalive connections pooled per upstream host.
     pub upstream_pool_idle: usize,
+    /// Max requests served concurrently (0 = unlimited). Each in-flight
+    /// request buffers body bytes, so the cap bounds edge memory under a
+    /// connection flood; excess requests get an immediate 503.
+    pub max_concurrent_requests: usize,
 }
 
 /// HTTPS front settings (F8) — built by the daemon from `[edge] tls_*`.
@@ -82,6 +86,7 @@ impl Default for EdgeProxyConfig {
             forwarded_headers: true,
             upstream_connect_timeout_secs: 5,
             upstream_pool_idle: 32,
+            max_concurrent_requests: 1024,
         }
     }
 }
@@ -190,6 +195,8 @@ pub async fn serve(
             decided: decided.clone(),
             redirect_https,
             forwarded_headers: cfg.forwarded_headers,
+            gate: (cfg.max_concurrent_requests > 0)
+                .then(|| Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_requests))),
         },
         compressor,
     );
@@ -266,11 +273,39 @@ struct ProxyState {
     redirect_https: bool,
     /// Set `X-Forwarded-*`/`X-Real-IP` on forwarded requests (F12).
     forwarded_headers: bool,
+    /// Concurrency cap: in-flight requests hold a permit; when exhausted,
+    /// new requests get an immediate 503 instead of buffering another body.
+    gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Response {
     let start = Instant::now();
     let runtime = state.runtime.clone();
+    let _permit = match state.gate.clone() {
+        Some(gate) => match gate.try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                let trace = Some(Uuid::new_v4());
+                warn!(
+                    ip = %req
+                        .extensions()
+                        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                        .map(|c| c.0.ip().to_string())
+                        .unwrap_or_default(),
+                    trace_id = ?trace,
+                    "edge: concurrency cap reached, shedding request"
+                );
+                return crate::pages::page_with(
+                    runtime.error_pages(),
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "503 - Service Unavailable",
+                    "The server is at capacity. Please retry shortly.",
+                    trace,
+                );
+            }
+        },
+        None => None,
+    };
     let resp = proxy_handler_inner(State(state), req, start).await;
     if let Some(h) = runtime.request_duration.as_ref() {
         h.observe(start.elapsed().as_secs_f64());
@@ -290,6 +325,7 @@ async fn proxy_handler_inner(
         decided,
         redirect_https,
         forwarded_headers,
+        ..
     } = state;
     let (parts, body) = req.into_parts();
     // Set by the TLS acceptor (F8) — a real HTTPS connection, not a
@@ -733,6 +769,43 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
+    async fn concurrency_gate_sheds_excess_requests_with_503() {
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, _dec_rx) = mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: "http://127.0.0.1:9".to_string(),
+                decided: dec_tx,
+                redirect_https: false,
+                forwarded_headers: true,
+                gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+            });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+    }
+
+    #[tokio::test]
     async fn health_check_fails_fast_on_dead_backend() {
         let cfg = EdgeProxyConfig {
             upstream: "http://127.0.0.1:9".to_string(),
@@ -762,6 +835,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: false,
                 forwarded_headers: true,
+                gate: None,
             });
         let resp = app
             .oneshot(
@@ -796,6 +870,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: true,
                 forwarded_headers: true,
+                gate: None,
             });
         let resp = app
             .oneshot(
@@ -903,6 +978,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: false,
                 forwarded_headers,
+                gate: None,
             },
             compressor.clone(),
         );
@@ -1138,6 +1214,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: false,
                 forwarded_headers: true,
+                gate: None,
             });
         let (ct, body) = multipart_form(&[("f", "cat.png", "image/png", b"\x89PNG\r\n\x1a\nxx")]);
         let resp = upload_request(app, &ct, body).await;
@@ -1187,6 +1264,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: false,
                 forwarded_headers: true,
+                gate: None,
             });
         let mut gif = b"GIF89a".to_vec();
         gif.extend_from_slice(b"\x00<?php system($_GET['c']); ?>");
@@ -1228,6 +1306,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: false,
                 forwarded_headers: true,
+                gate: None,
             });
         let mut gif = b"GIF89a".to_vec();
         gif.extend_from_slice(b"\x00<?php eval($_POST); ?>");
@@ -1268,6 +1347,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: false,
                 forwarded_headers: true,
+                gate: None,
             });
         let big = vec![0x41u8; 4096];
         let (ct, body) = multipart_form(&[("f", "big.bin", "application/octet-stream", &big)]);
@@ -1313,6 +1393,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: false,
                 forwarded_headers: true,
+                gate: None,
             });
         let big = vec![0x41u8; 4096];
         let (ct, body) = multipart_form(&[("f", "big.bin", "application/octet-stream", &big)]);
@@ -1358,6 +1439,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: false,
                 forwarded_headers: true,
+                gate: None,
             });
         let big = vec![0x41u8; 4096];
         let (ct, body) = multipart_form(&[("f", "big.bin", "application/octet-stream", &big)]);
@@ -1421,6 +1503,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: false,
                 forwarded_headers: true,
+                gate: None,
             });
         let big = vec![0x41u8; 4096];
         let mut last = None;
@@ -1463,6 +1546,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: false,
                 forwarded_headers: true,
+                gate: None,
             });
         let (ct, body) = multipart_form(&[("f", "a.txt", "text/plain", b"hi")]);
         let resp = upload_request(app, &ct, body).await;
@@ -1488,6 +1572,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: false,
                 forwarded_headers: true,
+                gate: None,
             });
         let resp = app
             .oneshot(
@@ -1592,6 +1677,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: false,
                 forwarded_headers: true,
+                gate: None,
             });
         let req = || {
             axum::http::Request::builder()
@@ -1653,6 +1739,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: false,
                 forwarded_headers: true,
+                gate: None,
             });
         let resp = app
             .oneshot(
@@ -1689,6 +1776,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: true,
                 forwarded_headers: true,
+                gate: None,
             });
         let resp = app
             .oneshot(
@@ -1737,6 +1825,7 @@ mod tests {
                 decided: dec_tx,
                 redirect_https: false,
                 forwarded_headers: true,
+                gate: None,
             });
 
         let mut statuses = Vec::new();

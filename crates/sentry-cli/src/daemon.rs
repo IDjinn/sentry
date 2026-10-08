@@ -128,6 +128,22 @@ fn instance_label(configured: &str) -> String {
     "sentry-0".to_string()
 }
 
+/// Run a storage write with a hard timeout: a statement that hangs on a
+/// saturated Postgres must not hold its rows (and its worker) indefinitely.
+/// The write is cancelled and reported as a dropped batch either way.
+async fn persist_write(
+    fut: impl std::future::Future<Output = sentry_storage::Result<()>>,
+    timeout_secs: u64,
+) -> sentry_storage::Result<()> {
+    let secs = timeout_secs.max(1);
+    match tokio::time::timeout(Duration::from_secs(secs), fut).await {
+        Ok(res) => res,
+        Err(_) => Err(sentry_storage::StorageError::Query(format!(
+            "insert timed out after {secs}s"
+        ))),
+    }
+}
+
 /// Run the daemon.
 pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     info!(
@@ -1001,6 +1017,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             forwarded_headers: cfg.edge.forwarded_headers,
             upstream_connect_timeout_secs: cfg.edge.upstream_connect_timeout_secs,
             upstream_pool_idle: cfg.edge.upstream_pool_idle,
+            max_concurrent_requests: cfg.edge.max_concurrent_requests,
         };
         let runtime = sentry_edge::EdgeRuntime::new(
             Arc::clone(&pipeline),
@@ -1357,8 +1374,10 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
 
     // Bounded persistence lane (W1): the worker drains the queue in batches
     // and writes one multi-row INSERT per batch, so 64 events cost one
+
     // round-trip instead of 64. Security events that find the queue full
     // fall back to a direct write; low-priority ones are shed (counted).
+    let stmt_timeout = cfg.storage.postgres.statement_timeout_secs;
     let persist_buffer = cfg.core.persist_buffer.max(64);
     let (persist_tx, mut persist_rx) =
         mpsc::channel::<(Arc<sentry_core::ProcessedEvent>, Option<u64>)>(persist_buffer);
@@ -1397,7 +1416,9 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                     continue;
                 }
                 let started = Instant::now();
-                if let Err(e) = repo.events().insert_batch_with_hash(&rows).await {
+                if let Err(e) =
+                    persist_write(repo.events().insert_batch_with_hash(&rows), stmt_timeout).await
+                {
                     warn!(error = %e, rows = rows.len(), "failed to persist event batch");
                 }
                 let elapsed_us = started.elapsed().as_micros() as u64;
@@ -1653,19 +1674,17 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                         tokio::spawn(async move {
                             let signals =
                                 serde_json::to_value(&result.analysis.signals).unwrap_or_default();
-                            if let Err(e) = repo
-                                .events()
-                                .insert_with_hash(
-                                    &result.event,
-                                    result.analysis.risk_score,
-                                    result.analysis.risk_level,
-                                    result.decision.action,
-                                    &signals,
-                                    Some(dedup_hash(&result.event) as i64),
-                                    process_us,
-                                )
-                                .await
-                            {
+                            let events = repo.events();
+                            let fut = events.insert_with_hash(
+                                &result.event,
+                                result.analysis.risk_score,
+                                result.analysis.risk_level,
+                                result.decision.action,
+                                &signals,
+                                Some(dedup_hash(&result.event) as i64),
+                                process_us,
+                            );
+                            if let Err(e) = persist_write(fut, stmt_timeout).await {
                                 warn!(error = %e, "failed to persist security event");
                             }
                         });

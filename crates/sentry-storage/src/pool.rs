@@ -18,6 +18,9 @@ impl PgPool {
         }
         let pool = PgPoolOptions::new()
             .max_connections(cfg.max_connections)
+            .acquire_timeout(std::time::Duration::from_secs(
+                cfg.acquire_timeout_secs.max(1),
+            ))
             .connect(&cfg.url)
             .await
             .map_err(|e| StorageError::Connect(e.to_string()))?;

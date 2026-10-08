@@ -278,6 +278,15 @@ pub struct PostgresConfig {
     /// Max connections in the pool.
     #[serde(default = "default_pg_max_conn")]
     pub max_connections: u32,
+    /// Seconds waiting for a free pool connection before the query fails
+    /// fast instead of piling up (default 5; sqlx default is 30).
+    #[serde(default = "default_pg_acquire_timeout")]
+    pub acquire_timeout_secs: u64,
+    /// Seconds a single INSERT may run before it is cancelled and the
+    /// batch dropped (default 30). Keeps a saturated Postgres from stalling
+    /// the persist worker indefinitely while batch memory stays allocated.
+    #[serde(default = "default_pg_statement_timeout")]
+    pub statement_timeout_secs: u64,
 }
 
 impl Default for PostgresConfig {
@@ -285,12 +294,22 @@ impl Default for PostgresConfig {
         Self {
             url: String::new(),
             max_connections: default_pg_max_conn(),
+            acquire_timeout_secs: default_pg_acquire_timeout(),
+            statement_timeout_secs: default_pg_statement_timeout(),
         }
     }
 }
 
 fn default_pg_max_conn() -> u32 {
     10
+}
+
+fn default_pg_acquire_timeout() -> u64 {
+    5
+}
+
+fn default_pg_statement_timeout() -> u64 {
+    30
 }
 
 /// Geo/ASN enrichment config.
@@ -1580,6 +1599,13 @@ pub struct EdgeConfig {
     /// edge → backend hop.
     #[serde(default = "default_edge_upstream_pool_idle")]
     pub upstream_pool_idle: usize,
+    /// Max requests served concurrently by the inline edge (default 1024;
+    /// 0 = unlimited). Each in-flight request buffers up to the inspection/
+    /// forward cap in memory, so an unbounded connection flood multiplies
+    /// that per-request cost into an OOM. Beyond the cap, requests get an
+    /// immediate 503 (custom error pages apply) instead of being buffered.
+    #[serde(default = "default_edge_max_concurrent")]
+    pub max_concurrent_requests: usize,
 }
 
 /// Response compression at the edge (F12). Bodies are already buffered in
@@ -1637,6 +1663,9 @@ fn default_edge_compress_level_zstd() -> u8 {
 }
 fn default_edge_forwarded_headers() -> bool {
     true
+}
+fn default_edge_max_concurrent() -> usize {
+    1024
 }
 fn default_edge_http2() -> bool {
     true
@@ -1743,6 +1772,7 @@ impl Default for EdgeConfig {
             http2: default_edge_http2(),
             upstream_connect_timeout_secs: default_edge_upstream_connect_timeout(),
             upstream_pool_idle: default_edge_upstream_pool_idle(),
+            max_concurrent_requests: default_edge_max_concurrent(),
         }
     }
 }

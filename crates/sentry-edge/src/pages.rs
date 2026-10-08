@@ -194,7 +194,7 @@ impl ErrorPages {
 }
 
 /// Render through the custom map when a page exists, else the built-in.
-fn page_with(
+pub(crate) fn page_with(
     custom: Option<&ErrorPages>,
     status: StatusCode,
     title: &str,

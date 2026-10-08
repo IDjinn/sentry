@@ -27,6 +27,12 @@ dedupe_ttl_secs = 10
 [storage.postgres]
 url = "postgres://sentry:changeme@localhost:5432/sentry"
 max_connections = 10
+# Fail fast instead of piling up when the pool is exhausted (default 5;
+# sqlx default is 30).
+# acquire_timeout_secs = 5
+# Cancel an INSERT that runs longer than this and drop the batch instead
+# of stalling the persist worker (default 30).
+# statement_timeout_secs = 30
 
 # ── Geo / ASN enrichment ─────────────────────────────────────────────────
 # Download GeoLite2 (free) from MaxMind and place the .mmdb files here.
@@ -622,6 +628,11 @@ challenge_backend = "sentry"
 # no TCP handshake per request.
 # upstream_connect_timeout_secs = 5
 # upstream_pool_idle = 32
+# Max requests served concurrently (default 1024; 0 = unlimited). Each
+# in-flight request buffers body bytes in memory, so under a connection
+# flood this cap bounds edge memory — excess requests get an immediate
+# 503 (custom error pages apply) instead of another buffered body.
+# max_concurrent_requests = 1024
 # Inline TCP front for non-HTTP services (verdict on connect):
 # tcp_listen = "0.0.0.0:2222"
 # tcp_upstream = "127.0.0.1:22"
