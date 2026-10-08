@@ -179,6 +179,12 @@ pub enum SignalKind {
     /// One IP pushed an abnormal number of uploads (count or total bytes)
     /// through the inline edge within the flood window (F10).
     UploadFlood,
+    /// Uploaded filename whose extension is outside
+    /// `[uploads] allowed_extensions` (F12).
+    UploadDisallowed,
+    /// Request body beyond the inspection cap forwarded uninspected while
+    /// `[uploads] oversize = "flag"` (F12) — risk recorded, not refused.
+    UploadOversize,
     /// Origin response missing or weak web security headers (F11): CSP,
     /// HSTS, COOP, frame protection, Trusted Types, nosniff, referrer
     /// policy. Describes the protected site, not the visitor — advisory
@@ -205,6 +211,10 @@ pub const UPLOAD_POLYGLOT_WEIGHT: u8 = 60;
 pub const UPLOAD_EXECUTABLE_WEIGHT: u8 = 50;
 /// Default weight for [`SignalKind::UploadFlood`] (F10).
 pub const UPLOAD_FLOOD_WEIGHT: u8 = 25;
+/// Default weight for [`SignalKind::UploadDisallowed`] (F12).
+pub const UPLOAD_DISALLOWED_WEIGHT: u8 = 30;
+/// Default weight for [`SignalKind::UploadOversize`] (F12).
+pub const UPLOAD_OVERSIZE_WEIGHT: u8 = 20;
 
 /// Weight for [`SignalKind::PostureAdvisory`] (F11) — always 0: advisories
 /// describe the protected site's missing security headers and must never

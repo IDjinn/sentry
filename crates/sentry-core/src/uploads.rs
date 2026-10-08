@@ -43,6 +43,15 @@ pub struct UploadsScan {
     pub scan_json: bool,
     /// Filename extensions that always raise `UploadExecutable`.
     pub blocked_extensions: Vec<String>,
+    /// Filename extensions allowlist (F12): when non-empty, extensions
+    /// outside it raise `UploadDisallowed`. Empty = off.
+    pub allowed_extensions: Vec<String>,
+    /// Policy for bodies beyond the inspection cap (F12): only `Flag`
+    /// produces the `UploadOversize` signal.
+    pub oversize: crate::config::OversizePolicy,
+    /// Inspection cap in bytes — an upload part (or synthetic oversize
+    /// entry) larger than this is what `oversize = "flag"` signals on.
+    pub inspect_bytes: usize,
 }
 
 impl UploadsScan {
@@ -52,14 +61,20 @@ impl UploadsScan {
             enabled: cfg.enabled,
             enforce: cfg.mode.is_enforce(),
             scan_json: cfg.scan_json,
-            blocked_extensions: cfg
-                .blocked_extensions
-                .iter()
-                .map(|e| e.trim().to_ascii_lowercase())
-                .filter(|e| !e.is_empty())
-                .collect(),
+            blocked_extensions: normalize_extensions(&cfg.blocked_extensions),
+            allowed_extensions: normalize_extensions(&cfg.allowed_extensions),
+            oversize: cfg.oversize,
+            inspect_bytes: cfg.inspect_kb.saturating_mul(1024),
         }
     }
+}
+
+/// Lowercase, trimmed, non-empty extension entries.
+fn normalize_extensions(list: &[String]) -> Vec<String> {
+    list.iter()
+        .map(|e| e.trim().to_ascii_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect()
 }
 
 impl Default for UploadsScan {

@@ -67,6 +67,8 @@ pub fn signal_label(kind: &str) -> &str {
         "upload_polyglot" => "UpPoly",
         "upload_executable" => "UpExec",
         "upload_flood" => "UpFlood",
+        "upload_disallowed" => "UpDeny",
+        "upload_oversize" => "UpOversize",
         "posture_advisory" => "Posture",
         other => match other.split_once('_') {
             Some((first, _)) => first,

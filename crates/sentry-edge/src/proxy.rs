@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
 use axum::http::header;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::any;
 use axum::Router;
 use tokio::sync::mpsc;
@@ -233,36 +233,61 @@ async fn proxy_handler_inner(
         .map(|c| c.0.ip().to_canonical())
         .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
 
-    // While upload inspection is armed, the inspection cap IS the body cap:
-    // bodies beyond it are refused outright (413), and the buffered bytes are
-    // what the heuristics analyze. The declared length is checked before any
-    // buffering; chunked bodies hit the cap inside `to_bytes`. Under
-    // overload pressure the inspection path is skipped (cheap mode) and the
-    // legacy forward buffering runs instead — `inspect_body` is gated too.
+    // While upload inspection is armed, the inspection cap IS the body cap
+    // in `reject` mode: bodies beyond it are refused outright (413), and the
+    // buffered bytes are what the heuristics analyze. The declared length is
+    // checked before any buffering; chunked bodies hit the cap inside
+    // `to_bytes`. In `skip`/`flag` mode (F12) oversize bodies buffer to the
+    // forward cap instead and bypass inspection (`inspect_body` decides).
+    // Under overload pressure the inspection path is skipped (cheap mode)
+    // and the legacy forward buffering runs instead.
     let declared_len = parts
         .headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok());
+    let error_pages = runtime.error_pages();
     if let Some(insp) = runtime
         .uploads_inspection()
         .filter(|_| !runtime.overloaded())
     {
-        if declared_len.is_some_and(|len| len > insp.inspect_bytes) {
-            return (
-                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-                "request body exceeds the upload inspection cap",
+        if insp.oversize == sentry_core::config::OversizePolicy::Reject {
+            if declared_len.is_some_and(|len| len > insp.inspect_bytes) {
+                runtime.record_oversize("reject");
+                let trace = Uuid::new_v4();
+                tracing::info!(ip = %peer, trace_id = %trace, declared = ?declared_len, cap = insp.inspect_bytes, elapsed = ?start.elapsed(), "edge: body beyond inspection cap rejected before buffering (no event persisted)");
+                return pages::payload_too_large_page(error_pages, Some(trace));
+            }
+            let body_bytes = match axum::body::to_bytes(body, insp.inspect_bytes).await {
+                Ok(b) => b.to_vec(),
+                Err(_) => {
+                    runtime.record_oversize("reject");
+                    let trace = Uuid::new_v4();
+                    tracing::info!(ip = %peer, trace_id = %trace, cap = insp.inspect_bytes, elapsed = ?start.elapsed(), "edge: chunked body beyond inspection cap rejected (no event persisted)");
+                    return pages::payload_too_large_page(error_pages, Some(trace));
+                }
+            };
+            return proxy_inspected(
+                runtime,
+                client,
+                upstream,
+                decided,
+                redirect_https,
+                parts,
+                body_bytes,
+                is_tls,
+                peer,
+                start,
             )
-                .into_response();
+            .await;
         }
-        let body_bytes = match axum::body::to_bytes(body, insp.inspect_bytes).await {
+        let forward_cap = runtime.body_cap().max(1024 * 1024);
+        let body_bytes = match axum::body::to_bytes(body, forward_cap).await {
             Ok(b) => b.to_vec(),
             Err(_) => {
-                return (
-                    axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-                    "request body exceeds the upload inspection cap",
-                )
-                    .into_response();
+                let trace = Uuid::new_v4();
+                tracing::info!(ip = %peer, trace_id = %trace, cap = forward_cap, elapsed = ?start.elapsed(), "edge: body beyond forward cap rejected (no event persisted)");
+                return pages::payload_too_large_page(error_pages, Some(trace));
             }
         };
         return proxy_inspected(
@@ -286,11 +311,9 @@ async fn proxy_handler_inner(
     let body_bytes = match axum::body::to_bytes(body, forward_cap).await {
         Ok(b) => b.to_vec(),
         Err(_) => {
-            return (
-                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-                "request body exceeds the edge limit",
-            )
-                .into_response();
+            let trace = Uuid::new_v4();
+            tracing::info!(ip = %peer, trace_id = %trace, cap = forward_cap, elapsed = ?start.elapsed(), "edge: body beyond forward cap rejected (no event persisted)");
+            return pages::payload_too_large_page(error_pages, Some(trace));
         }
     };
     proxy_inspected(
@@ -323,6 +346,7 @@ async fn proxy_inspected(
     peer: std::net::IpAddr,
     start: Instant,
 ) -> Response {
+    let error_pages = runtime.error_pages();
     let captured = if runtime.body_cap() > 0 {
         Some(
             body_bytes
@@ -360,7 +384,7 @@ async fn proxy_inspected(
     if runtime.is_hard_blocked(client_ip) {
         let trace = Uuid::new_v4();
         tracing::info!(ip = %client_ip, trace_id = %trace, elapsed = ?start.elapsed(), "edge fast-path: blocked ip denied before pipeline (no event persisted)");
-        return pages::block_page(Some(trace));
+        return pages::block_page(error_pages, Some(trace));
     }
     let http = sentry_core::event::HttpData {
         method: Some(sentry_core::event::HttpMethod::from_str_lossy(
@@ -420,11 +444,12 @@ async fn proxy_inspected(
                 redirect_https,
                 &client,
                 &upstream,
+                runtime.error_pages_handle(),
             )
             .await
         }
         sentry_core::analysis::Verdict::RateLimit => {
-            pages::rate_limit_page(Some(processed.event.id))
+            pages::rate_limit_page(error_pages, Some(processed.event.id))
         }
         sentry_core::analysis::Verdict::Challenge => {
             match runtime.challenge_gate(&parts.headers, client_ip, Some(processed.event.id)) {
@@ -436,18 +461,19 @@ async fn proxy_inspected(
                         redirect_https,
                         &client,
                         &upstream,
+                        runtime.error_pages_handle(),
                     )
                     .await
                 }
                 crate::ChallengeGate::Page(page) => page,
                 crate::ChallengeGate::Blocked(page) => page,
                 crate::ChallengeGate::Disabled => {
-                    pages::challenge_required_page(Some(processed.event.id))
+                    pages::challenge_required_page(error_pages, Some(processed.event.id))
                 }
             }
         }
         sentry_core::analysis::Verdict::Block | sentry_core::analysis::Verdict::Quarantine => {
-            pages::block_page(Some(processed.event.id))
+            pages::block_page(error_pages, Some(processed.event.id))
         }
     };
 
@@ -508,6 +534,7 @@ async fn proxy_inspected(
 /// Allow path (and challenge-passed requests): plain-HTTP → HTTPS redirect
 /// (F8) when configured, otherwise forward to the upstream and pass its
 /// response through.
+#[allow(clippy::too_many_arguments)]
 async fn serve_allow(
     parts: &axum::http::request::Parts,
     body_bytes: &[u8],
@@ -515,6 +542,7 @@ async fn serve_allow(
     redirect_https: bool,
     client: &reqwest::Client,
     upstream: &str,
+    error_pages: Option<std::sync::Arc<pages::ErrorPages>>,
 ) -> Response {
     // Plain-HTTP → HTTPS redirect (F8): port-80 traffic stays monitored and
     // enforced; benign requests get the 301 instead of double-hitting the
@@ -537,7 +565,11 @@ async fn serve_allow(
                     format!("https://{host}{}{query}", parts.uri.path()),
                 )
                 .body(axum::body::Body::empty())
-                .unwrap_or_else(|_| axum::http::StatusCode::BAD_GATEWAY.into_response());
+                .unwrap_or_else(|_| {
+                    let trace = Uuid::new_v4();
+                    tracing::error!(trace_id = %trace, "edge: redirect response build failed");
+                    pages::bad_gateway_page(error_pages.as_deref(), Some(trace))
+                });
         }
     }
 
@@ -576,15 +608,22 @@ async fn serve_allow(
                 out = out.header(name, v);
             }
             match resp.bytes().await {
-                Ok(bytes) => out
-                    .body(axum::body::Body::from(bytes))
-                    .unwrap_or_else(|_| axum::http::StatusCode::BAD_GATEWAY.into_response()),
-                Err(_) => axum::http::StatusCode::BAD_GATEWAY.into_response(),
+                Ok(bytes) => out.body(axum::body::Body::from(bytes)).unwrap_or_else(|_| {
+                    let trace = Uuid::new_v4();
+                    tracing::error!(trace_id = %trace, "edge: upstream response body build failed");
+                    pages::bad_gateway_page(error_pages.as_deref(), Some(trace))
+                }),
+                Err(_) => {
+                    let trace = Uuid::new_v4();
+                    tracing::warn!(trace_id = %trace, url = %url, "edge: upstream response body read failed");
+                    pages::bad_gateway_page(error_pages.as_deref(), Some(trace))
+                }
             }
         }
         Err(e) => {
-            warn!(error = %e, url = %url, "edge upstream request failed");
-            (axum::http::StatusCode::BAD_GATEWAY, "upstream unavailable").into_response()
+            let trace = Uuid::new_v4();
+            warn!(error = %e, url = %url, trace_id = %trace, "edge upstream request failed");
+            pages::bad_gateway_page(error_pages.as_deref(), Some(trace))
         }
     }
 }
@@ -759,6 +798,7 @@ mod tests {
             crate::UploadsInspection {
                 inspect_bytes: cfg.inspect_kb * 1024,
                 max_files: 16,
+                oversize: sentry_core::config::OversizePolicy::Reject,
             },
         );
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
@@ -806,6 +846,7 @@ mod tests {
             crate::UploadsInspection {
                 inspect_bytes: cfg.inspect_kb * 1024,
                 max_files: 16,
+                oversize: sentry_core::config::OversizePolicy::Reject,
             },
         );
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
@@ -845,6 +886,7 @@ mod tests {
             crate::UploadsInspection {
                 inspect_bytes: cfg.inspect_kb * 1024,
                 max_files: 16,
+                oversize: sentry_core::config::OversizePolicy::Reject,
             },
         );
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
@@ -883,6 +925,7 @@ mod tests {
             crate::UploadsInspection {
                 inspect_bytes: 1024,
                 max_files: 16,
+                oversize: sentry_core::config::OversizePolicy::Reject,
             },
         );
         let (dec_tx, _dec_rx) = tokio::sync::mpsc::channel(8);
@@ -899,6 +942,170 @@ mod tests {
         let (ct, body) = multipart_form(&[("f", "big.bin", "application/octet-stream", &big)]);
         let resp = upload_request(app, &ct, body).await;
         assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "text/html; charset=utf-8",
+            "413 must render the HTML page, not plaintext"
+        );
+        assert!(resp.headers().get(pages::TRACE_HEADER).is_some());
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let page = String::from_utf8_lossy(&bytes);
+        assert!(page.contains("413 - Payload Too Large"), "{page}");
+        assert!(page.contains("Trace ID:"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn oversize_skip_forwards_uninspected() {
+        let upstream = spawn_404_upstream().await;
+        let mut cfg = upload_cfg(true, 1);
+        cfg.oversize = sentry_core::config::OversizePolicy::Skip;
+        let runtime = crate::EdgeRuntime::new(upload_pipeline(&cfg), None, 0).with_uploads(
+            crate::UploadsInspection {
+                inspect_bytes: cfg.inspect_kb * 1024,
+                max_files: 16,
+                oversize: cfg.oversize,
+            },
+        );
+        let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: format!("http://{upstream}"),
+                decided: dec_tx,
+                redirect_https: false,
+            });
+        let big = vec![0x41u8; 4096];
+        let (ct, body) = multipart_form(&[("f", "big.bin", "application/octet-stream", &big)]);
+        let resp = upload_request(app, &ct, body).await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "skip forwards the body to the upstream"
+        );
+        let pe = dec_rx.try_recv().expect("decided event");
+        match &pe.event.protocol {
+            sentry_core::ProtocolData::Http(h) => {
+                assert!(h.uploads.is_none(), "skip attaches no upload metadata");
+            }
+            other => panic!("expected http event, got {other:?}"),
+        }
+        assert!(pe
+            .analysis
+            .signals
+            .iter()
+            .all(|s| s.kind != sentry_core::analysis::SignalKind::UploadOversize));
+    }
+
+    #[tokio::test]
+    async fn oversize_flag_signals_and_forwards() {
+        let upstream = spawn_404_upstream().await;
+        let mut cfg = upload_cfg(true, 1);
+        cfg.oversize = sentry_core::config::OversizePolicy::Flag;
+        let runtime = crate::EdgeRuntime::new(upload_pipeline(&cfg), None, 0).with_uploads(
+            crate::UploadsInspection {
+                inspect_bytes: cfg.inspect_kb * 1024,
+                max_files: 16,
+                oversize: cfg.oversize,
+            },
+        );
+        let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: format!("http://{upstream}"),
+                decided: dec_tx,
+                redirect_https: false,
+            });
+        let big = vec![0x41u8; 4096];
+        let (ct, body) = multipart_form(&[("f", "big.bin", "application/octet-stream", &big)]);
+        let body_len = body.len() as u64;
+        let resp = upload_request(app, &ct, body).await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "flag forwards the body but the risk signal escalates the verdict"
+        );
+        let pe = dec_rx.try_recv().expect("decided event");
+        let sig = pe
+            .analysis
+            .signals
+            .iter()
+            .find(|s| s.kind == sentry_core::analysis::SignalKind::UploadOversize)
+            .expect("oversize signal on the flagged event");
+        assert_eq!(sig.weight, 20, "enforce mode carries full weight");
+        assert!(sig.detail.as_deref().unwrap().contains("inspected"));
+        match &pe.event.protocol {
+            sentry_core::ProtocolData::Http(h) => {
+                let uploads = h.uploads.as_ref().expect("synthetic metadata on event");
+                assert_eq!(uploads.len(), 1);
+                assert_eq!(uploads[0].filename, None);
+                assert_eq!(
+                    uploads[0].size, body_len,
+                    "synthetic entry carries the buffered body size"
+                );
+            }
+            other => panic!("expected http event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn oversize_flag_volume_counts_in_flood_window() {
+        let mut cfg = upload_cfg(true, 1);
+        cfg.oversize = sentry_core::config::OversizePolicy::Flag;
+        cfg.flood.max_uploads = 2;
+        let mut pipeline = sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        );
+        pipeline.configure_uploads(&cfg);
+        pipeline = pipeline.with_upload_tracker(std::sync::Arc::new(std::sync::RwLock::new(
+            sentry_core::uploads::UploadTracker::from_config(&cfg),
+        )));
+        let runtime = crate::EdgeRuntime::new(std::sync::Arc::new(pipeline), None, 0).with_uploads(
+            crate::UploadsInspection {
+                inspect_bytes: cfg.inspect_kb * 1024,
+                max_files: 16,
+                oversize: cfg.oversize,
+            },
+        );
+        let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream: "http://127.0.0.1:9".to_string(),
+                decided: dec_tx,
+                redirect_https: false,
+            });
+        let big = vec![0x41u8; 4096];
+        let mut last = None;
+        for _ in 0..2 {
+            let (ct, body) = multipart_form(&[("f", "big.bin", "application/octet-stream", &big)]);
+            let resp = upload_request(app.clone(), &ct, body).await;
+            let _ = resp.status();
+            last = dec_rx.try_recv().ok();
+        }
+        let pe = last.expect("second decided event");
+        let kinds: Vec<_> = pe.analysis.signals.iter().map(|s| s.kind).collect();
+        assert!(
+            kinds.contains(&sentry_core::analysis::SignalKind::UploadOversize),
+            "flag signal present: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&sentry_core::analysis::SignalKind::UploadFlood),
+            "synthetic entries feed the flood window: {kinds:?}"
+        );
     }
 
     #[tokio::test]
@@ -909,6 +1116,7 @@ mod tests {
             .with_uploads(crate::UploadsInspection {
                 inspect_bytes: cfg.inspect_kb * 1024,
                 max_files: 16,
+                oversize: sentry_core::config::OversizePolicy::Reject,
             })
             .with_uploads_inspected(counter.clone());
         let (dec_tx, _dec_rx) = tokio::sync::mpsc::channel(8);

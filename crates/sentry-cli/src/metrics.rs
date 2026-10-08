@@ -40,6 +40,7 @@ pub struct Metrics {
     pub correlation_hits: prometheus::Counter,
     pub edge_block_hits: prometheus::Counter,
     pub edge_uploads_inspected: prometheus::Counter,
+    pub edge_uploads_oversize: prometheus::CounterVec,
     pub posture_findings: prometheus::CounterVec,
     pub bot_verifications: prometheus::CounterVec,
     pub edge_challenge: prometheus::CounterVec,
@@ -165,6 +166,16 @@ impl Metrics {
             "sentry_edge_uploads_inspected_total",
             "Requests whose body went through upload inspection (F10) — \
              multipart parts parsed and upload heuristics fed.",
+        )
+        .unwrap();
+        let edge_uploads_oversize = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sentry_edge_uploads_oversize_total",
+                "Request bodies that crossed the upload inspection cap (F12), \
+                 by action (reject = refused with 413, skip = forwarded \
+                 uninspected, flag = forwarded + UploadOversize signal).",
+            ),
+            &["action"],
         )
         .unwrap();
         let posture_findings = prometheus::CounterVec::new(
@@ -361,6 +372,10 @@ impl Metrics {
         ] {
             registry.register(Box::new(m.clone())).ok();
         }
+        registry
+            .register(Box::new(edge_uploads_oversize.clone()))
+            .map_err(|e| warn!(error = %e, "register uploads oversize counter vec"))
+            .ok();
         for m in [&queue_occupancy, &postgres_pool] {
             registry
                 .register(Box::new(m.clone()))
@@ -470,6 +485,7 @@ impl Metrics {
             correlation_hits,
             edge_block_hits,
             edge_uploads_inspected,
+            edge_uploads_oversize,
             posture_findings,
             bot_verifications,
             edge_challenge,

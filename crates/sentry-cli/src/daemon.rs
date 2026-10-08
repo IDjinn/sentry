@@ -1018,14 +1018,29 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 mode = cfg.uploads.mode.as_str(),
                 inspect_kb = cfg.uploads.inspect_kb,
                 max_files = cfg.uploads.max_files,
+                oversize = cfg.uploads.oversize.as_str(),
+                allowed_extensions = cfg.uploads.allowed_extensions.len(),
                 "upload inspection enabled (F10)"
             );
             runtime
                 .with_uploads(sentry_edge::UploadsInspection {
                     inspect_bytes,
                     max_files: cfg.uploads.max_files.clamp(1, 256),
+                    oversize: cfg.uploads.oversize,
                 })
                 .with_uploads_inspected(metrics.edge_uploads_inspected.clone())
+                .with_uploads_oversize(metrics.edge_uploads_oversize.clone())
+        } else {
+            runtime
+        };
+        let runtime = if let Some(ref dir) = cfg.edge.error_pages.dir {
+            let pages = Arc::new(sentry_edge::pages::ErrorPages::from_dir(dir));
+            info!(
+                dir = %dir.display(),
+                pages = pages.page_count(),
+                "custom edge error pages loaded (F12)"
+            );
+            runtime.with_error_pages(pages)
         } else {
             runtime
         };

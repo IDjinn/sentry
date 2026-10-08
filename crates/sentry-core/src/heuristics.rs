@@ -383,7 +383,8 @@ impl HeuristicEngine {
                 Box::new(TcpScanner),
                 Box::new(UploadFilename::new(scan.clone())),
                 Box::new(UploadContent::new(scan.clone())),
-                Box::new(UploadImage::new(scan)),
+                Box::new(UploadImage::new(scan.clone())),
+                Box::new(UploadOversize::new(scan)),
             ],
         }
     }
@@ -396,7 +397,9 @@ impl HeuristicEngine {
             .push(Box::new(UploadFilename::new(scan.clone())));
         self.detectors
             .push(Box::new(UploadContent::new(scan.clone())));
-        self.detectors.push(Box::new(UploadImage::new(scan)));
+        self.detectors
+            .push(Box::new(UploadImage::new(scan.clone())));
+        self.detectors.push(Box::new(UploadOversize::new(scan)));
         self
     }
 
@@ -903,8 +906,39 @@ impl Heuristic for UploadFilename {
                     }];
                 }
             }
+            if let Some(sig) = self.allowlist_violation(&decoded, filename) {
+                return vec![sig];
+            }
         }
         vec![]
+    }
+}
+
+impl UploadFilename {
+    /// Allowlist check (F12): with `allowed_extensions` set, both the last
+    /// and the double extension must be listed. Extensionless files are not
+    /// affected.
+    fn allowlist_violation(&self, decoded: &str, filename: &str) -> Option<Signal> {
+        if self.scan.allowed_extensions.is_empty() {
+            return None;
+        }
+        let not_allowed = |ext: String| !self.scan.allowed_extensions.contains(&ext);
+        if crate::uploads::extension(Some(decoded)).is_some_and(not_allowed) {
+            return Some(Signal {
+                kind: SignalKind::UploadDisallowed,
+                weight: upload_weight(&self.scan, crate::analysis::UPLOAD_DISALLOWED_WEIGHT),
+                detail: Some(format!("upload extension not allowed: {filename}")),
+            });
+        }
+        let base = filename.rsplit_once('.').map(|(base, _)| base)?;
+        if crate::uploads::extension(Some(base)).is_some_and(not_allowed) {
+            return Some(Signal {
+                kind: SignalKind::UploadDisallowed,
+                weight: upload_weight(&self.scan, crate::analysis::UPLOAD_DISALLOWED_WEIGHT),
+                detail: Some(format!("double upload extension not allowed: {filename}")),
+            });
+        }
+        None
     }
 }
 
@@ -1089,6 +1123,55 @@ impl UploadImage {
             });
         }
         None
+    }
+}
+
+/// Oversize bodies forwarded uninspected (F12): the edge attaches a
+/// synthetic size-only entry when `[uploads] oversize = "flag"` and the
+/// body crossed `inspect_kb`; this detector turns it into the
+/// `UploadOversize` signal (weight-0 in shadow mode). The same entry feeds
+/// the per-IP flood window, so repeated oversize pushes still escalate.
+pub struct UploadOversize {
+    scan: crate::uploads::UploadsScan,
+}
+
+impl UploadOversize {
+    /// Build with an `[uploads]` projection.
+    pub fn new(scan: crate::uploads::UploadsScan) -> Self {
+        Self { scan }
+    }
+}
+
+impl Heuristic for UploadOversize {
+    fn name(&self) -> &'static str {
+        "upload_oversize"
+    }
+    fn analyze(&self, evt: &Event, _text: &DecodedHttp<'_>) -> Vec<Signal> {
+        if !self.scan.enabled
+            || self.scan.oversize != crate::config::OversizePolicy::Flag
+            || self.scan.inspect_bytes == 0
+        {
+            return vec![];
+        }
+        let Some(uploads) = evt.http().and_then(|h| h.uploads.as_ref()) else {
+            return vec![];
+        };
+        for part in uploads {
+            // Parsed parts can never exceed the cap (their body fit inside
+            // it); only the edge's synthetic size-only entry does.
+            if part.size as usize > self.scan.inspect_bytes {
+                return vec![Signal {
+                    kind: SignalKind::UploadOversize,
+                    weight: upload_weight(&self.scan, crate::analysis::UPLOAD_OVERSIZE_WEIGHT),
+                    detail: Some(format!(
+                        "body {:.1} MiB exceeds {:.1} MiB inspection cap — forwarded uninspected",
+                        part.size as f64 / (1024.0 * 1024.0),
+                        self.scan.inspect_bytes as f64 / (1024.0 * 1024.0)
+                    )),
+                }];
+            }
+        }
+        vec![]
     }
 }
 
@@ -1326,6 +1409,156 @@ mod tests {
             .find(|s| s.kind == SignalKind::UploadExecutable)
             .expect(".php upload must be flagged");
         assert_eq!(sig.weight, 50);
+    }
+
+    fn upload_engine_cfg(cfg: &UploadsConfig) -> HeuristicEngine {
+        HeuristicEngine::with_defaults().with_uploads_scan(UploadsScan::from_config(cfg))
+    }
+
+    #[test]
+    fn upload_allowlist_flags_disallowed_extension() {
+        let cfg = UploadsConfig {
+            enabled: true,
+            mode: crate::config::UploadMode::Enforce,
+            allowed_extensions: vec!["png".into(), "jpg".into()],
+            ..UploadsConfig::default()
+        };
+        let allowed = upload_evt(
+            MULTIPART_CT,
+            multipart_body("photo.png", "image/png", b"\x89PNG\r\n\x1a\n"),
+            Some(crate::event::HttpMethod::Post),
+        );
+        assert!(upload_engine_cfg(&cfg).analyze(&allowed).is_empty());
+
+        let denied = upload_evt(
+            MULTIPART_CT,
+            multipart_body("report.pdf", "application/pdf", b"%PDF-1.7"),
+            Some(crate::event::HttpMethod::Post),
+        );
+        let sig = upload_engine_cfg(&cfg)
+            .analyze(&denied)
+            .into_iter()
+            .find(|s| s.kind == SignalKind::UploadDisallowed)
+            .expect("extension outside the allowlist must be flagged");
+        assert_eq!(sig.weight, 30);
+        assert!(sig.detail.as_deref().unwrap().contains("report.pdf"));
+    }
+
+    #[test]
+    fn upload_allowlist_catches_double_extension_and_spares_extensionless() {
+        let cfg = UploadsConfig {
+            enabled: true,
+            mode: crate::config::UploadMode::Enforce,
+            allowed_extensions: vec!["jpg".into()],
+            ..UploadsConfig::default()
+        };
+        let trick = upload_evt(
+            MULTIPART_CT,
+            multipart_body("archive.zip.jpg", "image/jpeg", b"\xff\xd8\xff\xe0"),
+            Some(crate::event::HttpMethod::Post),
+        );
+        assert!(upload_engine_cfg(&cfg)
+            .analyze(&trick)
+            .iter()
+            .any(|s| s.kind == SignalKind::UploadDisallowed));
+
+        let mut blob =
+            b"--XBOUND\r\nContent-Disposition: form-data; name=\"data\"\r\n\r\n".to_vec();
+        blob.extend_from_slice(&[0u8; 32]);
+        blob.extend_from_slice(b"\r\n--XBOUND--\r\n");
+        let unnamed = upload_evt(MULTIPART_CT, blob, Some(crate::event::HttpMethod::Post));
+        assert!(upload_engine_cfg(&cfg)
+            .analyze(&unnamed)
+            .iter()
+            .all(|s| s.kind != SignalKind::UploadDisallowed));
+    }
+
+    #[test]
+    fn upload_oversize_flag_signals_synthetic_entry_only() {
+        let cfg = UploadsConfig {
+            enabled: true,
+            mode: crate::config::UploadMode::Enforce,
+            oversize: crate::config::OversizePolicy::Flag,
+            inspect_kb: 1,
+            ..UploadsConfig::default()
+        };
+        let engine = upload_engine_cfg(&cfg);
+
+        let mut evt = upload_evt(
+            "application/octet-stream",
+            Vec::new(),
+            Some(crate::event::HttpMethod::Post),
+        );
+        if let Some(http) = evt.http_mut() {
+            http.uploads = Some(vec![crate::event::UploadInfo {
+                size: 5 * 1024 * 1024,
+                ..Default::default()
+            }]);
+        }
+        let signals = engine.analyze(&evt);
+        let sig = signals
+            .iter()
+            .find(|s| s.kind == SignalKind::UploadOversize)
+            .expect("synthetic oversize entry must be flagged");
+        assert_eq!(sig.weight, 20);
+        assert!(sig.detail.as_deref().unwrap().contains("5.0 MiB"));
+
+        if let Some(http) = evt.http_mut() {
+            http.uploads = Some(vec![crate::event::UploadInfo {
+                size: 512,
+                ..Default::default()
+            }]);
+        }
+        assert!(engine
+            .analyze(&evt)
+            .iter()
+            .all(|s| s.kind != SignalKind::UploadOversize));
+    }
+
+    #[test]
+    fn upload_oversize_signal_is_zero_weight_in_shadow() {
+        let cfg = UploadsConfig {
+            enabled: true,
+            oversize: crate::config::OversizePolicy::Flag,
+            inspect_kb: 1,
+            ..UploadsConfig::default()
+        };
+        let mut evt = upload_evt("application/octet-stream", Vec::new(), None);
+        if let Some(http) = evt.http_mut() {
+            http.uploads = Some(vec![crate::event::UploadInfo {
+                size: 2 * 1024 * 1024,
+                ..Default::default()
+            }]);
+        }
+        let signals = HeuristicEngine::with_defaults()
+            .with_uploads_scan(UploadsScan::from_config(&cfg))
+            .analyze(&evt);
+        let sig = signals
+            .iter()
+            .find(|s| s.kind == SignalKind::UploadOversize)
+            .expect("shadow still detects");
+        assert_eq!(sig.weight, 0, "shadow mode must not enforce");
+    }
+
+    #[test]
+    fn upload_allowlist_is_zero_weight_in_shadow() {
+        let cfg = UploadsConfig {
+            enabled: true,
+            allowed_extensions: vec!["png".into()],
+            ..UploadsConfig::default()
+        };
+        let e = upload_evt(
+            MULTIPART_CT,
+            multipart_body("report.pdf", "application/pdf", b"%PDF-1.7"),
+            Some(crate::event::HttpMethod::Post),
+        );
+        let sig = HeuristicEngine::with_defaults()
+            .with_uploads_scan(UploadsScan::from_config(&cfg))
+            .analyze(&e)
+            .into_iter()
+            .find(|s| s.kind == SignalKind::UploadDisallowed)
+            .expect("shadow still detects");
+        assert_eq!(sig.weight, 0);
     }
 
     #[test]

@@ -21,9 +21,9 @@ use std::time::Instant;
 
 use axum::extract::Request;
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::header;
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use sentry_core::analysis::Verdict;
 use sentry_core::event::{Event, HttpData, ProtocolData, SourceKind, Transport};
 use uuid::Uuid;
@@ -79,19 +79,40 @@ async fn handler_inner(
     // when uploads are enabled (F10). 0 = don't buffer (unless inspection).
     // Under overload pressure the raise is skipped (cheap mode): bodies
     // still buffer to the capture cap because the handler needs them back.
+    // In `reject` mode (F12) bodies declaring more than the inspection cap
+    // are refused before buffering, matching the reverse proxy.
+    let error_pages = runtime.error_pages();
+    let peer = parts
+        .extensions
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip().to_canonical())
+        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
     let cap = match runtime.uploads_inspection() {
-        Some(insp) if !runtime.overloaded() => runtime.body_cap().max(insp.inspect_bytes),
+        Some(insp) if !runtime.overloaded() => {
+            if insp.oversize == sentry_core::config::OversizePolicy::Reject {
+                let declared_len = parts
+                    .headers
+                    .get(header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<usize>().ok());
+                if declared_len.is_some_and(|len| len > insp.inspect_bytes) {
+                    runtime.record_oversize("reject");
+                    let trace = Uuid::new_v4();
+                    tracing::info!(ip = %peer, trace_id = %trace, declared = ?declared_len, cap = insp.inspect_bytes, "edge middleware: body beyond inspection cap rejected before buffering (no event persisted)");
+                    return pages::payload_too_large_page(error_pages, Some(trace));
+                }
+            }
+            runtime.body_cap().max(insp.inspect_bytes)
+        }
         _ => runtime.body_cap(),
     };
     let (buffered, body) = if cap > 0 {
         match axum::body::to_bytes(body, cap).await {
             Ok(bytes) => (Some(bytes.to_vec()), axum::body::Body::from(bytes)),
             Err(_) => {
-                return (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request body exceeds the inspection cap",
-                )
-                    .into_response();
+                let trace = Uuid::new_v4();
+                tracing::info!(ip = %peer, trace_id = %trace, cap = cap, "edge middleware: body beyond buffer cap rejected (no event persisted)");
+                return pages::payload_too_large_page(error_pages, Some(trace));
             }
         }
     } else {
@@ -117,11 +138,6 @@ async fn handler_inner(
         None => (None, None),
     };
 
-    let peer = parts
-        .extensions
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|c| c.0.ip().to_canonical())
-        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
     let client_ip = crate::real_client_ip_with(&parts.headers, peer, runtime.trust());
 
     // Sticky blocks deny before the pipeline runs — a blocked IP stays
@@ -131,7 +147,7 @@ async fn handler_inner(
     if runtime.is_hard_blocked(client_ip) {
         let trace = Uuid::new_v4();
         tracing::info!(ip = %client_ip, trace_id = %trace, elapsed = ?start.elapsed(), "edge fast-path: blocked ip denied before pipeline (no event persisted)");
-        return pages::block_page(Some(trace));
+        return pages::block_page(error_pages, Some(trace));
     }
 
     let headers: std::collections::HashMap<String, String> = parts
@@ -196,7 +212,7 @@ async fn handler_inner(
             let req = Request::from_parts(parts, body);
             next.run(req).await
         }
-        Verdict::RateLimit => pages::rate_limit_page(Some(processed.event.id)),
+        Verdict::RateLimit => pages::rate_limit_page(error_pages, Some(processed.event.id)),
         Verdict::Challenge => {
             match runtime.challenge_gate(&parts.headers, client_ip, Some(processed.event.id)) {
                 crate::ChallengeGate::Pass => {
@@ -207,11 +223,13 @@ async fn handler_inner(
                 crate::ChallengeGate::Page(page) => page,
                 crate::ChallengeGate::Blocked(page) => page,
                 crate::ChallengeGate::Disabled => {
-                    pages::challenge_required_page(Some(processed.event.id))
+                    pages::challenge_required_page(error_pages, Some(processed.event.id))
                 }
             }
         }
-        Verdict::Block | Verdict::Quarantine => pages::block_page(Some(processed.event.id)),
+        Verdict::Block | Verdict::Quarantine => {
+            pages::block_page(error_pages, Some(processed.event.id))
+        }
     }
 }
 
@@ -246,6 +264,7 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
     use axum::routing::get;
     use axum::Router;
     use sentry_core::pipeline::Pipeline;
@@ -397,6 +416,7 @@ mod tests {
             .with_uploads(crate::UploadsInspection {
                 inspect_bytes: 64 * 1024,
                 max_files: 16,
+                oversize: sentry_core::config::OversizePolicy::Reject,
             })
     }
 

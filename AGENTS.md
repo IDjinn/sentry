@@ -751,6 +751,57 @@ telemetria de handshake + provider de appliance
     `sentry_signal_kinds_total` de graça; webhook inerte por design
     (weight-0 nunca sobe level)
 
+# F12 (concluída): Error pages HTML customizáveis + políticas de upload —
+# toda resposta gerada pela edge é uma página HTML com Trace ID; allowlist
+# de extensões e política de oversize em [uploads]
+  - ✅ F12.1 Páginas de erro HTML (`sentry-edge/src/pages.rs`): `ErrorPages`
+    (HashMap<u16, String> + default) carregado 1× no startup de
+    `[edge.error_pages] dir` (`<status>.html` por código + `default.html`
+    genérico; UTF-8, cap 256 KiB/arquivo, arquivo ruim = warn + skip, nunca
+    derruba a edge). Placeholders `{{SENTRY_STATUS}}/{{SENTRY_TITLE}}/
+    {{SENTRY_MESSAGE}}/{{SENTRY_TRACE_ID}}/{{SENTRY_ICON}}` com
+    HTML-escape; headers preservados (`Retry-After`, `Cache-Control`,
+    `x-sentry-trace-id`). Todos os helpers de página (`block_page`,
+    `rate_limit_page`, `challenge_required_page`, `challenge_failed_page`,
+    `delegated_challenge_page`, novos `payload_too_large_page` e
+    `bad_gateway_page`) consultam o mapa antes do built-in. Os 4 sites de
+    413 (3 no proxy + 1 no middleware, 4 wordings) e os 502
+    ("upstream unavailable" + fallbacks vazios) saem de plaintext e viram
+    HTML com **Trace ID sempre** (Uuid novo + log, padrão do fast-path —
+    nada user-facing sem trace). Interstitial PoW do challenge não muda
+    (funcional, já tem `template_path` próprio hot-read); error pages são
+    cold-load por design (413/502 em rajada não pode virar I/O por render).
+    Wiring: `EdgeRuntime::with_error_pages(Arc<ErrorPages>)` +
+    `error_pages()`/`error_pages_handle()` — 6 testes novos
+  - ✅ F12.2 `[uploads] oversize = "reject"|"skip"|"flag"` (default
+    `reject` = comportamento F10): reject → 413 (página HTML); skip →
+    bufferiza até o forward cap e encaminha sem parse nem sinal; flag →
+    idem skip + entrada sintética em `HttpData.uploads` (size-only,
+    filename None) que (a) alimenta o `UploadTracker` (volume conta na
+    janela de flood) e (b) vira sinal `UploadOversize` (peso 20, override
+    `[scorer.weights] upload_oversize`, shadow → 0) no novo detector
+    `upload_oversize`. `EdgeRuntime::inspect_body` decide reject/skip/flag
+    pelo tamanho real (body > inspect_bytes); proxy faz o pre-check de
+    `Content-Length` só em reject e bufferiza até o forward cap em
+    skip/flag. Métrica `sentry_edge_uploads_oversize_total{action}` — 3
+    testes de integração no proxy (skip encaminha mudo, flag sinaliza +
+    escala verdict, flag alimenta flood window)
+  - ✅ F12.3 `[uploads] allowed_extensions` (allowlist, default vazio =
+    off): extensão (e dupla extensão — `archive.zip.jpg` falha allowlist de
+    imagens) fora da lista → sinal `UploadDisallowed` (peso 30, override
+    `[scorer.weights] upload_disallowed`, shadow → 0) no
+    `UploadFilename::analyze`; arquivos sem extensão não são afetados;
+    `blocked_extensions` (denylist) tem precedência (short-circuit antes).
+    `UploadsScan` projeta allowlist + policy + `inspect_bytes`;
+    `normalize_extensions` centraliza lower/trim — 4 testes novos nas
+    heurísticas (allowlist enforce/shadow, dupla extensão, extensionless,
+    oversize sintético)
+  - ✅ F12.4 TUI: labels `UpDeny` (upload_disallowed) e `UpOversize`
+    (upload_oversize) em `tui/agg.rs`; `sentry.example.toml` documenta
+    `[edge.error_pages]`, `oversize` e `allowed_extensions` (o rate limit
+    de uploads já existia: `[uploads.flood]` 60s/30 arquivos/50 MiB →
+    `UploadFlood` 25)
+
 Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4).
 
 ### Status atual (verificação contínua)

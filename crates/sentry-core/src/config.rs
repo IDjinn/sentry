@@ -785,6 +785,32 @@ fn default_protocol_max_schemas() -> usize {
     64
 }
 
+/// What happens to a request body larger than `inspect_kb` (F12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OversizePolicy {
+    /// Refuse with 413 (default — keeps the memory ceiling at
+    /// concurrent requests × `inspect_kb`).
+    #[default]
+    Reject,
+    /// Forward the body uninspected — no parsing, no signals.
+    Skip,
+    /// Forward the body uninspected but raise `UploadOversize`
+    /// (weight-0 in shadow mode) and count the volume in the flood window.
+    Flag,
+}
+
+impl OversizePolicy {
+    /// Lowercase stable name used in logs and config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reject => "reject",
+            Self::Skip => "skip",
+            Self::Flag => "flag",
+        }
+    }
+}
+
 /// Request-body/upload inspection (F10): the inline edge buffers the body,
 /// parses multipart/urlencoded/JSON and the upload heuristics score what
 /// they find — SQLi/XSS in filenames and form fields, polyglot images,
@@ -801,10 +827,10 @@ pub struct UploadsConfig {
     /// verdicts block/challenge before the upstream sees the request).
     #[serde(default)]
     pub mode: UploadMode,
-    /// Per-request inspection cap in KiB — bodies larger than this are
-    /// rejected with 413 while uploads are enabled (they also raise the
-    /// proxy forward cap, so enabling uploads consciously raises the
-    /// memory ceiling: concurrent requests × this size).
+    /// Per-request inspection cap in KiB — what happens to larger bodies is
+    /// `oversize` (default: rejected with 413 while uploads are enabled).
+    /// Enabling uploads consciously raises the memory ceiling: concurrent
+    /// requests × this size.
     #[serde(default = "default_uploads_inspect_kb")]
     pub inspect_kb: usize,
     /// Max multipart parts parsed per request.
@@ -817,6 +843,16 @@ pub struct UploadsConfig {
     /// (lowercase, without the dot).
     #[serde(default = "default_uploads_blocked_extensions")]
     pub blocked_extensions: Vec<String>,
+    /// Filename extensions allowlist (lowercase, without the dot). When
+    /// non-empty, a named upload whose extension (or double extension) is
+    /// not listed raises `UploadDisallowed`. Files without an extension are
+    /// not affected. `blocked_extensions` wins over this list.
+    #[serde(default)]
+    pub allowed_extensions: Vec<String>,
+    /// Policy for bodies larger than `inspect_kb` (F12): `reject` (413),
+    /// `skip` (forward uninspected) or `flag` (forward + `UploadOversize`).
+    #[serde(default)]
+    pub oversize: OversizePolicy,
     /// Volume thresholds (`UploadFlood`).
     #[serde(default)]
     pub flood: UploadFloodConfig,
@@ -831,6 +867,8 @@ impl Default for UploadsConfig {
             max_files: default_uploads_max_files(),
             scan_json: default_uploads_scan_json(),
             blocked_extensions: default_uploads_blocked_extensions(),
+            allowed_extensions: Vec::new(),
+            oversize: OversizePolicy::default(),
             flood: UploadFloodConfig::default(),
         }
     }
@@ -1453,12 +1491,29 @@ pub struct EdgeConfig {
     /// Interactive JavaScript challenge for `Challenge` verdicts (F7.8).
     #[serde(default)]
     pub challenge: EdgeChallengeConfig,
+    /// Custom HTML error pages for every edge-generated response (F12).
+    #[serde(default)]
+    pub error_pages: EdgeErrorPagesConfig,
     /// Who executes `Challenge` verdicts — `sentry` (built-in PoW) or
     /// `cloudflare` (the verdict becomes a Cloudflare rule via the CF
     /// provider; requires an action with `provider = "cloudflare"`).
     /// Default `sentry`.
     #[serde(default)]
     pub challenge_backend: ChallengeBackend,
+}
+
+/// Custom HTML error pages (F12): `<status>.html` files (e.g. `403.html`,
+/// `413.html`, `429.html`, `502.html`) override that status and
+/// `default.html` covers every other edge-rendered status. Loaded once at
+/// startup — editing a page requires a restart (the challenge interstitial
+/// keeps its own hot-read `template_path`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EdgeErrorPagesConfig {
+    /// Directory holding the page overrides. Missing/unreadable files are
+    /// skipped with a warning; without this the built-in styled pages are
+    /// served.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
 }
 
 /// JavaScript proof-of-work challenge settings (F7.8). When enabled, the
@@ -1535,6 +1590,7 @@ impl Default for EdgeConfig {
             tcp_listen: None,
             tcp_upstream: None,
             challenge: EdgeChallengeConfig::default(),
+            error_pages: EdgeErrorPagesConfig::default(),
             challenge_backend: ChallengeBackend::default(),
         }
     }
@@ -2036,6 +2092,8 @@ mod tests {
         assert_eq!(c.max_files, 16);
         assert!(c.scan_json);
         assert!(c.blocked_extensions.iter().any(|e| e == "php"));
+        assert!(c.allowed_extensions.is_empty(), "allowlist off by default");
+        assert_eq!(c.oversize, OversizePolicy::Reject);
         assert_eq!(c.flood.max_uploads, 30);
 
         let parsed: UploadsConfig = toml::from_str(
@@ -2044,6 +2102,8 @@ mod tests {
             mode = "enforce"
             inspect_kb = 8192
             blocked_extensions = ["php", "jsp"]
+            allowed_extensions = ["png", "jpg", "pdf"]
+            oversize = "flag"
         "#,
         )
         .unwrap();
@@ -2051,9 +2111,25 @@ mod tests {
         assert!(parsed.mode.is_enforce());
         assert_eq!(parsed.inspect_kb, 8192);
         assert_eq!(parsed.blocked_extensions, vec!["php", "jsp"]);
+        assert_eq!(parsed.allowed_extensions, vec!["png", "jpg", "pdf"]);
+        assert_eq!(parsed.oversize, OversizePolicy::Flag);
 
         let err = toml::from_str::<UploadsConfig>("mode = \"block\"");
         assert!(err.is_err(), "typos must fail at config-load time");
+        let err = toml::from_str::<UploadsConfig>("oversize = \"ignore\"");
+        assert!(err.is_err(), "oversize typos must fail at config-load time");
+    }
+
+    #[test]
+    fn edge_error_pages_default_and_parse() {
+        let c = EdgeConfig::default();
+        assert!(c.error_pages.dir.is_none());
+
+        let parsed: EdgeConfig = toml::from_str("error_pages.dir = \"/etc/sentry/pages\"").unwrap();
+        assert_eq!(
+            parsed.error_pages.dir,
+            Some(std::path::PathBuf::from("/etc/sentry/pages"))
+        );
     }
 
     #[test]

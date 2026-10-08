@@ -54,7 +54,7 @@ use std::time::SystemTime;
 
 use axum::http::HeaderMap;
 use axum::response::Response;
-use sentry_core::config::ChallengeBackend;
+use sentry_core::config::{ChallengeBackend, OversizePolicy};
 use sentry_core::event::Event;
 use sentry_core::pipeline::Pipeline;
 use sentry_core::BlockTable;
@@ -77,6 +77,9 @@ pub struct UploadsInspection {
     pub inspect_bytes: usize,
     /// Max multipart parts parsed per request.
     pub max_files: usize,
+    /// What happens to bodies beyond `inspect_bytes` (F12): reject with
+    /// 413, forward uninspected, or forward and raise `UploadOversize`.
+    pub oversize: OversizePolicy,
 }
 
 /// Gate outcome for a `Challenge` verdict (F7.8).
@@ -112,9 +115,11 @@ pub struct EdgeRuntime {
     protocol_metrics: Option<crate::protocol::ProtocolMetrics>,
     uploads: Option<UploadsInspection>,
     uploads_inspected: Option<prometheus::Counter>,
+    uploads_oversize: Option<prometheus::CounterVec>,
     overload: Option<sentry_core::OverloadState>,
     posture: Option<Arc<sentry_core::posture::PostureTracker>>,
     posture_findings: Option<prometheus::CounterVec>,
+    error_pages: Option<Arc<pages::ErrorPages>>,
 }
 
 impl EdgeRuntime {
@@ -141,9 +146,11 @@ impl EdgeRuntime {
             protocol_metrics: None,
             uploads: None,
             uploads_inspected: None,
+            uploads_oversize: None,
             overload: None,
             posture: None,
             posture_findings: None,
+            error_pages: None,
         }
     }
 
@@ -181,6 +188,38 @@ impl EdgeRuntime {
     pub fn with_uploads_inspected(mut self, counter: prometheus::Counter) -> Self {
         self.uploads_inspected = Some(counter);
         self
+    }
+
+    /// `sentry_edge_uploads_oversize_total{action}` counter — bodies that
+    /// crossed the inspection cap (reject / skip / flag, F12).
+    pub fn with_uploads_oversize(mut self, counter: prometheus::CounterVec) -> Self {
+        self.uploads_oversize = Some(counter);
+        self
+    }
+
+    /// Custom HTML error pages (F12), when `[edge.error_pages]` is set.
+    pub fn with_error_pages(mut self, pages: Arc<pages::ErrorPages>) -> Self {
+        self.error_pages = Some(pages);
+        self
+    }
+
+    /// Custom error-page overrides, when loaded.
+    pub fn error_pages(&self) -> Option<&pages::ErrorPages> {
+        self.error_pages.as_deref()
+    }
+
+    /// Shared handle to the custom error pages (for handlers without the
+    /// runtime in scope, e.g. the upstream forward tail).
+    pub fn error_pages_handle(&self) -> Option<Arc<pages::ErrorPages>> {
+        self.error_pages.clone()
+    }
+
+    /// Count a body that crossed the inspection cap (`reject` at the proxy
+    /// buffer sites; `skip`/`flag` inside [`Self::inspect_body`]).
+    pub fn record_oversize(&self, action: &str) {
+        if let Some(c) = &self.uploads_oversize {
+            c.with_label_values(&[action]).inc();
+        }
     }
 
     /// Arm web security posture advisories (F11): origin responses are
@@ -243,6 +282,29 @@ impl EdgeRuntime {
         }
         if let Some(counter) = &self.uploads_inspected {
             counter.inc();
+        }
+        if body.len() > insp.inspect_bytes {
+            // Oversize body (F12): reject is handled by the caller's buffer
+            // caps; here we only decide between a blind forward and a
+            // flagged one. The synthetic metadata keeps the flood window
+            // (per-IP bytes/files) counting the volume.
+            return match insp.oversize {
+                OversizePolicy::Reject => (None, None),
+                OversizePolicy::Skip => {
+                    self.record_oversize("skip");
+                    (None, None)
+                }
+                OversizePolicy::Flag => {
+                    self.record_oversize("flag");
+                    (
+                        Some(vec![sentry_core::event::UploadInfo {
+                            size: body.len() as u64,
+                            ..Default::default()
+                        }]),
+                        None,
+                    )
+                }
+            };
         }
         let parts = content_type
             .filter(|ct| ct.to_ascii_lowercase().starts_with("multipart/"))
@@ -386,7 +448,7 @@ impl EdgeRuntime {
     ) -> ChallengeGate {
         if self.challenge_backend == ChallengeBackend::Cloudflare {
             self.challenge_metric("delegated");
-            return ChallengeGate::Page(pages::delegated_challenge_page(trace));
+            return ChallengeGate::Page(pages::delegated_challenge_page(self.error_pages(), trace));
         }
 
         let Some(ch) = self.challenge.as_ref() else {
@@ -425,7 +487,10 @@ impl EdgeRuntime {
                 }
                 crate::challenge::CookieCheck::Failed => {
                     self.challenge_metric("failed");
-                    return ChallengeGate::Blocked(pages::challenge_failed_page(trace));
+                    return ChallengeGate::Blocked(pages::challenge_failed_page(
+                        self.error_pages(),
+                        trace,
+                    ));
                 }
                 crate::challenge::CookieCheck::Stale => {}
             }
@@ -582,6 +647,7 @@ mod tests {
             .with_uploads(UploadsInspection {
                 inspect_bytes: 64 * 1024,
                 max_files: 8,
+                oversize: OversizePolicy::Reject,
             })
             .with_overload(state.clone());
         assert!(!runtime.overloaded());

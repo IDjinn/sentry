@@ -10,6 +10,8 @@
 //! failures are 403 (the PoW interstitial included — it already sends
 //! `Cache-Control: no-store`, so caches cannot pin it), rate limits are 429.
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::LazyLock;
 
 use axum::http::{header, HeaderValue, StatusCode};
@@ -74,9 +76,156 @@ pub fn verdict_page(
     resp
 }
 
+/// Per-request cap on a custom error page file — pages are static HTML;
+/// anything bigger is a mistake (or an attempt to make the edge allocate).
+const MAX_PAGE_BYTES: u64 = 256 * 1024;
+
+/// Custom HTML error pages for every edge-generated response (F12).
+///
+/// Loaded once at startup from `[edge.error_pages] dir`: `<status>.html`
+/// files (e.g. `403.html`, `413.html`) override that status, `default.html`
+/// covers every other status the edge renders. Unlike the challenge
+/// `template_path` (hot-read per render), these are read once — 413/502
+/// responses can fire at attack rate and per-render I/O would turn the
+/// error path into a disk amplifier.
+///
+/// Templates may use `{{SENTRY_STATUS}}`, `{{SENTRY_TITLE}}`,
+/// `{{SENTRY_MESSAGE}}`, `{{SENTRY_TRACE_ID}}` (empty when absent) and
+/// `{{SENTRY_ICON}}` (embedded logo data URI); substituted values are
+/// HTML-escaped.
+#[derive(Debug, Clone, Default)]
+pub struct ErrorPages {
+    pages: HashMap<u16, String>,
+    default: Option<String>,
+}
+
+impl ErrorPages {
+    /// Load `<status>.html` / `default.html` overrides from `dir`. Unreadable
+    /// or oversized files are skipped with a warning — a broken page must
+    /// never take the edge down.
+    pub fn from_dir(dir: &Path) -> Self {
+        let mut out = Self::default();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            tracing::warn!(dir = %dir.display(), "[edge.error_pages] dir unreadable — built-in pages only");
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let is_default = stem == "default";
+            let status = if is_default {
+                None
+            } else {
+                match stem.parse::<u16>() {
+                    Ok(code) if (100..=599).contains(&code) => Some(code),
+                    _ => continue,
+                }
+            };
+            if path.extension().and_then(|e| e.to_str()) != Some("html") {
+                continue;
+            }
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(file = %path.display(), error = %e, "[edge.error_pages] stat failed — skipped");
+                    continue;
+                }
+            };
+            if meta.len() > MAX_PAGE_BYTES {
+                tracing::warn!(file = %path.display(), cap_kb = MAX_PAGE_BYTES / 1024, "[edge.error_pages] page too large — skipped");
+                continue;
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(html) => {
+                    if is_default {
+                        out.default = Some(html);
+                    } else {
+                        out.pages.insert(status.unwrap_or(0), html);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(file = %path.display(), error = %e, "[edge.error_pages] page unreadable — skipped");
+                }
+            }
+        }
+        out
+    }
+
+    /// Number of custom pages loaded (status overrides + default).
+    pub fn page_count(&self) -> usize {
+        self.pages.len() + usize::from(self.default.is_some())
+    }
+
+    /// Render a custom page for `status` when one is configured; `None`
+    /// means the caller falls back to the built-in page.
+    pub fn render_response(
+        &self,
+        status: StatusCode,
+        title: &str,
+        message: &str,
+        trace: Option<Uuid>,
+    ) -> Option<Response> {
+        let template = self.pages.get(&status.as_u16()).or(self.default.as_ref())?;
+        let trace_html = trace.map(|id| id.to_string()).unwrap_or_default();
+        let html = template
+            .replace("{{SENTRY_STATUS}}", &status.as_u16().to_string())
+            .replace("{{SENTRY_TITLE}}", &escape_html(title))
+            .replace("{{SENTRY_MESSAGE}}", &escape_html(message))
+            .replace("{{SENTRY_TRACE_ID}}", &escape_html(&trace_html))
+            .replace("{{SENTRY_ICON}}", sentry_icon());
+        let mut resp = (
+            status,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            html,
+        )
+            .into_response();
+        if let Some(id) = trace {
+            if let Ok(v) = HeaderValue::from_str(&id.to_string()) {
+                resp.headers_mut().insert(TRACE_HEADER, v);
+            }
+        }
+        Some(resp)
+    }
+}
+
+/// Render through the custom map when a page exists, else the built-in.
+fn page_with(
+    custom: Option<&ErrorPages>,
+    status: StatusCode,
+    title: &str,
+    message: &str,
+    trace: Option<Uuid>,
+) -> Response {
+    if let Some(resp) = custom.and_then(|ep| ep.render_response(status, title, message, trace)) {
+        return resp;
+    }
+    verdict_page(status, title, message, trace)
+}
+
+/// Escape interpolated values into custom templates (`&`, `<`, `>`, `"`).
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// 403 page for `Block` / `Quarantine` verdicts and fast-path denials.
-pub fn block_page(trace: Option<Uuid>) -> Response {
-    verdict_page(
+pub fn block_page(custom: Option<&ErrorPages>, trace: Option<Uuid>) -> Response {
+    page_with(
+        custom,
         StatusCode::FORBIDDEN,
         "403 - Forbidden",
         "You are unable to access this website.",
@@ -85,8 +234,9 @@ pub fn block_page(trace: Option<Uuid>) -> Response {
 }
 
 /// 429 for `RateLimit` verdicts.
-pub fn rate_limit_page(trace: Option<Uuid>) -> Response {
-    let mut resp = verdict_page(
+pub fn rate_limit_page(custom: Option<&ErrorPages>, trace: Option<Uuid>) -> Response {
+    let mut resp = page_with(
+        custom,
         StatusCode::TOO_MANY_REQUESTS,
         "429 - Too Many Requests",
         "Slow down and retry shortly.",
@@ -99,8 +249,9 @@ pub fn rate_limit_page(trace: Option<Uuid>) -> Response {
 
 /// 403 page for `Challenge` verdicts without an interactive challenge
 /// configured (see `[edge.challenge]`, F7.8).
-pub fn challenge_required_page(trace: Option<Uuid>) -> Response {
-    verdict_page(
+pub fn challenge_required_page(custom: Option<&ErrorPages>, trace: Option<Uuid>) -> Response {
+    page_with(
+        custom,
         StatusCode::FORBIDDEN,
         "403 - Forbidden",
         "This resource requires verification. If you believe this is an error, contact the administrator.",
@@ -110,8 +261,9 @@ pub fn challenge_required_page(trace: Option<Uuid>) -> Response {
 
 /// Terminal 403 page for a presented challenge cookie that failed
 /// verification — the client tried and failed, so no retry loop.
-pub fn challenge_failed_page(trace: Option<Uuid>) -> Response {
-    verdict_page(
+pub fn challenge_failed_page(custom: Option<&ErrorPages>, trace: Option<Uuid>) -> Response {
+    page_with(
+        custom,
         StatusCode::FORBIDDEN,
         "403 - Forbidden",
         "Your browser did not pass the security check. If you believe this is an error, contact the administrator.",
@@ -124,8 +276,9 @@ pub fn challenge_failed_page(trace: Option<Uuid>) -> Response {
 /// into a Cloudflare rule via its API and Cloudflare challenges the
 /// visitor on the next hop — this page only holds the current request
 /// until that happens.
-pub fn delegated_challenge_page(trace: Option<Uuid>) -> Response {
-    let mut resp = verdict_page(
+pub fn delegated_challenge_page(custom: Option<&ErrorPages>, trace: Option<Uuid>) -> Response {
+    let mut resp = page_with(
+        custom,
         StatusCode::FORBIDDEN,
         "Verifying your browser...",
         "Please wait a few seconds and retry.",
@@ -138,6 +291,31 @@ pub fn delegated_challenge_page(trace: Option<Uuid>) -> Response {
         HeaderValue::from_static("no-store, max-age=0"),
     );
     resp
+}
+
+/// 413 for request bodies beyond the inspection/forward caps (F10/F12).
+/// No event is persisted for these, so the trace id only lives on the page
+/// and the caller's log line.
+pub fn payload_too_large_page(custom: Option<&ErrorPages>, trace: Option<Uuid>) -> Response {
+    page_with(
+        custom,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "413 - Payload Too Large",
+        "The request body exceeds the allowed size.",
+        trace,
+    )
+}
+
+/// 502 when the upstream cannot be reached or its response cannot be
+/// relayed.
+pub fn bad_gateway_page(custom: Option<&ErrorPages>, trace: Option<Uuid>) -> Response {
+    page_with(
+        custom,
+        StatusCode::BAD_GATEWAY,
+        "502 - Bad Gateway",
+        "The upstream server is unavailable.",
+        trace,
+    )
 }
 
 /// Standard-alphabet base64 (with padding) — used only for the embedded
@@ -183,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn block_page_carries_copy_icon_trace_and_footer() {
-        let resp = block_page(Some(trace()));
+        let resp = block_page(None, Some(trace()));
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             resp.headers().get(TRACE_HEADER).unwrap().to_str().unwrap(),
@@ -206,7 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn block_page_without_trace_omits_the_line_and_header() {
-        let resp = block_page(None);
+        let resp = block_page(None, None);
         assert!(resp.headers().get(TRACE_HEADER).is_none());
         let page = body(resp).await;
         assert!(!page.contains("Trace ID:"), "{page}");
@@ -214,7 +392,7 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_page_is_429_with_retry_after() {
-        let resp = rate_limit_page(Some(trace()));
+        let resp = rate_limit_page(None, Some(trace()));
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "60");
         let page = body(resp).await;
@@ -225,8 +403,8 @@ mod tests {
     #[tokio::test]
     async fn challenge_fallback_and_failed_pages_are_403() {
         for resp in [
-            challenge_required_page(Some(trace())),
-            challenge_failed_page(Some(trace())),
+            challenge_required_page(None, Some(trace())),
+            challenge_failed_page(None, Some(trace())),
         ] {
             assert_eq!(resp.status(), StatusCode::FORBIDDEN);
             let page = body(resp).await;
@@ -237,12 +415,118 @@ mod tests {
 
     #[tokio::test]
     async fn delegated_page_is_403_with_retry_after_3() {
-        let resp = delegated_challenge_page(Some(trace()));
+        let resp = delegated_challenge_page(None, Some(trace()));
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "3");
         let page = body(resp).await;
         assert!(page.contains("Verifying your browser..."), "{page}");
         assert!(page.contains("Trace ID:"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn oversized_and_bad_gateway_pages_are_html() {
+        for resp in [
+            payload_too_large_page(None, Some(trace())),
+            bad_gateway_page(None, Some(trace())),
+        ] {
+            assert_eq!(
+                resp.headers()
+                    .get(header::CONTENT_TYPE)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "text/html; charset=utf-8"
+            );
+            assert_eq!(
+                resp.headers().get(TRACE_HEADER).unwrap().to_str().unwrap(),
+                trace().to_string()
+            );
+            let page = body(resp).await;
+            assert!(page.contains("<!DOCTYPE html>"), "{page}");
+            assert!(page.contains("Trace ID:"), "{page}");
+            assert!(page.contains(&trace().to_string()), "{page}");
+            assert!(
+                page.contains("Performance &amp; security by Sentry"),
+                "{page}"
+            );
+        }
+        let resp = payload_too_large_page(None, None);
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(resp.headers().get(TRACE_HEADER).is_none());
+        let page = body(resp).await;
+        assert!(page.contains("413 - Payload Too Large"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn custom_pages_override_by_status_and_fall_back_to_default() {
+        let tmp = std::env::temp_dir().join(format!("sentry-pages-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("413.html"),
+            "<html>{{SENTRY_STATUS}}|{{SENTRY_MESSAGE}}|{{SENTRY_TRACE_ID}}</html>",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("default.html"),
+            "<html>generic {{SENTRY_TITLE}}|{{SENTRY_TRACE_ID}}</html>",
+        )
+        .unwrap();
+        std::fs::write(tmp.join("bogus.txt"), "ignored").unwrap();
+        std::fs::write(tmp.join("999.html"), "<html>ignored</html>").unwrap();
+        let ep = ErrorPages::from_dir(&tmp);
+        assert_eq!(ep.page_count(), 2);
+
+        let resp = payload_too_large_page(Some(&ep), Some(trace()));
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            resp.headers().get(TRACE_HEADER).unwrap().to_str().unwrap(),
+            trace().to_string()
+        );
+        let page = body(resp).await;
+        assert!(
+            page.contains(&format!(
+                "413|The request body exceeds the allowed size.|{}",
+                trace()
+            )),
+            "{page}"
+        );
+
+        let resp = rate_limit_page(Some(&ep), Some(trace()));
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "60");
+        let page = body(resp).await;
+        assert!(page.contains("generic 429 - Too Many Requests"), "{page}");
+        assert!(page.contains(&trace().to_string()), "{page}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn custom_page_values_are_html_escaped() {
+        let tmp = std::env::temp_dir().join(format!("sentry-pages-esc-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("502.html"), "<html>{{SENTRY_MESSAGE}}</html>").unwrap();
+        let ep = ErrorPages::from_dir(&tmp);
+        let resp = bad_gateway_page(Some(&ep), None);
+        let page = body(resp).await;
+        assert!(
+            page.contains("The upstream server is unavailable."),
+            "{page}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn unreadable_page_dir_falls_back_to_builtin() {
+        let missing = std::env::temp_dir().join("sentry-pages-does-not-exist");
+        let ep = ErrorPages::from_dir(&missing);
+        assert_eq!(ep.page_count(), 0);
+        let resp = block_page(Some(&ep), Some(trace()));
+        let page = body(resp).await;
+        assert!(
+            page.contains("You are unable to access this website."),
+            "{page}"
+        );
     }
 
     #[test]
