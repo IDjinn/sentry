@@ -53,6 +53,7 @@ pub async fn serve_tcp(
         let Ok((inbound, peer)) = listener.accept().await else {
             continue;
         };
+        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
         let runtime = runtime.clone();
         let cfg = cfg.clone();
         let decided = decided.clone();

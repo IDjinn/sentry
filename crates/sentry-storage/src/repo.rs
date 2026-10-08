@@ -390,6 +390,7 @@ impl EventRepo {
     ///
     /// Backs the per-IP info panel in the tail TUI.
     pub async fn recent_for_ip(&self, ip: IpAddr, limit: i64) -> Result<Vec<EventRow>> {
+        let ip = sentry_core::event::Event::canonical_ip(ip);
         let rows = sqlx::query_as::<_, EventRow>(
             r#"SELECT id, timestamp, source, host(client_ip) AS client_ip,
                       client_port, server_port, asn, country,
@@ -676,6 +677,8 @@ impl IncidentRepo {
         action: Verdict,
         notes: Option<&str>,
     ) -> Result<Uuid> {
+        let client_ip = sentry_core::event::Event::canonical_ip(client_ip);
+        let client_ip = sentry_core::event::Event::canonical_ip(client_ip);
         let id = Uuid::new_v4();
         // The unique index is partial (`WHERE event_id IS NOT NULL`), so the
         // conflict target must repeat the predicate or Postgres rejects the
@@ -710,6 +713,7 @@ impl IncidentRepo {
     /// Used to coalesce bursts of High/Critical events into a single open
     /// incident per attacker instead of one row per event.
     pub async fn open_incident_for_ip(&self, ip: IpAddr) -> Result<Option<Uuid>> {
+        let ip = sentry_core::event::Event::canonical_ip(ip);
         sqlx::query_scalar::<_, Uuid>(
             r#"SELECT id FROM incidents
                WHERE client_ip = $1::inet AND resolved = false
@@ -793,6 +797,7 @@ impl IpStateRepo {
         reason: Option<&str>,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<()> {
+        let ip = sentry_core::event::Event::canonical_ip(ip);
         sqlx::query(
             r#"INSERT INTO ip_state (ip, status, reason, expires_at)
                VALUES ($1::inet, 'blocked', $2, $3)
@@ -813,6 +818,7 @@ impl IpStateRepo {
 
     /// Check if an IP is blocked.
     pub async fn is_blocked(&self, ip: IpAddr) -> Result<bool> {
+        let ip = sentry_core::event::Event::canonical_ip(ip);
         let row: (bool,) = sqlx::query_as(
             r#"SELECT EXISTS(
                    SELECT 1 FROM ip_state
@@ -850,6 +856,7 @@ impl IpStateRepo {
 
     /// Remove an IP from the state table.
     pub async fn unblock(&self, ip: IpAddr) -> Result<()> {
+        let ip = sentry_core::event::Event::canonical_ip(ip);
         sqlx::query("DELETE FROM ip_state WHERE ip = $1::inet")
             .bind(ip.to_string())
             .execute(self.pool.inner())
@@ -864,6 +871,7 @@ impl IpStateRepo {
     ///
     /// Returns the resulting row.
     pub async fn record_violation(&self, ip: IpAddr, window_secs: u64) -> Result<OffenderRow> {
+        let ip = sentry_core::event::Event::canonical_ip(ip);
         let row = sqlx::query_as::<_, OffenderRow>(
             r#"INSERT INTO ip_state (ip, status, strikes, total_violations, last_violation_at)
                VALUES ($1::inet, 'watched', 1, 1, now())
@@ -887,6 +895,7 @@ impl IpStateRepo {
 
     /// Offender state for a single IP (strikes, totals, last violation).
     pub async fn offender(&self, ip: IpAddr) -> Result<Option<OffenderRow>> {
+        let ip = sentry_core::event::Event::canonical_ip(ip);
         let row = sqlx::query_as::<_, OffenderRow>(
             r#"SELECT host(ip) AS ip, strikes, total_violations, last_violation_at
                FROM ip_state WHERE ip = $1::inet"#,
@@ -919,6 +928,7 @@ impl IpStateRepo {
     /// Reset the strike counters for an IP (manual forgiveness). Keeps the
     /// `total_violations` history.
     pub async fn reset_offender(&self, ip: IpAddr) -> Result<()> {
+        let ip = sentry_core::event::Event::canonical_ip(ip);
         sqlx::query(
             r#"UPDATE ip_state
                SET strikes = 0, last_violation_at = NULL, updated_at = now()

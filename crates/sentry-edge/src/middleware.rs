@@ -120,7 +120,7 @@ async fn handler_inner(
     let peer = parts
         .extensions
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|c| c.0.ip())
+        .map(|c| c.0.ip().to_canonical())
         .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
     let client_ip = crate::real_client_ip_with(&parts.headers, peer, runtime.trust());
 

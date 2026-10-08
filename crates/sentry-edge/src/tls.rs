@@ -57,6 +57,7 @@ pub async fn serve_tls(
         let Ok((tcp, peer)) = listener.accept().await else {
             continue;
         };
+        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
         // Sticky blocks deny before any TLS bytes flow — the client only
         // sees a closed connection, no handshake, no event.
         if runtime.is_hard_blocked(peer.ip()) {
@@ -93,6 +94,7 @@ pub async fn serve_tls_on(
         let Ok((tcp, peer)) = listener.accept().await else {
             continue;
         };
+        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
         // Sticky blocks deny before any TLS bytes flow — the client only
         // sees a closed connection, no handshake, no event.
         if runtime.is_hard_blocked(peer.ip()) {

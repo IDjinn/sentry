@@ -116,7 +116,8 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
             let cfg = require_config(&cfg)?;
             let repo = connect_storage(cfg).await?;
             let ip_addr: std::net::IpAddr = ip
-                .parse()
+                .parse::<std::net::IpAddr>()
+                .map(sentry_core::event::Event::canonical_ip)
                 .map_err(|e| color_eyre::eyre::eyre!("invalid IP: {e}"))?;
             match action {
                 Some(IpCmd::Block { ttl, note }) => {
@@ -1328,7 +1329,9 @@ fn list_trusted_lists(cfg: &SentryConfig) {
 /// `sentry firewall status` — probe the local ban backends (F7.3).
 /// One-off rDNS bot verification for an (ip, UA) pair (no daemon needed).
 async fn bots_check(ip: &str, ua: &str) -> color_eyre::Result<()> {
-    let ip: std::net::IpAddr = ip.parse()?;
+    let ip: std::net::IpAddr = ip
+        .parse::<std::net::IpAddr>()
+        .map(sentry_core::event::Event::canonical_ip)?;
     let Some(engine) = sentry_core::botverify::claimed_engine(Some(ua)) else {
         println!("UA does not claim a verifiable crawler:");
         println!("  {ua}");
@@ -1429,7 +1432,8 @@ async fn refresh_feeds(cfg: &SentryConfig) -> color_eyre::Result<()> {
 
 async fn check_feed_ip(cfg: &SentryConfig, ip: &str) -> color_eyre::Result<()> {
     let ip: std::net::IpAddr = ip
-        .parse()
+        .parse::<std::net::IpAddr>()
+        .map(sentry_core::event::Event::canonical_ip)
         .map_err(|e| color_eyre::eyre::eyre!("invalid IP `{ip}`: {e}"))?;
     let svc = std::sync::Arc::new(sentry_reputation::ReputationService::new(&cfg.rules.feeds));
     if !svc.is_active() {
@@ -1918,7 +1922,8 @@ fn test_rules(
 
     let client_ip: std::net::IpAddr = ip
         .as_deref()
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+        .map(sentry_core::event::Event::canonical_ip)
         .unwrap_or(std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
 
     let mut http = HttpData {

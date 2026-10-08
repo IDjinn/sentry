@@ -30,17 +30,29 @@ impl BlockTable {
     /// Block `ip` until `expires_at` (`None` = no expiry). A newer decision
     /// overwrites the previous one.
     pub fn block(&self, ip: IpAddr, expires_at: Option<Instant>) {
-        self.inner.write().unwrap().insert(ip, expires_at);
+        self.inner
+            .write()
+            .unwrap()
+            .insert(crate::event::Event::canonical_ip(ip), expires_at);
     }
 
     /// Remove a block. Returns whether the IP was blocked before.
     pub fn unblock(&self, ip: IpAddr) -> bool {
-        self.inner.write().unwrap().remove(&ip).is_some()
+        self.inner
+            .write()
+            .unwrap()
+            .remove(&crate::event::Event::canonical_ip(ip))
+            .is_some()
     }
 
     /// Whether `ip` is currently blocked (an expired entry does not count).
     pub fn is_blocked(&self, ip: IpAddr) -> bool {
-        match self.inner.read().unwrap().get(&ip) {
+        match self
+            .inner
+            .read()
+            .unwrap()
+            .get(&crate::event::Event::canonical_ip(ip))
+        {
             Some(None) => true,
             Some(Some(exp)) => *exp > Instant::now(),
             None => false,
@@ -50,6 +62,7 @@ impl BlockTable {
     /// Seed from persistent state without weakening an existing entry: the
     /// longer expiry wins and a permanent block outranks a TTL one.
     pub fn seed(&self, ip: IpAddr, expires_at: Option<Instant>) {
+        let ip = crate::event::Event::canonical_ip(ip);
         let mut inner = self.inner.write().unwrap();
         let keep = match (inner.get(&ip), expires_at) {
             (Some(None), _) => return,
@@ -63,7 +76,11 @@ impl BlockTable {
     pub fn reload<I: IntoIterator<Item = (IpAddr, Option<Instant>)>>(&self, entries: I) {
         let mut inner = self.inner.write().unwrap();
         inner.clear();
-        inner.extend(entries);
+        inner.extend(
+            entries
+                .into_iter()
+                .map(|(ip, exp)| (crate::event::Event::canonical_ip(ip), exp)),
+        );
     }
 
     /// Drop expired entries, returning how many were removed.

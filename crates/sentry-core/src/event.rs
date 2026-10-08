@@ -237,6 +237,13 @@ pub struct Event {
 }
 
 impl Event {
+    /// Normalizes IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) to plain
+    /// IPv4, so the same client always maps to a single key across events,
+    /// block table, storage and CLI.
+    pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+        ip.to_canonical()
+    }
+
     /// Creates a new event with a fresh id and current timestamp.
     pub fn new(source: SourceKind, client_ip: IpAddr, protocol: ProtocolData) -> Self {
         Self {
@@ -245,7 +252,7 @@ impl Event {
             source,
             transport: Transport::Tcp,
             direction: Direction::Inbound,
-            client_ip,
+            client_ip: client_ip.to_canonical(),
             client_port: None,
             server_port: None,
             geo: None,
@@ -366,7 +373,7 @@ impl RawEvent {
             source: self.source,
             transport: self.transport,
             direction: Direction::Inbound,
-            client_ip,
+            client_ip: client_ip.to_canonical(),
             client_port: self.client_port,
             server_port: self.server_port,
             geo: None,
@@ -586,4 +593,36 @@ pub struct SyslogData {
     pub msg_id: Option<String>,
     /// Free-form message content (after STRUCTURED-DATA).
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_client_ip_is_canonicalized() {
+        let mapped: IpAddr = "::ffff:177.171.45.43".parse().unwrap();
+        let evt = Event::new(
+            SourceKind::HttpProxy,
+            mapped,
+            ProtocolData::Tcp(TcpData::default()),
+        );
+        assert_eq!(evt.client_ip, "177.171.45.43".parse::<IpAddr>().unwrap());
+
+        let raw = RawEvent {
+            timestamp: Utc::now(),
+            source: SourceKind::Tcp,
+            transport: Transport::Tcp,
+            client_ip: Some(mapped),
+            client_port: None,
+            server_port: None,
+            bytes_in: None,
+            bytes_out: None,
+            duration_ms: None,
+            raw: None,
+            protocol: ProtocolData::Tcp(TcpData::default()),
+        };
+        let evt = raw.into_event(mapped);
+        assert_eq!(evt.client_ip, "177.171.45.43".parse::<IpAddr>().unwrap());
+    }
 }

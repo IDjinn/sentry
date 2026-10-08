@@ -230,7 +230,7 @@ async fn proxy_handler_inner(
     let peer = parts
         .extensions
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
-        .map(|c| c.0.ip())
+        .map(|c| c.0.ip().to_canonical())
         .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
 
     // While upload inspection is armed, the inspection cap IS the body cap:

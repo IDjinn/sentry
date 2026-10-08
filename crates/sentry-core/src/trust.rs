@@ -58,7 +58,7 @@ pub fn parse_net(entry: &str) -> Result<IpNet, String> {
         return Ok(net);
     }
     s.parse::<IpAddr>()
-        .map(IpNet::from)
+        .map(|ip| IpNet::from(ip.to_canonical()))
         .map_err(|e| format!("not a CIDR or IP: {e}"))
 }
 

@@ -530,7 +530,8 @@ async fn block_ip(
     Path(ip): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let ip: IpAddr = ip
-        .parse()
+        .parse::<IpAddr>()
+        .map(sentry_core::event::Event::canonical_ip)
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, format!("invalid IP `{ip}`")))?;
     state
         .repo
@@ -547,7 +548,8 @@ async fn unblock_ip(
     Path(ip): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let ip: IpAddr = ip
-        .parse()
+        .parse::<IpAddr>()
+        .map(sentry_core::event::Event::canonical_ip)
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, format!("invalid IP `{ip}`")))?;
     state
         .repo
@@ -564,7 +566,8 @@ async fn forgive_ip(
     Path(ip): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let ip: IpAddr = ip
-        .parse()
+        .parse::<IpAddr>()
+        .map(sentry_core::event::Event::canonical_ip)
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, format!("invalid IP `{ip}`")))?;
     state
         .repo
