@@ -217,3 +217,30 @@ warns de startup para HTTPS/redirect, métrica
   `Set-Cookie` de sessão) como check adicional.
 - **[ ] F11.4 — Permissions-Policy** e avaliações de `object-src 'none'` /
   `base-uri` na eficácia da CSP (paridade completa com o Lighthouse).
+
+### 5.5 F12 — Performance da edge (roadmap restante)
+
+F12 (§27 do ARCHITECTURE.md) entregou a parte de runtime: compressão de
+resposta (`[edge.compress]`, default on, zstd > brotli > gzip com níveis
+por algoritmo), HTTP/2 por ALPN no listener TLS (`[edge] http2`),
+forwarded headers (`X-Forwarded-*`/`X-Real-IP` resolvidos pela edge),
+pool de keepalive + connect timeout no hop de upstream e advisories de
+topologia (TLS duplo / upstream fora de loopback). Restante:
+
+- **[ ] F12.9 — Gerador de config nginx otimizada**: incluir
+  `sentry-perf.conf` (http-context: gzip/brotli module-aware,
+  keepalive, sendfile/tcp_nopush) + snippet server-context (`real_ip`
+  contra a edge, `proxy_http_version 1.1`, cache de estáticos opt-in)
+  seguindo o padrão do `sentry-action-nginx` (stamps, write atômico,
+  `nginx -t`, worker debounced), com detecção de módulos via `nginx -V`
+  (padrão `detect_probes()` do firewall crate) e CLI
+  `sentry nginx status|optimize [--write|--reload]`.
+- **[ ] F12.10 — Performance posture checks**: `compression` e
+  `cache_headers` como checks shadow weight-0 no módulo posture (resposta
+  compressível sem encoding; asset estático sem `Cache-Control`), com
+  arms no `posture_advice()` e linhas de checklist no `sentry posture`.
+- **[ ] F12.11 — HTTP/3 / QUIC** (quinn + rustls): listener UDP 443
+  paralelo ao TCP, mesma pipeline; aguardar maturidade do ecossistema.
+- **[ ] F12.12 — Streaming de corpos**: hoje request/response são
+  bufferizados (limite prático de uploads grandes e SSE); forwarding
+  streaming mudaria a inspeção (F10) para o caminho de chunks.

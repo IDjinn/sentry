@@ -47,7 +47,9 @@ pub struct Metrics {
     pub edge_tls_handshakes: prometheus::CounterVec,
     pub edge_tls_failures: prometheus::Counter,
     pub edge_tls_sni_mismatches: prometheus::Counter,
+    pub edge_tls_alpn: prometheus::CounterVec,
     pub edge_tls_cert_not_after: prometheus::Gauge,
+    pub edge_compressed: prometheus::CounterVec,
     pub protocol_violations: prometheus::CounterVec,
     pub protocol_frames: prometheus::CounterVec,
     pub block_table_size: prometheus::Gauge,
@@ -227,10 +229,29 @@ impl Metrics {
              tls_allowed_hosts (F8).",
         )
         .unwrap();
+        let edge_tls_alpn = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sentry_edge_tls_alpn_total",
+                "TLS handshakes by ALPN-negotiated protocol (h2 | http/1.1 | \
+                 none) — F12 HTTP/2 support.",
+            ),
+            &["alpn"],
+        )
+        .unwrap();
         let edge_tls_cert_not_after = prometheus::Gauge::new(
             "sentry_edge_tls_cert_not_after",
             "Unix timestamp of the edge TLS certificate's notAfter, \
              refreshed daily (F8).",
+        )
+        .unwrap();
+        let edge_compressed = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sentry_edge_compressed_total",
+                "Responses re-encoded by the inline edge, by algorithm \
+                 (zstd | br | gzip) — F12. Compression is skipped under \
+                 overload pressure.",
+            ),
+            &["algo"],
         )
         .unwrap();
         let block_table_size = prometheus::Gauge::new(
@@ -492,6 +513,8 @@ impl Metrics {
             edge_tls_handshakes,
             edge_tls_failures,
             edge_tls_sni_mismatches,
+            edge_tls_alpn,
+            edge_compressed,
             edge_tls_cert_not_after,
             protocol_violations,
             protocol_frames,

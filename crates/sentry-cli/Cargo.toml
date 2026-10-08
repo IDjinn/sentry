@@ -19,6 +19,7 @@ rate-redis = ["dep:redis"]
 onnx = ["sentry-ai/onnx"]
 pcap = ["sentry-source-tcp/pcap"]
 edge-tls = ["sentry-edge/edge-tls"]
+edge-zstd = ["sentry-edge/edge-zstd"]
 service = ["dep:windows-service"]
 
 [target.'cfg(windows)'.dependencies]

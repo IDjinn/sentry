@@ -9,6 +9,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
@@ -37,6 +38,16 @@ pub struct EdgeProxyConfig {
     pub health_timeout_secs: u64,
     /// HTTPS front (F8): `None` serves plain HTTP only.
     pub tls: Option<TlsEdgeConfig>,
+    /// Response compression settings (F12) — projected from
+    /// `[edge.compress]`.
+    pub compress: sentry_core::config::EdgeCompressConfig,
+    /// Set `X-Forwarded-*`/`X-Real-IP` on forwarded requests (F12), after
+    /// stripping the client's copies.
+    pub forwarded_headers: bool,
+    /// Connect timeout for the upstream hop (seconds).
+    pub upstream_connect_timeout_secs: u64,
+    /// Idle keepalive connections pooled per upstream host.
+    pub upstream_pool_idle: usize,
 }
 
 /// HTTPS front settings (F8) — built by the daemon from `[edge] tls_*`.
@@ -55,6 +66,8 @@ pub struct TlsEdgeConfig {
     pub allowed_hosts: Vec<String>,
     /// Emit one `TlsHandshake` event per completed handshake.
     pub handshake_events: bool,
+    /// Negotiate HTTP/2 via ALPN alongside HTTP/1.1 (F12).
+    pub http2: bool,
 }
 
 impl Default for EdgeProxyConfig {
@@ -65,6 +78,10 @@ impl Default for EdgeProxyConfig {
             health_path: "/".to_string(),
             health_timeout_secs: 5,
             tls: None,
+            compress: sentry_core::config::EdgeCompressConfig::default(),
+            forwarded_headers: true,
+            upstream_connect_timeout_secs: 5,
+            upstream_pool_idle: 32,
         }
     }
 }
@@ -81,6 +98,17 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
     "host",
     "content-length",
+];
+
+/// Client-supplied forwarding headers (F12): when `[edge]
+/// forwarded_headers` is on, these are stripped before the edge sets its
+/// own — a direct client cannot spoof its IP or scheme past the edge, and
+/// the backend's `real_ip` module sees exactly the edge's view.
+const FORWARDED_STRIP: &[&str] = &[
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "x-real-ip",
 ];
 
 /// Marks a response that actually came from the upstream backend, so the
@@ -128,21 +156,43 @@ pub async fn serve(
     decided: mpsc::Sender<sentry_core::ProcessedEvent>,
 ) -> sentry_core::error::Result<()> {
     health_check(&cfg).await?;
+    // Upstream hop tuning (F12): a connect timeout fails fast on a hung
+    // backend; the keepalive pool removes a TCP handshake per request
+    // (reused connections stay warm, `tcp_nodelay` kills Nagle latency).
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(
+            cfg.upstream_connect_timeout_secs.max(1),
+        ))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(cfg.upstream_pool_idle)
+        .tcp_keepalive(Duration::from_secs(60))
+        .tcp_nodelay(true)
         .build()
         .map_err(|e| sentry_core::error::CoreError::Config(format!("edge http client: {e}")))?;
 
+    // Response compression (F12): one middleware around the router covers
+    // upstream responses and edge-generated pages on both listeners. The
+    // compressor shares the overload state, so pressure sheds the
+    // compression CPU automatically.
+    let compressor = Arc::new(crate::compression::Compressor::new(
+        cfg.compress.clone(),
+        runtime.overload_state(),
+        runtime.compressed().cloned(),
+    ));
+
     let redirect_https = cfg.tls.as_ref().is_some_and(|t| t.redirect_https);
-    let app = Router::new()
-        .fallback(any(proxy_handler))
-        .with_state(ProxyState {
+    let app = build_router(
+        ProxyState {
             runtime: runtime.clone(),
             client,
             upstream: cfg.upstream.clone(),
             decided: decided.clone(),
             redirect_https,
-        });
+            forwarded_headers: cfg.forwarded_headers,
+        },
+        compressor,
+    );
 
     match cfg.tls {
         None => serve_plain(app, cfg.listen).await,
@@ -166,6 +216,21 @@ pub async fn serve(
             }
         }
     }
+}
+
+/// Router shared by both listeners: the proxy handler as fallback, wrapped
+/// in the response-compression middleware (F12). Extracted so tests drive
+/// the exact production path.
+fn build_router(state: ProxyState, compressor: Arc<crate::compression::Compressor>) -> Router {
+    Router::new()
+        .fallback(any(proxy_handler))
+        .layer(axum::middleware::from_fn(
+            move |req: Request, next: axum::middleware::Next| {
+                let compressor = compressor.clone();
+                crate::compression::compress_layer(compressor, req, next)
+            },
+        ))
+        .with_state(state)
 }
 
 /// Plain-HTTP listener. An empty `listen` disables it (HTTPS-only edge).
@@ -199,6 +264,8 @@ struct ProxyState {
     decided: mpsc::Sender<sentry_core::ProcessedEvent>,
     /// 301 plain-HTTP requests to HTTPS (F8, TLS front only).
     redirect_https: bool,
+    /// Set `X-Forwarded-*`/`X-Real-IP` on forwarded requests (F12).
+    forwarded_headers: bool,
 }
 
 async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Response {
@@ -222,6 +289,7 @@ async fn proxy_handler_inner(
         upstream,
         decided,
         redirect_https,
+        forwarded_headers,
     } = state;
     let (parts, body) = req.into_parts();
     // Set by the TLS acceptor (F8) — a real HTTPS connection, not a
@@ -273,6 +341,7 @@ async fn proxy_handler_inner(
                 upstream,
                 decided,
                 redirect_https,
+                forwarded_headers,
                 parts,
                 body_bytes,
                 is_tls,
@@ -296,6 +365,7 @@ async fn proxy_handler_inner(
             upstream,
             decided,
             redirect_https,
+            forwarded_headers,
             parts,
             body_bytes,
             is_tls,
@@ -322,6 +392,7 @@ async fn proxy_handler_inner(
         upstream,
         decided,
         redirect_https,
+        forwarded_headers,
         parts,
         body_bytes,
         is_tls,
@@ -340,6 +411,7 @@ async fn proxy_inspected(
     upstream: String,
     decided: mpsc::Sender<sentry_core::ProcessedEvent>,
     redirect_https: bool,
+    forwarded_headers: bool,
     parts: axum::http::request::Parts,
     body_bytes: Vec<u8>,
     is_tls: bool,
@@ -442,6 +514,8 @@ async fn proxy_inspected(
                 &body_bytes,
                 is_tls,
                 redirect_https,
+                forwarded_headers,
+                client_ip,
                 &client,
                 &upstream,
                 runtime.error_pages_handle(),
@@ -459,6 +533,8 @@ async fn proxy_inspected(
                         &body_bytes,
                         is_tls,
                         redirect_https,
+                        forwarded_headers,
+                        client_ip,
                         &client,
                         &upstream,
                         runtime.error_pages_handle(),
@@ -533,13 +609,19 @@ async fn proxy_inspected(
 
 /// Allow path (and challenge-passed requests): plain-HTTP → HTTPS redirect
 /// (F8) when configured, otherwise forward to the upstream and pass its
-/// response through.
+/// response through. With `forwarded_headers` (F12) the client's own
+/// `X-Forwarded-*`/`X-Real-IP` are stripped and replaced with the edge's
+/// resolved view: `X-Forwarded-For`/`X-Real-IP` carry the client IP,
+/// `X-Forwarded-Proto` the real scheme, `X-Forwarded-Host` the requested
+/// host — so backend `real_ip` modules and virtual hosts work unchanged.
 #[allow(clippy::too_many_arguments)]
 async fn serve_allow(
     parts: &axum::http::request::Parts,
     body_bytes: &[u8],
     is_tls: bool,
     redirect_https: bool,
+    forwarded_headers: bool,
+    client_ip: std::net::IpAddr,
     client: &reqwest::Client,
     upstream: &str,
     error_pages: Option<std::sync::Arc<pages::ErrorPages>>,
@@ -587,8 +669,25 @@ async fn serve_allow(
         if HOP_BY_HOP.contains(&name) {
             continue;
         }
+        if forwarded_headers && FORWARDED_STRIP.contains(&name) {
+            continue;
+        }
         if let Ok(val) = v.to_str() {
             fwd = fwd.header(name, val);
+        }
+    }
+    if forwarded_headers {
+        let proto = if is_tls { "https" } else { "http" };
+        fwd = fwd
+            .header("x-forwarded-for", client_ip.to_canonical().to_string())
+            .header("x-real-ip", client_ip.to_canonical().to_string())
+            .header("x-forwarded-proto", proto);
+        if let Some(host) = parts
+            .headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+        {
+            fwd = fwd.header("x-forwarded-host", host);
         }
     }
     if !body_bytes.is_empty() {
@@ -662,6 +761,7 @@ mod tests {
                 upstream: "http://127.0.0.1:9".to_string(),
                 decided: dec_tx,
                 redirect_https: false,
+                forwarded_headers: true,
             });
         let resp = app
             .oneshot(
@@ -695,6 +795,7 @@ mod tests {
                 upstream: "http://127.0.0.1:9".to_string(),
                 decided: dec_tx,
                 redirect_https: true,
+                forwarded_headers: true,
             });
         let resp = app
             .oneshot(
@@ -728,6 +829,232 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         addr
+    }
+
+    /// Upstream echoing the forwarding headers the edge sent, pipe-separated
+    /// (`xff|proto|x-real-ip|x-forwarded-host`), for F12 header tests.
+    async fn spawn_forward_echo_upstream() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().fallback(|headers: axum::http::HeaderMap| async move {
+            let pick = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("-")
+                    .to_string()
+            };
+            (
+                axum::http::StatusCode::OK,
+                format!(
+                    "{}|{}|{}|{}",
+                    pick("x-forwarded-for"),
+                    pick("x-forwarded-proto"),
+                    pick("x-real-ip"),
+                    pick("x-forwarded-host")
+                ),
+            )
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// Large compressible HTML upstream response (clears the 256-byte floor).
+    async fn spawn_html_upstream() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = "<html><body>".to_string()
+            + &"<p>compressible paragraph for the edge encoder test.</p>".repeat(10)
+            + "</body></html>";
+        let app = Router::new().fallback(move || {
+            let body = body.clone();
+            async move {
+                (
+                    axum::http::StatusCode::OK,
+                    [("content-type", "text/html; charset=utf-8")],
+                    body,
+                )
+            }
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    fn test_state(
+        runtime: crate::EdgeRuntime,
+        upstream: String,
+        forwarded_headers: bool,
+        dec_tx: mpsc::Sender<sentry_core::ProcessedEvent>,
+    ) -> (Router, Arc<crate::compression::Compressor>) {
+        let compressor = Arc::new(crate::compression::Compressor::new(
+            sentry_core::config::EdgeCompressConfig::default(),
+            runtime.overload_state(),
+            None,
+        ));
+        let app = build_router(
+            ProxyState {
+                runtime,
+                client: reqwest::Client::new(),
+                upstream,
+                decided: dec_tx,
+                redirect_https: false,
+                forwarded_headers,
+            },
+            compressor.clone(),
+        );
+        (app, compressor)
+    }
+
+    // ── Response compression (F12) ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn proxied_html_is_brotli_compressed_for_capable_clients() {
+        let upstream = spawn_html_upstream().await;
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, _dec_rx) = mpsc::channel(8);
+        let (app, _compressor) = test_state(runtime, format!("http://{upstream}"), true, dec_tx);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .header("accept-encoding", "gzip, deflate, br")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("br"),
+            "production layer compresses the upstream body"
+        );
+        let vary = resp
+            .headers()
+            .get(axum::http::header::VARY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(vary.contains("accept-encoding"), "{vary}");
+    }
+
+    #[tokio::test]
+    async fn clients_without_accept_encoding_get_plain_bytes() {
+        let upstream = spawn_html_upstream().await;
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, _dec_rx) = mpsc::channel(8);
+        let (app, _) = test_state(runtime, format!("http://{upstream}"), true, dec_tx);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.headers().get("content-encoding").is_none());
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(bytes.starts_with(b"<html>"), "plain HTML still flows");
+    }
+
+    // ── Forwarded headers (F12) ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn forwarded_headers_replace_client_supplied_copies() {
+        let upstream = spawn_forward_echo_upstream().await;
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        // Empty `[real_ip]` trust set: the direct peer is not a trusted
+        // proxy, so header-borne IPs lose and the client IP is the peer —
+        // exactly what must land in the upstream's XFF.
+        let trust =
+            sentry_core::trust::SharedTrustSet::new(
+                sentry_core::trust::TrustSet::from_config(
+                    &sentry_core::config::RealIpConfig::default(),
+                )
+                .unwrap(),
+            );
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0).with_trust(trust);
+        let (dec_tx, _dec_rx) = mpsc::channel(8);
+        let (app, _) = test_state(runtime, format!("http://{upstream}"), true, dec_tx);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .header("host", "example.com")
+                    // Spoofed copy: the edge must replace it with its own view.
+                    .header("x-forwarded-for", "198.51.100.66")
+                    .header("x-forwarded-proto", "gopher")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        // xff | proto | x-real-ip | x-forwarded-host
+        let parts: Vec<&str> = body.split('|').collect();
+        assert_eq!(parts.len(), 4, "{body}");
+        assert_eq!(
+            parts[0], "127.0.0.1",
+            "XFF is the edge-resolved peer, not the client's spoof"
+        );
+        assert_eq!(parts[1], "http", "proto reflects the real scheme");
+        assert_eq!(parts[2], "127.0.0.1", "x-real-ip mirrors the client");
+        assert_eq!(parts[3], "example.com", "original host preserved");
+    }
+
+    #[tokio::test]
+    async fn forwarded_headers_off_restores_passthrough() {
+        let upstream = spawn_forward_echo_upstream().await;
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, _dec_rx) = mpsc::channel(8);
+        let (app, _) = test_state(runtime, format!("http://{upstream}"), false, dec_tx);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .header("host", "example.com")
+                    .header("x-forwarded-for", "198.51.100.66")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        let parts: Vec<&str> = body.split('|').collect();
+        assert_eq!(parts[0], "198.51.100.66", "client XFF passes through");
+        assert_eq!(parts[1], "-", "no edge-set proto");
+        assert_eq!(parts[2], "-", "no edge-set x-real-ip");
+        assert_eq!(parts[3], "-", "no edge-set forwarded host");
     }
 
     // ── Upload inspection (F10) ──────────────────────────────────────────
@@ -810,6 +1137,7 @@ mod tests {
                 upstream: format!("http://{upstream}"),
                 decided: dec_tx,
                 redirect_https: false,
+                forwarded_headers: true,
             });
         let (ct, body) = multipart_form(&[("f", "cat.png", "image/png", b"\x89PNG\r\n\x1a\nxx")]);
         let resp = upload_request(app, &ct, body).await;
@@ -858,6 +1186,7 @@ mod tests {
                 upstream: format!("http://{upstream}"),
                 decided: dec_tx,
                 redirect_https: false,
+                forwarded_headers: true,
             });
         let mut gif = b"GIF89a".to_vec();
         gif.extend_from_slice(b"\x00<?php system($_GET['c']); ?>");
@@ -898,6 +1227,7 @@ mod tests {
                 upstream: format!("http://{upstream}"),
                 decided: dec_tx,
                 redirect_https: false,
+                forwarded_headers: true,
             });
         let mut gif = b"GIF89a".to_vec();
         gif.extend_from_slice(b"\x00<?php eval($_POST); ?>");
@@ -937,6 +1267,7 @@ mod tests {
                 upstream: "http://127.0.0.1:9".to_string(),
                 decided: dec_tx,
                 redirect_https: false,
+                forwarded_headers: true,
             });
         let big = vec![0x41u8; 4096];
         let (ct, body) = multipart_form(&[("f", "big.bin", "application/octet-stream", &big)]);
@@ -981,6 +1312,7 @@ mod tests {
                 upstream: format!("http://{upstream}"),
                 decided: dec_tx,
                 redirect_https: false,
+                forwarded_headers: true,
             });
         let big = vec![0x41u8; 4096];
         let (ct, body) = multipart_form(&[("f", "big.bin", "application/octet-stream", &big)]);
@@ -1025,6 +1357,7 @@ mod tests {
                 upstream: format!("http://{upstream}"),
                 decided: dec_tx,
                 redirect_https: false,
+                forwarded_headers: true,
             });
         let big = vec![0x41u8; 4096];
         let (ct, body) = multipart_form(&[("f", "big.bin", "application/octet-stream", &big)]);
@@ -1087,6 +1420,7 @@ mod tests {
                 upstream: "http://127.0.0.1:9".to_string(),
                 decided: dec_tx,
                 redirect_https: false,
+                forwarded_headers: true,
             });
         let big = vec![0x41u8; 4096];
         let mut last = None;
@@ -1128,6 +1462,7 @@ mod tests {
                 upstream: "http://127.0.0.1:9".to_string(),
                 decided: dec_tx,
                 redirect_https: false,
+                forwarded_headers: true,
             });
         let (ct, body) = multipart_form(&[("f", "a.txt", "text/plain", b"hi")]);
         let resp = upload_request(app, &ct, body).await;
@@ -1152,6 +1487,7 @@ mod tests {
                 upstream: format!("http://{upstream}"),
                 decided: dec_tx,
                 redirect_https: false,
+                forwarded_headers: true,
             });
         let resp = app
             .oneshot(
@@ -1255,6 +1591,7 @@ mod tests {
                 upstream: format!("http://{upstream}"),
                 decided: dec_tx,
                 redirect_https: false,
+                forwarded_headers: true,
             });
         let req = || {
             axum::http::Request::builder()
@@ -1315,6 +1652,7 @@ mod tests {
                 upstream: format!("http://{upstream}"),
                 decided: dec_tx,
                 redirect_https: false,
+                forwarded_headers: true,
             });
         let resp = app
             .oneshot(
@@ -1350,6 +1688,7 @@ mod tests {
                 upstream: "http://127.0.0.1:9".to_string(),
                 decided: dec_tx,
                 redirect_https: true,
+                forwarded_headers: true,
             });
         let resp = app
             .oneshot(
@@ -1397,6 +1736,7 @@ mod tests {
                 upstream: format!("http://{upstream}"),
                 decided: dec_tx,
                 redirect_https: false,
+                forwarded_headers: true,
             });
 
         let mut statuses = Vec::new();

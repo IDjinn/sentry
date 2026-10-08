@@ -1017,6 +1017,60 @@ impl SentryConfig {
     pub fn resolve_feed_presets(&mut self) -> Vec<String> {
         crate::feed_presets::expand(&mut self.rules.feeds, &self.rules.feed_presets)
     }
+
+    /// Performance/topology advisories for the inline edge (F12): config
+    /// combinations that cost speed or expose traffic unnecessarily. Pure
+    /// and testable — the daemon logs each entry with `warn!` at startup
+    /// and `sentry config validate` prints them.
+    pub fn edge_advisories(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.deployment.is_inline() {
+            if self.edge.compress.enabled {
+                out.push(
+                    "[edge.compress] enabled but [deployment] mode is not inline — \
+                     compression only applies to the reverse proxy"
+                        .to_string(),
+                );
+            }
+            return out;
+        }
+        let tls = self.edge.tls_cert.is_some() && self.edge.tls_key.is_some();
+        let upstream_https = self.edge.upstream.starts_with("https://");
+        if tls && upstream_https {
+            out.push(
+                "[edge] TLS terminates at the edge but upstream is https:// — double TLS \
+                 costs CPU and a second certificate to manage; serve the backend over \
+                 plain http:// (ideally on 127.0.0.1)"
+                    .to_string(),
+            );
+        }
+        if let Some(host) = upstream_host(&self.edge.upstream) {
+            let loopback = host == "127.0.0.1" || host == "::1" || host == "localhost";
+            if !loopback && !upstream_https {
+                out.push(format!(
+                    "[edge] upstream {host} is off-loopback over plain http — \
+                     edge→backend traffic crosses the network unencrypted; \
+                     prefer 127.0.0.1 or a tunnel"
+                ));
+            }
+        }
+        out
+    }
+}
+
+/// Host component of an upstream base URL (`http://127.0.0.1:8080` →
+/// `127.0.0.1`), parsed without a URL dependency. Returns `None` for
+/// scheme-less or empty inputs.
+fn upstream_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host.strip_prefix('[') {
+        // IPv6 literal: the port lives outside the closing bracket.
+        Some(h) => h.split_once(']').map_or(h, |(h, _)| h),
+        None => host.split_once(':').map_or(host, |(h, _)| h),
+    };
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 fn default_posture_enabled() -> bool {
@@ -1500,6 +1554,98 @@ pub struct EdgeConfig {
     /// Default `sentry`.
     #[serde(default)]
     pub challenge_backend: ChallengeBackend,
+    /// Response compression at the edge (F12) — `[edge.compress]`.
+    /// Enabled by default: compressible responses (HTML/JSON/CSS/JS/…)
+    /// are negotiated against `Accept-Encoding` (zstd > brotli > gzip).
+    #[serde(default)]
+    pub compress: EdgeCompressConfig,
+    /// Set `X-Forwarded-For` / `X-Forwarded-Proto` / `X-Forwarded-Host` /
+    /// `X-Real-IP` on forwarded requests (default true). Client-supplied
+    /// copies of these headers are stripped first — the edge is the
+    /// internet-facing boundary, so its view of the client wins. Turning
+    /// this off restores pass-through (the backend sees the edge's own
+    /// address and whatever the client sent).
+    #[serde(default = "default_edge_forwarded_headers")]
+    pub forwarded_headers: bool,
+    /// Negotiate HTTP/2 on the TLS listener (ALPN `h2` + `http/1.1`).
+    /// Only meaningful with `tls_cert`/`tls_key` and a build carrying the
+    /// `edge-tls` feature; default true.
+    #[serde(default = "default_edge_http2")]
+    pub http2: bool,
+    /// Connect timeout for the edge → upstream hop, in seconds (default 5).
+    #[serde(default = "default_edge_upstream_connect_timeout")]
+    pub upstream_connect_timeout_secs: u64,
+    /// Idle keepalive connections pooled per upstream host (default 32).
+    /// Connection reuse removes a TCP handshake per request on the
+    /// edge → backend hop.
+    #[serde(default = "default_edge_upstream_pool_idle")]
+    pub upstream_pool_idle: usize,
+}
+
+/// Response compression at the edge (F12). Bodies are already buffered in
+/// memory, so compression is a synchronous re-encode of the response body:
+/// compressible content types only (HTML/JSON/CSS/JS/SVG/…), negotiated
+/// against the request's `Accept-Encoding`. Range responses (206) and
+/// responses already carrying a `content-encoding` are never touched; under
+/// overload pressure compression turns itself off (CPU shedding).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeCompressConfig {
+    /// Master switch (default true — the point of the feature).
+    #[serde(default = "default_edge_compress_enabled")]
+    pub enabled: bool,
+    /// Bodies smaller than this are passed through untouched (default 256).
+    #[serde(default = "default_edge_compress_min_length")]
+    pub min_length: usize,
+    /// Brotli quality 0..=11 (default 4 — the CDN sweet spot).
+    #[serde(default = "default_edge_compress_level_br")]
+    pub level_br: u8,
+    /// gzip level 0..=9 (default 6).
+    #[serde(default = "default_edge_compress_level_gzip")]
+    pub level_gzip: u8,
+    /// zstd level 1..=22 (default 3). Only honored when the binary was
+    /// built with the `edge-zstd` feature.
+    #[serde(default = "default_edge_compress_level_zstd")]
+    pub level_zstd: u8,
+}
+
+impl Default for EdgeCompressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_edge_compress_enabled(),
+            min_length: default_edge_compress_min_length(),
+            level_br: default_edge_compress_level_br(),
+            level_gzip: default_edge_compress_level_gzip(),
+            level_zstd: default_edge_compress_level_zstd(),
+        }
+    }
+}
+
+fn default_edge_compress_enabled() -> bool {
+    true
+}
+fn default_edge_compress_min_length() -> usize {
+    256
+}
+fn default_edge_compress_level_br() -> u8 {
+    4
+}
+fn default_edge_compress_level_gzip() -> u8 {
+    6
+}
+fn default_edge_compress_level_zstd() -> u8 {
+    3
+}
+fn default_edge_forwarded_headers() -> bool {
+    true
+}
+fn default_edge_http2() -> bool {
+    true
+}
+fn default_edge_upstream_connect_timeout() -> u64 {
+    5
+}
+fn default_edge_upstream_pool_idle() -> usize {
+    32
 }
 
 /// Custom HTML error pages (F12): `<status>.html` files (e.g. `403.html`,
@@ -1592,6 +1738,11 @@ impl Default for EdgeConfig {
             challenge: EdgeChallengeConfig::default(),
             error_pages: EdgeErrorPagesConfig::default(),
             challenge_backend: ChallengeBackend::default(),
+            compress: EdgeCompressConfig::default(),
+            forwarded_headers: default_edge_forwarded_headers(),
+            http2: default_edge_http2(),
+            upstream_connect_timeout_secs: default_edge_upstream_connect_timeout(),
+            upstream_pool_idle: default_edge_upstream_pool_idle(),
         }
     }
 }
@@ -2130,6 +2281,108 @@ mod tests {
             parsed.error_pages.dir,
             Some(std::path::PathBuf::from("/etc/sentry/pages"))
         );
+    }
+
+    #[test]
+    fn edge_compress_defaults_are_on_and_parse() {
+        let c = EdgeConfig::default();
+        assert!(c.compress.enabled, "compression ships enabled");
+        assert_eq!(c.compress.min_length, 256);
+        assert_eq!(c.compress.level_br, 4);
+        assert_eq!(c.compress.level_gzip, 6);
+        assert_eq!(c.compress.level_zstd, 3);
+        assert!(c.forwarded_headers);
+        assert!(c.http2);
+        assert_eq!(c.upstream_connect_timeout_secs, 5);
+        assert_eq!(c.upstream_pool_idle, 32);
+
+        let parsed: EdgeConfig = toml::from_str(
+            r#"
+            forwarded_headers = false
+            http2 = false
+            upstream_connect_timeout_secs = 2
+            upstream_pool_idle = 8
+            [compress]
+            enabled = false
+            min_length = 1024
+            level_br = 9
+            level_gzip = 1
+            level_zstd = 19
+            "#,
+        )
+        .unwrap();
+        assert!(!parsed.forwarded_headers);
+        assert!(!parsed.http2);
+        assert_eq!(parsed.upstream_connect_timeout_secs, 2);
+        assert_eq!(parsed.upstream_pool_idle, 8);
+        assert!(!parsed.compress.enabled);
+        assert_eq!(parsed.compress.min_length, 1024);
+        assert_eq!(parsed.compress.level_br, 9);
+        assert_eq!(parsed.compress.level_gzip, 1);
+        assert_eq!(parsed.compress.level_zstd, 19);
+    }
+
+    #[test]
+    fn edge_advisories_flag_double_tls_and_off_loopback_upstream() {
+        let mut cfg = SentryConfig::default();
+        cfg.deployment.mode = "inline".to_string();
+        cfg.edge.upstream = "http://127.0.0.1:8080".to_string();
+        assert!(
+            cfg.edge_advisories().is_empty(),
+            "loopback plain upstream is the recommended topology"
+        );
+
+        // TLS at the edge + https upstream = double TLS.
+        cfg.edge.tls_cert = Some("/certs/fullchain.pem".into());
+        cfg.edge.tls_key = Some("/certs/privkey.pem".into());
+        cfg.edge.upstream = "https://backend.internal:8443".to_string();
+        let advisories = cfg.edge_advisories();
+        assert!(
+            advisories.iter().any(|a| a.contains("double TLS")),
+            "{advisories:?}"
+        );
+
+        // Off-loopback plain upstream = unencrypted hop.
+        cfg.edge.upstream = "http://10.0.0.5:80".to_string();
+        let advisories = cfg.edge_advisories();
+        assert!(
+            advisories
+                .iter()
+                .any(|a| a.contains("off-loopback over plain http")),
+            "{advisories:?}"
+        );
+        assert!(
+            !advisories.iter().any(|a| a.contains("double TLS")),
+            "plain upstream is not a double-TLS problem"
+        );
+
+        // Passive mode: only the inert-compression note.
+        let mut cfg = SentryConfig::default();
+        cfg.deployment.mode = "passive".to_string();
+        let advisories = cfg.edge_advisories();
+        assert_eq!(advisories.len(), 1, "{advisories:?}");
+        assert!(advisories[0].contains("not inline"));
+        cfg.edge.compress.enabled = false;
+        assert!(cfg.edge_advisories().is_empty());
+    }
+
+    #[test]
+    fn upstream_host_parses_authority_forms() {
+        assert_eq!(
+            upstream_host("http://127.0.0.1:8080").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            upstream_host("https://backend.internal").as_deref(),
+            Some("backend.internal")
+        );
+        assert_eq!(
+            upstream_host("http://user:pw@10.0.0.9:9000/").as_deref(),
+            Some("10.0.0.9")
+        );
+        assert_eq!(upstream_host("http://[::1]:8443").as_deref(), Some("::1"));
+        assert_eq!(upstream_host("127.0.0.1:80"), None, "no scheme");
+        assert_eq!(upstream_host(""), None);
     }
 
     #[test]

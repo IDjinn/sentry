@@ -21,6 +21,7 @@
 
 pub mod challenge;
 pub mod clienthello;
+pub mod compression;
 pub mod middleware;
 pub mod pages;
 pub mod protocol;
@@ -46,6 +47,9 @@ pub struct TlsMetrics {
     pub failures: prometheus::Counter,
     /// `sentry_edge_tls_sni_mismatch_total` — missing or unknown SNI.
     pub sni_mismatches: prometheus::Counter,
+    /// `sentry_edge_tls_alpn_total{alpn}` — negotiated protocol per
+    /// handshake (`h2` / `http/1.1` / `none`, F12).
+    pub alpn: prometheus::CounterVec,
 }
 
 use std::net::IpAddr;
@@ -120,6 +124,7 @@ pub struct EdgeRuntime {
     posture: Option<Arc<sentry_core::posture::PostureTracker>>,
     posture_findings: Option<prometheus::CounterVec>,
     error_pages: Option<Arc<pages::ErrorPages>>,
+    compressed: Option<prometheus::CounterVec>,
 }
 
 impl EdgeRuntime {
@@ -151,6 +156,7 @@ impl EdgeRuntime {
             posture: None,
             posture_findings: None,
             error_pages: None,
+            compressed: None,
         }
     }
 
@@ -168,6 +174,24 @@ impl EdgeRuntime {
         self.overload
             .as_ref()
             .is_some_and(sentry_core::OverloadState::under_pressure)
+    }
+
+    /// Clone of the shared overload state, for components that poll it per
+    /// request outside the runtime (the response compressor, F12).
+    pub fn overload_state(&self) -> Option<sentry_core::OverloadState> {
+        self.overload.clone()
+    }
+
+    /// `sentry_edge_compressed_total{algo}` counter (F12) — responses the
+    /// edge re-encoded (zstd / br / gzip).
+    pub fn with_compressed(mut self, counter: prometheus::CounterVec) -> Self {
+        self.compressed = Some(counter);
+        self
+    }
+
+    /// Compression counter, when attached.
+    pub fn compressed(&self) -> Option<&prometheus::CounterVec> {
+        self.compressed.as_ref()
     }
 
     /// Arm request-body inspection (F10): bodies are buffered up to the

@@ -802,7 +802,50 @@ telemetria de handshake + provider de appliance
     de uploads já existia: `[uploads.flood]` 60s/30 arquivos/50 MiB →
     `UploadFlood` 25)
 
-Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4).
+# F12 (parte 2 — concluída): Performance da edge — compressão, HTTP/2,
+# forwarded headers e tuning do hop de upstream (detalhes em
+# `ARCHITECTURE.md` §27)
+  - ✅ F12.5 Compressão de resposta (`[edge.compress]`, ligada por
+    default; `crates/sentry-edge/src/compression.rs`): um middleware axum
+    em `build_router` cobre respostas do upstream + páginas da edge nos
+    dois listeners; corpos já bufferizados → re-encode síncrono sobre
+    `Vec<u8>` (content-length exato, sem stream). Negociação hand-rolled
+    de `Accept-Encoding` (q 0..=100, empate por preferência
+    **zstd > brotli > gzip**, wildcard resolve o topo da preferência);
+    encoders diretos (`brotli`/`flate2`/`zstd`) em vez de tower-http para
+    níveis por algoritmo (`level_br` 4 / `level_gzip` 6 / `level_zstd` 3).
+    Nunca comprimido: `content-encoding` já presente, 206/`content-range`,
+    `no-transform`, corpo < `min_length` (256), content-type fora da
+    allowlist (semântica nginx `gzip_types`; `text/event-stream` excluído
+    explicitamente) e payload que não encolhe. `Vary: Accept-Encoding`
+    sempre em candidatos. Sob overload desliga sozinho (compartilha
+    `OverloadState`). Métrica `sentry_edge_compressed_total{algo}`;
+    zstd atrás da feature `edge-zstd` (zstd-sys compila C) — 8 testes
+  - ✅ F12.6 Forwarded headers (`[edge] forwarded_headers`, default true)
+    + tuning do hop: a edge remove `X-Forwarded-*`/`X-Real-IP` do cliente
+    e seta a visão resolvida — XFF/X-Real-IP = IP do cliente (precedência
+    §8.1), `X-Forwarded-Proto` = scheme real (extensão `TlsTerminated`,
+    nunca header), `X-Forwarded-Host` = Host original — backend nginx
+    mantém `real_ip`/vhost funcionando sem spoof. Cliente reqwest ganha
+    `connect_timeout` (`upstream_connect_timeout_secs` = 5), pool de
+    keepalive (`upstream_pool_idle` = 32/host, idle 90s, tcp_keepalive 60s)
+    e `tcp_nodelay` — zero handshake TCP por request no hop edge→backend —
+    2 testes (echo upstream)
+  - ✅ F12.7 HTTP/2 no listener TLS (`[edge] http2`, default true): feature
+    `edge-tls` carrega `hyper/http2` + `hyper-util/http2`; ALPN vira
+    `["h2", "http/1.1"]` (`http2 = false` fixa h1) e o auto-builder do
+    hyper-util serve o protocolo negociado no MESMO router/pipeline.
+    Métrica `sentry_edge_tls_alpn_total{alpn}`; teste de integração com
+    client h2 real (handshake ALPN + request/respond + contador) —
+    2 testes
+  - ✅ F12.8 Advisories de topologia (`SentryConfig::edge_advisories()`,
+    pura; warn no daemon + impressas no `sentry config validate`):
+    TLS na edge + upstream `https://` → "TLS duplo" (sirva o backend em
+    http:// no loopback); upstream fora de loopback em http → hop sem
+    criptografia; `[edge.compress]` fora de inline → inerte —
+    2 testes no core
+
+Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4; §27 F12 idem).
 
 ### Status atual (verificação contínua)
 
@@ -811,8 +854,9 @@ Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 644+ testes passando sem features (646 com
-# --features sentry-cli/onnx — os 2 testes de inferência ONNX)
+# Resultado esperado: 674 testes passando sem features (676 com
+# --features sentry-cli/onnx — os 2 testes de inferência ONNX; com
+# edge-tls/edge-zstd entram os testes de TLS/h2/compressão zstd)
 ```
 
 ## 8. Convenões de código

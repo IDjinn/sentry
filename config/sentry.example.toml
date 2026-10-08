@@ -605,9 +605,43 @@ challenge_backend = "sentry"
 # missing or unknown SNI scores as a scanner probe (TlsSniMismatch signal,
 # honeypot behavior):
 # tls_allowed_hosts = ["api.example.com", "example.com"]
+# HTTP/2 on the TLS listener (F12): ALPN negotiates h2 alongside HTTP/1.1 —
+# multiplexing removes head-of-line blocking for browsers on lossy links.
+# Needs TLS + the `edge-tls` build feature; `false` pins HTTP/1.1.
+# http2 = true
+# Forwarded headers (F12): the edge strips the client's own X-Forwarded-* /
+# X-Real-IP and sets X-Forwarded-For (client IP), X-Forwarded-Proto (real
+# scheme), X-Forwarded-Host and X-Real-IP on the forwarded request — a
+# direct client cannot spoof its IP or scheme past the edge. The backend
+# nginx can trust them (set_real_ip_from <edge>; real_ip_header
+# X-Forwarded-For) and keep logging the real client. `false` restores the
+# pass-through behavior (backend sees the edge's address).
+# forwarded_headers = true
+# Upstream hop tuning (F12): connect timeout fails fast on a hung backend;
+# the keepalive pool reuses warm connections so the edge → backend hop pays
+# no TCP handshake per request.
+# upstream_connect_timeout_secs = 5
+# upstream_pool_idle = 32
 # Inline TCP front for non-HTTP services (verdict on connect):
 # tcp_listen = "0.0.0.0:2222"
 # tcp_upstream = "127.0.0.1:22"
+
+# Edge response compression (F12) — on by default. Compressible responses
+# (HTML/JSON/CSS/JS/SVG/wasm…) are negotiated against the request's
+# Accept-Encoding (zstd > brotli > gzip) and re-encoded inline; bodies
+# already compressed upstream, range responses (206), `no-transform`
+# responses and content types outside the compressible allowlist pass
+# through untouched. Vary: Accept-Encoding is always set for candidates, so
+# caches stay correct even when a client receives plain bytes. Under
+# overload pressure compression turns itself off (CPU shedding —
+# sentry_edge_compressed_total{algo} counts what was served encoded).
+# zstd requires the build feature: cargo build --release --features sentry-cli/edge-zstd
+[edge.compress]
+enabled = true
+min_length = 256             # bodies smaller than this pass through
+level_br = 4                 # brotli quality 0..=11 (CDN sweet spot)
+level_gzip = 6               # gzip level 0..=9
+level_zstd = 3               # zstd level 1..=22 (only with the edge-zstd feature)
 
 # Interactive JavaScript challenge for `Challenge` verdicts (F7.8) — the
 # self-hosted "checking your browser": a SHA-256 proof-of-work page browsers

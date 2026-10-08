@@ -1890,3 +1890,79 @@ hsts_min_max_age = 31536000
   event popup.
 - Webhook: unaffected by design — weight-0 never raises a level, so
   advisories never fire actions.
+
+## 27. F12 — Edge performance: compression, HTTP/2, forwarding
+
+> The inline edge already buffers every response body in memory and serves
+> the site's public ports — the natural place for the classic
+> speed-the-site knobs a CDN would apply: response compression, HTTP/2 on
+> the front, correct forwarded headers and a tuned connection pool toward
+> the backend. F12 makes the default inline posture fast instead of merely
+> safe.
+
+### 27.1 Response compression (`[edge.compress]`, on by default)
+
+- **Mechanism**: one axum middleware around the proxy router
+  (`compression::compress_layer`, installed by `build_router`) covers every
+  response — upstream passes, edge pages (403/429/challenge/301) — on both
+  the plain and the TLS listener. Bodies are already buffered, so the
+  re-encode is synchronous over `Vec<u8>` (no stream wrapping, exact
+  `content-length`).
+- **Hand-rolled negotiation** (`negotiate`): `Accept-Encoding` parsed into
+  q-values scaled 0..=100 (malformed q = 1.0); highest q wins, ties break
+  by preference **zstd > brotli > gzip** (zstd decompresses fastest, brotli
+  is the universal sweet spot, gzip the fallback). Wildcards resolve to the
+  preference head. Direct encoder crates (brotli, flate2, zstd) instead of
+  tower-http: per-algorithm levels (`level_br`/`level_gzip`/`level_zstd`)
+  map 1:1 onto config, and the dep tree stays small.
+- **Never touched**: responses already carrying `content-encoding`;
+  206 / `content-range` (a re-encoded body no longer matches the range);
+  `Cache-Control: no-transform`; bodies under `min_length` (default 256);
+  content types outside the compressible allowlist (nginx `gzip_types`
+  semantics — `text/*` except `text/event-stream`, JSON/XML variants,
+  JavaScript, SVG, wasm); and encodings that would not shrink the payload
+  (the uncompressed bytes stay the better wire format).
+- **Cache correctness**: `Vary: Accept-Encoding` is appended for every
+  candidate response, even when the client ends up receiving plain bytes.
+- **Overload coupling**: the `Compressor` shares the daemon's
+  `OverloadState`; under pressure compression turns itself off (CPU sheds
+  before the bytes slow down). Metric `sentry_edge_compressed_total{algo}`.
+- **zstd is feature-gated** (`edge-zstd`) because zstd-sys compiles C;
+  brotli + gzip are pure Rust and always built. Without the feature the
+  negotiation simply never selects zstd.
+
+### 27.2 Forwarded headers (`[edge] forwarded_headers`, default true)
+
+- The edge strips the client's own `X-Forwarded-For`, `X-Forwarded-Proto`,
+  `X-Forwarded-Host` and `X-Real-IP`, then sets its resolved view:
+  `X-Forwarded-For`/`X-Real-IP` = client IP (real-IP precedence §8.1),
+  `X-Forwarded-Proto` = `https` when the TLS acceptor terminated the
+  connection (the unspoofable `TlsTerminated` extension, never a header),
+  `X-Forwarded-Host` = original Host.
+- A direct client cannot spoof its IP or scheme past the edge; the backend
+  nginx keeps working unchanged — `set_real_ip_from <edge>; real_ip_header
+  X-Forwarded-For` restores real-client logging, and vhost routing sees the
+  original Host that the proxy previously dropped.
+
+### 27.3 HTTP/2 on the TLS listener (`[edge] http2`, default true)
+
+- The `edge-tls` build feature now carries hyper's `http2`; the rustls
+  server config advertises ALPN `h2` + `http/1.1` and the hyper-util auto
+  builder serves whichever the handshake negotiates — the same router, the
+  same pipeline, the same block fast-path. `http2 = false` pins HTTP/1.1
+  (pre-F12 behavior).
+- Metric `sentry_edge_tls_alpn_total{alpn}` counts negotiations
+  (`h2` / `http/1.1` / `none`).
+
+### 27.4 Upstream hop tuning + advisories
+
+- The reqwest client toward the backend gains `connect_timeout`
+  (`upstream_connect_timeout_secs`, default 5), a keepalive pool
+  (`upstream_pool_idle` idle connections per host, default 32,
+  90s idle timeout, 60s TCP keepalive) and `tcp_nodelay` — connection reuse
+  removes a TCP handshake per request on the edge → backend hop.
+- `SentryConfig::edge_advisories()` (pure, also printed by
+  `sentry config validate` and warned at daemon startup) flags the slow
+  topologies: TLS terminated at the edge while the upstream is `https://`
+  (double TLS — serve the backend plain on loopback), and an off-loopback
+  plain-http upstream (unencrypted hop).

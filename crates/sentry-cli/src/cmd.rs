@@ -927,6 +927,9 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                         unknown.join(", ")
                     );
                 }
+                for advisory in cfg.edge_advisories() {
+                    eprintln!("warning: {advisory}");
+                }
                 println!("config OK");
                 println!(
                     "  posture:   {} (mode = {})",
@@ -936,6 +939,22 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                         "disabled"
                     },
                     cfg.posture.mode.as_str()
+                );
+                println!(
+                    "  edge:      mode = {} | compression = {} | http2 = {} | \
+                     forwarded headers = {}",
+                    if cfg.deployment.is_inline() {
+                        "inline"
+                    } else {
+                        "passive"
+                    },
+                    if cfg.edge.compress.enabled {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                    cfg.edge.http2,
+                    cfg.edge.forwarded_headers
                 );
                 println!("  sources:   {}", cfg.sources.len());
                 println!("  actions:   {}", cfg.actions.len());

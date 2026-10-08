@@ -174,6 +174,14 @@ async fn handle_conn(
         .negotiated_cipher_suite()
         .map(|c| format!("{c:?}"))
         .unwrap_or_else(|| "unknown".to_string());
+    if let Some(m) = runtime.tls_metrics() {
+        let alpn = match server_conn.alpn_protocol() {
+            Some(b"h2") => "h2",
+            Some(b"http/1.1") => "http/1.1",
+            _ => "none",
+        };
+        m.alpn.with_label_values(&[alpn]).inc();
+    }
 
     if let Some(hello) = &hello {
         let blocked =
@@ -365,9 +373,14 @@ fn load_server_config(
             sentry_core::error::CoreError::Config(format!("edge tls: cert/key mismatch: {e}"))
         })?;
     let mut config = config;
-    // HTTP/1.1 only: the edge forwards each request through reqwest to the
-    // upstream, so h2 would add no fidelity and more surface.
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // ALPN (F12): h2 + HTTP/1.1 by default — the hyper-util auto builder
+    // serves whichever protocol the handshake negotiates, so both share the
+    // same router. `http2 = false` pins HTTP/1.1 (the pre-F12 behavior).
+    config.alpn_protocols = if cfg.http2 {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    };
     Ok(Arc::new(config))
 }
 
@@ -484,7 +497,105 @@ mod tests {
             redirect_https: false,
             allowed_hosts: vec![],
             handshake_events: true,
+            http2: false,
         }
+    }
+
+    #[tokio::test]
+    async fn alpn_config_follows_the_http2_flag() {
+        let cfg = test_tls_cfg("alpn");
+        let alpn = load_server_config(&cfg).unwrap().alpn_protocols.clone();
+        assert_eq!(alpn, vec![b"http/1.1".to_vec()], "http2=false pins h1");
+        let cfg = TlsEdgeConfig {
+            http2: true,
+            ..test_tls_cfg("alpn2")
+        };
+        let alpn = load_server_config(&cfg).unwrap().alpn_protocols.clone();
+        assert_eq!(
+            alpn,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            "http2=true offers h2 first"
+        );
+    }
+
+    /// Full HTTP/2 round trip: a real h2 client negotiates ALPN `h2`, the
+    /// auto builder serves it on the same router, and the ALPN counter
+    /// records the negotiation (F12).
+    #[tokio::test]
+    async fn alpn_h2_serves_requests_through_the_same_router() {
+        use prometheus::CounterVec;
+
+        let cfg = TlsEdgeConfig {
+            http2: true,
+            ..test_tls_cfg("h2")
+        };
+        let handshakes =
+            CounterVec::new(prometheus::Opts::new("t_handshakes", "test"), &["version"]).unwrap();
+        let failures = prometheus::Counter::new("t_failures", "test").unwrap();
+        let sni_mismatches = prometheus::Counter::new("t_mismatches", "test").unwrap();
+        let alpn = CounterVec::new(prometheus::Opts::new("t_alpn", "test"), &["alpn"]).unwrap();
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime =
+            crate::EdgeRuntime::new(pipeline, None, 0).with_tls_metrics(crate::TlsMetrics {
+                handshakes: handshakes.clone(),
+                failures: failures.clone(),
+                sni_mismatches: sni_mismatches.clone(),
+                alpn: alpn.clone(),
+            });
+        let (dec_tx, _dec_rx) = mpsc::channel(8);
+        let app = Router::new().fallback(|| async { (axum::http::StatusCode::OK, "h2 ok") });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = load_server_config(&cfg).unwrap();
+        let server_task = tokio::spawn(serve_tls_on(
+            runtime,
+            cfg.clone(),
+            server,
+            listener,
+            app,
+            dec_tx,
+        ));
+
+        // Client trusting the self-signed leaf, offering only h2.
+        let cert_pem = std::fs::read(&cfg.cert).unwrap();
+        let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_pem[..])
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(certs);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_cfg.alpn_protocols = vec![b"h2".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let server_name: rustls_pki_types::ServerName<'static> =
+            "localhost".to_string().try_into().unwrap();
+        let tls = connector.connect(server_name, tcp).await.unwrap();
+
+        let (mut client, conn) = h2::client::handshake(tls).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let request = axum::http::Request::builder()
+            .uri("https://localhost/")
+            .body(())
+            .unwrap();
+        let (resp_fut, _stream) = client.send_request(request, true).unwrap();
+        let resp = resp_fut.await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            alpn.get_metric_with_label_values(&["h2"]).unwrap().get(),
+            1.0,
+            "h2 negotiation counted"
+        );
+        server_task.abort();
     }
 
     #[tokio::test]
@@ -496,6 +607,7 @@ mod tests {
             CounterVec::new(prometheus::Opts::new("t_handshakes", "test"), &["version"]).unwrap();
         let failures = prometheus::Counter::new("t_failures", "test").unwrap();
         let sni_mismatches = prometheus::Counter::new("t_mismatches", "test").unwrap();
+        let alpn = CounterVec::new(prometheus::Opts::new("t_alpn", "test"), &["alpn"]).unwrap();
         let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
             sentry_core::RuleSet::default(),
             sentry_core::RouteValidator::new(vec![]),
@@ -505,6 +617,7 @@ mod tests {
                 handshakes: handshakes.clone(),
                 failures: failures.clone(),
                 sni_mismatches: sni_mismatches.clone(),
+                alpn: alpn.clone(),
             });
         let (dec_tx, _dec_rx) = mpsc::channel(8);
         let app = Router::new();

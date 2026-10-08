@@ -116,6 +116,12 @@ notify = "6"
 # Regex
 regex = "1"
 
+# Edge response compression (F12): brotli + gzip inline (pure Rust);
+# zstd stays optional (C build) behind the `edge-zstd` feature
+brotli = "8"
+flate2 = "1"
+zstd = "0.13"
+
 # Testing
 proptest = "1"
 insta = "1"

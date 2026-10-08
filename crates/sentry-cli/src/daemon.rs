@@ -957,6 +957,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 redirect_https: cfg.edge.tls_redirect_https,
                 allowed_hosts: cfg.edge.tls_allowed_hosts.clone(),
                 handshake_events: cfg.edge.tls_handshake_events,
+                http2: cfg.edge.http2,
             }),
             (None, None) => None,
             _ => {
@@ -965,6 +966,12 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 ));
             }
         };
+        // Performance/topology advisories (F12): double TLS, off-loopback
+        // upstream, inert compression — same warn channel as the F11.5
+        // posture advisories below.
+        for advisory in cfg.edge_advisories() {
+            warn!("{advisory}");
+        }
         // Site-level posture advisories (F11): these two warn about exactly
         // what browser security checklists flag on the protected origin.
         match &tls_cfg {
@@ -990,6 +997,10 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             health_path: cfg.edge.health_path.clone(),
             health_timeout_secs: cfg.edge.health_timeout_secs,
             tls: tls_cfg.clone(),
+            compress: cfg.edge.compress.clone(),
+            forwarded_headers: cfg.edge.forwarded_headers,
+            upstream_connect_timeout_secs: cfg.edge.upstream_connect_timeout_secs,
+            upstream_pool_idle: cfg.edge.upstream_pool_idle,
         };
         let runtime = sentry_edge::EdgeRuntime::new(
             Arc::clone(&pipeline),
@@ -1007,7 +1018,9 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             handshakes: metrics.edge_tls_handshakes.clone(),
             failures: metrics.edge_tls_failures.clone(),
             sni_mismatches: metrics.edge_tls_sni_mismatches.clone(),
-        });
+            alpn: metrics.edge_tls_alpn.clone(),
+        })
+        .with_compressed(metrics.edge_compressed.clone());
         let runtime = if cfg.uploads.enabled {
             let inspect_bytes = cfg
                 .uploads
