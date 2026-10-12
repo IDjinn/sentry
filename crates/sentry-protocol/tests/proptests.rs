@@ -66,10 +66,13 @@ proptest! {
         let got = sentry_protocol::feed_on(proto, &mut state, &frame).is_ok();
 
         let declared = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
-        let want = header == 4096
-            && frame.len() == 4 + declared
-            && payload_len > 0
-            && payload_len < 512;
+        // `validate: - payload_len: u16 >0 <512` reads a u16 field from the
+        // wire (first 2 payload bytes) and bounds-checks the VALUE.
+        let mut want = header == 4096 && frame.len() == 4 + declared && payload_len >= 2;
+        if want {
+            let value = u16::from_be_bytes([frame[6], frame[7]]);
+            want = value > 0 && value < 512;
+        }
         prop_assert_eq!(got, want);
     }
 }

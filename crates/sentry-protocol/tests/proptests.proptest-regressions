@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 153f7cc6f4f268dfb5255cb9f9c6e27d98b2a71c2c21423f9ea02c45a84cdfc0 # shrinks to header = 0, payload_len = 0, byte = 0
 cc 3a365ce5f1fdf788bd567218f777449e3e22d207627080436841a57b515b42b3 # shrinks to bytes = []
+cc abc07e75b23afea68fbfff904af359cac99cc4e03a5722ef100813d09257c1e9 # shrinks to header = 4096, payload_len = 1, byte = 0

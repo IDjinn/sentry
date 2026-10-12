@@ -709,19 +709,15 @@ impl Heuristic for SensitivePath {
     fn gate_bit(&self) -> Option<u8> {
         Some(gate::SENSITIVE)
     }
-    fn analyze(&self, evt: &Event, _text: &DecodedHttp) -> Vec<Signal> {
-        let http = match evt.http() {
-            Some(h) => h,
-            None => return vec![],
-        };
+    fn analyze(&self, _evt: &Event, text: &DecodedHttp<'_>) -> Vec<Signal> {
         if SENSITIVE_PATH_RE
             .load()
-            .is_match(&http.path.to_ascii_lowercase())
+            .is_match(&text.path.to_ascii_lowercase())
         {
             return vec![Signal {
                 kind: SignalKind::SensitivePath,
                 weight: 30,
-                detail: Some(http.path.clone()),
+                detail: Some(text.path.clone()),
             }];
         }
         vec![]
@@ -1368,6 +1364,15 @@ mod tests {
         let e = http_evt("/.env", None);
         let signals = SensitivePath.analyze(&e, &text_of(&e));
         assert!(!signals.is_empty());
+    }
+
+    #[test]
+    fn detects_sensitive_path_in_subdir_and_encoded() {
+        for path in ["/app/.env.local", "/site/.git/config", "/%2Egit/config"] {
+            let e = http_evt(path, None);
+            let signals = SensitivePath.analyze(&e, &text_of(&e));
+            assert!(!signals.is_empty(), "missed encoded/subdir path {path:?}");
+        }
     }
 
     #[test]

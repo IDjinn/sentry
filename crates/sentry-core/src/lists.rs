@@ -35,11 +35,11 @@ pub struct PathPattern {
 /// panels).
 pub const SENSITIVE_PATHS: &[PathPattern] = &[
     PathPattern {
-        pattern: r"^/\.(env|git|svn|hg|bzr|ssh|aws|gcp|azure|kube|docker|terraform|npmrc|pypirc|netrc|htpasswd|ds_store)",
-        literals: &["/."],
+        pattern: r"(^|/)\.(env|git|svn|hg|bzr|ssh|aws|gcp|azure|kube|docker|terraform|npmrc|pypirc|netrc|htpasswd|ds_store)",
+        literals: &["."],
     },
     PathPattern {
-        pattern: r"/(wp-admin|wp-login\.php|phpmyadmin|pma|adminer|wp-content)(?:/|$)",
+        pattern: r"/(wp-admin|wp-login\.php|phpmyadmin|pma|adminer|wp-content)(?:[./]|$)",
         literals: &[
             "wp-admin",
             "wp-login",
@@ -50,8 +50,14 @@ pub const SENSITIVE_PATHS: &[PathPattern] = &[
         ],
     },
     PathPattern {
-        pattern: r"/(server-status|server-info|nginx-status|fpm-status)",
-        literals: &["server-status", "server-info", "nginx-status", "fpm-status"],
+        pattern: r"/(server-status|server-info|nginx-status|nginx_status|fpm-status)",
+        literals: &[
+            "server-status",
+            "server-info",
+            "nginx-status",
+            "nginx_status",
+            "fpm-status",
+        ],
     },
     PathPattern {
         pattern: r"/actuator(/env|/heapdump|/threaddump)",
@@ -157,7 +163,11 @@ mod tests {
     #[test]
     fn literals_are_anchored_to_their_pattern() {
         for p in SENSITIVE_PATHS {
-            let plain = p.pattern.replace('\\', "").to_ascii_lowercase();
+            let plain = p
+                .pattern
+                .replace("\\", "")
+                .replace("(^|/)", "")
+                .to_ascii_lowercase();
             assert!(
                 !p.literals.is_empty(),
                 "pattern {:?} has no literals",
@@ -214,11 +224,125 @@ mod tests {
             "/Telerik.Web.UI.WebResource.axd",
             "/GponForm/diag_Form",
             "/wp-includes/js/jquery/jquery.php",
+            "/.env.local",
+            "/.env.production",
+            "/api/.env",
+            "/app/.env.backup",
+            "/site/.git/config",
+            "/blog/.git/HEAD",
+            "/.git",
         ];
         for s in samples {
             assert!(
                 re.is_match(&s.to_ascii_lowercase()),
                 "merged regex missed {s:?}"
+            );
+        }
+    }
+
+    /// Real-world scanner corpus — probes seen in the wild (masscan/nmap
+    /// scripts, botnets, bug-bounty tooling) plus benign traffic that must
+    /// stay clean. Split is asserted, not just "matches something".
+    #[test]
+    fn real_world_scanner_corpus() {
+        let re = Regex::new(&sensitive_paths_regex()).unwrap();
+        let attacks = [
+            // env / secrets
+            "/.env",
+            "/.env.local",
+            "/.env.production",
+            "/.env.bak",
+            "/laravel/.env",
+            "/backend/.env",
+            "/api/.env",
+            "/.env.dist",
+            // git / vcs
+            "/.git/config",
+            "/.git/HEAD",
+            "/.git/logs/HEAD",
+            "/site/.git/index",
+            "/backup/.git/packed-refs",
+            "/.svn/entries",
+            "/.svn/wc.db",
+            "/.hg/hgrc",
+            "/.bzr/README",
+            // cloud / infra creds
+            "/.aws/credentials",
+            "/.ssh/id_rsa",
+            "/.ssh/authorized_keys",
+            "/.kube/config",
+            "/.docker/config.json",
+            "/.terraform/terraform.tfstate",
+            "/.npmrc",
+            "/.pypirc",
+            "/.netrc",
+            "/.htpasswd",
+            // wordpress / panels
+            "/wp-admin/",
+            "/wp-login.php",
+            "/wp-content/uploads/shell.php",
+            "/wp-includes/js/jquery/jquery.php",
+            "/phpmyadmin/index.php",
+            "/pma/",
+            "/adminer.php",
+            // status endpoints
+            "/server-status",
+            "/nginx_status",
+            "/actuator/env",
+            "/actuator/heapdump",
+            // backups / editors
+            "/dump.sql",
+            "/database.sql.bak",
+            "/config.php.old",
+            "/index.php.swp",
+            "/wp-config.php.save",
+            // known CVE probes
+            "/_ignition/execute-solution",
+            "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
+            "/Autodiscover/Autodiscover.xml",
+            "/HNAP1",
+            "/remote/fgt_lang",
+            "/GponForm/diag_Form",
+            "/Telerik.Web.UI.WebResource.axd",
+            "/RestAPI/LogonCustomization",
+            "/ecp/Current/exporttool/microsoft.exchange.ediscovery.exporttool.application",
+            "/manager/html",
+        ];
+        for s in attacks {
+            assert!(
+                re.is_match(&s.to_ascii_lowercase()),
+                "scanner probe missed: {s:?}"
+            );
+        }
+        for s in [
+            "/",
+            "/index.html",
+            "/api/users?page=2",
+            "/api/v1/orders/1234",
+            "/static/js/main.min.js",
+            "/static/css/app.css",
+            "/assets/logo.png",
+            "/favicon.ico",
+            "/robots.txt",
+            "/sitemap.xml",
+            "/.well-known/security.txt",
+            "/.well-known/acme-challenge/token",
+            "/blog/2024/what-is-dotenv",
+            "/docs/guides/deploy",
+            "/environnement-fr",
+            "/upload/documents/prospectus.pdf",
+            "/health",
+            "/metrics",
+            "/login",
+            "/checkout/cart",
+            "/posts/how-to-git-rebase-safely",
+            "/wp-content-free-alternatives",
+            "/manager-api/status",
+            "/gateway.sqlformat",
+        ] {
+            assert!(
+                !re.is_match(&s.to_ascii_lowercase()),
+                "false positive on benign path: {s:?}"
             );
         }
     }
@@ -232,6 +356,8 @@ mod tests {
             "/api/users?page=1",
             "/static/main.css",
             "/posts/my-processor-notes",
+            "/docs/notes.development",
+            "/tags/.development-notes",
         ] {
             assert!(
                 !re.is_match(&s.to_ascii_lowercase()),
