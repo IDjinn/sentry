@@ -310,6 +310,12 @@ fn host_allowlist_rules(enforce: bool, domains: &[String]) -> Vec<Rule> {
 /// - tryrankly.com crawler/scrapper index
 /// - useragentstring.com UA database
 /// - common pentesting tool UAs
+///
+/// Bare generic words from the upstream blocker corpus (`http`, `agent`,
+/// `check`, `crawl`, `test`, …) are deliberately absent: as case-insensitive
+/// substrings they match legitimate UAs (e.g. the WordPress cron loopback
+/// `WordPress/7.1.3; https://site`, which self-blocks the origin behind an
+/// inline edge). Only specific product/tool names belong here.
 fn bad_crawler_rules(enforce: bool) -> Vec<Rule> {
     let action = if enforce {
         RuleAction::Block
@@ -322,7 +328,7 @@ fn bad_crawler_rules(enforce: bool) -> Vec<Rule> {
         priority: 10,
         enabled: true,
         match_: RuleMatch::UserAgent(crate::rules::StrOp::Regex {
-            pattern: r"(?i)(sqlmap|nikto|nmap|masscan|zgrab|zmap|rustscan|unicornscan|nessus|acunetix|dirbuster|dirsearch|gobuster|feroxbuster|ffuf|wfuzz|wpscan|hydra|metasploit|burp|httrack|libwww|python-requests|python-urllib|go-http-client|scrapy|crawler4j|semrush|ahrefs|mj12bot|dotbot|petalbot|bytespider|yandexaccessibilitybot|seznambot|dataforseobot|screaming.frog|sitechecker|siteauditbot|linkchecker|nuclei|arachni|openvas|havij|commix|xsser|dalfox|gospider|hakrawler|webbandit|emailcollector|wget|curl/[0-9]|lwp-|mechanize|httpclient|okhttp|axios|got/|fetch/|node-fetch|java/|perl/|ruby|php/|lua-curl|winhttp|httprequest|scrapy-requests|httpx|subfinder|amass|theHarvester|shodan|censys|project.sonar|securitytrails|intelx\.io|censys\.io|netsparker|appscan|paros|ratproxy|w3af|skipfish|whatweb|joomscan|droopescan|cloudflare-nginx|semrushbot|BLEXBot|BLEXBot/1\.0|bombabot|coccocbot|dotbot/1|duckduckbot|exabot|ezooms|facebot|facebookexternalhit|feedfetcher-google|googlebot|ia_archiver|icc-crawler|inversebot|ips-agent|java.*outeq|kalooga|koepa|libwww-perl|linkdex\.com|lwp-trivial|maui|mediapartners-google|meanpath|memorybot|mojeek|nejlo|netvamps|newsearch|page2rss|peach|picsearch|postrank|psyduck|purebot|pycurl|queryseekerspider|r6-commentreader|rssingbot|searchsite|seeker|semrushbot|seokicks|seznambot|seznambot/3\.0|showlink|simplepie|sitebot|sistrix|sogou|spbot|sputnik|surveybot|topicbot|trendictionbot|tuezilla|tweetmemebot|tweetbot|twiceler|twitterbot|universalfeedparser|urlappendbot|vagabondo|voilabot|vortex|wasalive|webcollage|webcrawler|webmon|webspider|wesee|wikiwix|wotbox|yacybot|yacy|yahooslurp|yahoo\!.slurp|yandexbot|yeti|yoofind|yoo|zao|zeal|zermelo|zeus|zibber|zitebot|zoombot|zoomspider|zoominfo|zyborg| crawly|crawl|scrap|spider|bot/|http|agent|fetch|check|monitor|scan|test|valid|analyz|index|track|survey|probe|collect|archive|validator|link|crawlbot|researchscan|preview|previewbot|content-fetcher|feedly|feedparser|inoreader|newsblur|tiny\.tiny|tinyrss|rss|atom|superfeedr|feedburner|bloglines|blogsearch|blogtrottr|blogping|weblogs|icerocket|blogument|blogosphere|blogster|blogflux|blogcatalog|blogrank|blogrolling|blogapart|blogometer|blogwise|blogburst|blogalytics|blogtactic|blogvertise|blogware|blogsmith|blogsmithmedia|blogomunity|blogosis|blogosurvey|blogowogo|blogpatrol|blogpulse)".into(),
+            pattern: r"(?i)(sqlmap|nikto|nmap|masscan|zgrab|zmap|rustscan|unicornscan|nessus|acunetix|dirbuster|dirsearch|gobuster|feroxbuster|ffuf|wfuzz|wpscan|hydra|metasploit|burp|httrack|libwww|python-requests|python-urllib|go-http-client|scrapy|crawler4j|semrush|ahrefs|mj12bot|dotbot|petalbot|bytespider|yandexaccessibilitybot|seznambot|dataforseobot|screaming.frog|sitechecker|siteauditbot|linkchecker|nuclei|arachni|openvas|havij|commix|xsser|dalfox|gospider|hakrawler|webbandit|emailcollector|wget|curl/[0-9]|lwp-|mechanize|httpclient|okhttp|axios|got/|fetch/|node-fetch|java/|perl/|ruby|php/|lua-curl|winhttp|httprequest|scrapy-requests|httpx|subfinder|amass|theHarvester|shodan|censys|project.sonar|securitytrails|intelx\.io|censys\.io|netsparker|appscan|paros|ratproxy|w3af|skipfish|whatweb|joomscan|droopescan|cloudflare-nginx|semrushbot|BLEXBot|BLEXBot/1\.0|bombabot|coccocbot|dotbot/1|duckduckbot|exabot|ezooms|facebot|facebookexternalhit|feedfetcher-google|googlebot|ia_archiver|icc-crawler|inversebot|ips-agent|java.*outeq|kalooga|koepa|libwww-perl|linkdex\.com|lwp-trivial|maui|mediapartners-google|meanpath|memorybot|mojeek|nejlo|netvamps|newsearch|page2rss|peach|picsearch|postrank|psyduck|purebot|pycurl|queryseekerspider|r6-commentreader|rssingbot|searchsite|seeker|semrushbot|seokicks|seznambot|seznambot/3\.0|showlink|simplepie|sitebot|sistrix|sogou|spbot|sputnik|surveybot|topicbot|trendictionbot|tuezilla|tweetmemebot|tweetbot|twiceler|twitterbot|universalfeedparser|urlappendbot|vagabondo|voilabot|vortex|wasalive|webcollage|webcrawler|webmon|webspider|wesee|wikiwix|wotbox|yacybot|yacy|yahooslurp|yahoo\!.slurp|yandexbot|yeti|yoofind|yoo|zao|zeal|zermelo|zeus|zibber|zitebot|zoombot|zoomspider|zoominfo|zyborg|spider|bot/|crawlbot|researchscan|previewbot|content-fetcher|feedly|feedparser|inoreader|newsblur|tiny\.tiny|tinyrss|rss|atom|superfeedr|feedburner|bloglines|blogsearch|blogtrottr|blogping|weblogs|icerocket|blogument|blogosphere|blogster|blogflux|blogcatalog|blogrank|blogrolling|blogapart|blogometer|blogwise|blogburst|blogalytics|blogtactic|blogvertise|blogware|blogsmith|blogsmithmedia|blogomunity|blogosis|blogosurvey|blogowogo|blogpatrol|blogpulse)".into(),
         }),
         action,
         ttl: None,
@@ -548,4 +554,48 @@ fn country_blocklist_rules(enforce: bool, countries: &[String]) -> Vec<Rule> {
         created_at: None,
         log_level: None,
     }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::{Event, HttpData, ProtocolData, SourceKind};
+
+    fn ua_rule_matches(ua: &str) -> bool {
+        let rule = &bad_crawler_rules(true)[0];
+        let evt = Event::new(
+            SourceKind::Synthetic,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+            ProtocolData::Http(HttpData {
+                path: "/".into(),
+                user_agent: Some(ua.into()),
+                ..Default::default()
+            }),
+        );
+        rule.match_.matches_with(&evt, None)
+    }
+
+    #[test]
+    fn wordpress_cron_loopback_ua_is_not_bad_crawler() {
+        // The WordPress cron loopback UA embeds a URL; the generic tokens
+        // (`http`, …) used to match it and self-blocked the origin IP.
+        assert!(!ua_rule_matches(
+            "WordPress/7.1.3; https://blog.lucas-romero.com"
+        ));
+        assert!(!ua_rule_matches("WordPress/6.4; http://18.228.156.129"));
+    }
+
+    #[test]
+    fn scanner_uas_still_match() {
+        for ua in [
+            "sqlmap/1.7.2#stable (https://sqlmap.org)",
+            "wpscan/3.8.25",
+            "Nikto/2.5.0",
+            "masscan/1.3",
+            "curl/8.5.0",
+            "Mozilla/5.0 (compatible; AhrefsBot/7.0; +http://ahrefs.com/robot/)",
+        ] {
+            assert!(ua_rule_matches(ua), "expected match: {ua}");
+        }
+    }
 }

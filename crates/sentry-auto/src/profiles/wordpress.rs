@@ -88,6 +88,18 @@ impl FrameworkDetector for WordPressDetector {
                 },
             ],
             recommended_rules: vec![
+                // wp-cron.php must stay reachable: WordPress spawns its cron
+                // via a loopback to this path on every page load when tasks
+                // are due, and that UA embeds a URL. Allowing it here (with
+                // priority below every pack) keeps the origin from
+                // self-blocking behind an inline edge.
+                RuleSuggestion {
+                    name: "wordpress_wp_cron_allow".to_string(),
+                    priority: 1,
+                    match_expr: r#"path = "/wp-cron.php""#.to_string(),
+                    action: "allow".to_string(),
+                    tags: vec!["auto".to_string(), "wordpress".to_string()],
+                },
                 RuleSuggestion {
                     name: "wordpress_wp_login_rate_limit".to_string(),
                     priority: 40,
@@ -144,7 +156,15 @@ mod tests {
             .find(|r| r.path == "/wp-login.php")
             .unwrap();
         assert_eq!(login.methods, vec!["GET", "POST"]);
-        assert_eq!(profile.recommended_rules.len(), 2);
+        assert_eq!(profile.recommended_rules.len(), 3);
+        let cron = profile
+            .recommended_rules
+            .iter()
+            .find(|r| r.name == "wordpress_wp_cron_allow")
+            .expect("wp-cron allow rule");
+        assert_eq!(cron.action, "allow");
+        assert_eq!(cron.priority, 1);
+        assert_eq!(cron.match_expr, r#"path = "/wp-cron.php""#);
     }
 
     #[test]

@@ -139,6 +139,10 @@ Roda **antes** de heurísticas e IA (fast path). Ordem de precedência:
 Default rule packs (`sensitive_paths` vem em `enforce`; demais em `shadow`):
 vpn_proxy, tor, crawlers_bad, crawlers_good, sensitive_paths, country_blocklist,
 http_anomaly, rate_scan. Ver `ARCHITECTURE.md` §10 para a lista completa.
+O `crawlers_bad` casa apenas nomes específicos de ferramentas/bots — tokens
+genéricos de substring (`http`, `agent`, `check`, `test`, …) foram removidos:
+casa UA legítimo (ex.: loopback do wp-cron do WordPress) e faz o origin se
+auto-bloquear atrás da edge inline.
 
 ### Actions — type-safe
 
@@ -858,8 +862,9 @@ telemetria de handshake + provider de appliance
   - ✅ Perfis: **nginx** (parse tolerante de `location`/`root`/`alias` —
     exact→exact, prefixo→path+`/*`, regex locations contados e skipados;
     `detect_from_dirs` p/ `/etc/nginx`+sites-enabled/conf.d), **WordPress**
-    (rotas fixas de stock + regras wp-login rate-limit / xmlrpc block +
-    packs enforce), **Laravel** (composer.json → regex routes/web|api.php,
+    (rotas fixas de stock + regras wp-cron allow prio 1 / wp-login
+    rate-limit / xmlrpc block + packs enforce; o allow de wp-cron evita o
+    origin se auto-bloquear via loopback do cron), **Laravel** (composer.json → regex routes/web|api.php,
     `Route::get/match/resource`, prefixo /api), **Next.js** (filesystem
     routing app//pages/, `[param]`→`{param}`, `(group)` ignored,
     `[...slug]`→`/*`, métodos de route handlers exportados), **Express**
