@@ -708,13 +708,36 @@ scan_json = true             # text-scan JSON bodies (API payloads) too
 #   flag   — forward uninspected + UploadOversize signal (weight-0 in
 #            shadow) and the volume counts in the flood window below
 oversize = "reject"
-# Filename extensions that always raise UploadExecutable:
+# Filename extensions that always raise UploadExecutable. Entries accept a
+# `*` glob in any position ("jp*" catches jpg/jpeg/jpe, "*php" catches
+# xphp, "*sh*" catches bash/dash). A bare "*" blocks EVERY named upload
+# (with or without a usable extension):
 blocked_extensions = ["php", "phtml", "php5", "jsp", "jspx", "asp", "aspx", "exe", "dll", "sh", "bat", "ps1"]
 # Filename extensions ALLOWLIST (F12): when set (non-empty), an upload whose
 # extension is not listed raises UploadDisallowed. Double extensions are
-# checked too ("shell.php.jpg" fails an images-only allowlist). Files
-# without an extension are not affected. blocked_extensions wins over this.
-# allowed_extensions = ["png", "jpg", "jpeg", "gif", "webp", "pdf"]
+# checked too ("shell.php.jpg" fails an images-only allowlist) and the same
+# `*` globs apply. Files without an extension follow allow_extensionless
+# below. blocked_extensions wins over this. Empty = everything allowed.
+# allowed_extensions = ["png", "jpg", "jpeg", "gif", "webp", "pdf", "ts*"]
+# Declared content-type allowlist ("tipo de payload"): a file part that
+# DECLARES a Content-Type matching none of these globs raises
+# UploadDisallowed ("image/*", "application/pdf", "*xml"). Parts without a
+# declared content type are not affected; a direct binary upload
+# (PUT/POST of image/* or application/octet-stream) is checked against the
+# request Content-Type. Empty = off.
+# allowed_content_types = ["image/*", "application/pdf"]
+# HTTP methods allowed to carry an upload body (multipart file parts or a
+# direct binary PUT/POST); an upload-shaped body on any other method raises
+# UploadDisallowed. Plain forms (GET searches, urlencoded bodies) are not
+# upload-shaped and never trigger this.
+# methods = ["POST", "PUT", "PATCH"]
+# Path prefixes where uploads may land (segment-boundary match: "/wp-admin"
+# also matches "/wp-admin/media-upload.php" but not "/wp-adminX/..."). An
+# upload-shaped body on any other path raises UploadDisallowed. Empty = off.
+# allowed_paths = ["/wp-admin/", "/wp-json/wp/v2/media", "/api/upload"]
+# Whether files WITHOUT an extension pass the allowed_extensions allowlist
+# (false raises UploadDisallowed for them).
+# allow_extensionless = true
 [uploads.flood]
 window_secs = 60
 max_uploads = 30             # files per IP in the window (0 = off)

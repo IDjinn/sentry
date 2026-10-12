@@ -176,23 +176,29 @@ pub enum Command {
         #[command(subcommand)]
         action: BenchCmd,
     },
-    /// Auto-detect framework and generate rules/routes (zero-config).
+    /// Auto-detect frameworks/routes and generate sentry.auto.toml.
+    ///
+    /// Without a root path, probes the local web service on ports 80/443
+    /// and reads server configs from disk. Module flags are opt-in: pass
+    /// none to run everything, or one/more to restrict the run.
     Auto {
-        /// Project root (default: current directory).
-        #[arg(long)]
+        /// Project root to scan (instead of the local-service default).
         root: Option<String>,
         /// Force a specific profile (skip detection).
         #[arg(long)]
         profile: Option<String>,
-        /// Only show what would be detected, don't write.
+        /// Run only the live HTTP probe (127.0.0.1:80 + :443).
         #[arg(long)]
-        dry_run: bool,
-        /// Merge into existing sentry.toml instead of writing sentry.auto.toml.
+        probe: bool,
+        /// Run only the on-disk config detection (nginx configs etc.).
         #[arg(long)]
-        merge: bool,
-        /// Deep scan: AST-parse route files (slower, precise).
+        disk: bool,
+        /// Scan the whole source tree, not just canonical route files.
         #[arg(long)]
         deep: bool,
+        /// Only show what would be detected, don't write sentry.auto.toml.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

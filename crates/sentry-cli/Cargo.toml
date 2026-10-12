@@ -32,6 +32,7 @@ sentry-ai = { workspace = true }
 sentry-geo = { workspace = true }
 sentry-reputation = { workspace = true }
 sentry-protocol = { workspace = true }
+sentry-auto = { workspace = true }
 notify = { workspace = true }
 sentry-source-nginx = { workspace = true }
 sentry-source-syslog = { workspace = true }
@@ -50,6 +51,7 @@ hickory-resolver = { workspace = true }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+futures = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
 figment = { workspace = true }

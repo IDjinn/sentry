@@ -384,7 +384,8 @@ impl HeuristicEngine {
                 Box::new(UploadFilename::new(scan.clone())),
                 Box::new(UploadContent::new(scan.clone())),
                 Box::new(UploadImage::new(scan.clone())),
-                Box::new(UploadOversize::new(scan)),
+                Box::new(UploadOversize::new(scan.clone())),
+                Box::new(UploadPolicy::new(scan)),
             ],
         }
     }
@@ -399,7 +400,9 @@ impl HeuristicEngine {
             .push(Box::new(UploadContent::new(scan.clone())));
         self.detectors
             .push(Box::new(UploadImage::new(scan.clone())));
-        self.detectors.push(Box::new(UploadOversize::new(scan)));
+        self.detectors
+            .push(Box::new(UploadOversize::new(scan.clone())));
+        self.detectors.push(Box::new(UploadPolicy::new(scan)));
         self
     }
 
@@ -883,8 +886,8 @@ impl Heuristic for UploadFilename {
                     detail: Some(format!("upload filename traversal: {filename}")),
                 }];
             }
-            if crate::uploads::extension(Some(&decoded))
-                .is_some_and(|ext| self.scan.blocked_extensions.contains(&ext))
+            let last_ext = crate::uploads::extension(Some(&decoded));
+            if crate::uploads::extension_matches(&self.scan.blocked_extensions, last_ext.as_deref())
             {
                 return vec![Signal {
                     kind: SignalKind::UploadExecutable,
@@ -893,17 +896,20 @@ impl Heuristic for UploadFilename {
                 }];
             }
             if let Some(name) = filename.rsplit_once('.').map(|(base, _)| base) {
-                if crate::uploads::extension(Some(name))
-                    .is_some_and(|ext| self.scan.blocked_extensions.contains(&ext))
-                {
-                    return vec![Signal {
-                        kind: SignalKind::UploadExecutable,
-                        weight: upload_weight(
-                            &self.scan,
-                            crate::analysis::UPLOAD_EXECUTABLE_WEIGHT,
-                        ),
-                        detail: Some(format!("double blocked extension: {filename}")),
-                    }];
+                if let Some(double) = crate::uploads::extension(Some(name)) {
+                    if crate::uploads::extension_matches(
+                        &self.scan.blocked_extensions,
+                        Some(&double),
+                    ) {
+                        return vec![Signal {
+                            kind: SignalKind::UploadExecutable,
+                            weight: upload_weight(
+                                &self.scan,
+                                crate::analysis::UPLOAD_EXECUTABLE_WEIGHT,
+                            ),
+                            detail: Some(format!("double blocked extension: {filename}")),
+                        }];
+                    }
                 }
             }
             if let Some(sig) = self.allowlist_violation(&decoded, filename) {
@@ -916,27 +922,38 @@ impl Heuristic for UploadFilename {
 
 impl UploadFilename {
     /// Allowlist check (F12): with `allowed_extensions` set, both the last
-    /// and the double extension must be listed. Extensionless files are not
-    /// affected.
+    /// and the double extension must be listed (globs allowed). Extensionless
+    /// files follow `allow_extensionless`.
     fn allowlist_violation(&self, decoded: &str, filename: &str) -> Option<Signal> {
         if self.scan.allowed_extensions.is_empty() {
             return None;
         }
-        let not_allowed = |ext: String| !self.scan.allowed_extensions.contains(&ext);
-        if crate::uploads::extension(Some(decoded)).is_some_and(not_allowed) {
-            return Some(Signal {
+        let disallowed = |detail: String| {
+            Some(Signal {
                 kind: SignalKind::UploadDisallowed,
                 weight: upload_weight(&self.scan, crate::analysis::UPLOAD_DISALLOWED_WEIGHT),
-                detail: Some(format!("upload extension not allowed: {filename}")),
-            });
+                detail: Some(detail),
+            })
+        };
+        let last = crate::uploads::extension(Some(decoded));
+        let Some(ext) = last.as_deref() else {
+            return if self.scan.allow_extensionless {
+                None
+            } else {
+                disallowed(format!("extensionless upload not allowed: {filename}"))
+            };
+        };
+        if !crate::uploads::extension_matches(&self.scan.allowed_extensions, Some(ext)) {
+            return disallowed(format!("upload extension not allowed: {filename}"));
         }
-        let base = filename.rsplit_once('.').map(|(base, _)| base)?;
-        if crate::uploads::extension(Some(base)).is_some_and(not_allowed) {
-            return Some(Signal {
-                kind: SignalKind::UploadDisallowed,
-                weight: upload_weight(&self.scan, crate::analysis::UPLOAD_DISALLOWED_WEIGHT),
-                detail: Some(format!("double upload extension not allowed: {filename}")),
-            });
+        let base = match filename.rsplit_once('.') {
+            Some((base, _)) => base,
+            None => return None,
+        };
+        if let Some(double) = crate::uploads::extension(Some(base)) {
+            if !crate::uploads::extension_matches(&self.scan.allowed_extensions, Some(&double)) {
+                return disallowed(format!("double upload extension not allowed: {filename}"));
+            }
         }
         None
     }
@@ -1169,6 +1186,107 @@ impl Heuristic for UploadOversize {
                         self.scan.inspect_bytes as f64 / (1024.0 * 1024.0)
                     )),
                 }];
+            }
+        }
+        vec![]
+    }
+}
+
+/// Upload placement policy (F12): method, path and declared content-type
+/// gates over **upload-shaped** bodies — multipart parts carrying a
+/// filename, or a direct binary `image/*`/`application/octet-stream`
+/// PUT/POST. Every violation rides the existing `UploadDisallowed` signal
+/// (weight-0 in shadow mode), so dashboards and `[scorer.weights]` need no
+/// changes. Form fields, urlencoded bodies and JSON stay out of scope —
+/// GET search forms are not uploads.
+pub struct UploadPolicy {
+    scan: crate::uploads::UploadsScan,
+}
+
+impl UploadPolicy {
+    /// Build with an `[uploads]` projection.
+    pub fn new(scan: crate::uploads::UploadsScan) -> Self {
+        Self { scan }
+    }
+
+    /// Whether the request carries an upload-shaped body outside the
+    /// multipart parts: a direct binary body on an upload-capable method.
+    fn direct_binary(http: &crate::event::HttpData) -> bool {
+        let ct = http
+            .headers
+            .get("content-type")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let ct = ct.to_ascii_lowercase();
+        matches!(
+            http.method,
+            Some(crate::event::HttpMethod::Put | crate::event::HttpMethod::Post)
+        ) && (ct.starts_with("image/") || ct.starts_with("application/octet-stream"))
+    }
+}
+
+impl Heuristic for UploadPolicy {
+    fn name(&self) -> &'static str {
+        "upload_policy"
+    }
+    fn analyze(&self, evt: &Event, text: &DecodedHttp<'_>) -> Vec<Signal> {
+        if !self.scan.enabled {
+            return vec![];
+        }
+        let Some(http) = evt.http() else {
+            return vec![];
+        };
+        let file_parts: Vec<&crate::multipart::UploadPart<'_>> = text
+            .uploads
+            .iter()
+            .filter(|p| p.filename.is_some())
+            .collect();
+        let direct = file_parts.is_empty() && Self::direct_binary(http);
+        if file_parts.is_empty() && !direct {
+            return vec![];
+        }
+        let disallowed = |detail: String| {
+            vec![Signal {
+                kind: SignalKind::UploadDisallowed,
+                weight: upload_weight(&self.scan, crate::analysis::UPLOAD_DISALLOWED_WEIGHT),
+                detail: Some(detail),
+            }]
+        };
+        if !self.scan.methods.is_empty() {
+            let method = http.method.map(|m| m.as_str()).unwrap_or("");
+            if !self.scan.methods.iter().any(|m| m == method) {
+                let shown = if method.is_empty() { "<none>" } else { method };
+                return disallowed(format!("upload on method {shown}"));
+            }
+        }
+        if !self.scan.allowed_paths.is_empty()
+            && !crate::uploads::path_allowed(&text.path, &self.scan.allowed_paths)
+        {
+            return disallowed(format!("upload outside allowed paths: {}", text.path));
+        }
+        if !self.scan.allowed_content_types.is_empty() {
+            for part in &file_parts {
+                // Only *declared* types are policy-checked; sniffed truth is
+                // `UploadImage`'s job (UploadTypeMismatch).
+                let Some(ct) = part.content_type.as_deref() else {
+                    continue;
+                };
+                if !crate::uploads::content_type_matches(&self.scan.allowed_content_types, Some(ct))
+                {
+                    let base = ct.split(';').next().unwrap_or("").trim();
+                    return disallowed(format!("upload content-type not allowed: {base}"));
+                }
+            }
+            if direct {
+                let ct = http.headers.get("content-type").map(|s| s.as_str());
+                if !crate::uploads::content_type_matches(&self.scan.allowed_content_types, ct) {
+                    let base = ct
+                        .and_then(|c| c.split(';').next())
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    return disallowed(format!("upload content-type not allowed: {base}"));
+                }
             }
         }
         vec![]
@@ -1658,6 +1776,302 @@ mod tests {
         assert!(signals
             .iter()
             .any(|s| s.kind == SignalKind::UploadTypeMismatch));
+    }
+
+    // ── Upload placement policy (F12): wildcards, method/path/content-type ──
+
+    fn png_bytes() -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.extend_from_slice(&[0; 64]);
+        v
+    }
+
+    fn upload_evt_at(
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+        method: Option<crate::event::HttpMethod>,
+    ) -> Event {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("content-type".to_string(), content_type.to_string());
+        Event::new(
+            SourceKind::Synthetic,
+            std::net::IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            ProtocolData::Http(HttpData {
+                path: path.to_string(),
+                method,
+                headers,
+                body: Some(body),
+                user_agent: Some("Mozilla/5.0".to_string()),
+                ..Default::default()
+            }),
+        )
+    }
+
+    #[test]
+    fn upload_blocked_star_denies_every_named_upload() {
+        let cfg = UploadsConfig {
+            enabled: true,
+            mode: crate::config::UploadMode::Enforce,
+            blocked_extensions: vec!["*".into()],
+            ..UploadsConfig::default()
+        };
+        let engine = upload_engine_cfg(&cfg);
+        let named = upload_evt(
+            MULTIPART_CT,
+            multipart_body("photo.png", "image/png", &png_bytes()),
+            Some(crate::event::HttpMethod::Post),
+        );
+        let sig = engine
+            .analyze(&named)
+            .into_iter()
+            .find(|s| s.kind == SignalKind::UploadExecutable)
+            .expect("bare * denylist blocks every named upload");
+        assert_eq!(sig.weight, 50);
+        let extensionless = upload_evt(
+            MULTIPART_CT,
+            multipart_body("Makefile", "application/octet-stream", b"all: build"),
+            Some(crate::event::HttpMethod::Post),
+        );
+        assert!(engine
+            .analyze(&extensionless)
+            .iter()
+            .any(|s| s.kind == SignalKind::UploadExecutable));
+    }
+
+    #[test]
+    fn upload_blocked_prefix_wildcard_spares_others() {
+        let cfg = UploadsConfig {
+            enabled: true,
+            mode: crate::config::UploadMode::Enforce,
+            blocked_extensions: vec!["jp*".into()],
+            ..UploadsConfig::default()
+        };
+        let engine = upload_engine_cfg(&cfg);
+        let blocked = upload_evt(
+            MULTIPART_CT,
+            multipart_body("photo.jpg", "image/jpeg", b"\xff\xd8\xff\xe0 rest"),
+            Some(crate::event::HttpMethod::Post),
+        );
+        assert!(engine
+            .analyze(&blocked)
+            .iter()
+            .any(|s| s.kind == SignalKind::UploadExecutable));
+        let spared = upload_evt(
+            MULTIPART_CT,
+            multipart_body("photo.png", "image/png", &png_bytes()),
+            Some(crate::event::HttpMethod::Post),
+        );
+        assert!(
+            engine.analyze(&spared).is_empty(),
+            "jp* must not touch .png"
+        );
+    }
+
+    #[test]
+    fn upload_allowlist_wildcards_match_globs() {
+        let cfg = UploadsConfig {
+            enabled: true,
+            mode: crate::config::UploadMode::Enforce,
+            allowed_extensions: vec!["ts*".into(), "*x".into()],
+            ..UploadsConfig::default()
+        };
+        let engine = upload_engine_cfg(&cfg);
+        for name in ["data.tsv", "notes.bx"] {
+            let e = upload_evt(
+                MULTIPART_CT,
+                multipart_body(name, "application/octet-stream", b"plain"),
+                Some(crate::event::HttpMethod::Post),
+            );
+            assert!(
+                engine.analyze(&e).is_empty(),
+                "{name} must pass the glob allowlist"
+            );
+        }
+        let denied = upload_evt(
+            MULTIPART_CT,
+            multipart_body("photo.png", "image/png", &png_bytes()),
+            Some(crate::event::HttpMethod::Post),
+        );
+        assert!(engine
+            .analyze(&denied)
+            .iter()
+            .any(|s| s.kind == SignalKind::UploadDisallowed));
+    }
+
+    #[test]
+    fn upload_content_type_allowlist_flags_foreign_mime() {
+        let cfg = UploadsConfig {
+            enabled: true,
+            mode: crate::config::UploadMode::Enforce,
+            allowed_content_types: vec!["image/*".into(), "application/pdf".into()],
+            ..UploadsConfig::default()
+        };
+        let engine = upload_engine_cfg(&cfg);
+        let ok = upload_evt(
+            MULTIPART_CT,
+            multipart_body("payload.png", "image/png; charset=binary", &png_bytes()),
+            Some(crate::event::HttpMethod::Post),
+        );
+        assert!(engine.analyze(&ok).is_empty());
+        let bad = upload_evt(
+            MULTIPART_CT,
+            multipart_body("payload.png", "application/x-php", &png_bytes()),
+            Some(crate::event::HttpMethod::Post),
+        );
+        let sig = engine
+            .analyze(&bad)
+            .into_iter()
+            .find(|s| s.kind == SignalKind::UploadDisallowed)
+            .expect("declared MIME outside the allowlist must be flagged");
+        assert!(sig.detail.as_deref().unwrap().contains("application/x-php"));
+    }
+
+    #[test]
+    fn upload_policy_flags_get_multipart_but_allows_patch() {
+        let body = multipart_body("photo.png", "image/png", &png_bytes());
+        let get = upload_evt(
+            MULTIPART_CT,
+            body.clone(),
+            Some(crate::event::HttpMethod::Get),
+        );
+        let sig = upload_engine(true)
+            .analyze(&get)
+            .into_iter()
+            .find(|s| s.kind == SignalKind::UploadDisallowed)
+            .expect("GET with a file part must be flagged");
+        assert_eq!(sig.weight, 30);
+        assert_eq!(sig.detail.as_deref(), Some("upload on method GET"));
+
+        let patch = upload_evt(MULTIPART_CT, body, Some(crate::event::HttpMethod::Patch));
+        assert!(upload_engine(true).analyze(&patch).is_empty());
+    }
+
+    #[test]
+    fn upload_policy_enforces_path_allowlist() {
+        let cfg = UploadsConfig {
+            enabled: true,
+            mode: crate::config::UploadMode::Enforce,
+            allowed_paths: vec!["/site/media/".into()],
+            ..UploadsConfig::default()
+        };
+        let engine = upload_engine_cfg(&cfg);
+        let body = multipart_body("photo.png", "image/png", &png_bytes());
+        let good = upload_evt_at(
+            "/site/media/upload-handler",
+            MULTIPART_CT,
+            body.clone(),
+            Some(crate::event::HttpMethod::Post),
+        );
+        assert!(engine.analyze(&good).is_empty());
+        let outside = upload_evt_at(
+            "/elsewhere/photo.png",
+            MULTIPART_CT,
+            body.clone(),
+            Some(crate::event::HttpMethod::Post),
+        );
+        let sig = engine
+            .analyze(&outside)
+            .into_iter()
+            .find(|s| s.kind == SignalKind::UploadDisallowed)
+            .expect("upload outside the prefixes must be flagged");
+        assert!(sig
+            .detail
+            .as_deref()
+            .unwrap()
+            .starts_with("upload outside allowed paths"));
+        let lookalike = upload_evt_at(
+            "/site/mediaX/photo.png",
+            MULTIPART_CT,
+            body,
+            Some(crate::event::HttpMethod::Post),
+        );
+        assert!(engine
+            .analyze(&lookalike)
+            .iter()
+            .any(|s| s.kind == SignalKind::UploadDisallowed));
+    }
+
+    #[test]
+    fn upload_extensionless_follows_allow_extensionless() {
+        let make_engine = |allow: bool| {
+            let cfg = UploadsConfig {
+                enabled: true,
+                mode: crate::config::UploadMode::Enforce,
+                allowed_extensions: vec!["png".into()],
+                allow_extensionless: allow,
+                ..UploadsConfig::default()
+            };
+            HeuristicEngine::with_defaults().with_uploads_scan(UploadsScan::from_config(&cfg))
+        };
+        let e = upload_evt(
+            MULTIPART_CT,
+            multipart_body("Makefile", "application/octet-stream", b"all: build"),
+            Some(crate::event::HttpMethod::Post),
+        );
+        let denied = make_engine(false)
+            .analyze(&e)
+            .into_iter()
+            .find(|s| s.kind == SignalKind::UploadDisallowed)
+            .expect("extensionless upload must be flagged when allow_extensionless = false");
+        assert!(denied
+            .detail
+            .as_deref()
+            .unwrap()
+            .starts_with("extensionless upload"));
+        assert!(make_engine(true).analyze(&e).is_empty());
+    }
+
+    #[test]
+    fn upload_direct_binary_respects_content_type_allowlist() {
+        let cfg = UploadsConfig {
+            enabled: true,
+            mode: crate::config::UploadMode::Enforce,
+            allowed_content_types: vec!["image/*".into()],
+            ..UploadsConfig::default()
+        };
+        let engine = upload_engine_cfg(&cfg);
+        let ok = upload_evt(
+            "image/png",
+            png_bytes(),
+            Some(crate::event::HttpMethod::Put),
+        );
+        assert!(engine.analyze(&ok).is_empty());
+        let bad = upload_evt(
+            "application/octet-stream",
+            png_bytes(),
+            Some(crate::event::HttpMethod::Put),
+        );
+        let sig = engine
+            .analyze(&bad)
+            .into_iter()
+            .find(|s| s.kind == SignalKind::UploadDisallowed)
+            .expect("direct binary outside the MIME allowlist must be flagged");
+        assert!(sig
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("application/octet-stream"));
+    }
+
+    #[test]
+    fn upload_policy_zero_weight_in_shadow() {
+        let cfg = UploadsConfig {
+            enabled: true,
+            ..UploadsConfig::default()
+        };
+        let e = upload_evt(
+            MULTIPART_CT,
+            multipart_body("photo.png", "image/png", &png_bytes()),
+            Some(crate::event::HttpMethod::Get),
+        );
+        let sig = HeuristicEngine::with_defaults()
+            .with_uploads_scan(UploadsScan::from_config(&cfg))
+            .analyze(&e)
+            .into_iter()
+            .find(|s| s.kind == SignalKind::UploadDisallowed)
+            .expect("shadow still detects");
+        assert_eq!(sig.weight, 0, "shadow mode must not enforce");
     }
 }
 

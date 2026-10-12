@@ -129,6 +129,7 @@ struct UpstreamServed;
 pub async fn health_check(cfg: &EdgeProxyConfig) -> sentry_core::error::Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(cfg.health_timeout_secs.max(1)))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| sentry_core::error::CoreError::Config(format!("edge http client: {e}")))?;
     let url = format!("{}{}", cfg.upstream.trim_end_matches('/'), cfg.health_path);
@@ -166,6 +167,7 @@ pub async fn serve(
     // (reused connections stay warm, `tcp_nodelay` kills Nagle latency).
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(
             cfg.upstream_connect_timeout_secs.max(1),
         ))
@@ -276,6 +278,18 @@ struct ProxyState {
     /// Concurrency cap: in-flight requests hold a permit; when exhausted,
     /// new requests get an immediate 503 instead of buffering another body.
     gate: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+/// Original request host: the `Host` header, or — for HTTP/2, where the
+/// host rides the `:authority` pseudo-header and no `Host` header exists
+/// on the wire — the request URI authority.
+fn original_host(parts: &axum::http::request::Parts) -> Option<String> {
+    parts
+        .headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| parts.uri.authority().map(|a| a.to_string()))
 }
 
 async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Response {
@@ -499,11 +513,7 @@ async fn proxy_inspected(
             parts.method.as_str(),
         )),
         scheme: Some(parts.uri.scheme_str().unwrap_or("http").to_string()),
-        host: parts
-            .headers
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string),
+        host: original_host(&parts),
         path: parts.uri.path().to_string(),
         query: parts
             .uri
@@ -699,6 +709,7 @@ async fn serve_allow(
     let url = format!("{}{}", upstream.trim_end_matches('/'), path_qs);
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
+    let original_host = original_host(parts);
     let mut fwd = client.request(method, &url);
     for (k, v) in parts.headers.iter() {
         let name = k.as_str();
@@ -712,17 +723,16 @@ async fn serve_allow(
             fwd = fwd.header(name, val);
         }
     }
+    if let Some(host) = original_host.as_deref() {
+        fwd = fwd.header(header::HOST, host);
+    }
     if forwarded_headers {
         let proto = if is_tls { "https" } else { "http" };
         fwd = fwd
             .header("x-forwarded-for", client_ip.to_canonical().to_string())
             .header("x-real-ip", client_ip.to_canonical().to_string())
             .header("x-forwarded-proto", proto);
-        if let Some(host) = parts
-            .headers
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-        {
+        if let Some(host) = original_host.as_deref() {
             fwd = fwd.header("x-forwarded-host", host);
         }
     }
@@ -1131,6 +1141,83 @@ mod tests {
         assert_eq!(parts[1], "-", "no edge-set proto");
         assert_eq!(parts[2], "-", "no edge-set x-real-ip");
         assert_eq!(parts[3], "-", "no edge-set forwarded host");
+    }
+
+    /// Upstream echoing the `Host` header it received (or `-`).
+    async fn spawn_host_echo_upstream() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().fallback(|headers: axum::http::HeaderMap| async move {
+            (
+                axum::http::StatusCode::OK,
+                headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("-")
+                    .to_string(),
+            )
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    // ── HTTP/2 `:authority` (no Host header on the wire) ─────────────────
+
+    #[test]
+    fn original_host_falls_back_to_uri_authority() {
+        let req = axum::http::Request::builder()
+            .uri("http://example.com/")
+            .header("host", "blog.lucas-romero.com")
+            .body(())
+            .unwrap();
+        let (parts, _) = req.into_parts();
+        assert_eq!(
+            original_host(&parts).as_deref(),
+            Some("blog.lucas-romero.com"),
+            "h1: the Host header wins"
+        );
+
+        let req = axum::http::Request::builder()
+            .uri("http://blog.lucas-romero.com/")
+            .body(())
+            .unwrap();
+        let (parts, _) = req.into_parts();
+        assert_eq!(
+            original_host(&parts).as_deref(),
+            Some("blog.lucas-romero.com"),
+            "h2: :authority (mapped into the URI) must substitute the absent Host"
+        );
+    }
+
+    #[tokio::test]
+    async fn http2_authority_is_forwarded_as_upstream_host() {
+        let upstream = spawn_host_echo_upstream().await;
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, _dec_rx) = mpsc::channel(8);
+        let (app, _) = test_state(runtime, format!("http://{upstream}"), true, dec_tx);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("http://blog.lucas-romero.com/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "blog.lucas-romero.com",
+            "upstream sees the virtual host, not the proxy address"
+        );
     }
 
     // ── Upload inspection (F10) ──────────────────────────────────────────

@@ -75,6 +75,48 @@ pub fn learn(events: &[Event], opts: &LearnOptions) -> Vec<RouteDef> {
     out.into_values().collect()
 }
 
+/// Normalize a route set: dedupe by exact path (merging method sets, `*`
+/// meaning "any method" and winning over specific methods), fix missing
+/// leading slashes, and sort.
+///
+/// Shared by `sentry routes import/learn` and `sentry auto` so every route
+/// producer emits the same canonical form.
+pub fn normalize_routes(routes: Vec<RouteDef>) -> Vec<RouteDef> {
+    let mut bucket: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for r in routes {
+        let path = normalize_route_path(&r.path);
+        let entry = bucket.entry(path).or_default();
+        if r.methods.is_empty() {
+            entry.insert("*".to_string());
+        } else {
+            for m in r.methods {
+                entry.insert(m.to_ascii_uppercase());
+            }
+        }
+    }
+    bucket
+        .into_iter()
+        .map(|(path, mut methods)| {
+            let wildcard = methods.remove("*");
+            let mut m: Vec<String> = methods.into_iter().collect();
+            if wildcard {
+                m.clear();
+            }
+            RouteDef { path, methods: m }
+        })
+        .collect()
+}
+
+/// Ensure a route path starts with a single leading slash.
+pub fn normalize_route_path(p: &str) -> String {
+    let p = p.trim();
+    if p.starts_with('/') {
+        p.to_string()
+    } else {
+        format!("/{p}")
+    }
+}
+
 /// Reduce a literal path to its shape template by collapsing dynamic
 /// segments into `{id}`.
 ///
@@ -212,5 +254,33 @@ mod tests {
         assert!(c.window_secs >= c.interval_secs, "window >= interval");
         assert!(c.min_hits >= 1);
         assert!(c.min_ips >= 1);
+    }
+
+    fn route(path: &str, methods: &[&str]) -> RouteDef {
+        RouteDef {
+            path: path.to_string(),
+            methods: methods.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn normalize_routes_dedupes_and_merges_methods() {
+        let out = normalize_routes(vec![
+            route("/api/users", &["GET"]),
+            route("api/users", &["get", "POST"]),
+            route("/other", &[]),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].path, "/api/users");
+        assert_eq!(out[0].methods, vec!["GET", "POST"]);
+        assert_eq!(out[1].path, "/other");
+        assert!(out[1].methods.is_empty(), "any-method stays empty");
+    }
+
+    #[test]
+    fn normalize_routes_any_method_wins_over_specific() {
+        let out = normalize_routes(vec![route("/x", &["GET"]), route("/x", &[])]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].methods.is_empty());
     }
 }

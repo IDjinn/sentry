@@ -472,43 +472,10 @@ fn is_dynamic_segment(s: &str) -> bool {
 
 // ─── Normalize ────────────────────────────────────────────────────────────
 
-/// Normalize parsed routes: dedup identical (lowercased path, methods set),
+/// Normalize parsed routes: dedup identical paths (merging method sets),
 /// drop leading/trailing slashes inconsistencies, and sort methods.
 fn normalize(routes: Vec<RouteDef>) -> Vec<RouteDef> {
-    use std::collections::BTreeMap;
-    let mut bucket: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
-    for r in routes {
-        let path = normalize_path(&r.path);
-        let entry = bucket.entry(path).or_default();
-        if r.methods.is_empty() {
-            entry.insert("*".to_string());
-        } else {
-            for m in r.methods {
-                entry.insert(m.to_ascii_uppercase());
-            }
-        }
-    }
-    bucket
-        .into_iter()
-        .map(|(path, mut methods)| {
-            let wildcard = methods.remove("*");
-            let mut m: Vec<String> = methods.into_iter().collect();
-            m.sort();
-            if wildcard && m.is_empty() {
-                m.clear();
-            }
-            RouteDef { path, methods: m }
-        })
-        .collect()
-}
-
-fn normalize_path(p: &str) -> String {
-    let p = p.trim();
-    if !p.starts_with('/') {
-        format!("/{p}")
-    } else {
-        p.to_string()
-    }
+    sentry_core::routes_learn::normalize_routes(routes)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────

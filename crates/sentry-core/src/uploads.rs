@@ -44,8 +44,23 @@ pub struct UploadsScan {
     /// Filename extensions that always raise `UploadExecutable`.
     pub blocked_extensions: Vec<String>,
     /// Filename extensions allowlist (F12): when non-empty, extensions
-    /// outside it raise `UploadDisallowed`. Empty = off.
+    /// outside it raise `UploadDisallowed`. Empty = off. Entries accept a
+    /// `*` glob in any position; a bare `*` allows everything.
     pub allowed_extensions: Vec<String>,
+    /// Declared content-type allowlist (F12): when non-empty, a file part
+    /// that *declares* a Content-Type matching none of these globs raises
+    /// `UploadDisallowed` (`image/*`, `*xml`, `*`). Parts without a
+    /// declared content type are not affected.
+    pub allowed_content_types: Vec<String>,
+    /// HTTP methods allowed to carry an upload body (multipart file parts
+    /// or a direct binary PUT/POST), normalized uppercase. Requests outside
+    /// the list raise `UploadDisallowed`.
+    pub methods: Vec<String>,
+    /// Path prefixes where uploads may land; an upload-shaped body on any
+    /// other path raises `UploadDisallowed`. Empty = off.
+    pub allowed_paths: Vec<String>,
+    /// Whether extensionless files pass the `allowed_extensions` allowlist.
+    pub allow_extensionless: bool,
     /// Policy for bodies beyond the inspection cap (F12): only `Flag`
     /// produces the `UploadOversize` signal.
     pub oversize: crate::config::OversizePolicy,
@@ -63,6 +78,20 @@ impl UploadsScan {
             scan_json: cfg.scan_json,
             blocked_extensions: normalize_extensions(&cfg.blocked_extensions),
             allowed_extensions: normalize_extensions(&cfg.allowed_extensions),
+            allowed_content_types: normalize_extensions(&cfg.allowed_content_types),
+            methods: cfg
+                .methods
+                .iter()
+                .map(|m| m.trim().to_ascii_uppercase())
+                .filter(|m| !m.is_empty())
+                .collect(),
+            allowed_paths: cfg
+                .allowed_paths
+                .iter()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect(),
+            allow_extensionless: cfg.allow_extensionless,
             oversize: cfg.oversize,
             inspect_bytes: cfg.inspect_kb.saturating_mul(1024),
         }
@@ -75,6 +104,70 @@ fn normalize_extensions(list: &[String]) -> Vec<String> {
         .map(|e| e.trim().to_ascii_lowercase())
         .filter(|e| !e.is_empty())
         .collect()
+}
+
+/// `*`-glob match over a short string. `*` stands for any run of
+/// characters (including empty) and may appear anywhere and multiple
+/// times (`php*`, `*php`, `*sh*`, `a*b*c`). Without `*` the match is
+/// exact. Callers pass already-normalized (lowercase) values.
+pub fn glob_match(pattern: &str, value: &str) -> bool {
+    let mut pat = pattern;
+    let mut val = value;
+    match pat.find('*') {
+        None => return pat == val,
+        Some(i) => {
+            if !val.starts_with(&pat[..i]) {
+                return false;
+            }
+            val = &val[i..];
+            pat = &pat[i + 1..];
+        }
+    }
+    while let Some(i) = pat.find('*') {
+        let mid = &pat[..i];
+        match val.find(mid) {
+            Some(p) => {
+                val = &val[p + mid.len()..];
+                pat = &pat[i + 1..];
+            }
+            None => return false,
+        }
+    }
+    val.ends_with(pat)
+}
+
+/// Whether any pattern matches the extension. Extensionless files match as
+/// the empty string: a bare `*` denylist catches them, literals and
+/// prefixes do not.
+pub fn extension_matches(patterns: &[String], ext: Option<&str>) -> bool {
+    let val = ext.unwrap_or("");
+    patterns.iter().any(|p| glob_match(p, val))
+}
+
+/// Whether any allowlist glob matches the declared content type, compared
+/// without parameters (`image/png; boundary=x` → `image/png`).
+pub fn content_type_matches(patterns: &[String], content_type: Option<&str>) -> bool {
+    let Some(ct) = content_type else {
+        return false;
+    };
+    let base = ct.split(';').next().unwrap_or("").trim();
+    let base = base.to_ascii_lowercase();
+    patterns.iter().any(|p| glob_match(p.trim(), &base))
+}
+
+/// Whether `path` falls under one of the allowlist prefixes. A prefix
+/// without a trailing slash still only matches on a `/` boundary:
+/// `/wp-admin` allows `/wp-admin/media.php` but not `/wp-adminX`.
+pub fn path_allowed(path: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|p| {
+        if p == "/" {
+            return true;
+        }
+        match path.strip_prefix(p.as_str()) {
+            Some(rest) => p.ends_with('/') || rest.is_empty() || rest.starts_with('/'),
+            None => false,
+        }
+    })
 }
 
 impl Default for UploadsScan {
@@ -453,5 +546,72 @@ mod tests {
         t.prune();
         let sigs = t.record(ip(), &[upload(1)]);
         assert_eq!(sigs[0].detail.as_deref(), Some("1 files in 0s (limit 1)"));
+    }
+
+    #[test]
+    fn glob_matcher_covers_any_position() {
+        assert!(glob_match("php", "php"));
+        assert!(!glob_match("php", "php5"));
+        assert!(glob_match("php*", "php"));
+        assert!(glob_match("php*", "php5"));
+        assert!(!glob_match("php*", "phtml"));
+        assert!(glob_match("*php", "xphp"));
+        assert!(!glob_match("*php", "php5"));
+        assert!(glob_match("*sh*", "bash"));
+        assert!(!glob_match("*sh*", "bath"));
+        assert!(glob_match("a*b*c", "aXbYc"));
+        assert!(!glob_match("a*b*c", "abYcX"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("*", "anything"));
+        assert!(!glob_match("png", ""));
+    }
+
+    #[test]
+    fn extension_and_content_type_matchers() {
+        let pats = vec!["ts*".to_string(), "*a*x".to_string()];
+        assert!(extension_matches(&pats, Some("ts")));
+        assert!(extension_matches(&pats, Some("tsx")));
+        assert!(extension_matches(&pats, Some("sax")));
+        assert!(!extension_matches(&pats, Some("png")));
+        assert!(!extension_matches(&pats, None), "no bare-* pattern");
+
+        let mimes = vec!["image/*".to_string(), "application/pdf".to_string()];
+        assert!(content_type_matches(&mimes, Some("image/png")));
+        assert!(content_type_matches(
+            &mimes,
+            Some("image/png; charset=binary")
+        ));
+        assert!(content_type_matches(&mimes, Some("Application/PDF")));
+        assert!(!content_type_matches(&mimes, Some("application/x-php")));
+        assert!(!content_type_matches(&mimes, None));
+    }
+
+    #[test]
+    fn path_allowlist_respects_segment_boundary() {
+        let prefixes = vec!["/wp-admin/".to_string(), "/wp-json/wp/v2/media".to_string()];
+        assert!(path_allowed("/wp-admin/media-upload.php", &prefixes));
+        assert!(path_allowed("/wp-json/wp/v2/media", &prefixes));
+        assert!(path_allowed("/wp-json/wp/v2/media/1", &prefixes));
+        assert!(!path_allowed("/wp-adminX/evil.php", &prefixes));
+        assert!(!path_allowed("/wp-json/wp/v2/mediaX", &prefixes));
+        assert!(!path_allowed("/upload", &prefixes));
+        assert!(path_allowed("/any", &["/".to_string()]));
+    }
+
+    #[test]
+    fn scan_projection_normalizes_new_policy_fields() {
+        let cfg = UploadsConfig {
+            enabled: true,
+            allowed_content_types: vec!["Image/*".into(), " ".into()],
+            methods: vec!["post".into(), " PATCH ".into(), "".into()],
+            allowed_paths: vec!["/wp-admin/".into(), "  ".into()],
+            allow_extensionless: false,
+            ..UploadsConfig::default()
+        };
+        let scan = UploadsScan::from_config(&cfg);
+        assert_eq!(scan.allowed_content_types, vec!["image/*"]);
+        assert_eq!(scan.methods, vec!["POST", "PATCH"]);
+        assert_eq!(scan.allowed_paths, vec!["/wp-admin/"]);
+        assert!(!scan.allow_extensionless);
     }
 }

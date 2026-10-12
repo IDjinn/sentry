@@ -11,6 +11,8 @@ use sentry_core::config::SentryConfig;
 
 /// Dispatch a parsed CLI invocation with a possibly-loaded config.
 pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_eyre::Result<()> {
+    let verbose = cli.verbose;
+    let config_path = cli.config.clone();
     match cli.command {
         Command::Run => {
             let cfg = cfg.ok_or_else(|| color_eyre::eyre::eyre!("config required for `run`"))?;
@@ -1229,11 +1231,22 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
         Command::Auto {
             root,
             profile,
-            dry_run,
-            merge,
+            probe,
+            disk,
             deep,
+            dry_run,
         } => {
-            println!("(stub) auto root={root:?} profile={profile:?} dry_run={dry_run} merge={merge} deep={deep}");
+            crate::auto::run(crate::auto::AutoArgs {
+                root,
+                profile,
+                probe,
+                disk,
+                deep,
+                dry_run,
+                verbose,
+                config_path,
+            })
+            .await?;
         }
     }
     Ok(())

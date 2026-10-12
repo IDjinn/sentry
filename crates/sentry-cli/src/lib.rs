@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod auto;
 pub mod bench_llm;
 pub mod botdns;
 pub mod cli;

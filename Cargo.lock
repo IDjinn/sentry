@@ -3162,6 +3162,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentry-auto"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "sentry-core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "toml",
+]
+
+[[package]]
 name = "sentry-cli"
 version = "0.1.0"
 dependencies = [
@@ -3174,6 +3186,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "figment",
+ "futures",
  "hickory-resolver",
  "hmac",
  "http-body-util",
@@ -3192,6 +3205,7 @@ dependencies = [
  "sentry-action-report",
  "sentry-action-webhook",
  "sentry-ai",
+ "sentry-auto",
  "sentry-core",
  "sentry-edge",
  "sentry-geo",

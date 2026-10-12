@@ -1398,32 +1398,39 @@ framework/stack** and **generates tailored rules, known routes and
 recommended packs**. Instead of starting from a generic config, Sentry
 understands what is running and protects what matters.
 
-### 20.1 Flow
+**Status (F1.x/A.1–A.14, v1 delivered)**: crate `crates/sentry-auto` with
+the `nginx`, `wordpress`, `laravel`, `nextjs` and `express` profiles, the
+bounded live HTTP probe (ports 80/443) and the cascade loader that merges
+`sentry.auto.toml` into every config load. Still roadmap: Django, Rails,
+ASP.NET, Docker and Flask profiles; tree-sitter AST parsing (`--deep` is a
+regex whole-tree scan today); Apache/Caddy config detection.
+
+### 20.1 Flow (as delivered)
 
 ```mermaid
 flowchart TB
-    ROOT[Project root] --> SCAN{File scanner}
-    SCAN -->|composer.json| WP[WordPress? Laravel?]
-    SCAN -->|package.json| NODE[Next.js? Express?]
-    SCAN -->|requirements.txt| PY[Django? Flask?]
-    SCAN -->|Gemfile| RB[Rails?]
-    SCAN -->|*.csproj| DOTNET[ASP.NET?]
-    SCAN -->|Dockerfile| DOCK[Docker stack detect]
-    SCAN -->|nginx.conf| NGINX[Nginx config parse]
-    SCAN -->|web.config| IIS[IIS/ASP.NET]
-    WP --> DETECT[FrameworkProfile]
-    NODE --> DETECT
-    PY --> DETECT
-    RB --> DETECT
-    DOTNET --> DETECT
-    DOCK --> DETECT
+    ROOT[Project root] --> SCAN{File scanner<br/>bounded walk}
+    SCAN -->|composer.json + routes/*.php| LAR[Laravel]
+    SCAN -->|package.json + next| NEXT[Next.js app//pages/ tree]
+    SCAN -->|package.json + express| EXPR[Express app.get regex]
+    SCAN -->|wp-config.php / wp-content| WP[WordPress stock routes]
+    SCAN -->|nginx.conf / sites-enabled| NGINX[Nginx location parse]
+    DISK[/etc/nginx, cwd/] --> NGINX2[Disk module<br/>--disk]
+    PROBE[Live HTTP probe<br/>127.0.0.1:80 + :443<br/>robots.txt / sitemap.xml<br/>common paths] --> SENT[Sentinel catch-all filter]
+    LAR --> DETECT[FrameworkProfile per framework]
+    NEXT --> DETECT
+    EXPR --> DETECT
+    WP --> DETECT
     NGINX --> DETECT
-    IIS --> DETECT
-    DETECT --> GEN[Generate rules + routes + packs]
+    NGINX2 --> DETECT
+    SENT --> DETECT
+    DETECT --> GEN[Generate routes + packs + rules]
     GEN --> OUT[sentry.auto.toml]
-    OUT --> MERGE[Merge with user's sentry.toml]
-    MERGE --> RUN[sentry run]
+    OUT --> CASCADE[Loader cascades it next to sentry.toml<br/>routes/packs/rules appended, user config wins]
+    CASCADE --> RUN[sentry run]
 ```
+
+Nothing found → the command prints nothing and writes nothing (exit 0).
 
 ### 20.2 Framework Profiles (`FrameworkProfile`)
 
@@ -1482,45 +1489,60 @@ From the `FrameworkProfile`, the generator produces:
 3. **Smart allowlists**: static assets (`/static/`, `/_next/static/`, `/wp-content/uploads/`) must not trigger rate-limit even at high volume.
 4. **Recommended packs**: enables `sensitive_paths` in enforce, `crawlers_bad` in enforce, `rate_scan` in enforce for admin paths.
 
-### 20.5 CLI
+### 20.5 CLI (as delivered)
 
 ```
-sentry auto                    # detects the framework in cwd, generates sentry.auto.toml
-sentry auto --root /var/www    # specifies the project root
-sentry auto --merge            # merges with existing sentry.toml
-sentry auto --dry-run          # only shows what it would detect, doesn't write
-sentry auto --profile wordpress # force a profile (skip detection)
-sentry auto --deep             # AST route scan (slow, accurate)
-sentry auto list-profiles      # lists supported profiles
+sentry auto                     # full run: disk configs + live probe of 127.0.0.1:80/443
+sentry auto /var/www/app        # filesystem scan of the given root (positional)
+sentry auto --probe             # opt-in: only the live HTTP probe
+sentry auto --disk              # opt-in: only on-disk config detection
+sentry auto --profile wordpress # force a profile (skip detection; probe gains profile paths)
+sentry auto --deep              # whole-tree regex scan instead of canonical files
+sentry auto --dry-run           # print findings, don't write sentry.auto.toml
+sentry auto -v                  # verbose: walked tree, versions (≥1); per-file detail (≥2)
 ```
 
-**Output**: `sentry.auto.toml` (or merged into `sentry.toml`) containing routes + rules + packs. The user reviews, adjusts, and done. `sentry run` loads both.
+**Output**: table of `METHODS | PATH` plus the frameworks detected; without
+a root path the local service on ports 80/443 is probed (robots.txt,
+sitemap.xml, curated common paths; a random sentinel path filters
+catch-all/SPA fallbacks). If no routes are found, nothing is printed and
+nothing is written. Otherwise `sentry.auto.toml` is written atomically next
+to the resolved `sentry.toml` (or cwd). `--merge` was dropped: the loader
+cascades the file automatically (below). Invalid `--profile` names error
+with the valid list (instead of a `list-profiles` subcommand).
 
-### 20.6 Subproject architecture
+**Cascade loader**: `config::load` looks for `sentry.auto.toml` next to the
+resolved main config and merges `routes.known`, `rules.pack` and
+`rules.custom` — append + dedupe (existing entries win; unknown sections in
+the auto file are warned about and ignored, so the auto file can never
+touch `[server]` etc.). Env overlay still applies on top.
+
+### 20.6 Subproject architecture (as delivered)
 
 ```
 crates/
-├── sentry-auto/                # crate for the `auto` command
+├── sentry-auto/                # pure crate: fs reads only, no network
 │   ├── src/
-│   │   ├── lib.rs               # FrameworkDetector trait, FrameworkProfile
-│   │   ├── detect.rs            # file scanner
-│   │   ├── generate.rs          # profile → rules/routes config
+│   │   ├── lib.rs               # FrameworkDetector trait, FrameworkProfile, scan()
+│   │   ├── detect.rs            # bounded walk (depth 6/12, 50k files, symlinks skipped)
+│   │   ├── generate.rs          # profiles → AutoArtifacts → sentry.auto.toml
+│   │   ├── probe.rs             # robots.txt/sitemap parsers, common paths, catch-all filter
 │   │   └── profiles/
-│   │       ├── wordpress.rs
-│   │       ├── laravel.rs
-│   │       ├── nextjs.rs
-│   │       ├── django.rs
-│   │       ├── rails.rs
-│   │       ├── express.rs
-│   │       ├── aspnet.rs
-│   │       └── nginx.rs         # nginx.conf parser
-│   └── tests/                   # fixtures of real projects per framework
-└── sentry-cli/                 # adds the `sentry auto` subcommand
+│   │       ├── wordpress.rs     # stock routes + rules (rate-limit wp-login, block xmlrpc)
+│   │       ├── laravel.rs       # composer.json + routes/web|api.php regex
+│   │       ├── nextjs.rs        # app//pages/ filesystem routing ([param] → {param})
+│   │       ├── express.rs       # app.get/router.route regex over js/ts
+│   │       └── nginx.rs         # location/root/alias parse (+ detect_from_dirs for --disk)
+│   └── tests/fixtures/          # per-framework fixtures
+└── sentry-cli/                  # src/auto.rs: orchestration + live HTTP probe (reqwest),
+                                 # config.rs: cascade loader
 ```
 
-### 20.7 Route detection via AST (`--deep` mode)
+### 20.7 Route detection via AST (`--deep` mode) — roadmap
 
-For frameworks where routes live in code (Rails, Django, Express, Flask), `--deep` does **AST parsing** with `syn` (not Rust — needs language-specific parsers):
+`--deep` today widens the **regex** scan (whole tree, deeper walk) — e.g.
+Laravel route files beyond `routes/web|api.php`. True AST parsing with
+`tree-sitter` stays in `BACKLOG.md` (A.12):
 
 | Framework | File               | Parser                   |
 | --------- | ------------------ | ------------------------ |

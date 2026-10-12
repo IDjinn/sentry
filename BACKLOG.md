@@ -50,20 +50,27 @@ gantt
 
 ## 3. Backlog (subprojeto `sentry auto`)
 
-- [ ] **A.1** `sentry-auto` crate skeleton + `FrameworkDetector` trait
-- [ ] **A.2** Scanner de arquivos-âncora + manifestos (composer, package.json, etc.)
-- [ ] **A.3** Perfil **WordPress**: wp-config detection, wp-login rate-limit, xmlrpc block, wp-admin allowlist
-- [ ] **A.4** Perfil **Laravel**: artisan detection, .env/storage protect, routes/web.php parse (PHP AST)
-- [ ] **A.5** Perfil **Django**: manage.py detection, admin/ rate-limit, urls.py parse (Python AST)
-- [ ] **A.6** Perfil **Next.js**: next.config.js, `/_next/static` allowlist, `/api/*` routes
-- [ ] **A.7** Perfil **Rails**: routes.rb parse (Ruby AST), admin protect
-- [ ] **A.8** Perfil **Express**: app.js/routes/ parse (JS AST)
-- [ ] **A.9** Perfil **nginx.conf**: parse `location` blocks → rotas conhecidas
-- [ ] **A.10** Gerador: profile → `sentry.auto.toml` (rotas + regras + packs)
-- [ ] **A.11** `sentry auto` CLI: `--root`, `--dry-run`, `--merge`, `--profile`, `--deep`
+> **v1 entregue (ver `ARCHITECTURE.md` §19)**: A.1, A.2, A.3, A.4 (regex,
+> sem AST), A.6, A.8 (regex), A.9, A.10, A.11 (flag set final: root
+> posicional, `--probe`/`--disk` opt-in, `--dry-run`, `--profile`,
+> `--deep`; `--merge` substituído pelo cascade loader), A.13 (fixtures de
+> teste por perfil) e A.14 (cascade append + dedupe, config do usuário
+> vence). Restante abaixo.
+
+- [x] **A.1** `sentry-auto` crate skeleton + `FrameworkDetector` trait
+- [x] **A.2** Scanner de arquivos-âncora + manifestos (composer, package.json)
+- [x] **A.3** Perfil **WordPress**: wp-config detection, wp-login rate-limit, xmlrpc block, wp-admin allowlist
+- [x] **A.4** Perfil **Laravel**: composer.json detection, .env/storage protect, routes/web|api.php parse (regex; AST fica no A.12)
+- [ ] **A.5** Perfil **Django**: manage.py detection, admin/ rate-limit, urls.py parse
+- [x] **A.6** Perfil **Next.js**: package.json, filesystem routing app//pages/, `/_next` assets
+- [ ] **A.7** Perfil **Rails**: routes.rb parse, admin protect
+- [x] **A.8** Perfil **Express**: package.json + regex sobre js/ts (AST fica no A.12)
+- [x] **A.9** Perfil **nginx.conf**: parse `location` blocks → rotas conhecidas (+ `--disk` via `/etc/nginx`)
+- [x] **A.10** Gerador: profile → `sentry.auto.toml` (rotas + regras + packs)
+- [x] **A.11** `sentry auto` CLI (root posicional; módulos `--probe`/`--disk` opt-in — sem flags roda tudo; `--dry-run`, `--profile`, `--deep`, `-v`; sem rotas = saída vazia)
 - [ ] **A.12** `tree-sitter` integration para AST scan (deep mode)
-- [ ] **A.13** Fixtures de testes: 1 projeto real por framework (em `tests/fixtures/`)
-- [ ] **A.14** Merge inteligente: preserva regras custom do usuário, só adiciona
+- [x] **A.13** Fixtures de testes por perfil (`crates/sentry-auto/tests/fixtures/`)
+- [x] **A.14** Merge inteligente: cascade loader appenda `routes.known`/`rules.pack`/`rules.custom` com dedupe — config do usuário sempre vence
 
 > **Fase**: F1.x (pode rodar em paralelo ao MVP nginx — o `auto` gera config que o `run` consome).
 

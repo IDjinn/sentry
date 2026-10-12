@@ -87,7 +87,8 @@ sentry/
 │   ├── sentry-action-firewall/    # plugin Action: bans de kernel nftables/ipset/firewalld (F7.3)
 │   ├── sentry-action-opnsense/    # plugin Action: bans OPNsense/pfSense (F6.1)
 │   ├── sentry-action-nginx/       # plugin Action: includes deny/challenge p/ nginx + reload (F7.8)
-│   └── sentry-cli/            # binário: clap + ratatui + daemon + server + auth + siem
+│   ├── sentry-auto/           # detecção de framework + extração de rotas p/ `sentry auto` (pura)
+│   └── sentry-cli/            # binário: clap + ratatui + daemon + server + auth + siem + auto
 ├── deploy/
 │   ├── docker/               # Dockerfile + docker-compose
 │   └── k8s/                  # manifests Kubernetes
@@ -845,7 +846,49 @@ telemetria de handshake + provider de appliance
     criptografia; `[edge.compress]` fora de inline → inerte —
     2 testes no core
 
-Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4; §27 F12 idem).
+# F1.x (concluída v1): `sentry auto` — detecção de framework e geração de
+# config (crate `sentry-auto`; detalhes em `ARCHITECTURE.md` §19)
+  - ✅ Crate `crates/sentry-auto` (pura: fs reads only; `scan(root, opts)`
+    → `ScanReport{profiles, files}`): walk limitado (profundidade 6/12 no
+    `--deep`, cap 50k arquivos, symlinks skip, never entra em
+    .git/node_modules/vendor/target); trait `FrameworkDetector` + registry;
+    `FoundRoute{path, methods, source}`; `normalize_found` sobre o
+    `normalize_routes` do core (movido de routes_import p/ core, reusado
+    pelo `routes import`)
+  - ✅ Perfis: **nginx** (parse tolerante de `location`/`root`/`alias` —
+    exact→exact, prefixo→path+`/*`, regex locations contados e skipados;
+    `detect_from_dirs` p/ `/etc/nginx`+sites-enabled/conf.d), **WordPress**
+    (rotas fixas de stock + regras wp-login rate-limit / xmlrpc block +
+    packs enforce), **Laravel** (composer.json → regex routes/web|api.php,
+    `Route::get/match/resource`, prefixo /api), **Next.js** (filesystem
+    routing app//pages/, `[param]`→`{param}`, `(group)` ignored,
+    `[...slug]`→`/*`, métodos de route handlers exportados), **Express**
+    (regex app/router/server .get|route sobre js/ts, `:param`→`{param}`,
+    `use`→glob)
+  - ✅ CLI (`sentry auto`, handler em `src/auto.rs`): root **posicional**
+    (`sentry auto /var/www/app`); sem root = scan completo do serviço
+    local — módulos **opt-in** (`--probe` só sonda HTTP 127.0.0.1:80/443;
+    `--disk` só configs de disco; sem flags roda tudo); sonda com timeout
+    2s/req, concorrência 8, /robots.txt + /sitemap.xml (`<loc>`) + ~60
+    paths comuns, path sentinela aleatória filtra catch-all/SPA fallback
+    por assinatura (status, len), 443 aceita cert self-signed (localhost);
+    `--profile` força perfil (e adiciona paths à sonda); `--deep` = árvore
+    inteira em regex (tree-sitter segue no backlog A.12); `--dry-run`;
+    verbosidade via `-v` global (árvore/resumo ≥1, detalhe ≥2). **Sem
+    rotas → nada impresso, nada escrito, exit 0**; achando → tabela
+    `METHODS | PATH` + `sentry.auto.toml` gravado atomicamente ao lado do
+    sentry.toml resolvido
+  - ✅ Cascade loader (`config.rs`): `sentry.auto.toml` no dir do config
+    principal é mergeado em todo load — `routes.known`, `rules.pack` e
+    `rules.custom` append + dedupe (case-insensitive; entrada existente
+    vence), seções desconhecidas no auto file viram warn + ignore (auto
+    file nunca toca em `[server]` etc.); env overlay continua por cima.
+    `--merge` removido (substituído pela cascata)
+  - ✅ ~56 testes novos (perfis/fixtures, parsers robots/sitemap, catch-all
+    filter, generate round-trip TOML→SentryConfig, cascade merge/dedupe,
+    write atômico)
+
+Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4; §27 F12 idem; §3 subprojeto auto — v1 entregue, A.5/A.7/A.12 restantes).
 
 ### Status atual (verificação contínua)
 
@@ -854,7 +897,7 @@ Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 674 testes passando sem features (676 com
+# Resultado esperado: 730 testes passando sem features (732 com
 # --features sentry-cli/onnx — os 2 testes de inferência ONNX; com
 # edge-tls/edge-zstd entram os testes de TLS/h2/compressão zstd)
 ```

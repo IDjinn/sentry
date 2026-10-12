@@ -864,10 +864,35 @@ pub struct UploadsConfig {
     pub blocked_extensions: Vec<String>,
     /// Filename extensions allowlist (lowercase, without the dot). When
     /// non-empty, a named upload whose extension (or double extension) is
-    /// not listed raises `UploadDisallowed`. Files without an extension are
-    /// not affected. `blocked_extensions` wins over this list.
+    /// not listed raises `UploadDisallowed`. Entries accept a `*` glob in
+    /// any position (`ts*`, `*php`, `*` = allow everything). Files without
+    /// an extension follow `allow_extensionless`. `blocked_extensions`
+    /// wins over this list.
     #[serde(default)]
     pub allowed_extensions: Vec<String>,
+    /// Declared content-type allowlist for file uploads: when non-empty, a
+    /// file part that declares a Content-Type matching none of these globs
+    /// (`image/*`, `application/pdf`, `*`) raises `UploadDisallowed`.
+    /// Parts without a declared content type are not affected; a direct
+    /// binary upload (PUT/POST of `image/*`/`application/octet-stream`)
+    /// is checked against the request Content-Type.
+    #[serde(default)]
+    pub allowed_content_types: Vec<String>,
+    /// HTTP methods allowed to carry an upload body (multipart file parts
+    /// or a direct binary PUT/POST). An upload-shaped body on any other
+    /// method raises `UploadDisallowed`.
+    #[serde(default = "default_uploads_methods")]
+    pub methods: Vec<String>,
+    /// Path prefixes where uploads may land (`/wp-admin/`,
+    /// `/wp-json/wp/v2/media`). An upload-shaped body on any other path
+    /// raises `UploadDisallowed`. Empty = off. A prefix without a trailing
+    /// slash still only matches on a `/` boundary.
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+    /// Whether files without an extension pass the `allowed_extensions`
+    /// allowlist (`false` raises `UploadDisallowed` for them).
+    #[serde(default = "default_uploads_allow_extensionless")]
+    pub allow_extensionless: bool,
     /// Policy for bodies larger than `inspect_kb` (F12): `reject` (413),
     /// `skip` (forward uninspected) or `flag` (forward + `UploadOversize`).
     #[serde(default)]
@@ -887,6 +912,10 @@ impl Default for UploadsConfig {
             scan_json: default_uploads_scan_json(),
             blocked_extensions: default_uploads_blocked_extensions(),
             allowed_extensions: Vec::new(),
+            allowed_content_types: Vec::new(),
+            methods: default_uploads_methods(),
+            allowed_paths: Vec::new(),
+            allow_extensionless: default_uploads_allow_extensionless(),
             oversize: OversizePolicy::default(),
             flood: UploadFloodConfig::default(),
         }
@@ -909,6 +938,15 @@ fn default_uploads_blocked_extensions() -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+fn default_uploads_methods() -> Vec<String> {
+    ["post", "put", "patch"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+fn default_uploads_allow_extensionless() -> bool {
+    true
 }
 
 /// Enforcement posture of upload inspection (F10).
@@ -2274,6 +2312,13 @@ mod tests {
         assert!(c.scan_json);
         assert!(c.blocked_extensions.iter().any(|e| e == "php"));
         assert!(c.allowed_extensions.is_empty(), "allowlist off by default");
+        assert!(
+            c.allowed_content_types.is_empty(),
+            "content-type allowlist off by default"
+        );
+        assert_eq!(c.methods, vec!["post", "put", "patch"]);
+        assert!(c.allowed_paths.is_empty(), "path allowlist off by default");
+        assert!(c.allow_extensionless, "extensionless files pass by default");
         assert_eq!(c.oversize, OversizePolicy::Reject);
         assert_eq!(c.flood.max_uploads, 30);
 

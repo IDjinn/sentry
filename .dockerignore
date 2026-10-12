@@ -1,6 +1,7 @@
 target/
 .git/
 .github/
+docs/
 *.md
 !config/sentry.example.toml
 deploy/k8s/

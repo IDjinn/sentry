@@ -11,26 +11,45 @@ use figment::providers::{Env, Format, Serialized, Toml};
 use figment::{Figment, Provider};
 use sentry_core::config::SentryConfig;
 
+/// Generated config cascaded into every load (routes/rules are appended,
+/// never replaced).
+pub const AUTO_FILE: &str = "sentry.auto.toml";
+
 /// Load config from the default search path, merging TOML + env.
 pub fn load(path: Option<&Path>) -> color_eyre::Result<SentryConfig> {
     let figment = Figment::from(Serialized::defaults(SentryConfig::default()));
 
     // Try explicit path, then cwd, then /etc/sentry/sentry.toml.
-    let figment = if let Some(p) = path {
-        figment.merge(Toml::file(p))
-    } else {
-        let cwd = PathBuf::from("sentry.toml");
-        let etc = PathBuf::from("/etc/sentry/sentry.toml");
-        let figment = if cwd.exists() {
-            figment.merge(Toml::file(&cwd))
-        } else {
-            figment
-        };
-        if etc.exists() {
-            figment.merge(Toml::file(&etc))
-        } else {
-            figment
+    let main_path = match path {
+        Some(p) => Some(PathBuf::from(p)),
+        None => {
+            let cwd = PathBuf::from("sentry.toml");
+            let etc = PathBuf::from("/etc/sentry/sentry.toml");
+            if cwd.exists() {
+                Some(cwd)
+            } else if etc.exists() {
+                Some(etc)
+            } else {
+                None
+            }
         }
+    };
+    let figment = match &main_path {
+        Some(p) => figment.merge(Toml::file(p)),
+        None => figment,
+    };
+
+    // Cascade: sentry.auto.toml sits next to the main config (`sentry auto`
+    // writes it); its routes/rules are appended to the user's own values.
+    let auto_path = main_path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|dir| dir.join(AUTO_FILE))
+        .unwrap_or_else(|| PathBuf::from(AUTO_FILE));
+    let figment = if auto_path.exists() {
+        merge_auto_file(figment, &auto_path)?
+    } else {
+        figment
     };
 
     // Env overlay: SENTRY_STORAGE__POSTGRES__URL=...
@@ -45,6 +64,111 @@ pub fn load(path: Option<&Path>) -> color_eyre::Result<SentryConfig> {
     }
 
     Ok(cfg)
+}
+
+/// Top-level sections the auto config may contribute to.
+const AUTO_SECTIONS: &[&str] = &["routes", "rules"];
+
+/// Merge `sentry.auto.toml` into the figment: `routes.known`,
+/// `rules.pack` and `rules.custom` are appended and deduped (existing
+/// entries win); anything else in the file is warned about and ignored.
+fn merge_auto_file(figment: Figment, path: &Path) -> color_eyre::Result<Figment> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| color_eyre::eyre::eyre!("{}: {e}", path.display()))?;
+    let auto: toml::Value =
+        toml::from_str(&content).map_err(|e| color_eyre::eyre::eyre!("{}: {e}", path.display()))?;
+    let auto_json = serde_json::to_value(auto)
+        .map_err(|e| color_eyre::eyre::eyre!("{}: {e}", path.display()))?;
+
+    let mut merged: serde_json::Value = figment
+        .extract()
+        .map_err(|e| color_eyre::eyre::eyre!("config data: {e}"))?;
+    let ignored = merge_auto_json(&mut merged, auto_json);
+    for section in ignored {
+        eprintln!(
+            "warning: ignoring `{section}` in {} — only {} are merged",
+            path.display(),
+            AUTO_SECTIONS.join("/")
+        );
+    }
+
+    Ok(Figment::from(JsonOverlay(
+        merged,
+        "sentry.auto.toml (cascade)",
+    )))
+}
+
+/// Append the auto config's routes/rules onto the merged config. Returns
+/// the ignored top-level sections.
+fn merge_auto_json(base: &mut serde_json::Value, auto: serde_json::Value) -> Vec<String> {
+    let mut ignored = Vec::new();
+    let serde_json::Value::Object(auto) = auto else {
+        return ignored;
+    };
+    for (key, value) in auto {
+        match key.as_str() {
+            "routes" => merge_auto_arrays(base, "routes", "known", &["path"], &value),
+            "rules" => {
+                merge_auto_arrays(base, "rules", "pack", &["name"], &value);
+                merge_auto_arrays(base, "rules", "custom", &["name"], &value);
+            }
+            other => ignored.push(other.to_string()),
+        }
+    }
+    ignored
+}
+
+/// Append `auto[section][array_key]` entries onto
+/// `base[section][array_key]`, skipping entries whose `dedupe_keys` values
+/// already exist (case-insensitive). Other keys inside the section are
+/// skipped.
+fn merge_auto_arrays(
+    base: &mut serde_json::Value,
+    section: &str,
+    array_key: &str,
+    dedupe_keys: &[&str],
+    auto_section: &serde_json::Value,
+) {
+    let Some(entries) = auto_section.get(array_key).and_then(|v| v.as_array()) else {
+        return;
+    };
+    let entry = base
+        .as_object_mut()
+        .expect("merged config is an object")
+        .entry(section.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !entry.is_object() {
+        *entry = serde_json::json!({});
+    }
+    let list = entry
+        .as_object_mut()
+        .expect("section is an object")
+        .entry(array_key.to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if !list.is_array() {
+        *list = serde_json::json!([]);
+    }
+    let arr = list.as_array_mut().expect("array key is an array");
+    for item in entries {
+        if entry_key(item, dedupe_keys).is_some_and(|key| {
+            arr.iter()
+                .any(|e| entry_key(e, dedupe_keys).as_deref() == Some(key.as_str()))
+        }) {
+            continue;
+        }
+        arr.push(item.clone());
+    }
+}
+
+/// Lowercased composite key of an entry over `keys` (dedupe identity).
+fn entry_key(entry: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let mut key = String::new();
+    for k in keys {
+        let value = entry.get(*k)?.as_str()?.to_ascii_lowercase();
+        key.push_str(&value);
+        key.push('\u{1}');
+    }
+    Some(key)
 }
 
 /// Deep-merge an env provider into `figment`.
@@ -68,15 +192,16 @@ fn deep_merge_env(figment: Figment, env: Env) -> color_eyre::Result<Figment> {
         merge_json(&mut merged, overlay);
     }
 
-    Ok(Figment::from(EnvOverlay(merged)))
+    Ok(Figment::from(JsonOverlay(merged, "env overlay (deep)")))
 }
 
-/// Provider serving a whole resolved config under the default profile.
-struct EnvOverlay(serde_json::Value);
+/// Provider serving a whole resolved config under the default profile
+/// (used by the env deep-merge and the `sentry.auto.toml` cascade).
+struct JsonOverlay(serde_json::Value, &'static str);
 
-impl figment::Provider for EnvOverlay {
+impl figment::Provider for JsonOverlay {
     fn metadata(&self) -> figment::Metadata {
-        figment::Metadata::named("env overlay (deep)")
+        figment::Metadata::named(self.1)
     }
 
     fn data(
@@ -163,5 +288,102 @@ mod tests {
         assert_eq!(cfg.server.auth.mode, "password");
         assert_eq!(cfg.server.auth.users.len(), 1);
         assert_eq!(cfg.server.auth.users[0].username, "admin");
+    }
+
+    fn write_config(dir: &Path, main: &str, auto: Option<&str>) -> PathBuf {
+        let main_path = dir.join("sentry.toml");
+        std::fs::write(&main_path, main).unwrap();
+        if let Some(auto) = auto {
+            std::fs::write(dir.join(AUTO_FILE), auto).unwrap();
+        }
+        main_path
+    }
+
+    #[test]
+    fn auto_config_appends_routes_and_packs() {
+        let dir = std::env::temp_dir().join(format!("sentry_cfg_auto_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main_path = write_config(
+            &dir,
+            "[[routes.known]]\npath = \"/mine\"\nmethods = [\"GET\"]\n",
+            Some(
+                "[[routes.known]]\npath = \"/api/*\"\n\n\
+                 [[rules.pack]]\nname = \"rate_scan\"\nmode = \"enforce\"\n\n\
+                 [[rules.custom]]\nname = \"auto_rule\"\npriority = 40\nmatch = 'path == \"/x\"'\naction = \"block\"\n",
+            ),
+        );
+        let cfg = load(Some(&main_path)).unwrap();
+        let paths: Vec<&str> = cfg.routes.known.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/mine", "/api/*"],
+            "main route kept, auto appended"
+        );
+        assert_eq!(cfg.rules.packs[0].name, "rate_scan");
+        assert_eq!(cfg.rules.custom[0].name, "auto_rule");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn auto_config_dedupes_by_path_and_name() {
+        let dir =
+            std::env::temp_dir().join(format!("sentry_cfg_auto_dedupe_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main_path = write_config(
+            &dir,
+            "[[routes.known]]\npath = \"/Mine\"\nmethods = [\"GET\"]\n\n\
+             [[rules.pack]]\nname = \"tor\"\nmode = \"shadow\"\n",
+            Some(
+                "[[routes.known]]\npath = \"/mine\"\nmethods = [\"POST\"]\n\n\
+                 [[rules.pack]]\nname = \"TOR\"\nmode = \"enforce\"\n",
+            ),
+        );
+        let cfg = load(Some(&main_path)).unwrap();
+        assert_eq!(cfg.routes.known.len(), 1, "existing path wins over auto");
+        assert_eq!(cfg.routes.known[0].methods, vec!["GET"]);
+        assert_eq!(cfg.rules.packs.len(), 1);
+        assert_eq!(cfg.rules.packs[0].mode, "shadow");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn auto_config_ignores_unknown_sections() {
+        let dir =
+            std::env::temp_dir().join(format!("sentry_cfg_auto_unknown_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main_path = write_config(
+            &dir,
+            "",
+            Some("[[routes.known]]\npath = \"/a\"\n\n[server]\nhost = \"9.9.9.9\"\n"),
+        );
+        let cfg = load(Some(&main_path)).unwrap();
+        assert_eq!(cfg.routes.known.len(), 1);
+        assert_eq!(
+            cfg.server.host, "127.0.0.1",
+            "auto file cannot touch server"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn merge_auto_arrays_appends_and_dedupes() {
+        let mut base =
+            serde_json::json!({"routes": {"known": [{"path": "/a", "methods": ["GET"]}]}});
+        merge_auto_arrays(
+            &mut base,
+            "routes",
+            "known",
+            &["path"],
+            &serde_json::json!({
+                "known": [
+                    {"path": "/A", "methods": ["POST"]},
+                    {"path": "/b"},
+                ]
+            }),
+        );
+        let known = base["routes"]["known"].as_array().unwrap();
+        assert_eq!(known.len(), 2);
+        assert_eq!(known[0]["methods"][0], "GET", "existing entry untouched");
+        assert_eq!(known[1]["path"], "/b");
     }
 }
