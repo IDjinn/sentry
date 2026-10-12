@@ -710,10 +710,13 @@ impl Heuristic for SensitivePath {
         Some(gate::SENSITIVE)
     }
     fn analyze(&self, _evt: &Event, text: &DecodedHttp<'_>) -> Vec<Signal> {
-        if SENSITIVE_PATH_RE
-            .load()
-            .is_match(&text.path.to_ascii_lowercase())
-        {
+        // Matches on the single-decoded path, falling back to a
+        // double-decoded view so %252E (encoded `%2E`) can't slip past a
+        // backend that decodes twice.
+        let re = SENSITIVE_PATH_RE.load();
+        let once = text.path.to_ascii_lowercase();
+        let hit = re.is_match(&once) || re.is_match(&url_decode(&text.path).to_ascii_lowercase());
+        if hit {
             return vec![Signal {
                 kind: SignalKind::SensitivePath,
                 weight: 30,
@@ -1368,7 +1371,15 @@ mod tests {
 
     #[test]
     fn detects_sensitive_path_in_subdir_and_encoded() {
-        for path in ["/app/.env.local", "/site/.git/config", "/%2Egit/config"] {
+        for path in [
+            "/app/.env.local",
+            "/site/.git/config",
+            "/%2Egit/config",
+            "/%252Egit/config",
+            "/\\.env",
+            "/app\\.git/config",
+            "/%5C.env",
+        ] {
             let e = http_evt(path, None);
             let signals = SensitivePath.analyze(&e, &text_of(&e));
             assert!(!signals.is_empty(), "missed encoded/subdir path {path:?}");

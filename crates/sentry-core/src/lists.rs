@@ -35,7 +35,7 @@ pub struct PathPattern {
 /// panels).
 pub const SENSITIVE_PATHS: &[PathPattern] = &[
     PathPattern {
-        pattern: r"(^|/)\.(env|git|svn|hg|bzr|ssh|aws|gcp|azure|kube|docker|terraform|npmrc|pypirc|netrc|htpasswd|ds_store)",
+        pattern: r"(^|[/\\])\.(env|git|svn|hg|bzr|ssh|aws|gcp|azure|kube|docker|terraform|npmrc|pypirc|netrc|htpasswd|ds_store)",
         literals: &["."],
     },
     PathPattern {
@@ -231,6 +231,8 @@ mod tests {
             "/site/.git/config",
             "/blog/.git/HEAD",
             "/.git",
+            "/\\.env",
+            "/backup\\.git/config",
         ];
         for s in samples {
             assert!(

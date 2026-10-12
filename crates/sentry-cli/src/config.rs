@@ -297,6 +297,15 @@ fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate the process environment or call
+    /// `load()` (which reads it): figment reads `SENTRY_*` vars at load
+    /// time, so parallel tests race on `set_var`/`remove_var` windows.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn merge_json_overrides_leaf_and_keeps_siblings() {
         let mut base = serde_json::json!({
@@ -315,6 +324,7 @@ mod tests {
 
     #[test]
     fn env_override_is_field_level() {
+        let _env = env_lock();
         std::env::set_var("SENTRY_METRICS__PORT", "9999");
         // Explicit (absent) path skips the cwd//etc search — defaults only.
         let cfg = load(Some(Path::new("/nonexistent/sentry.toml"))).unwrap();
@@ -326,6 +336,7 @@ mod tests {
 
     #[test]
     fn env_override_keeps_file_auth_section() {
+        let _env = env_lock();
         let path = std::env::temp_dir().join("sentry_cfg_env_test.toml");
         std::fs::write(
             &path,
@@ -380,6 +391,7 @@ mod tests {
 
     #[test]
     fn env_file_next_to_config_feeds_overlay() {
+        let _env = env_lock();
         let dir = std::env::temp_dir().join(format!("sentry_cfg_dotenv_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let main_path = write_config(&dir, "", None);
@@ -413,6 +425,7 @@ mod tests {
 
     #[test]
     fn auto_config_appends_routes_and_packs() {
+        let _env = env_lock();
         let dir = std::env::temp_dir().join(format!("sentry_cfg_auto_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let main_path = write_config(
@@ -438,6 +451,7 @@ mod tests {
 
     #[test]
     fn auto_config_dedupes_by_path_and_name() {
+        let _env = env_lock();
         let dir =
             std::env::temp_dir().join(format!("sentry_cfg_auto_dedupe_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -460,6 +474,7 @@ mod tests {
 
     #[test]
     fn auto_config_ignores_unknown_sections() {
+        let _env = env_lock();
         let dir =
             std::env::temp_dir().join(format!("sentry_cfg_auto_unknown_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
