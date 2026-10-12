@@ -263,13 +263,71 @@ pub fn sparkline(rows: &[&EventRow], now_ms: i64, bucket_ms: i64, buckets: usize
     data
 }
 
-/// Approximate requests per second over the last 5 seconds.
-pub fn req_per_sec(rows: &[&EventRow], now_ms: i64) -> u64 {
-    let cutoff = now_ms - 5_000;
-    rows.iter()
-        .filter(|r| r.timestamp.timestamp_millis() > cutoff)
-        .count() as u64
-        / 5
+/// Adaptive rate display scale derived from the age of the oldest event
+/// in the window: seconds → minutes → hours → days, so sparse traffic
+/// still shows a meaningful rate instead of a constant `req/s 0`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateScale {
+    /// Sparkline bucket span in milliseconds.
+    pub bucket_ms: i64,
+    /// Number of sparkline buckets (window = `bucket_ms * buckets`).
+    pub buckets: usize,
+    /// Effective aggregation window (age of the oldest row, clamped).
+    pub window_ms: i64,
+    /// Rate unit label (`req/s`, `req/min`, `req/h`, `req/day`).
+    pub label: &'static str,
+    /// Events per unit over the window.
+    pub rate: f64,
+}
+
+impl RateScale {
+    /// Human-readable window size, e.g. `200s`, `1.5h`, `40d`.
+    pub fn window_label(&self) -> String {
+        let s = self.window_ms as f64 / 1_000.0;
+        if s < 120.0 {
+            format!("{s:.0}s")
+        } else if s < 172_800.0 {
+            format!("{:.1}h", s / 3_600.0)
+        } else {
+            format!("{:.0}d", s / 86_400.0)
+        }
+    }
+
+    /// Rate formatted for the header: one decimal below 10, integer above.
+    pub fn rate_label(&self) -> String {
+        if self.rate < 10.0 {
+            format!("{:.1}", self.rate)
+        } else {
+            format!("{:.0}", self.rate)
+        }
+    }
+}
+
+/// Pick the display scale and rate for the current event window.
+pub fn rate_scale(rows: &[&EventRow], now_ms: i64) -> RateScale {
+    let oldest = rows
+        .iter()
+        .map(|r| r.timestamp.timestamp_millis())
+        .min()
+        .unwrap_or(now_ms);
+    let (bucket_ms, buckets, label, unit_ms) = if now_ms - oldest < 120_000 {
+        (5_000, 40, "req/s", 1_000)
+    } else if now_ms - oldest < 2 * 3_600_000 {
+        (180_000, 40, "req/min", 60_000)
+    } else if now_ms - oldest < 48 * 3_600_000 {
+        (3_600_000, 40, "req/h", 3_600_000)
+    } else {
+        (86_400_000, 40, "req/day", 86_400_000)
+    };
+    let window_ms = (now_ms - oldest).clamp(unit_ms, bucket_ms * buckets as i64);
+    let rate = rows.len() as f64 / (window_ms as f64 / unit_ms as f64);
+    RateScale {
+        bucket_ms,
+        buckets,
+        window_ms,
+        label,
+        rate,
+    }
 }
 
 /// Aggregated count for one suspicious IP.
@@ -578,19 +636,63 @@ mod tests {
         assert_eq!(data[9], 1);
         assert_eq!(data[3], 1);
         assert!(data[..3].iter().all(|d| *d == 0));
+    }
 
-        assert_eq!(req_per_sec(&rows, now), 0);
-        let burst: Vec<EventRow> = (0..10)
-            .map(|i| {
-                row(
-                    "low",
-                    "1.1.1.1",
-                    Utc.timestamp_millis_opt(now - i * 100).unwrap(),
-                )
-            })
-            .collect();
-        let refs: Vec<&EventRow> = burst.iter().chain(rows.iter().copied()).collect();
-        assert_eq!(req_per_sec(&refs, now), 2);
+    #[test]
+    fn rate_scale_adapts_to_window_age() {
+        let now = t(0).timestamp_millis();
+
+        let recent = row(
+            "low",
+            "1.1.1.1",
+            Utc.timestamp_millis_opt(now - 3_000).unwrap(),
+        );
+        let refs = vec![&recent];
+        let s = rate_scale(&refs, now);
+        assert_eq!(s.label, "req/s");
+        assert_eq!(s.bucket_ms, 5_000);
+        assert_eq!(s.window_label(), "3s");
+        assert!((s.rate - 1.0 / 3.0).abs() < 1e-9);
+        assert_eq!(s.rate_label(), "0.3");
+
+        let ten_min = row(
+            "low",
+            "1.1.1.1",
+            Utc.timestamp_millis_opt(now - 600_000).unwrap(),
+        );
+        let refs = vec![&ten_min];
+        let s = rate_scale(&refs, now);
+        assert_eq!(s.label, "req/min");
+        assert_eq!(s.bucket_ms, 180_000);
+        assert_eq!(s.window_label(), "0.2h");
+        assert!((s.rate - 0.1).abs() < 1e-9);
+
+        let day = row(
+            "low",
+            "1.1.1.1",
+            Utc.timestamp_millis_opt(now - 86_400_000).unwrap(),
+        );
+        let refs = vec![&day];
+        let s = rate_scale(&refs, now);
+        assert_eq!(s.label, "req/h");
+        assert_eq!(s.bucket_ms, 3_600_000);
+        assert_eq!(s.window_label(), "24.0h");
+
+        let week = row(
+            "low",
+            "1.1.1.1",
+            Utc.timestamp_millis_opt(now - 7 * 86_400_000).unwrap(),
+        );
+        let refs = vec![&week];
+        let s = rate_scale(&refs, now);
+        assert_eq!(s.label, "req/day");
+        assert_eq!(s.bucket_ms, 86_400_000);
+        assert_eq!(s.window_label(), "7d");
+
+        let empty: Vec<&EventRow> = vec![];
+        let s = rate_scale(&empty, now);
+        assert_eq!(s.label, "req/s");
+        assert_eq!(s.rate, 0.0);
     }
 
     #[test]

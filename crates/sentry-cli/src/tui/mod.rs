@@ -569,14 +569,22 @@ impl App {
             .split(rows[0]);
 
         let view_rows = self.view_rows();
-        let data = agg::sparkline(&view_rows, agg::now_ms(), 5_000, 40);
+        let scale = agg::rate_scale(&view_rows, agg::now_ms());
+        let data = agg::sparkline(&view_rows, agg::now_ms(), scale.bucket_ms, scale.buckets);
         let spark = Sparkline::default().data(&data);
         f.render_widget(spark, top[0]);
 
         let counts = agg::level_counts(&view_rows);
-        let rps = agg::req_per_sec(&view_rows, agg::now_ms());
         let names = ["Info", "Low", "Med", "High", "Crit"];
-        let mut spans = vec![Span::raw(format!("req/s {rps}  "))];
+        let mut spans = vec![Span::styled(
+            format!(
+                "{} {} ({})  ",
+                scale.label,
+                scale.rate_label(),
+                scale.window_label()
+            ),
+            self.theme.accent_style(),
+        )];
         for (i, name) in names.iter().enumerate() {
             spans.push(Span::styled(
                 format!("{name} {}  ", counts[i]),

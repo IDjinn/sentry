@@ -205,7 +205,11 @@ pub enum Command {
 #[derive(Debug, Subcommand)]
 pub enum IncidentsCmd {
     /// List recent incidents.
-    List,
+    List {
+        /// Include the client IP column.
+        #[arg(long)]
+        show_ip: bool,
+    },
     /// Show details of a specific incident.
     Show { id: String },
 }

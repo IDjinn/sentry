@@ -218,7 +218,7 @@ mod tests {
         profiles[1].recommended_rules.push(RuleSuggestion {
             name: "r1".to_string(),
             priority: 40,
-            match_expr: r#"path == "/xmlrpc.php""#.to_string(),
+            match_expr: r#"path = "/xmlrpc.php""#.to_string(),
             action: "block".to_string(),
             tags: vec!["auto".to_string()],
         });
@@ -260,7 +260,7 @@ mod tests {
         profile.recommended_rules.push(RuleSuggestion {
             name: "wp_xmlrpc_block".to_string(),
             priority: 40,
-            match_expr: r#"path == "/xmlrpc.php""#.to_string(),
+            match_expr: r#"path = "/xmlrpc.php""#.to_string(),
             action: "block".to_string(),
             tags: vec!["auto".to_string()],
         });
@@ -271,7 +271,7 @@ mod tests {
         assert!(toml_text.contains("[[rules.pack]]"));
         assert!(toml_text.contains("name = \"rate_scan\""));
         assert!(toml_text.contains("[[rules.custom]]"));
-        assert!(toml_text.contains("path == \"/xmlrpc.php\""));
+        assert!(toml_text.contains("path = \"/xmlrpc.php\""));
 
         let parsed: sentry_core::config::SentryConfig =
             toml::from_str(&toml_text).expect("generated TOML loads as config fragments");

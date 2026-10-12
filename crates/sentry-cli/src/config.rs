@@ -4,6 +4,11 @@
 //! keys separated by `__` (e.g. `SENTRY_STORAGE__POSTGRES__URL`). Overrides
 //! are field-level: setting `SENTRY_SERVER__HOST` replaces `server.host` and
 //! leaves the rest of `[server]` (auth, users, …) untouched.
+//!
+//! A `.env` file next to the resolved config (the same file the systemd unit
+//! uses as `EnvironmentFile`) is loaded dotenv-style before the overlay, so
+//! CLI commands run from a plain shell see the same secrets the daemon does.
+//! Vars already present in the environment always win.
 
 use std::path::{Path, PathBuf};
 
@@ -14,6 +19,10 @@ use sentry_core::config::SentryConfig;
 /// Generated config cascaded into every load (routes/rules are appended,
 /// never replaced).
 pub const AUTO_FILE: &str = "sentry.auto.toml";
+
+/// Secrets file looked up next to the resolved config (systemd
+/// `EnvironmentFile` companion); fed into the env overlay, non-override.
+const ENV_FILE: &str = ".env";
 
 /// Load config from the default search path, merging TOML + env.
 pub fn load(path: Option<&Path>) -> color_eyre::Result<SentryConfig> {
@@ -52,6 +61,15 @@ pub fn load(path: Option<&Path>) -> color_eyre::Result<SentryConfig> {
         figment
     };
 
+    // Dotenv cascade: `.env` sits next to the main config and carries the
+    // secrets the daemon gets via `EnvironmentFile=`; loading it here gives
+    // interactive CLI commands the same view. Real env vars win.
+    if let Some(p) = &main_path {
+        if let Some(dir) = p.parent() {
+            load_env_file(dir);
+        }
+    }
+
     // Env overlay: SENTRY_STORAGE__POSTGRES__URL=...
     let figment = deep_merge_env(figment, Env::prefixed("SENTRY_").split("__"))?;
 
@@ -64,6 +82,49 @@ pub fn load(path: Option<&Path>) -> color_eyre::Result<SentryConfig> {
     }
 
     Ok(cfg)
+}
+
+/// Load `<dir>/.env` into the process environment, dotenv-style: vars that
+/// are already set (shell export, systemd unit, …) are never overridden.
+/// A missing or unreadable file is silently ignored.
+fn load_env_file(dir: &Path) {
+    let Ok(content) = std::fs::read_to_string(dir.join(ENV_FILE)) else {
+        return;
+    };
+    for (key, value) in parse_env_file(&content) {
+        if std::env::var_os(&key).is_none() {
+            std::env::set_var(&key, value);
+        }
+    }
+}
+
+/// Parse the systemd `EnvironmentFile` subset: `KEY=VALUE` lines, `#`/`;`
+/// comments, blank lines, surrounding whitespace trimmed, optional
+/// single/double quotes stripped. Malformed lines are skipped.
+fn parse_env_file(content: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            continue;
+        }
+        let mut value = value.trim();
+        if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            value = &value[1..value.len() - 1];
+        }
+        pairs.push((key.to_string(), value.to_string()));
+    }
+    pairs
 }
 
 /// Top-level sections the auto config may contribute to.
@@ -288,6 +349,57 @@ mod tests {
         assert_eq!(cfg.server.auth.mode, "password");
         assert_eq!(cfg.server.auth.users.len(), 1);
         assert_eq!(cfg.server.auth.users[0].username, "admin");
+    }
+
+    #[test]
+    fn parse_env_file_covers_environmentfile_subset() {
+        let pairs = parse_env_file(
+            "# comment\n\
+             ; also a comment\n\
+             \n\
+             SENTRY_STORAGE__POSTGRES__URL=postgres://u:p@localhost/db\n\
+             SENTRY_JEV_KEY=\"abc=123\"\n\
+             SENTRY_QUOTED='single'\n\
+             SPACED =  spaced value \n\
+             NO_EQUALS_LINE\n\
+             = novalue\n",
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "SENTRY_STORAGE__POSTGRES__URL".to_string(),
+                    "postgres://u:p@localhost/db".to_string()
+                ),
+                ("SENTRY_JEV_KEY".to_string(), "abc=123".to_string()),
+                ("SENTRY_QUOTED".to_string(), "single".to_string()),
+                ("SPACED".to_string(), "spaced value".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_file_next_to_config_feeds_overlay() {
+        let dir = std::env::temp_dir().join(format!("sentry_cfg_dotenv_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main_path = write_config(&dir, "", None);
+        std::fs::write(
+            dir.join(ENV_FILE),
+            "SENTRY_STORAGE__POSTGRES__URL=postgres://fromfile/db\n",
+        )
+        .unwrap();
+
+        let cfg = load(Some(&main_path)).unwrap();
+        assert_eq!(cfg.storage.postgres.url, "postgres://fromfile/db");
+
+        std::env::set_var("SENTRY_STORAGE__POSTGRES__URL", "postgres://fromenv/db");
+        let cfg = load(Some(&main_path)).unwrap();
+        std::env::remove_var("SENTRY_STORAGE__POSTGRES__URL");
+        assert_eq!(
+            cfg.storage.postgres.url, "postgres://fromenv/db",
+            "real env wins over the .env file"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn write_config(dir: &Path, main: &str, auto: Option<&str>) -> PathBuf {

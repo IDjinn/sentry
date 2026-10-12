@@ -91,14 +91,14 @@ impl FrameworkDetector for WordPressDetector {
                 RuleSuggestion {
                     name: "wordpress_wp_login_rate_limit".to_string(),
                     priority: 40,
-                    match_expr: r#"path == "/wp-login.php""#.to_string(),
+                    match_expr: r#"path = "/wp-login.php""#.to_string(),
                     action: "rate_limit".to_string(),
                     tags: vec!["auto".to_string(), "wordpress".to_string()],
                 },
                 RuleSuggestion {
                     name: "wordpress_xmlrpc_block".to_string(),
                     priority: 40,
-                    match_expr: r#"path == "/xmlrpc.php""#.to_string(),
+                    match_expr: r#"path = "/xmlrpc.php""#.to_string(),
                     action: "block".to_string(),
                     tags: vec!["auto".to_string(), "wordpress".to_string()],
                 },

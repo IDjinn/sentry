@@ -2259,7 +2259,10 @@ impl AiFork {
 }
 
 /// Build the AI fork from config when `[ai] enabled = true`.
-fn build_ai_fork(cfg: &SentryConfig, metrics: &crate::metrics::Metrics) -> Option<Arc<AiFork>> {
+fn build_ai_fork(
+    cfg: &SentryConfig,
+    #[cfg_attr(not(feature = "onnx"), allow(unused_variables))] metrics: &crate::metrics::Metrics,
+) -> Option<Arc<AiFork>> {
     if !cfg.ai.enabled {
         return None;
     }

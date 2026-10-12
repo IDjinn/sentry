@@ -58,7 +58,7 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
             }
         }
         Command::Incidents { action } => match action {
-            IncidentsCmd::List => {
+            IncidentsCmd::List { show_ip } => {
                 let cfg = require_config(&cfg)?;
                 let repo = connect_storage(cfg).await?;
                 let incidents = repo
@@ -68,6 +68,22 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                     .map_err(|e| color_eyre::eyre::eyre!("query failed: {e}"))?;
                 if incidents.is_empty() {
                     println!("No unresolved incidents.");
+                } else if show_ip {
+                    println!(
+                        "{:<38} {:<20} {:<16} {:<10} {:<8} NOTES",
+                        "ID", "CREATED", "IP", "LEVEL", "ACTION"
+                    );
+                    for i in &incidents {
+                        println!(
+                            "{:<38} {:<20} {:<16} {:<10} {:<8} {}",
+                            i.id,
+                            i.created_at.format("%Y-%m-%d %H:%M"),
+                            i.client_ip.as_deref().unwrap_or("-"),
+                            i.risk_level,
+                            i.action,
+                            i.notes.as_deref().unwrap_or("-"),
+                        );
+                    }
                 } else {
                     println!(
                         "{:<38} {:<20} {:<10} {:<8} NOTES",
