@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use sentry_core::pipeline::RouteDef;
 use sentry_core::routes_learn::normalize_routes;
+use sentry_core::sensitive_files::Filter;
 
 /// Cap for a single file read performed by a detector (route files and
 /// configs are small; big files are irrelevant).
@@ -122,6 +123,11 @@ pub struct ScanOptions {
     /// Extra directories searched by the nginx config detector (system
     /// config locations like `/etc/nginx`); tests pass an empty vec.
     pub nginx_extra_dirs: Vec<PathBuf>,
+    /// Sensitive-file categories force-added to the walk filter on top of
+    /// the defaults (e.g. `config`).
+    pub sensitive_extra: Vec<String>,
+    /// Sensitive-file categories removed from the walk filter.
+    pub sensitive_skip: Vec<String>,
 }
 
 /// Result of a [`scan`] pass.
@@ -140,7 +146,9 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> Result<ScanReport, AutoError> {
     if !root.is_dir() {
         return Err(AutoError::RootNotFound(root.display().to_string()));
     }
-    let files = detect::bounded_walk(root, opts.deep);
+    let filter = Filter::from_names(&opts.sensitive_extra, &opts.sensitive_skip)
+        .map_err(AutoError::UnknownCategory)?;
+    let files = detect::bounded_walk_with(root, opts.deep, &filter);
     let ctx = ScanContext {
         root: root.to_path_buf(),
         deep: opts.deep,
@@ -174,6 +182,8 @@ pub enum AutoError {
     RootNotFound(String),
     #[error("unknown profile `{0}` — valid profiles: {}", .1.join(", "))]
     UnknownProfile(String, Vec<String>),
+    #[error("{0}")]
+    UnknownCategory(String),
 }
 
 /// Shared context handed to every detector: the root, the bounded file walk

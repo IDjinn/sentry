@@ -61,6 +61,18 @@ methods = ["GET", "POST", "PATCH", "DELETE"]
 path = "/static/*"
 methods = ["GET"]
 
+# ── sentry auto ────────────────────────────────────────────────────────────
+# Sensitive-file categories for the `sentry auto` disk scan: files matching
+# an enabled category never enter the scan inventory (and dumps/archives do
+# not burn the walk budget). Defaults cover every category except `config`
+# (framework detectors read those files).
+# Categories: secrets, keys, cloud, data, ssh, dev, logs, config.
+# `sentry datasets preset` renders them as dataset .txt files ready for a
+# gist + `sentry datasets import <raw-url> --kind path`.
+[auto.sensitive]
+skip = []                 # e.g. ["data"] to scan dumps/archives again
+enable = []               # e.g. ["config"] to also skip app config files
+
 # ── Scorer ─────────────────────────────────────────────────────────────────
 # Override default weights for specific signal kinds (key = signal name).
 # repetition_bonus adds score for repeated signals within the sliding window.

@@ -588,6 +588,13 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                     .map_err(|e| color_eyre::eyre::eyre!("delete failed: {e}"))?;
                 println!("dataset `{name}` deleted");
             }
+            DatasetsCmd::Preset {
+                list,
+                category,
+                out,
+            } => {
+                crate::datasets::run_preset(&category, out.as_deref(), list)?;
+            }
             DatasetsCmd::Fetch => {
                 let cfg = require_config(&cfg)?;
                 let repo = connect_storage(cfg).await?;
@@ -901,6 +908,12 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                     if let Err(e) = parsed {
                         errors.push(e);
                     }
+                }
+                if let Err(e) = sentry_core::sensitive_files::Filter::from_names(
+                    &cfg.auto.sensitive.enable,
+                    &cfg.auto.sensitive.skip,
+                ) {
+                    color_eyre::eyre::bail!("config INVALID: [auto.sensitive]: {e}");
                 }
                 if !errors.is_empty() {
                     for e in &errors {
@@ -1251,7 +1264,20 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
             disk,
             deep,
             dry_run,
+            category,
+            skip_category,
         } => {
+            let (mut sensitive_enable, mut sensitive_skip) = cfg
+                .as_ref()
+                .map(|c| {
+                    (
+                        c.auto.sensitive.enable.clone(),
+                        c.auto.sensitive.skip.clone(),
+                    )
+                })
+                .unwrap_or_default();
+            sensitive_enable.extend(category);
+            sensitive_skip.extend(skip_category);
             crate::auto::run(crate::auto::AutoArgs {
                 root,
                 profile,
@@ -1261,6 +1287,8 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 dry_run,
                 verbose,
                 config_path,
+                sensitive_enable,
+                sensitive_skip,
             })
             .await?;
         }

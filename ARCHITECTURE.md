@@ -1499,17 +1499,24 @@ sentry auto --disk              # opt-in: only on-disk config detection
 sentry auto --profile wordpress # force a profile (skip detection; probe gains profile paths)
 sentry auto --deep              # whole-tree regex scan instead of canonical files
 sentry auto --dry-run           # print findings, don't write sentry.auto.toml
+sentry auto --category config   # add a sensitive category to the walk filter
+sentry auto --skip-category data # remove a sensitive category from the walk filter
 sentry auto -v                  # verbose: walked tree, versions (≥1); per-file detail (≥2)
+sentry datasets preset          # list the sensitive-file categories
+sentry datasets preset --category ssh      # print the dataset text
+sentry datasets preset --out ./lists       # write <category>.txt files for a gist
 ```
 
-**Output**: table of `METHODS | PATH` plus the frameworks detected; without
-a root path the local service on ports 80/443 is probed (robots.txt,
-sitemap.xml, curated common paths; a random sentinel path filters
-catch-all/SPA fallbacks). If no routes are found, nothing is printed and
-nothing is written. Otherwise `sentry.auto.toml` is written atomically next
-to the resolved `sentry.toml` (or cwd). `--merge` was dropped: the loader
-cascades the file automatically (below). Invalid `--profile` names error
-with the valid list (instead of a `list-profiles` subcommand).
+**Output**: table of `METHODS | PATH`, the frameworks detected and a
+`summary:` line with the totals (routes added after dedupe, per-framework
+contributions, packs and rule suggestions); without a root path the local
+service on ports 80/443 is probed (robots.txt, sitemap.xml, curated common
+paths; a random sentinel path filters catch-all/SPA fallbacks). If no
+routes are found, nothing is printed and nothing is written. Otherwise
+`sentry.auto.toml` is written atomically next to the resolved `sentry.toml`
+(or cwd). `--merge` was dropped: the loader cascades the file automatically
+(below). Invalid `--profile` names error with the valid list (instead of a
+`list-profiles` subcommand).
 
 **Cascade loader**: `config::load` looks for `sentry.auto.toml` next to the
 resolved main config and merges `routes.known`, `rules.pack` and
@@ -1553,6 +1560,48 @@ Laravel route files beyond `routes/web|api.php`. True AST parsing with
 | Laravel   | `routes/web.php`   | `tree-sitter-php`        |
 
 `tree-sitter` is the choice: fast incremental parsers, multi-language, a single `tree-sitter` crate with bindings. Extracting `@app.route("/foo")` or `get "/bar"` → `RouteDef { path: "/foo", methods: ["GET"] }`.
+
+### 20.8 Sensitive-file categories (as delivered)
+
+Categorized corpus of sensitive files in `sentry-core/src/sensitive_files.rs`
+(pure, compiled in) with two consumers:
+
+1. **`sentry auto` walk** — `bounded_walk_with` skips files and directories
+   matching an enabled category (`Filter::is_sensitive`, case-insensitive;
+   `Dir` = any path component, `Name` = basename equals, `Prefix`/`Suffix` =
+   basename affix). Secrets never enter the scan inventory (printed with
+   `-v`) and dumps/archives stop burning the 50k-file walk budget.
+   `[auto.sensitive]` (enable/skip) + `sentry auto --category/--skip-category`
+   tune the set; `sentry config validate` rejects unknown names. The
+   `config` category is opt-in (`walk_default = false`) because framework
+   detectors read `wp-config.php` and friends.
+2. **`sentry datasets preset`** — renders categories as dataset text
+   (`<category>.txt`, one entry per line, web-safe entries only) for a gist +
+   `sentry datasets import <raw-url> --kind path --name sensitive-<category>
+   --action block`: requests for `.env`, `id_rsa`, `terraform.tfstate`, …
+   become rules with per-dataset enable/disable and refresh (F7.6/F7.7
+   machinery; no new daemon code). Exported literals are segment-shaped
+   (`/id_rsa`, `/.ssh`, `.pem`); bare URL words (`credentials`) are
+   walk-only (`web_block = false`) because dataset rules are unanchored.
+
+| Category  | walk | Entries (curated) |
+| --------- | ---- | ----------------- |
+| `secrets` | yes  | `.env`, `.env.*`, `.envrc`, `.netrc`, `.npmrc`, `.pypirc`, `.boto`, `.s3cfg`, `.git-credentials`, `.gitconfig`, `.htpasswd`, `.pgpass`, `.my.cnf`, `.ftpconfig`, `.npm-token`, `credentials(.json)`, `secrets.json`, `secret(s).ya?ml`, `vault.json/yml`, `config.secret.json`, `appsettings.Production.json`, `application-prod.yml/yaml` |
+| `keys`    | yes  | suffixes `.key .pem .p12 .pfx .p8 .jks .keystore .truststore .ppk .asc .gpg .kdb .kdbx .ovpn` |
+| `cloud`   | yes  | dirs `.aws .azure .gcloud .kube .docker`; `service-account(.key)?.json`, `gcloud-credentials.json`, `application_default_credentials.json`, `azureProfile.json`, `kubeconfig`, `terraform.tfstate(.backup)`, `terraform.tfplan`, `*.tfvars` |
+| `data`    | yes  | suffixes `.sql .sqlite .sqlite3 .db .db3 .mdb .accdb .rdb .bson .aof .bak .backup .dump .orig .save .swp .swo .tar .tar.gz .tgz .zip .7z .rar` |
+| `ssh`     | yes  | dir `.ssh`; `id_rsa id_dsa id_ecdsa id_ed25519` |
+| `dev`     | yes  | dirs `.svn .hg .bzr .history`; `.DS_Store`, `Thumbs.db`, `.bash_history`, `.zsh_history`, `.psql_history`, `.mysql_history`; suffixes `.sublime-workspace .code-workspace` |
+| `logs`    | yes  | suffixes `.log .dmp .hprof .heapdump .core` |
+| `config`  | no   | `web.config`, `app.config`, `appsettings.json`, `application.properties/yml/yaml`, `bootstrap.yml/yaml`, `settings.py`, `local_settings.py`, `config.php`, `configuration.php`, `wp-config.php`, `configuration.nix`, `database.yml`, `settings.xml`, `gradle.properties` |
+
+Curated out of the original proposal (verdict: not useful / harmful): public
+material (`.crt .cer .der .csr .p7b .p7c .p10 .pub`, `authorized_keys`,
+`known_hosts`), build/deploy files a scanner must read (`Dockerfile`,
+`.dockerignore`, `docker-compose*.yml`, `kustomization.yaml`,
+`helmfile.yaml`, `inventory.ini`, `hosts`), bare `config`/`hosts` as web
+literals (match `/api/config`, `/api/hosts`), and noise (`.tmp .debug .prof
+.trace`).
 
 ## 22. Performance (F5 — practical part, delivered)
 

@@ -199,6 +199,14 @@ pub enum Command {
         /// Only show what would be detected, don't write sentry.auto.toml.
         #[arg(long)]
         dry_run: bool,
+        /// Sensitive-file category added to the scan filter on top of the
+        /// defaults (repeatable/comma-separated; e.g. `config`).
+        #[arg(long, value_name = "CATEGORY", value_delimiter = ',')]
+        category: Vec<String>,
+        /// Sensitive-file category removed from the scan filter
+        /// (repeatable/comma-separated).
+        #[arg(long, value_name = "CATEGORY", value_delimiter = ',')]
+        skip_category: Vec<String>,
     },
 }
 
@@ -372,6 +380,22 @@ pub enum DatasetsCmd {
     },
     /// Re-fetch every dataset that has a source URL and show the new counts.
     Fetch,
+    /// Print or write the built-in sensitive-file categories as dataset
+    /// text (one entry per line) ready for a gist plus
+    /// `sentry datasets import <raw-url> --kind path`.
+    Preset {
+        /// List categories with descriptions (default when nothing else is
+        /// requested).
+        #[arg(long)]
+        list: bool,
+        /// Print/write only these categories (repeatable; default: all).
+        #[arg(long, value_name = "CATEGORY", value_delimiter = ',')]
+        category: Vec<String>,
+        /// Write `<category>.txt` files into this directory instead of
+        /// printing.
+        #[arg(long, value_name = "DIR")]
+        out: Option<String>,
+    },
 }
 
 /// Entry kind accepted by `sentry datasets import`.

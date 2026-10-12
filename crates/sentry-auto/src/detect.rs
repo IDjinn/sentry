@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use sentry_core::sensitive_files::Filter;
+
 use crate::profiles;
 use crate::{FrameworkDetector, ScanContext};
 
@@ -28,18 +30,33 @@ const SKIPPED_DIRS: &[&str] = &[
 /// Walk `root` (bounded, symlinks skipped) and return `/`-separated paths
 /// relative to it, sorted. Depth is 6 by default and 12 with `deep`.
 pub fn bounded_walk(root: &Path, deep: bool) -> Vec<String> {
+    bounded_walk_with(root, deep, &Filter::walk_defaults())
+}
+
+/// Like [`bounded_walk`], but files and directories matching the
+/// sensitive-file `filter` never enter the inventory: secrets are not
+/// listed (the walk is printed with `-v`) and dumps/archives do not burn
+/// the [`MAX_FILES`] budget.
+pub fn bounded_walk_with(root: &Path, deep: bool, sensitive: &Filter) -> Vec<String> {
     let max_depth = if deep {
         MAX_DEPTH_DEEP
     } else {
         MAX_DEPTH_PLAIN
     };
     let mut out = Vec::new();
-    walk_dir(root, String::new(), 0, max_depth, &mut out);
+    walk_dir(root, String::new(), 0, max_depth, &mut out, sensitive);
     out.sort();
     out
 }
 
-fn walk_dir(root: &Path, rel: String, depth: usize, max_depth: usize, out: &mut Vec<String>) {
+fn walk_dir(
+    root: &Path,
+    rel: String,
+    depth: usize,
+    max_depth: usize,
+    out: &mut Vec<String>,
+    sensitive: &Filter,
+) {
     if out.len() >= MAX_FILES || depth > max_depth {
         return;
     }
@@ -66,11 +83,11 @@ fn walk_dir(root: &Path, rel: String, depth: usize, max_depth: usize, out: &mut 
             format!("{rel}/{name}")
         };
         if ft.is_dir() {
-            if SKIPPED_DIRS.contains(&name.as_ref()) {
+            if SKIPPED_DIRS.contains(&name.as_ref()) || sensitive.is_sensitive(&child) {
                 continue;
             }
-            walk_dir(&entry.path(), child, depth + 1, max_depth, out);
-        } else if ft.is_file() {
+            walk_dir(&entry.path(), child, depth + 1, max_depth, out, sensitive);
+        } else if ft.is_file() && !sensitive.is_sensitive(&child) {
             out.push(child);
         }
     }
@@ -120,6 +137,30 @@ mod tests {
 
         let files = bounded_walk(&dir, false);
         assert_eq!(files, vec!["a/b/web.php", "composer.json"]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn walk_excludes_sensitive_files_by_default() {
+        let dir =
+            std::env::temp_dir().join(format!("sentry-auto-walk-sens-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".aws")).unwrap();
+        std::fs::create_dir_all(dir.join(".svn/pristine")).unwrap();
+        std::fs::create_dir_all(dir.join("routes")).unwrap();
+        std::fs::write(dir.join(".env"), "X=1").unwrap();
+        std::fs::write(dir.join(".env.production"), "X=1").unwrap();
+        std::fs::write(dir.join("id_rsa"), "k").unwrap();
+        std::fs::write(dir.join("dump.sql"), "--").unwrap();
+        std::fs::write(dir.join("backup.zip"), "").unwrap();
+        std::fs::write(dir.join("server.pem"), "").unwrap();
+        std::fs::write(dir.join(".aws/credentials"), "k").unwrap();
+        std::fs::write(dir.join(".svn/pristine/x"), "").unwrap();
+        std::fs::write(dir.join("wp-config.php"), "<?php").unwrap();
+        std::fs::write(dir.join("routes/web.php"), "<?php").unwrap();
+
+        let files = bounded_walk(&dir, false);
+        assert_eq!(files, vec!["routes/web.php", "wp-config.php"]);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

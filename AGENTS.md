@@ -887,6 +887,29 @@ telemetria de handshake + provider de appliance
   - ✅ ~56 testes novos (perfis/fixtures, parsers robots/sitemap, catch-all
     filter, generate round-trip TOML→SentryConfig, cascade merge/dedupe,
     write atômico)
+  - ✅ Resumo de totais no fim do `sentry auto`: linha `summary:` com
+    rotas adicionadas (dedup/canônicas), contribuição por framework,
+    packs e rules sugeridos
+  - ✅ Categorias de arquivos sensíveis (`sentry-core/src/
+    sensitive_files.rs`, corpus compilado; ver ARCHITECTURE.md §20.8):
+    `secrets`/`keys`/`cloud`/`data`/`ssh`/`dev`/`logs`/`config` com
+    matcher Dir/Name/Prefix/Suffix case-insensitive. O walk do
+    `sentry auto` filtra por categoria (`Filter::walk_defaults` = tudo
+    menos `config`, que detectors leem — `wp-config.php` é âncora);
+    `[auto.sensitive]` (enable/skip) + `--category`/`--skip-category`
+    afinam o conjunto e `sentry config validate` rejeita nome
+    desconhecido. `sentry datasets preset [--list|--category N|--out
+    DIR]` renderiza as categorias como datasets (`<cat>.txt`, só
+    entradas web-safe — bare `credentials` fica walk-only) prontos p/
+    gist + `sentry datasets import <raw-url> --kind path` (bloqueio web
+    com enable/disable por dataset; zero código novo de daemon).
+    Curadoria: material público (`crt/cer/der/csr/pub`,
+    authorized_keys/known_hosts), arquivos de build/deploy
+    (Dockerfile/compose/kustomization/hosts) e ruído (.tmp/.debug)
+    foram cortados da proposta original
+  - ✅ 13 testes novos (corpus estrutural/dupes/web-safe, matcher por
+    tipo de entrada, walk com exclusões, render/preset, parse do
+    `[auto.sensitive]`, summary_lines)
 
 Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4; §27 F12 idem; §3 subprojeto auto — v1 entregue, A.5/A.7/A.12 restantes).
 
@@ -897,7 +920,7 @@ Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 730 testes passando sem features (732 com
+# Resultado esperado: 746 testes passando sem features (748 com
 # --features sentry-cli/onnx — os 2 testes de inferência ONNX; com
 # edge-tls/edge-zstd entram os testes de TLS/h2/compressão zstd)
 ```

@@ -93,12 +93,37 @@ pub struct SentryConfig {
     /// never degrade.
     #[serde(default)]
     pub overload: OverloadConfig,
+    /// `sentry auto` command settings (framework scan).
+    #[serde(default)]
+    pub auto: AutoConfig,
     /// Event sources.
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
     /// Response actions.
     #[serde(default, rename = "action")]
     pub actions: Vec<ActionConfig>,
+}
+
+/// `sentry auto` command settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AutoConfig {
+    /// Sensitive-file category filter for the disk scan.
+    #[serde(default)]
+    pub sensitive: AutoSensitiveConfig,
+}
+
+/// Sensitive-file categories for the `sentry auto` walk: the built-in
+/// defaults apply (every category but `config`), `enable` adds opt-in
+/// categories and `skip` removes defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AutoSensitiveConfig {
+    /// Category names removed from the default walk filter.
+    #[serde(default)]
+    pub skip: Vec<String>,
+    /// Category names added on top of the default walk filter (e.g.
+    /// `config`).
+    #[serde(default)]
+    pub enable: Vec<String>,
 }
 
 /// Core runtime settings.
@@ -2217,6 +2242,18 @@ mod tests {
     #[test]
     fn feed_default_refresh_is_24h() {
         assert_eq!(FeedConfig::default().refresh_hours, 24);
+    }
+
+    #[test]
+    fn auto_sensitive_section_parses_with_defaults() {
+        let cfg: SentryConfig =
+            toml::from_str("[auto.sensitive]\nskip = [\"logs\"]\nenable = [\"config\"]\n").unwrap();
+        assert_eq!(cfg.auto.sensitive.skip, vec!["logs"]);
+        assert_eq!(cfg.auto.sensitive.enable, vec!["config"]);
+
+        let cfg: SentryConfig = toml::from_str("").unwrap();
+        assert!(cfg.auto.sensitive.skip.is_empty());
+        assert!(cfg.auto.sensitive.enable.is_empty());
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub mod reputation;
 pub mod routes_learn;
 pub mod rules;
 pub mod scan;
+pub mod sensitive_files;
 pub mod source;
 pub mod tcpfp;
 pub mod throttle;
@@ -89,6 +90,7 @@ pub use rules::{
     RuleSource, SharedRuleSet,
 };
 pub use scan::ScanTracker;
+pub use sensitive_files::{category_names, Category, Entry, EntryKind, Filter, CATEGORIES};
 pub use source::Source;
 pub use throttle::DropLogThrottle;
 pub use trust::{SharedTrustSet, TrustSet};

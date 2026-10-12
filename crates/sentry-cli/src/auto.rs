@@ -21,7 +21,8 @@ const MAX_CANDIDATES_PER_PORT: usize = 80;
 const MAX_SITEMAPS: usize = 2;
 const BODY_PREFIX_CAP: usize = 64 * 1024;
 
-/// Arguments for [`run`], straight from the CLI variant.
+/// Arguments for [`run`], straight from the CLI variant plus the
+/// `[auto.sensitive]` config section (CLI flags extend both lists).
 pub struct AutoArgs {
     pub root: Option<String>,
     pub profile: Option<String>,
@@ -31,6 +32,10 @@ pub struct AutoArgs {
     pub dry_run: bool,
     pub verbose: u8,
     pub config_path: Option<String>,
+    /// Sensitive-file categories added to the walk filter.
+    pub sensitive_enable: Vec<String>,
+    /// Sensitive-file categories removed from the walk filter.
+    pub sensitive_skip: Vec<String>,
 }
 
 /// Run the auto-discovery pipeline. Returns `Ok(())` with no output when
@@ -50,6 +55,8 @@ pub async fn run(args: AutoArgs) -> color_eyre::Result<()> {
                 deep: args.deep,
                 forced_profile: args.profile.clone(),
                 nginx_extra_dirs: nginx_extra_dirs(),
+                sensitive_extra: args.sensitive_enable.clone(),
+                sensitive_skip: args.sensitive_skip.clone(),
             };
             let report = sentry_auto::scan(&path, &opts)?;
             if args.verbose >= 1 {
@@ -120,6 +127,8 @@ fn scan_disk(args: &AutoArgs) -> Vec<FrameworkProfile> {
             deep: args.deep,
             forced_profile: args.profile.clone(),
             nginx_extra_dirs: Vec::new(),
+            sensitive_extra: args.sensitive_enable.clone(),
+            sensitive_skip: args.sensitive_skip.clone(),
         };
         let Ok(report) = sentry_auto::scan(&doc_root, &opts) else {
             continue;
@@ -397,11 +406,81 @@ fn report(artifacts: &AutoArtifacts, profiles: &[FrameworkProfile], verbose: u8)
         println!("{:<24} {}", methods, route.path);
     }
     println!();
+    for line in summary_lines(artifacts, profiles) {
+        println!("{line}");
+    }
+}
+
+/// End-of-run totals: routes actually added (deduped, canonical), the
+/// per-framework contributions (overlapping frameworks can sum above the
+/// total) and the pack/rule suggestions generated alongside.
+fn summary_lines(artifacts: &AutoArtifacts, profiles: &[FrameworkProfile]) -> Vec<String> {
+    let mut lines = vec![format!(
+        "summary: {} routes added, {} pack(s), {} rule(s)",
+        artifacts.routes.len(),
+        artifacts.packs.len(),
+        artifacts.rules.len()
+    )];
+    let mut by_framework: Vec<(String, usize)> = profiles
+        .iter()
+        .filter(|p| !p.routes.is_empty())
+        .map(|p| (p.framework.clone(), p.routes.len()))
+        .collect();
+    by_framework.sort();
+    for (framework, count) in by_framework {
+        lines.push(format!("  {framework:<14} {count} routes"));
+    }
+    lines
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_lines_totals_routes_and_frameworks() {
+        let artifacts = AutoArtifacts {
+            routes: vec![
+                sentry_core::config::RouteDefConfig {
+                    path: "/a".to_string(),
+                    methods: Vec::new(),
+                },
+                sentry_core::config::RouteDefConfig {
+                    path: "/b".to_string(),
+                    methods: Vec::new(),
+                },
+            ],
+            packs: vec![sentry_core::config::RulePackConfig {
+                name: "sensitive_paths".to_string(),
+                mode: "enforce".to_string(),
+                params: Default::default(),
+            }],
+            rules: Vec::new(),
+        };
+        let profiles = vec![
+            FrameworkProfile {
+                framework: "wordpress".to_string(),
+                routes: vec![FoundRoute::new("/wp-login.php", &[], "disk")],
+                ..Default::default()
+            },
+            FrameworkProfile {
+                framework: "http-probe".to_string(),
+                routes: vec![
+                    FoundRoute::new("/", &[], "probe:80"),
+                    FoundRoute::new("/robots.txt", &[], "probe:80"),
+                ],
+                ..Default::default()
+            },
+        ];
+        let lines = summary_lines(&artifacts, &profiles);
+        assert_eq!(lines[0], "summary: 2 routes added, 1 pack(s), 0 rule(s)");
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("http-probe") && l.contains("2 routes")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("wordpress") && l.contains("1 routes")));
+    }
 
     #[test]
     fn auto_file_path_prefers_config_parent() {
