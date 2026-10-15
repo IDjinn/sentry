@@ -154,19 +154,21 @@ mod tests {
 
     #[tokio::test]
     async fn binds_with_backlog_and_reuseport() {
+        // SO_REUSEPORT must be set on every socket sharing the port before
+        // each bind — a later bind over a plain socket fails AddrInUse.
         let l1 = bind_listener(
             free_addr(),
             ListenerOptions {
                 backlog: 64,
-                reuseport: false,
+                reuseport: true,
                 tuning: TcpTuning::default(),
             },
         )
-        .expect("plain bind");
+        .expect("first bind");
         let addr = l1.local_addr().unwrap();
 
-        // A second bind on the same port requires SO_REUSEPORT (unix). On
-        // Windows this fails — the daemon passes reuseport=false there.
+        // On Windows this path is compiled out — the daemon passes
+        // reuseport=false there (a second bind would fail).
         #[cfg(unix)]
         {
             let l2 = bind_listener(
