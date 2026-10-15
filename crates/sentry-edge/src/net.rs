@@ -93,7 +93,7 @@ pub fn bind_listener(addr: SocketAddr, opts: ListenerOptions) -> io::Result<TcpL
     socket.set_reuse_address(true)?;
     #[cfg(unix)]
     if opts.reuseport {
-        socket.set_reuse_port()?;
+        socket.set_reuse_port(true)?;
     }
     apply_buffers(&socket, &opts.tuning);
     socket.bind(&addr.into())?;
