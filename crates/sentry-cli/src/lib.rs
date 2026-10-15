@@ -21,6 +21,7 @@ pub mod protocol_cmd;
 #[cfg(feature = "rate-redis")]
 pub mod rate_redis;
 pub mod routes_import;
+pub mod runtime;
 pub mod server;
 pub mod service;
 pub mod siem;

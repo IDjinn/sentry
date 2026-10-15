@@ -943,6 +943,12 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 if let Err(e) = cfg.update.validate() {
                     color_eyre::eyre::bail!("config INVALID: {e}");
                 }
+                if let Some(e) = cfg.edge.validate().first() {
+                    color_eyre::eyre::bail!("config INVALID: {e}");
+                }
+                if let Some(e) = cfg.runtime.validate().first() {
+                    color_eyre::eyre::bail!("config INVALID: {e}");
+                }
                 if !errors.is_empty() {
                     for e in &errors {
                         eprintln!("invalid custom rule: {e}");
@@ -1014,6 +1020,32 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                     },
                     cfg.edge.http2,
                     cfg.edge.forwarded_headers
+                );
+                if cfg.deployment.is_inline() {
+                    println!(
+                        "  vhosts:    {} (balance = {})",
+                        cfg.edge.vhosts.len(),
+                        cfg.edge.balance.as_str()
+                    );
+                }
+                println!(
+                    "  runtime:   workers = {} | pinned cores = {} | priority = {}",
+                    if cfg.runtime.worker_threads == 0 {
+                        "auto".to_string()
+                    } else {
+                        cfg.runtime.worker_threads.to_string()
+                    },
+                    if cfg.runtime.pin_cores.is_empty() {
+                        "none".to_string()
+                    } else {
+                        cfg.runtime
+                            .pin_cores
+                            .iter()
+                            .map(std::string::ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    },
+                    cfg.runtime.thread_priority.as_str()
                 );
                 println!("  sources:   {}", cfg.sources.len());
                 println!("  actions:   {}", cfg.actions.len());

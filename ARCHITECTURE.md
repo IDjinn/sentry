@@ -2119,3 +2119,103 @@ hsts_min_max_age = 31536000
 - Restart requires service-manager privileges (root/admin); the update
   flow surfaces the failure instead of elevating.
 - Channels (beta/stable) would be a second `tag_prefix` release family.
+
+## 29. F14 — Edge proxy at nginx level: vhosts, upstream groups, failover, WebSocket, OS/runtime tuning
+
+The inline edge goes from "one protected upstream" to an nginx-grade front:
+Host-header virtual hosts, load-balanced upstream groups with passive
+health checks and failover, WebSocket pass-through, response streaming and
+kernel/runtime tuning knobs.
+
+### 29.1 Vhost routing (`[[edge.vhosts]]`, F14)
+
+- `crates/sentry-edge/src/upstream.rs`: `VhostRouter` (Host header →
+  upstream group) + `UpstreamGroup` (balancer + passive health state).
+  Host normalization lowercases and strips `:port` (`host_key`); matching
+  is exact-first, then `*.wildcard` by longest suffix (multi-label, not the
+  bare domain — nginx semantics). `:authority` (h2) works via the existing
+  `original_host`.
+- The scalar `[edge] upstream` stays as the default (catch-all) group;
+  `[edge] upstreams` replaces it with a multi-server group. The backend
+  already receives the original Host, so backend vhosts keep working.
+- `EdgeConfig::validate()` (pure, run by `sentry config validate` and the
+  daemon) rejects empty/duplicate/uppercase hosts, mid-string `*`,
+  scheme-less upstreams and cert pairing mistakes.
+
+### 29.2 Upstream groups: balancing + passive health + failover
+
+- `UpstreamGroup` strategies: `round_robin` (default), `least_conn`
+  (in-flight atomics), `ip_hash` (deterministic hash of the client IP).
+- Passive health (nginx `max_fails`/`fail_timeout`): a server that fails
+  `max_fails` connection-level attempts (connect error/timeout) inside the
+  window is ejected for the window, then retried. A successful request
+  clears the history. Selection is lock-free (atomics); only failures lock.
+- Failover (`proxy_next_upstream error timeout`): `serve_allow` tries each
+  healthy untried server once per request; the buffered body makes replay
+  safe. 5xx responses are NOT retried. All servers down → 502 page.
+  Counter `sentry_edge_upstream_failovers_total{vhost}`.
+- Startup health check is per group: every group needs ≥1 healthy server
+  (a down secondary warns — that is what failover is for); a fully dead
+  group refuses startup, as before.
+- Hostname upstreams (Docker container names, k8s services) resolve via
+  the system resolver at connect time — both HTTP (reqwest) and TCP
+  (`TcpStream::connect`) hops. `https://` upstreams always verify
+  certificates (unverified TLS only protects against passive sniffing, so
+  `verify_tls = false` was deliberately not implemented).
+
+### 29.3 WebSocket/h1 upgrade pass-through + response streaming
+
+- Upgrades (`Connection: upgrade` + `Upgrade`, h1 only) bypass the buffered
+  forward: `proxy_upgrade` replays the request with a hyper-util legacy h1
+  client (`reqwest` has no upgrade API; the hop-by-hop strip would remove
+  `Connection`/`Upgrade`), answers `101` and pipes the two upgraded
+  connections with `copy_bidirectional` (the upstream `Response` moves
+  whole into the pipe task — dropping its body early cancels the
+  handoff). Non-101 upstream answers pass through normally; block/
+  rate-limit/challenge still apply (the pipeline runs first). Limitation:
+  upgrade over `https://` upstreams is not supported (no TLS connector on
+  the raw client) — 502 explains it.
+- `response_buffering = false` (or `content-type: text/event-stream`,
+  auto-detected) streams `bytes_stream` to the client and marks the
+  response `StreamedResponse`, which the F12 compressor passes through —
+  SSE payloads are no longer held until the stream ends.
+
+### 29.4 TLS: per-vhost certificates via SNI
+
+- `TlsEdgeConfig.extra_certs` (daemon groups vhost `tls_cert`/`tls_key`
+  pairs by identical paths) → `SniCertResolver` implements
+  `rustls::server::ResolvesServerCert`: exact names, `*.suffix` wildcards,
+  default = the global chain. rustls resolves with the SNI it re-parsed
+  from the replayed ClientHello — no extra wiring.
+- `sentry_edge_tls_cert_not_after` now tracks the EARLIEST expiry across
+  all configured certs (the one that breaks a site first).
+
+### 29.5 Listener + runtime tuning (OS)
+
+- `crates/sentry-edge/src/net.rs`: listeners bind via `socket2` —
+  `SO_REUSEADDR` always; `SO_REUSEPORT` × `[edge] reuseport_workers`
+  (unix; each accept loop owns a kernel accept queue; the plain listener
+  runs N loops, TLS keeps one acceptor); `[edge] tcp_backlog` (0 = reads
+  `/proc/sys/net/core/somaxconn` on Linux); per-connection
+  `TCP_NODELAY`, keepalive (idle `[edge] tcp_keepalive_secs`, probe 10s × 5)
+  and `SO_SNDBUF`/`SO_RCVBUF` (`tcp_send_buffer_kb`/`tcp_recv_buffer_kb`).
+  Windows: `SO_REUSEADDR` + backlog only (reuseport needs unix).
+  `TCP_DEFER_ACCEPT`/`TCP_QUICKACK` are NOT wired: the crates forbid
+  `unsafe` and no safe wrapper covers them (QUICKACK also resets per ACK,
+  so a listener-level knob would mislead) — roadmap.
+- The event loop itself (epoll/kqueue/IOCP) is tokio/mio — nothing to
+  switch. `sendfile`/`splice` do not apply to the proxy path (socket →
+  socket, bodies inspected/compressed in memory); they become relevant
+  only with a disk proxy cache (backlog §5.5).
+- `[runtime]`: `worker_threads` (0 = tokio auto), `pin_cores` (workers
+  pinned in order via `core_affinity`, cycling through the list) and
+  `thread_priority` (`idle|below_normal|normal|above_normal|high` via
+  `thread-priority`, mapped to nice/priority-class; elevated levels need
+  privileges on unix — failure warns and continues). Built in
+  `sentry-cli/src/runtime.rs`, applied in `main.rs` before any command.
+
+### 29.6 Out of scope (backlog)
+
+Disk proxy cache (+ `sendfile` on hits), active health checks, UDP stream
+proxying, rewrite/`proxy_redirect`, forward proxy, WebSocket over
+`https://` upstreams.

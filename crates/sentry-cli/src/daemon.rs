@@ -986,27 +986,59 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     // already-decided events back through the fan-in for persistence and
     // action dispatch.
     if cfg.deployment.is_inline() {
-        if cfg.edge.upstream.is_empty() {
+        // Config errors (F14): bad vhost hosts, scheme-less upstreams,
+        // duplicate hosts, cert pairing — fail before anything binds.
+        let edge_errors = cfg.edge.validate();
+        if !edge_errors.is_empty() {
             return Err(color_eyre::eyre::eyre!(
-                "[deployment] mode = \"inline\" requires [edge] upstream"
+                "[edge] invalid configuration:\n  - {}",
+                edge_errors.join("\n  - ")
+            ));
+        }
+        let default_servers = cfg.edge.default_group_servers();
+        if default_servers.is_empty() && cfg.edge.vhosts.is_empty() {
+            return Err(color_eyre::eyre::eyre!(
+                "[deployment] mode = \"inline\" requires [edge] upstream (or [[edge.vhosts]])"
             ));
         }
         let enricher = make_enricher(&geo, &reputation, &shared_trust);
         let (dec_tx, mut dec_rx) = mpsc::channel::<sentry_core::ProcessedEvent>(buffer);
+        let mut extra_certs: Vec<sentry_edge::proxy::VhostCert> = Vec::new();
         let tls_cfg = match (&cfg.edge.tls_cert, &cfg.edge.tls_key) {
-            (Some(cert), Some(key)) => Some(sentry_edge::proxy::TlsEdgeConfig {
-                listen: cfg
-                    .edge
-                    .tls_listen
-                    .clone()
-                    .unwrap_or_else(|| "0.0.0.0:443".to_string()),
-                cert: cert.clone(),
-                key: key.clone(),
-                redirect_https: cfg.edge.tls_redirect_https,
-                allowed_hosts: cfg.edge.tls_allowed_hosts.clone(),
-                handshake_events: cfg.edge.tls_handshake_events,
-                http2: cfg.edge.http2,
-            }),
+            (Some(cert), Some(key)) => {
+                // Per-vhost certificates (F14): group vhosts that declare
+                // their own cert/key by identical paths.
+                for vhost in &cfg.edge.vhosts {
+                    let (Some(vcert), Some(vkey)) = (&vhost.tls_cert, &vhost.tls_key) else {
+                        continue;
+                    };
+                    match extra_certs
+                        .iter_mut()
+                        .find(|c| &c.cert == vcert && &c.key == vkey)
+                    {
+                        Some(entry) => entry.hosts.push(vhost.host.clone()),
+                        None => extra_certs.push(sentry_edge::proxy::VhostCert {
+                            hosts: vec![vhost.host.clone()],
+                            cert: vcert.clone(),
+                            key: vkey.clone(),
+                        }),
+                    }
+                }
+                Some(sentry_edge::proxy::TlsEdgeConfig {
+                    listen: cfg
+                        .edge
+                        .tls_listen
+                        .clone()
+                        .unwrap_or_else(|| "0.0.0.0:443".to_string()),
+                    cert: cert.clone(),
+                    key: key.clone(),
+                    redirect_https: cfg.edge.tls_redirect_https,
+                    allowed_hosts: cfg.edge.tls_allowed_hosts.clone(),
+                    handshake_events: cfg.edge.tls_handshake_events,
+                    http2: cfg.edge.http2,
+                    extra_certs,
+                })
+            }
             (None, None) => None,
             _ => {
                 return Err(color_eyre::eyre::eyre!(
@@ -1041,15 +1073,29 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         }
         let proxy_cfg = sentry_edge::proxy::EdgeProxyConfig {
             listen: cfg.edge.listen.clone(),
-            upstream: cfg.edge.upstream.clone(),
+            upstreams: default_servers,
+            balance: cfg.edge.balance,
+            max_fails: cfg.edge.max_fails,
+            fail_timeout_secs: cfg.edge.fail_timeout_secs,
             health_path: cfg.edge.health_path.clone(),
             health_timeout_secs: cfg.edge.health_timeout_secs,
             tls: tls_cfg.clone(),
+            vhosts: cfg.edge.vhosts.clone(),
             compress: cfg.edge.compress.clone(),
             forwarded_headers: cfg.edge.forwarded_headers,
+            response_buffering: cfg.edge.response_buffering,
             upstream_connect_timeout_secs: cfg.edge.upstream_connect_timeout_secs,
+            upstream_timeout_secs: cfg.edge.upstream_timeout_secs,
             upstream_pool_idle: cfg.edge.upstream_pool_idle,
             max_concurrent_requests: cfg.edge.max_concurrent_requests,
+            reuseport_workers: cfg.edge.reuseport_workers,
+            tcp_backlog: cfg.edge.tcp_backlog,
+            tcp_tuning: sentry_edge::net::TcpTuning {
+                nodelay: cfg.edge.tcp_nodelay,
+                keepalive_secs: cfg.edge.tcp_keepalive_secs,
+                send_buffer_kb: cfg.edge.tcp_send_buffer_kb,
+                recv_buffer_kb: cfg.edge.tcp_recv_buffer_kb,
+            },
         };
         let runtime = sentry_edge::EdgeRuntime::new(
             Arc::clone(&pipeline),
@@ -1069,7 +1115,8 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             sni_mismatches: metrics.edge_tls_sni_mismatches.clone(),
             alpn: metrics.edge_tls_alpn.clone(),
         })
-        .with_compressed(metrics.edge_compressed.clone());
+        .with_compressed(metrics.edge_compressed.clone())
+        .with_upstream_failovers(metrics.edge_upstream_failovers.clone());
         let runtime = if cfg.uploads.enabled {
             let inspect_bytes = cfg
                 .uploads
@@ -1175,10 +1222,19 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 );
             }
         }
-        let edge_pipeline = cfg.edge.upstream.clone();
+        let edge_summary = {
+            let mut servers = cfg.edge.default_group_servers();
+            servers.extend(
+                cfg.edge
+                    .vhosts
+                    .iter()
+                    .map(|v| format!("{}→{}", v.host, v.upstreams.join(","))),
+            );
+            servers.join(" ")
+        };
         tokio::spawn(async move {
             if let Err(e) = sentry_edge::proxy::serve(runtime, proxy_cfg, dec_tx).await {
-                error!(error = %e, upstream = %edge_pipeline, "edge proxy terminated");
+                error!(error = %e, upstreams = %edge_summary, "edge proxy terminated");
             }
         });
         let pump_tx = event_tx.clone();
@@ -1205,12 +1261,19 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             }
         });
         // Certificate expiry gauge + daily refresh (F8): operators see the
-        // runway in `/metrics` long before browsers start warning.
+        // runway in `/metrics` long before browsers start warning. With
+        // per-vhost certs (F14) the gauge tracks the EARLIEST expiry — the
+        // one that breaks a site first.
         #[cfg(feature = "edge-tls")]
         if let Some(ref tls_cfg) = tls_cfg {
             let gauge = metrics.edge_tls_cert_not_after.clone();
-            let cert_path = tls_cfg.cert.clone();
-            if let Some(not_after) = sentry_edge::tls::cert_not_after(&cert_path) {
+            let mut cert_paths: Vec<std::path::PathBuf> = vec![tls_cfg.cert.clone()];
+            cert_paths.extend(tls_cfg.extra_certs.iter().map(|c| c.cert.clone()));
+            let earliest = cert_paths
+                .iter()
+                .filter_map(|p| sentry_edge::tls::cert_not_after(p))
+                .min();
+            if let Some(not_after) = earliest {
                 let ts = not_after
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -1223,20 +1286,24 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 if days_left < 14 {
                     warn!(
                         days_left,
-                        cert = %cert_path.display(),
-                        "edge tls certificate expires soon"
+                        certs = cert_paths.len(),
+                        "the earliest edge tls certificate expires soon"
                     );
                 }
             } else {
                 warn!(
-                    cert = %cert_path.display(),
+                    cert = %tls_cfg.cert.display(),
                     "edge tls certificate expiry could not be parsed"
                 );
             }
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
-                    if let Some(not_after) = sentry_edge::tls::cert_not_after(&cert_path) {
+                    if let Some(not_after) = cert_paths
+                        .iter()
+                        .filter_map(|p| sentry_edge::tls::cert_not_after(p))
+                        .min()
+                    {
                         let ts = not_after
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
@@ -1302,7 +1369,9 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         }
         info!(
             listen = %cfg.edge.listen,
-            upstream = %cfg.edge.upstream,
+            upstream = %cfg.edge.default_group_servers().join(","),
+            vhosts = cfg.edge.vhosts.len(),
+            balance = cfg.edge.balance.as_str(),
             "inline edge enabled (deployment.mode = inline)"
         );
     }

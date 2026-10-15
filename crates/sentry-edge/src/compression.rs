@@ -209,6 +209,13 @@ fn add_vary(headers: &mut axum::http::HeaderMap) {
     }
 }
 
+/// Marks a response whose body is being streamed from the upstream
+/// (`[edge] response_buffering = false` or `text/event-stream`, F14):
+/// the bytes cannot be collected and re-encoded, so compression passes
+/// the response through untouched.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamedResponse;
+
 /// Shared compression decision, built once per listener by the proxy and
 /// shared across requests.
 #[derive(Clone)]
@@ -253,6 +260,15 @@ impl Compressor {
             return resp;
         }
         let (mut parts, body) = resp.into_parts();
+
+        // Streamed responses (F14) cannot be buffered for re-encoding.
+        if parts
+            .extensions
+            .get::<crate::compression::StreamedResponse>()
+            .is_some()
+        {
+            return Response::from_parts(parts, body);
+        }
 
         // Range responses: a re-encoded body no longer matches the
         // requested byte range, so 206 / content-range passes through.

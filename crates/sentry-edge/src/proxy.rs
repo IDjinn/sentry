@@ -24,34 +24,57 @@ use crate::pages;
 use crate::EdgeRuntime;
 use uuid::Uuid;
 
-/// Inline proxy configuration.
+/// Inline proxy configuration (F14): the default (catch-all) upstream
+/// group, optional vhost groups, and the listener/socket tuning knobs.
 #[derive(Debug, Clone)]
 pub struct EdgeProxyConfig {
     /// Listen address (`0.0.0.0:80`). An empty string disables the plain
     /// listener (HTTPS-only edge).
     pub listen: String,
-    /// Protected upstream base URL (`http://127.0.0.1:8080`).
-    pub upstream: String,
+    /// Default (catch-all) upstream base URLs — IP or hostname
+    /// (`http://web:3000`), load-balanced with `balance`.
+    pub upstreams: Vec<String>,
+    /// Load-balancing strategy for every group without an override.
+    pub balance: sentry_core::config::BalanceMode,
+    /// Passive health check: failures inside `fail_timeout_secs` before a
+    /// server is ejected (0 = never).
+    pub max_fails: u32,
+    /// Failure window and ejection duration (seconds).
+    pub fail_timeout_secs: u64,
     /// Path used for the mandatory startup health check (default `/`).
     pub health_path: String,
     /// Health check timeout in seconds (default 5).
     pub health_timeout_secs: u64,
     /// HTTPS front (F8): `None` serves plain HTTP only.
     pub tls: Option<TlsEdgeConfig>,
+    /// Nginx-style virtual hosts (F14): Host-header routing to per-site
+    /// upstream groups.
+    pub vhosts: Vec<sentry_core::config::EdgeVhostConfig>,
     /// Response compression settings (F12) — projected from
     /// `[edge.compress]`.
     pub compress: sentry_core::config::EdgeCompressConfig,
     /// Set `X-Forwarded-*`/`X-Real-IP` on forwarded requests (F12), after
     /// stripping the client's copies.
     pub forwarded_headers: bool,
+    /// Stream upstream responses instead of buffering them (F14): fixes
+    /// SSE/streaming payloads, at the cost of response compression.
+    pub response_buffering: bool,
     /// Connect timeout for the upstream hop (seconds).
     pub upstream_connect_timeout_secs: u64,
+    /// Total per-request upstream budget (seconds): connect + read + write.
+    pub upstream_timeout_secs: u64,
     /// Idle keepalive connections pooled per upstream host.
     pub upstream_pool_idle: usize,
     /// Max requests served concurrently (0 = unlimited). Each in-flight
     /// request buffers body bytes, so the cap bounds edge memory under a
     /// connection flood; excess requests get an immediate 503.
     pub max_concurrent_requests: usize,
+    /// Accept-loop workers sharing the port via `SO_REUSEPORT` (F14, unix).
+    pub reuseport_workers: usize,
+    /// Listen backlog (F14); 0 = system maximum.
+    pub tcp_backlog: u32,
+    /// Client-facing TCP flags (F14): nodelay, keepalive, buffers.
+    pub tcp_tuning: crate::net::TcpTuning,
 }
 
 /// HTTPS front settings (F8) — built by the daemon from `[edge] tls_*`.
@@ -59,7 +82,8 @@ pub struct EdgeProxyConfig {
 pub struct TlsEdgeConfig {
     /// HTTPS listen address (`0.0.0.0:443`).
     pub listen: String,
-    /// Certificate PEM file.
+    /// Certificate PEM file — also the default chain for hostnames without
+    /// a per-vhost cert (F14).
     pub cert: PathBuf,
     /// Private key PEM file.
     pub key: PathBuf,
@@ -72,21 +96,45 @@ pub struct TlsEdgeConfig {
     pub handshake_events: bool,
     /// Negotiate HTTP/2 via ALPN alongside HTTP/1.1 (F12).
     pub http2: bool,
+    /// Per-vhost certificates (F14): SNI-selected, `cert`/`key` remain the
+    /// default chain for unknown hostnames.
+    pub extra_certs: Vec<VhostCert>,
+}
+
+/// One vhost TLS certificate (F14): served via SNI for `hosts` (exact
+/// names or `*.wildcard` patterns).
+#[derive(Debug, Clone)]
+pub struct VhostCert {
+    /// Hostnames this certificate answers.
+    pub hosts: Vec<String>,
+    /// Certificate PEM file.
+    pub cert: PathBuf,
+    /// Private key PEM file.
+    pub key: PathBuf,
 }
 
 impl Default for EdgeProxyConfig {
     fn default() -> Self {
         Self {
             listen: "0.0.0.0:80".to_string(),
-            upstream: "http://127.0.0.1:8080".to_string(),
+            upstreams: vec!["http://127.0.0.1:8080".to_string()],
+            balance: sentry_core::config::BalanceMode::default(),
+            max_fails: 2,
+            fail_timeout_secs: 30,
             health_path: "/".to_string(),
             health_timeout_secs: 5,
             tls: None,
+            vhosts: Vec::new(),
             compress: sentry_core::config::EdgeCompressConfig::default(),
             forwarded_headers: true,
+            response_buffering: true,
             upstream_connect_timeout_secs: 5,
+            upstream_timeout_secs: 300,
             upstream_pool_idle: 32,
             max_concurrent_requests: 1024,
+            reuseport_workers: 1,
+            tcp_backlog: 0,
+            tcp_tuning: crate::net::TcpTuning::default(),
         }
     }
 }
@@ -122,32 +170,151 @@ const FORWARDED_STRIP: &[&str] = &[
 #[derive(Debug, Clone)]
 struct UpstreamServed;
 
-/// Verify the upstream answers before the edge starts accepting traffic.
+/// The reqwest client toward the upstreams. Certificates on `https://`
+/// upstreams are always verified — an unverified TLS hop protects against
+/// passive eavesdropping only, so backends with self-signed certificates
+/// should be served over plain `http://` inside the private network
+/// instead (same trust assumption, one less thing to misconfigure).
+#[derive(Clone)]
+pub(crate) struct UpstreamClients {
+    verified: reqwest::Client,
+}
+
+impl UpstreamClients {
+    fn build(cfg: &EdgeProxyConfig) -> sentry_core::error::Result<Self> {
+        Ok(Self {
+            verified: reqwest::Client::builder()
+                .timeout(Duration::from_secs(cfg.upstream_timeout_secs.max(1)))
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(
+                    cfg.upstream_connect_timeout_secs.max(1),
+                ))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .pool_max_idle_per_host(cfg.upstream_pool_idle)
+                .tcp_keepalive(Duration::from_secs(60))
+                .tcp_nodelay(true)
+                .build()
+                .map_err(|e| {
+                    sentry_core::error::CoreError::Config(format!("edge http client: {e}"))
+                })?,
+        })
+    }
+
+    /// Single verified client (tests).
+    #[cfg(test)]
+    fn verified_only(client: reqwest::Client) -> Self {
+        Self { verified: client }
+    }
+}
+
+/// The raw h1 client used for WebSocket/h1 upgrade pass-through (F14).
+/// reqwest cannot handle `101 Switching Protocols`, so upgrades bypass it.
+type UpgradeClient = hyper_util::client::legacy::Client<
+    hyper_util::client::legacy::connect::HttpConnector,
+    http_body_util::Full<bytes::Bytes>,
+>;
+
+fn default_upgrade_client() -> UpgradeClient {
+    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build_http()
+}
+
+/// Build the host-routing table (F14) from the proxy config: one default
+/// (catch-all) group plus one group per vhost, each with the effective
+/// balancer/health settings resolved from the globals.
+fn build_vhost_router(cfg: &EdgeProxyConfig) -> crate::upstream::VhostRouter {
+    use sentry_core::config::EdgeVhostConfig;
+    let default = crate::upstream::UpstreamGroup::new(
+        "",
+        &cfg.upstreams,
+        cfg.balance,
+        cfg.max_fails,
+        cfg.fail_timeout_secs,
+    );
+    let entries: Vec<(String, crate::upstream::UpstreamGroup)> = cfg
+        .vhosts
+        .iter()
+        .map(|v: &EdgeVhostConfig| {
+            (
+                v.host.clone(),
+                crate::upstream::UpstreamGroup::new(
+                    v.host.clone(),
+                    &v.upstreams,
+                    v.effective_balance(cfg.balance),
+                    v.effective_max_fails(cfg.max_fails),
+                    v.effective_fail_timeout(cfg.fail_timeout_secs),
+                ),
+            )
+        })
+        .collect();
+    crate::upstream::VhostRouter::new(default, entries)
+}
+
+/// Verify the upstreams answer before the edge starts accepting traffic.
 ///
 /// Inline mode is an explicit opt-in precisely because a dead backend turns
-/// the edge into an outage; this check is mandatory by design.
+/// the edge into an outage. With groups (F14) the contract is per group:
+/// at least one server must answer — a down secondary is a warning (that is
+/// exactly what failover exists for), a group with no healthy server is
+/// fatal.
 pub async fn health_check(cfg: &EdgeProxyConfig) -> sentry_core::error::Result<()> {
+    let router = build_vhost_router(cfg);
+    health_check_router(&router, cfg).await
+}
+
+async fn health_check_router(
+    router: &crate::upstream::VhostRouter,
+    cfg: &EdgeProxyConfig,
+) -> sentry_core::error::Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(cfg.health_timeout_secs.max(1)))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| sentry_core::error::CoreError::Config(format!("edge http client: {e}")))?;
-    let url = format!("{}{}", cfg.upstream.trim_end_matches('/'), cfg.health_path);
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| {
-            sentry_core::error::CoreError::Config(format!(
-                "edge upstream health check failed ({url}): {e} — refusing to start inline on a dead backend"
-            ))
-        })?;
-    info!(
-        url = %url,
-        status = resp.status().as_u16(),
-        "edge upstream healthy"
-    );
-    Ok(())
+    let checks = router.groups().map(|group| {
+        let client = client.clone();
+        let health_path = match group.name.is_empty() {
+            true => cfg.health_path.clone(),
+            false => cfg
+                .vhosts
+                .iter()
+                .find(|v| v.host == group.name)
+                .and_then(|v| v.health_path.clone())
+                .unwrap_or_else(|| cfg.health_path.clone()),
+        };
+        async move {
+            let mut failures: Vec<String> = Vec::new();
+            let mut healthy = 0usize;
+            for idx in 0..group.len() {
+                let url = format!("{}{}", group.url(idx).trim_end_matches('/'), health_path);
+                match client.get(&url).send().await {
+                    Ok(_) => healthy += 1,
+                    Err(e) => failures.push(format!("{}: {e}", group.url(idx))),
+                }
+            }
+            (group.name.clone(), healthy, failures)
+        }
+    });
+    let results = futures::future::join_all(checks).await;
+    let mut errors: Vec<String> = Vec::new();
+    for (name, healthy, failures) in results {
+        let label = match name.is_empty() {
+            true => "default".to_string(),
+            false => format!("vhost {name}"),
+        };
+        for f in failures {
+            warn!(group = %label, "edge upstream failed the startup health check: {f}");
+        }
+        if healthy == 0 {
+            errors.push(format!(
+                "edge upstream health check failed for {label} — refusing to start inline on a dead backend"
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(sentry_core::error::CoreError::Config(errors.join("; ")))
+    }
 }
 
 /// Serve the inline edge until the process stops.
@@ -155,28 +322,16 @@ pub async fn health_check(cfg: &EdgeProxyConfig) -> sentry_core::error::Result<(
 /// With a TLS front (F8) the plain and HTTPS listeners run concurrently
 /// on the same pipeline: port 80 and port 443 are both monitored, blocked
 /// IPs are denied on both, and the SNI/JA3 telemetry flows from the TLS
-/// acceptor.
+/// acceptor. Requests are routed by Host header across the upstream
+/// groups (F14) with load balancing, passive health checks and failover.
 pub async fn serve(
     runtime: EdgeRuntime,
     cfg: EdgeProxyConfig,
     decided: mpsc::Sender<sentry_core::ProcessedEvent>,
 ) -> sentry_core::error::Result<()> {
-    health_check(&cfg).await?;
-    // Upstream hop tuning (F12): a connect timeout fails fast on a hung
-    // backend; the keepalive pool removes a TCP handshake per request
-    // (reused connections stay warm, `tcp_nodelay` kills Nagle latency).
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(
-            cfg.upstream_connect_timeout_secs.max(1),
-        ))
-        .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(cfg.upstream_pool_idle)
-        .tcp_keepalive(Duration::from_secs(60))
-        .tcp_nodelay(true)
-        .build()
-        .map_err(|e| sentry_core::error::CoreError::Config(format!("edge http client: {e}")))?;
+    let router = Arc::new(build_vhost_router(&cfg));
+    let clients = UpstreamClients::build(&cfg)?;
+    health_check_router(&router, &cfg).await?;
 
     // Response compression (F12): one middleware around the router covers
     // upstream responses and edge-generated pages on both listeners. The
@@ -189,34 +344,47 @@ pub async fn serve(
     ));
 
     let redirect_https = cfg.tls.as_ref().is_some_and(|t| t.redirect_https);
+    let listener_opts = crate::net::ListenerOptions {
+        backlog: cfg.tcp_backlog,
+        reuseport: cfg.reuseport_workers > 1,
+        tuning: cfg.tcp_tuning,
+    };
     let app = build_router(
         ProxyState {
             runtime: runtime.clone(),
-            client,
-            upstream: cfg.upstream.clone(),
+            clients,
+            router,
             decided: decided.clone(),
             redirect_https,
             forwarded_headers: cfg.forwarded_headers,
+            response_buffering: cfg.response_buffering,
             gate: (cfg.max_concurrent_requests > 0)
                 .then(|| Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_requests))),
+            failovers: runtime.upstream_failovers().cloned(),
+            upgrade_client: default_upgrade_client(),
         },
         compressor,
     );
 
     match cfg.tls {
-        None => serve_plain(app, cfg.listen).await,
+        None => serve_plain(app, cfg.listen, listener_opts, cfg.reuseport_workers).await,
         Some(tls_cfg) => {
             #[cfg(feature = "edge-tls")]
             {
                 tokio::try_join!(
-                    serve_plain(app.clone(), cfg.listen),
-                    crate::tls::serve_tls(runtime, tls_cfg, app, decided)
+                    serve_plain(
+                        app.clone(),
+                        cfg.listen,
+                        listener_opts,
+                        cfg.reuseport_workers
+                    ),
+                    crate::tls::serve_tls(runtime, tls_cfg, app, decided, listener_opts)
                 )?;
                 Ok(())
             }
             #[cfg(not(feature = "edge-tls"))]
             {
-                let _ = (tls_cfg, runtime, app, decided);
+                let _ = (tls_cfg, runtime, app, decided, listener_opts);
                 Err(sentry_core::error::CoreError::Config(
                     "edge tls configured but sentry was built without the `edge-tls` \
                      feature — rebuild with --features sentry-cli/edge-tls"
@@ -243,41 +411,123 @@ fn build_router(state: ProxyState, compressor: Arc<crate::compression::Compresso
 }
 
 /// Plain-HTTP listener. An empty `listen` disables it (HTTPS-only edge).
-async fn serve_plain(app: Router, listen: String) -> sentry_core::error::Result<()> {
+/// With `reuseport_workers > 1` (unix) several sockets bind the same
+/// address, each with its own kernel accept queue (F14).
+async fn serve_plain(
+    app: Router,
+    listen: String,
+    opts: crate::net::ListenerOptions,
+    workers: usize,
+) -> sentry_core::error::Result<()> {
     if listen.is_empty() {
         return Ok(());
     }
     let addr: SocketAddr = listen.parse().map_err(|e| {
         sentry_core::error::CoreError::Config(format!("invalid edge listen address: {e}"))
     })?;
-    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-        sentry_core::error::CoreError::Config(format!("edge bind on {addr} failed: {e}"))
-    })?;
-    info!(addr = %addr, "edge (inline) listening on http");
-    // `into_make_service` + ready loop keeps ConnectInfo available for the
-    // real-IP precedence chain.
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .map_err(|e| sentry_core::error::CoreError::Config(format!("edge server error: {e}")))
+    let mut workers = workers.max(1);
+    #[cfg(not(unix))]
+    if workers > 1 {
+        workers = 1;
+        warn!(
+            "edge: reuseport_workers > 1 requires SO_REUSEPORT (unix) — using a single accept loop"
+        );
+    }
+    let mut listeners = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        listeners.push(crate::net::bind_listener(addr, opts).map_err(|e| {
+            sentry_core::error::CoreError::Config(format!("edge bind on {addr} failed: {e}"))
+        })?);
+    }
+    if workers == 1 {
+        info!(addr = %addr, "edge (inline) listening on http");
+    } else {
+        info!(
+            addr = %addr,
+            workers,
+            "edge (inline) listening on http with reuseport workers"
+        );
+    }
+    let mut tasks = Vec::with_capacity(listeners.len());
+    for listener in listeners {
+        let app = app.clone();
+        tasks.push(tokio::spawn(async move {
+            accept_loop(listener, app, opts.tuning).await
+        }));
+    }
+    for task in tasks {
+        task.await
+            .map_err(|e| sentry_core::error::CoreError::Config(format!("edge accept task: {e}")))?
+            .map_err(|e| {
+                sentry_core::error::CoreError::Config(format!("edge server error: {e}"))
+            })?;
+    }
+    Ok(())
+}
+
+/// Per-connection accept loop: tune the socket (F14 `tcp_*` flags), inject
+/// `ConnectInfo` and serve it with hyper's auto builder so h1 — and
+/// `serve_connection_with_upgrades` — powers WebSocket pass-through (F14).
+async fn accept_loop(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    tuning: crate::net::TcpTuning,
+) -> std::io::Result<()> {
+    loop {
+        let (tcp, peer) = listener.accept().await?;
+        crate::net::tune_accepted(&tcp, &tuning);
+        tokio::spawn({
+            let app = app.clone();
+            async move {
+                let svc = hyper::service::service_fn(
+                    move |req: hyper::Request<hyper::body::Incoming>| {
+                        let mut app = app.clone();
+                        async move {
+                            let mut req = req.map(axum::body::Body::new);
+                            req.extensions_mut()
+                                .insert(axum::extract::ConnectInfo(peer));
+                            use tower_service::Service as _;
+                            app.call(req).await
+                        }
+                    },
+                );
+                let io = hyper_util::rt::TokioIo::new(tcp);
+                if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection_with_upgrades(io, svc)
+                .await
+                {
+                    tracing::debug!(error = %e, "edge connection ended");
+                }
+            }
+        });
+    }
 }
 
 /// Shared handler state (single struct — the state tuple got unwieldy).
 #[derive(Clone)]
 struct ProxyState {
     runtime: EdgeRuntime,
-    client: reqwest::Client,
-    upstream: String,
+    clients: UpstreamClients,
+    /// Host-header routing table (F14): default group + vhost groups with
+    /// their balancers and passive-health state.
+    router: Arc<crate::upstream::VhostRouter>,
     decided: mpsc::Sender<sentry_core::ProcessedEvent>,
     /// 301 plain-HTTP requests to HTTPS (F8, TLS front only).
     redirect_https: bool,
     /// Set `X-Forwarded-*`/`X-Real-IP` on forwarded requests (F12).
     forwarded_headers: bool,
+    /// Buffer upstream responses before forwarding (F14). `false` streams
+    /// them (SSE payloads) — compression passes those through.
+    response_buffering: bool,
     /// Concurrency cap: in-flight requests hold a permit; when exhausted,
     /// new requests get an immediate 503 instead of buffering another body.
     gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// `sentry_edge_upstream_failovers_total{vhost}` (F14).
+    failovers: Option<prometheus::CounterVec>,
+    /// Raw h1 client for WebSocket/h1 upgrade pass-through (F14).
+    upgrade_client: UpgradeClient,
 }
 
 /// Original request host: the `Host` header, or — for HTTP/2, where the
@@ -290,6 +540,24 @@ fn original_host(parts: &axum::http::request::Parts) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
         .or_else(|| parts.uri.authority().map(|a| a.to_string()))
+}
+
+#[cfg(test)]
+impl ProxyState {
+    fn with_gate(mut self, gate: Option<Arc<tokio::sync::Semaphore>>) -> Self {
+        self.gate = gate;
+        self
+    }
+
+    fn with_redirect_https(mut self, redirect: bool) -> Self {
+        self.redirect_https = redirect;
+        self
+    }
+
+    fn with_buffering(mut self, buffering: bool) -> Self {
+        self.response_buffering = buffering;
+        self
+    }
 }
 
 async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> Response {
@@ -332,15 +600,6 @@ async fn proxy_handler_inner(
     req: Request,
     start: Instant,
 ) -> Response {
-    let ProxyState {
-        runtime,
-        client,
-        upstream,
-        decided,
-        redirect_https,
-        forwarded_headers,
-        ..
-    } = state;
     let (parts, body) = req.into_parts();
     // Set by the TLS acceptor (F8) — a real HTTPS connection, not a
     // spoofable header.
@@ -364,14 +623,15 @@ async fn proxy_handler_inner(
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok());
-    let error_pages = runtime.error_pages();
-    if let Some(insp) = runtime
+    let error_pages = state.runtime.error_pages();
+    if let Some(insp) = state
+        .runtime
         .uploads_inspection()
-        .filter(|_| !runtime.overloaded())
+        .filter(|_| !state.runtime.overloaded())
     {
         if insp.oversize == sentry_core::config::OversizePolicy::Reject {
             if declared_len.is_some_and(|len| len > insp.inspect_bytes) {
-                runtime.record_oversize("reject");
+                state.runtime.record_oversize("reject");
                 let trace = Uuid::new_v4();
                 tracing::info!(ip = %peer, trace_id = %trace, declared = ?declared_len, cap = insp.inspect_bytes, elapsed = ?start.elapsed(), "edge: body beyond inspection cap rejected before buffering (no event persisted)");
                 return pages::payload_too_large_page(error_pages, Some(trace));
@@ -379,28 +639,15 @@ async fn proxy_handler_inner(
             let body_bytes = match axum::body::to_bytes(body, insp.inspect_bytes).await {
                 Ok(b) => b.to_vec(),
                 Err(_) => {
-                    runtime.record_oversize("reject");
+                    state.runtime.record_oversize("reject");
                     let trace = Uuid::new_v4();
                     tracing::info!(ip = %peer, trace_id = %trace, cap = insp.inspect_bytes, elapsed = ?start.elapsed(), "edge: chunked body beyond inspection cap rejected (no event persisted)");
                     return pages::payload_too_large_page(error_pages, Some(trace));
                 }
             };
-            return proxy_inspected(
-                runtime,
-                client,
-                upstream,
-                decided,
-                redirect_https,
-                forwarded_headers,
-                parts,
-                body_bytes,
-                is_tls,
-                peer,
-                start,
-            )
-            .await;
+            return proxy_inspected(&state, parts, body_bytes, is_tls, peer, start).await;
         }
-        let forward_cap = runtime.body_cap().max(1024 * 1024);
+        let forward_cap = state.runtime.body_cap().max(1024 * 1024);
         let body_bytes = match axum::body::to_bytes(body, forward_cap).await {
             Ok(b) => b.to_vec(),
             Err(_) => {
@@ -409,25 +656,12 @@ async fn proxy_handler_inner(
                 return pages::payload_too_large_page(error_pages, Some(trace));
             }
         };
-        return proxy_inspected(
-            runtime,
-            client,
-            upstream,
-            decided,
-            redirect_https,
-            forwarded_headers,
-            parts,
-            body_bytes,
-            is_tls,
-            peer,
-            start,
-        )
-        .await;
+        return proxy_inspected(&state, parts, body_bytes, is_tls, peer, start).await;
     }
 
     // Inspection disabled: legacy behavior — buffer for forwarding (≥1 MiB)
     // and capture the first `body_cap` bytes for persistence when enabled.
-    let forward_cap = runtime.body_cap().max(1024 * 1024);
+    let forward_cap = state.runtime.body_cap().max(1024 * 1024);
     let body_bytes = match axum::body::to_bytes(body, forward_cap).await {
         Ok(b) => b.to_vec(),
         Err(_) => {
@@ -436,38 +670,21 @@ async fn proxy_handler_inner(
             return pages::payload_too_large_page(error_pages, Some(trace));
         }
     };
-    proxy_inspected(
-        runtime,
-        client,
-        upstream,
-        decided,
-        redirect_https,
-        forwarded_headers,
-        parts,
-        body_bytes,
-        is_tls,
-        peer,
-        start,
-    )
-    .await
+    proxy_inspected(&state, parts, body_bytes, is_tls, peer, start).await
 }
 
 /// Shared tail of the proxy handler once the body is buffered: upload
 /// inspection, pipeline, verdict and upstream forwarding.
-#[allow(clippy::too_many_arguments)]
 async fn proxy_inspected(
-    runtime: crate::EdgeRuntime,
-    client: reqwest::Client,
-    upstream: String,
-    decided: mpsc::Sender<sentry_core::ProcessedEvent>,
-    redirect_https: bool,
-    forwarded_headers: bool,
+    state: &ProxyState,
     parts: axum::http::request::Parts,
     body_bytes: Vec<u8>,
     is_tls: bool,
     peer: std::net::IpAddr,
     start: Instant,
 ) -> Response {
+    let runtime = &state.runtime;
+    let mut parts = parts;
     let error_pages = runtime.error_pages();
     let captured = if runtime.body_cap() > 0 {
         Some(
@@ -555,16 +772,14 @@ async fn proxy_inspected(
 
     let resp = match processed.decision.action {
         sentry_core::analysis::Verdict::Allow => {
+            let client_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
             serve_allow(
+                state,
                 &parts,
                 &body_bytes,
                 is_tls,
-                redirect_https,
-                forwarded_headers,
                 client_ip,
-                &client,
-                &upstream,
-                runtime.error_pages_handle(),
+                client_upgrade,
             )
             .await
         }
@@ -574,16 +789,14 @@ async fn proxy_inspected(
         sentry_core::analysis::Verdict::Challenge => {
             match runtime.challenge_gate(&parts.headers, client_ip, Some(processed.event.id)) {
                 crate::ChallengeGate::Pass => {
+                    let client_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
                     serve_allow(
+                        state,
                         &parts,
                         &body_bytes,
                         is_tls,
-                        redirect_https,
-                        forwarded_headers,
                         client_ip,
-                        &client,
-                        &upstream,
-                        runtime.error_pages_handle(),
+                        client_upgrade,
                     )
                     .await
                 }
@@ -646,7 +859,7 @@ async fn proxy_inspected(
         processed.event.duration_ms = Some(start.elapsed().as_millis() as u64);
     }
 
-    if let Err(e) = decided.try_send(processed) {
+    if let Err(e) = state.decided.try_send(processed) {
         warn!(error = %e, "failed to publish decided event");
     }
 
@@ -654,28 +867,29 @@ async fn proxy_inspected(
 }
 
 /// Allow path (and challenge-passed requests): plain-HTTP → HTTPS redirect
-/// (F8) when configured, otherwise forward to the upstream and pass its
-/// response through. With `forwarded_headers` (F12) the client's own
+/// (F8) when configured, otherwise resolve the Host's upstream group (F14)
+/// and forward with load balancing, passive health checks and failover
+/// (a connection-level failure retries the next server — nginx
+/// `proxy_next_upstream error timeout`; the buffered body makes retrying
+/// safe). With `forwarded_headers` (F12) the client's own
 /// `X-Forwarded-*`/`X-Real-IP` are stripped and replaced with the edge's
 /// resolved view: `X-Forwarded-For`/`X-Real-IP` carry the client IP,
 /// `X-Forwarded-Proto` the real scheme, `X-Forwarded-Host` the requested
 /// host — so backend `real_ip` modules and virtual hosts work unchanged.
-#[allow(clippy::too_many_arguments)]
+/// h1 upgrade requests (WebSocket, F14) take the raw pass-through path.
 async fn serve_allow(
+    state: &ProxyState,
     parts: &axum::http::request::Parts,
     body_bytes: &[u8],
     is_tls: bool,
-    redirect_https: bool,
-    forwarded_headers: bool,
     client_ip: std::net::IpAddr,
-    client: &reqwest::Client,
-    upstream: &str,
-    error_pages: Option<std::sync::Arc<pages::ErrorPages>>,
+    client_upgrade: Option<hyper::upgrade::OnUpgrade>,
 ) -> Response {
+    let error_pages = state.runtime.error_pages_handle();
     // Plain-HTTP → HTTPS redirect (F8): port-80 traffic stays monitored and
     // enforced; benign requests get the 301 instead of double-hitting the
     // upstream.
-    if redirect_https && !is_tls {
+    if state.redirect_https && !is_tls {
         if let Some(host) = parts
             .headers
             .get(header::HOST)
@@ -701,17 +915,108 @@ async fn serve_allow(
         }
     }
 
-    // Forward to upstream.
+    let host = original_host(parts);
+    let group = state.router.resolve(host.as_deref());
+    let client = &state.clients.verified;
+
+    // WebSocket / h1 upgrade: bypass the buffered forward and pipe the two
+    // upgraded connections bidirectionally (F14).
+    if is_upgrade_request(parts) {
+        return proxy_upgrade(state, group, parts, host.as_deref(), client_upgrade).await;
+    }
+
     let path_qs = match parts.uri.query() {
         Some(q) => format!("{}?{q}", parts.uri.path()),
         None => parts.uri.path().to_string(),
     };
-    let url = format!("{}{}", upstream.trim_end_matches('/'), path_qs);
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
-    let original_host = original_host(parts);
-    let mut fwd = client.request(method, &url);
-    for (k, v) in parts.headers.iter() {
+    let now = crate::upstream::now_ms();
+    let mut tried: Vec<usize> = Vec::new();
+    loop {
+        let Some(idx) = group.pick_excluding(&tried, client_ip, now) else {
+            // Every server is down or was already tried this request.
+            let trace = Uuid::new_v4();
+            warn!(
+                vhost = %group.name,
+                trace_id = %trace,
+                "edge: upstream group exhausted — all servers down or failing"
+            );
+            return pages::bad_gateway_page(error_pages.as_deref(), Some(trace));
+        };
+        tried.push(idx);
+        let url = format!("{}{}", group.url(idx).trim_end_matches('/'), path_qs);
+        group.begin(idx);
+        let hop = HopRequest {
+            parts,
+            body: body_bytes,
+            is_tls,
+            host: host.as_deref(),
+            client_ip,
+        };
+        let outcome =
+            forward_once(client, method.clone(), &url, &hop, state.forwarded_headers).await;
+        group.done(idx);
+        match outcome {
+            Ok(resp) => {
+                group.record_success(idx);
+                return finalize_upstream_response(state, resp, &url).await;
+            }
+            Err(ForwardError::Retryable(e)) => {
+                let ejected = group.record_failure(idx, crate::upstream::now_ms());
+                if let Some(counter) = &state.failovers {
+                    let label = match group.name.is_empty() {
+                        true => "default".to_string(),
+                        false => group.name.clone(),
+                    };
+                    counter.with_label_values(&[&label]).inc();
+                }
+                warn!(
+                    server = %group.server_label(idx),
+                    ejected,
+                    error = %e,
+                    url = %url,
+                    "edge upstream failed — failing over to the next server"
+                );
+            }
+            Err(ForwardError::Fatal(e)) => {
+                let trace = Uuid::new_v4();
+                warn!(error = %e, url = %url, trace_id = %trace, "edge upstream request failed");
+                return pages::bad_gateway_page(error_pages.as_deref(), Some(trace));
+            }
+        }
+    }
+}
+
+/// Why a forward attempt ended: a connection-level failure is retryable on
+/// the next server (nginx `proxy_next_upstream error timeout`); anything
+/// else aborts the request.
+enum ForwardError {
+    Retryable(reqwest::Error),
+    Fatal(reqwest::Error),
+}
+
+/// Everything one upstream attempt needs from the original request —
+/// bundled so the retry loop stays readable.
+struct HopRequest<'a> {
+    parts: &'a axum::http::request::Parts,
+    body: &'a [u8],
+    is_tls: bool,
+    host: Option<&'a str>,
+    client_ip: std::net::IpAddr,
+}
+
+/// One attempt against one upstream server. The request body is already in
+/// memory, so a retryable failure can replay it on the next server.
+async fn forward_once(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    hop: &HopRequest<'_>,
+    forwarded_headers: bool,
+) -> Result<reqwest::Response, ForwardError> {
+    let mut fwd = client.request(method, url);
+    for (k, v) in hop.parts.headers.iter() {
         let name = k.as_str();
         if HOP_BY_HOP.contains(&name) {
             continue;
@@ -723,54 +1028,256 @@ async fn serve_allow(
             fwd = fwd.header(name, val);
         }
     }
-    if let Some(host) = original_host.as_deref() {
+    if let Some(host) = hop.host {
         fwd = fwd.header(header::HOST, host);
     }
     if forwarded_headers {
-        let proto = if is_tls { "https" } else { "http" };
+        let proto = if hop.is_tls { "https" } else { "http" };
         fwd = fwd
-            .header("x-forwarded-for", client_ip.to_canonical().to_string())
-            .header("x-real-ip", client_ip.to_canonical().to_string())
+            .header("x-forwarded-for", hop.client_ip.to_canonical().to_string())
+            .header("x-real-ip", hop.client_ip.to_canonical().to_string())
             .header("x-forwarded-proto", proto);
-        if let Some(host) = original_host.as_deref() {
+        if let Some(host) = hop.host {
             fwd = fwd.header("x-forwarded-host", host);
         }
     }
-    if !body_bytes.is_empty() {
-        fwd = fwd.body(body_bytes.to_vec());
+    if !hop.body.is_empty() {
+        fwd = fwd.body(hop.body.to_vec());
+    }
+    match fwd.send().await {
+        Ok(resp) => Ok(resp),
+        // Connect failures and timeouts are exactly the cases another
+        // server can still serve; response-level errors are not retried.
+        Err(e) if e.is_connect() || e.is_timeout() => Err(ForwardError::Retryable(e)),
+        Err(e) => Err(ForwardError::Fatal(e)),
+    }
+}
+
+/// Turn an upstream response into the client response: full buffering
+/// (default — compression and posture grade the body) or streaming when
+/// `response_buffering = false` or the payload is `text/event-stream`.
+async fn finalize_upstream_response(
+    state: &ProxyState,
+    resp: reqwest::Response,
+    url: &str,
+) -> Response {
+    let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    let mut out = Response::builder().status(status).extension(UpstreamServed);
+    for (k, v) in resp.headers().iter() {
+        let name = k.as_str();
+        if HOP_BY_HOP.contains(&name) {
+            continue;
+        }
+        out = out.header(name, v);
+    }
+    let streaming = !state.response_buffering
+        || resp.headers().get(header::CONTENT_TYPE).is_some_and(|v| {
+            v.to_str()
+                .map(|ct| {
+                    ct.split(';')
+                        .next()
+                        .map(|ct| ct.trim().eq_ignore_ascii_case("text/event-stream"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+    if streaming {
+        return out
+            .extension(crate::compression::StreamedResponse)
+            .body(axum::body::Body::from_stream(resp.bytes_stream()))
+            .unwrap_or_else(|_| {
+                let trace = Uuid::new_v4();
+                tracing::error!(trace_id = %trace, "edge: streaming response build failed");
+                pages::bad_gateway_page(state.runtime.error_pages(), Some(trace))
+            });
+    }
+    match resp.bytes().await {
+        Ok(bytes) => out.body(axum::body::Body::from(bytes)).unwrap_or_else(|_| {
+            let trace = Uuid::new_v4();
+            tracing::error!(trace_id = %trace, "edge: upstream response body build failed");
+            pages::bad_gateway_page(state.runtime.error_pages(), Some(trace))
+        }),
+        Err(_) => {
+            let trace = Uuid::new_v4();
+            tracing::warn!(trace_id = %trace, url = %url, "edge: upstream response body read failed");
+            pages::bad_gateway_page(state.runtime.error_pages(), Some(trace))
+        }
+    }
+}
+
+/// True when the request asks for an h1 protocol upgrade (WebSocket and
+/// friends): `Connection: upgrade` + an `Upgrade` token, HTTP/1.1 only —
+/// HTTP/2 multiplexes streams instead.
+fn is_upgrade_request(parts: &axum::http::request::Parts) -> bool {
+    if parts.version != axum::http::Version::HTTP_11 {
+        return false;
+    }
+    let connection = parts
+        .headers
+        .get(header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+        });
+    connection && parts.headers.contains_key(header::UPGRADE)
+}
+
+/// Raw h1 pass-through for upgrade requests (F14): the buffered forward
+/// cannot relay a `101 Switching Protocols` (reqwest has no upgrade API and
+/// the hop-by-hop strip removes `Connection`/`Upgrade`), so this opens its
+/// own h1 connection with a hyper legacy client, answers 101 and pipes both
+/// upgraded connections bidirectionally. Upstream TLS is not supported on
+/// this path yet (the raw client has no TLS connector) — a 502 explains it.
+async fn proxy_upgrade(
+    state: &ProxyState,
+    group: &crate::upstream::UpstreamGroup,
+    parts: &axum::http::request::Parts,
+    host: Option<&str>,
+    client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+) -> Response {
+    let error_pages = state.runtime.error_pages_handle();
+    let bad_gateway = |why: &str| {
+        let trace = Uuid::new_v4();
+        warn!(vhost = %group.name, why, trace_id = %trace, "edge: upgrade request failed");
+        pages::bad_gateway_page(error_pages.as_deref(), Some(trace))
+    };
+    let Some(client_upgrade) = client_upgrade else {
+        return bad_gateway("no client upgrade channel (not an upgradeable connection)");
+    };
+    if group.is_empty() {
+        return bad_gateway("upstream group has no servers");
+    }
+    let Some(upgrade_protocol) = parts
+        .headers
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+    else {
+        return bad_gateway("upgrade request without an Upgrade header");
+    };
+    if group.url(0).trim_end_matches('/').starts_with("https://") {
+        return bad_gateway(
+            "WebSocket pass-through does not support https upstreams yet — use http:// behind the edge",
+        );
     }
 
-    match fwd.send().await {
-        Ok(resp) => {
-            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
-                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-            let mut out = Response::builder().status(status).extension(UpstreamServed);
-            for (k, v) in resp.headers().iter() {
-                let name = k.as_str();
-                if HOP_BY_HOP.contains(&name) {
-                    continue;
-                }
-                out = out.header(name, v);
-            }
-            match resp.bytes().await {
-                Ok(bytes) => out.body(axum::body::Body::from(bytes)).unwrap_or_else(|_| {
-                    let trace = Uuid::new_v4();
-                    tracing::error!(trace_id = %trace, "edge: upstream response body build failed");
-                    pages::bad_gateway_page(error_pages.as_deref(), Some(trace))
-                }),
-                Err(_) => {
-                    let trace = Uuid::new_v4();
-                    tracing::warn!(trace_id = %trace, url = %url, "edge: upstream response body read failed");
-                    pages::bad_gateway_page(error_pages.as_deref(), Some(trace))
-                }
-            }
+    let path_qs = match parts.uri.query() {
+        Some(q) => format!("{}?{q}", parts.uri.path()),
+        None => parts.uri.path().to_string(),
+    };
+    let uri: hyper::Uri = match format!("{}{}", group.url(0).trim_end_matches('/'), path_qs).parse()
+    {
+        Ok(u) => u,
+        Err(e) => return bad_gateway(&format!("upstream URI build failed: {e}")),
+    };
+    let method: hyper::http::Method = match parts.method.as_str().parse() {
+        Ok(m) => m,
+        Err(_) => hyper::http::Method::GET,
+    };
+    let mut builder = hyper::Request::builder()
+        .method(method)
+        .uri(uri)
+        .version(hyper::http::Version::HTTP_11);
+    for (k, v) in parts.headers.iter() {
+        let name = k.as_str();
+        if HOP_BY_HOP.contains(&name) || FORWARDED_STRIP.contains(&name) {
+            // `connection`/`upgrade` are re-added explicitly below.
+            continue;
         }
-        Err(e) => {
-            let trace = Uuid::new_v4();
-            warn!(error = %e, url = %url, trace_id = %trace, "edge upstream request failed");
-            pages::bad_gateway_page(error_pages.as_deref(), Some(trace))
+        if let Ok(val) = v.to_str() {
+            builder = builder.header(name, val);
         }
     }
+    builder = builder
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, upgrade_protocol);
+    if let Some(host) = host {
+        builder = builder.header(header::HOST, host);
+    }
+    if state.forwarded_headers {
+        let proto = if parts.extensions.get::<crate::TlsTerminated>().is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        builder = builder
+            .header("x-forwarded-proto", proto)
+            .header("x-forwarded-host", host.unwrap_or(""));
+    }
+    let request = match builder.body(http_body_util::Full::new(bytes::Bytes::new())) {
+        Ok(r) => r,
+        Err(e) => return bad_gateway(&format!("upgrade request build failed: {e}")),
+    };
+    let upstream_resp = match state.upgrade_client.clone().request(request).await {
+        Ok(r) => r,
+        Err(e) => return bad_gateway(&format!("upstream upgrade failed: {e}")),
+    };
+    if upstream_resp.status() != hyper::http::StatusCode::SWITCHING_PROTOCOLS {
+        // The backend answered normally (e.g. rejected the upgrade): pass
+        // the regular response through.
+        let status = axum::http::StatusCode::from_u16(upstream_resp.status().as_u16())
+            .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+        let mut out = Response::builder().status(status).extension(UpstreamServed);
+        for (k, v) in upstream_resp.headers().iter() {
+            let name = k.as_str();
+            if HOP_BY_HOP.contains(&name) {
+                continue;
+            }
+            out = out.header(name, v);
+        }
+        let bytes = http_body_util::BodyExt::collect(upstream_resp.into_body())
+            .await
+            .map(|b| b.to_bytes())
+            .map_err(|e| {
+                warn!(error = %e, "edge: upgrade rejection body read failed");
+            })
+            .unwrap_or_default();
+        return out.body(axum::body::Body::from(bytes)).unwrap_or_else(|_| {
+            let trace = Uuid::new_v4();
+            pages::bad_gateway_page(error_pages.as_deref(), Some(trace))
+        });
+    }
+
+    let mut out = Response::builder()
+        .status(axum::http::StatusCode::SWITCHING_PROTOCOLS)
+        .extension(UpstreamServed);
+    for (k, v) in upstream_resp.headers().iter() {
+        let name = k.as_str();
+        if HOP_BY_HOP.contains(&name) {
+            continue;
+        }
+        out = out.header(name, v);
+    }
+    // The pipe owns BOTH sides for the whole connection lifetime: dropping
+    // the upstream response body early would cancel the connection before
+    // the upgrade handoff, so the response moves into the task whole and
+    // `hyper::upgrade::on` extracts its upgrade channel there.
+    tokio::spawn(async move {
+        let (client_io, upstream_io) =
+            futures::join!(client_upgrade, hyper::upgrade::on(upstream_resp));
+        match (client_io, upstream_io) {
+            // hyper 1 upgrades speak `hyper::rt` traits — TokioIo adapts
+            // them to tokio's AsyncRead/AsyncWrite for the pipe.
+            (Ok(a), Ok(b)) => {
+                // hyper 1 upgrades speak `hyper::rt` traits — TokioIo adapts
+                // them to tokio's AsyncRead/AsyncWrite for the pipe.
+                let mut a = hyper_util::rt::TokioIo::new(a);
+                let mut b = hyper_util::rt::TokioIo::new(b);
+                let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                #[cfg(test)]
+                eprintln!("DEBUG pipe: handoff failed: {e}");
+                tracing::debug!(error = %e, "edge: upgraded connection handoff failed");
+            }
+        }
+    });
+    out.body(axum::body::Body::empty()).unwrap_or_else(|_| {
+        let trace = Uuid::new_v4();
+        pages::bad_gateway_page(error_pages.as_deref(), Some(trace))
+    })
 }
 
 #[cfg(test)]
@@ -786,17 +1293,10 @@ mod tests {
         ));
         let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
         let (dec_tx, _dec_rx) = mpsc::channel(8);
-        let app = Router::new()
-            .fallback(any(proxy_handler))
-            .with_state(ProxyState {
-                runtime,
-                client: reqwest::Client::new(),
-                upstream: "http://127.0.0.1:9".to_string(),
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers: true,
-                gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
-            });
+        let app = Router::new().fallback(any(proxy_handler)).with_state(
+            proxy_state(runtime, "http://127.0.0.1:9".to_string(), dec_tx)
+                .with_gate(Some(Arc::new(tokio::sync::Semaphore::new(0)))),
+        );
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -818,12 +1318,34 @@ mod tests {
     #[tokio::test]
     async fn health_check_fails_fast_on_dead_backend() {
         let cfg = EdgeProxyConfig {
-            upstream: "http://127.0.0.1:9".to_string(),
+            upstreams: vec!["http://127.0.0.1:9".to_string()],
             health_timeout_secs: 1,
             ..Default::default()
         };
         let err = health_check(&cfg).await.expect_err("dead backend");
         assert!(err.to_string().contains("refusing to start inline"));
+    }
+
+    #[tokio::test]
+    async fn health_check_needs_one_healthy_server_per_group() {
+        // Default group healthy, vhost group dead → the vhost kills startup.
+        let cfg = EdgeProxyConfig {
+            upstreams: vec!["http://127.0.0.1:9".to_string()],
+            health_timeout_secs: 1,
+            vhosts: vec![sentry_core::config::EdgeVhostConfig {
+                host: "app.example.com".to_string(),
+                upstreams: vec!["http://127.0.0.1:9".to_string()],
+                balance: None,
+                max_fails: None,
+                fail_timeout_secs: None,
+                health_path: Some("/".to_string()),
+                tls_cert: None,
+                tls_key: None,
+            }],
+            ..Default::default()
+        };
+        let err = health_check(&cfg).await.expect_err("dead vhost");
+        assert!(err.to_string().contains("vhost app.example.com"), "{err}");
     }
 
     #[tokio::test]
@@ -838,15 +1360,11 @@ mod tests {
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
         let app = Router::new()
             .fallback(any(proxy_handler))
-            .with_state(ProxyState {
+            .with_state(proxy_state(
                 runtime,
-                client: reqwest::Client::new(),
-                upstream: "http://127.0.0.1:9".to_string(),
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers: true,
-                gate: None,
-            });
+                "http://127.0.0.1:9".to_string(),
+                dec_tx,
+            ));
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -871,17 +1389,10 @@ mod tests {
         ));
         let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
-        let app = Router::new()
-            .fallback(any(proxy_handler))
-            .with_state(ProxyState {
-                runtime,
-                client: reqwest::Client::new(),
-                upstream: "http://127.0.0.1:9".to_string(),
-                decided: dec_tx,
-                redirect_https: true,
-                forwarded_headers: true,
-                gate: None,
-            });
+        let app = Router::new().fallback(any(proxy_handler)).with_state(
+            proxy_state(runtime, "http://127.0.0.1:9".to_string(), dec_tx)
+                .with_redirect_https(true),
+        );
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -969,6 +1480,27 @@ mod tests {
         addr
     }
 
+    /// Single-upstream state baseline for the proxy tests (F14: wraps the
+    /// URL in a one-server `VhostRouter`).
+    fn proxy_state(
+        runtime: crate::EdgeRuntime,
+        upstream: String,
+        dec_tx: mpsc::Sender<sentry_core::ProcessedEvent>,
+    ) -> ProxyState {
+        ProxyState {
+            runtime,
+            clients: UpstreamClients::verified_only(reqwest::Client::new()),
+            router: Arc::new(crate::upstream::VhostRouter::single(upstream)),
+            decided: dec_tx,
+            redirect_https: false,
+            forwarded_headers: true,
+            response_buffering: true,
+            gate: None,
+            failovers: None,
+            upgrade_client: default_upgrade_client(),
+        }
+    }
+
     fn test_state(
         runtime: crate::EdgeRuntime,
         upstream: String,
@@ -980,18 +1512,9 @@ mod tests {
             runtime.overload_state(),
             None,
         ));
-        let app = build_router(
-            ProxyState {
-                runtime,
-                client: reqwest::Client::new(),
-                upstream,
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers,
-                gate: None,
-            },
-            compressor.clone(),
-        );
+        let mut state = proxy_state(runtime, upstream, dec_tx);
+        state.forwarded_headers = forwarded_headers;
+        let app = build_router(state, compressor.clone());
         (app, compressor)
     }
 
@@ -1294,15 +1817,7 @@ mod tests {
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
         let app = Router::new()
             .fallback(any(proxy_handler))
-            .with_state(ProxyState {
-                runtime,
-                client: reqwest::Client::new(),
-                upstream: format!("http://{upstream}"),
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers: true,
-                gate: None,
-            });
+            .with_state(proxy_state(runtime, format!("http://{upstream}"), dec_tx));
         let (ct, body) = multipart_form(&[("f", "cat.png", "image/png", b"\x89PNG\r\n\x1a\nxx")]);
         let resp = upload_request(app, &ct, body).await;
         assert_eq!(
@@ -1344,15 +1859,7 @@ mod tests {
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
         let app = Router::new()
             .fallback(any(proxy_handler))
-            .with_state(ProxyState {
-                runtime,
-                client: reqwest::Client::new(),
-                upstream: format!("http://{upstream}"),
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers: true,
-                gate: None,
-            });
+            .with_state(proxy_state(runtime, format!("http://{upstream}"), dec_tx));
         let mut gif = b"GIF89a".to_vec();
         gif.extend_from_slice(b"\x00<?php system($_GET['c']); ?>");
         let (ct, body) = multipart_form(&[("f", "avatar.gif", "image/gif", &gif)]);
@@ -1386,15 +1893,7 @@ mod tests {
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
         let app = Router::new()
             .fallback(any(proxy_handler))
-            .with_state(ProxyState {
-                runtime,
-                client: reqwest::Client::new(),
-                upstream: format!("http://{upstream}"),
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers: true,
-                gate: None,
-            });
+            .with_state(proxy_state(runtime, format!("http://{upstream}"), dec_tx));
         let mut gif = b"GIF89a".to_vec();
         gif.extend_from_slice(b"\x00<?php eval($_POST); ?>");
         let (ct, body) = multipart_form(&[("f", "avatar.gif", "image/gif", &gif)]);
@@ -1427,15 +1926,11 @@ mod tests {
         let (dec_tx, _dec_rx) = tokio::sync::mpsc::channel(8);
         let app = Router::new()
             .fallback(any(proxy_handler))
-            .with_state(ProxyState {
+            .with_state(proxy_state(
                 runtime,
-                client: reqwest::Client::new(),
-                upstream: "http://127.0.0.1:9".to_string(),
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers: true,
-                gate: None,
-            });
+                "http://127.0.0.1:9".to_string(),
+                dec_tx,
+            ));
         let big = vec![0x41u8; 4096];
         let (ct, body) = multipart_form(&[("f", "big.bin", "application/octet-stream", &big)]);
         let resp = upload_request(app, &ct, body).await;
@@ -1473,15 +1968,7 @@ mod tests {
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
         let app = Router::new()
             .fallback(any(proxy_handler))
-            .with_state(ProxyState {
-                runtime,
-                client: reqwest::Client::new(),
-                upstream: format!("http://{upstream}"),
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers: true,
-                gate: None,
-            });
+            .with_state(proxy_state(runtime, format!("http://{upstream}"), dec_tx));
         let big = vec![0x41u8; 4096];
         let (ct, body) = multipart_form(&[("f", "big.bin", "application/octet-stream", &big)]);
         let resp = upload_request(app, &ct, body).await;
@@ -1519,15 +2006,7 @@ mod tests {
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
         let app = Router::new()
             .fallback(any(proxy_handler))
-            .with_state(ProxyState {
-                runtime,
-                client: reqwest::Client::new(),
-                upstream: format!("http://{upstream}"),
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers: true,
-                gate: None,
-            });
+            .with_state(proxy_state(runtime, format!("http://{upstream}"), dec_tx));
         let big = vec![0x41u8; 4096];
         let (ct, body) = multipart_form(&[("f", "big.bin", "application/octet-stream", &big)]);
         let body_len = body.len() as u64;
@@ -1583,15 +2062,11 @@ mod tests {
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
         let app = Router::new()
             .fallback(any(proxy_handler))
-            .with_state(ProxyState {
+            .with_state(proxy_state(
                 runtime,
-                client: reqwest::Client::new(),
-                upstream: "http://127.0.0.1:9".to_string(),
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers: true,
-                gate: None,
-            });
+                "http://127.0.0.1:9".to_string(),
+                dec_tx,
+            ));
         let big = vec![0x41u8; 4096];
         let mut last = None;
         for _ in 0..2 {
@@ -1626,15 +2101,11 @@ mod tests {
         let (dec_tx, _dec_rx) = tokio::sync::mpsc::channel(8);
         let app = Router::new()
             .fallback(any(proxy_handler))
-            .with_state(ProxyState {
+            .with_state(proxy_state(
                 runtime,
-                client: reqwest::Client::new(),
-                upstream: "http://127.0.0.1:9".to_string(),
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers: true,
-                gate: None,
-            });
+                "http://127.0.0.1:9".to_string(),
+                dec_tx,
+            ));
         let (ct, body) = multipart_form(&[("f", "a.txt", "text/plain", b"hi")]);
         let resp = upload_request(app, &ct, body).await;
         let _ = resp.status();
@@ -1652,15 +2123,7 @@ mod tests {
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
         let app = Router::new()
             .fallback(any(proxy_handler))
-            .with_state(ProxyState {
-                runtime,
-                client: reqwest::Client::new(),
-                upstream: format!("http://{upstream}"),
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers: true,
-                gate: None,
-            });
+            .with_state(proxy_state(runtime, format!("http://{upstream}"), dec_tx));
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -1757,15 +2220,7 @@ mod tests {
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
         let app = Router::new()
             .fallback(any(proxy_handler))
-            .with_state(ProxyState {
-                runtime,
-                client: reqwest::Client::new(),
-                upstream: format!("http://{upstream}"),
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers: true,
-                gate: None,
-            });
+            .with_state(proxy_state(runtime, format!("http://{upstream}"), dec_tx));
         let req = || {
             axum::http::Request::builder()
                 .uri("/")
@@ -1819,15 +2274,7 @@ mod tests {
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
         let app = Router::new()
             .fallback(any(proxy_handler))
-            .with_state(ProxyState {
-                runtime,
-                client: reqwest::Client::new(),
-                upstream: format!("http://{upstream}"),
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers: true,
-                gate: None,
-            });
+            .with_state(proxy_state(runtime, format!("http://{upstream}"), dec_tx));
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -1854,17 +2301,10 @@ mod tests {
         ));
         let runtime = crate::EdgeRuntime::new(pipeline, None, 0).with_posture(tracker);
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(8);
-        let app = Router::new()
-            .fallback(any(proxy_handler))
-            .with_state(ProxyState {
-                runtime,
-                client: reqwest::Client::new(),
-                upstream: "http://127.0.0.1:9".to_string(),
-                decided: dec_tx,
-                redirect_https: true,
-                forwarded_headers: true,
-                gate: None,
-            });
+        let app = Router::new().fallback(any(proxy_handler)).with_state(
+            proxy_state(runtime, "http://127.0.0.1:9".to_string(), dec_tx)
+                .with_redirect_https(true),
+        );
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -1905,15 +2345,7 @@ mod tests {
         let (dec_tx, mut dec_rx) = tokio::sync::mpsc::channel(64);
         let app = Router::new()
             .fallback(any(proxy_handler))
-            .with_state(ProxyState {
-                runtime,
-                client: reqwest::Client::new(),
-                upstream: format!("http://{upstream}"),
-                decided: dec_tx,
-                redirect_https: false,
-                forwarded_headers: true,
-                gate: None,
-            });
+            .with_state(proxy_state(runtime, format!("http://{upstream}"), dec_tx));
 
         let mut statuses = Vec::new();
         for i in 0..20 {
@@ -1955,5 +2387,338 @@ mod tests {
             }
         }
         assert!(saw_404 && saw_403);
+    }
+
+    // ── Multi-upstream: vhost routing, failover, streaming (F14) ────────
+
+    /// Upstream answering every request with a fixed marker body — lets a
+    /// test tell which backend actually served the request.
+    async fn spawn_marker_upstream(marker: &'static str) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .fallback(move || async move { (axum::http::StatusCode::OK, marker.to_string()) });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// `text/event-stream` upstream — the auto-stream content type.
+    async fn spawn_sse_upstream() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().fallback(|| async move {
+            (
+                axum::http::StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                "data: hello\n\n".to_string(),
+            )
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    fn router_with_vhosts(
+        default: std::net::SocketAddr,
+        entries: Vec<(&'static str, std::net::SocketAddr)>,
+    ) -> Arc<crate::upstream::VhostRouter> {
+        use sentry_core::config::BalanceMode;
+        Arc::new(crate::upstream::VhostRouter::new(
+            crate::upstream::UpstreamGroup::new(
+                "",
+                &[format!("http://{default}")],
+                BalanceMode::RoundRobin,
+                0,
+                30,
+            ),
+            entries
+                .into_iter()
+                .map(|(host, addr)| {
+                    (
+                        host.to_string(),
+                        crate::upstream::UpstreamGroup::new(
+                            host,
+                            &[format!("http://{addr}")],
+                            BalanceMode::RoundRobin,
+                            0,
+                            30,
+                        ),
+                    )
+                })
+                .collect(),
+        ))
+    }
+
+    async fn request_with_host(app: Router, host: &str) -> axum::response::Response {
+        app.oneshot(
+            axum::http::Request::builder()
+                .uri("/")
+                .header("host", host)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn body_string(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    #[tokio::test]
+    async fn vhost_routes_by_host_header_with_default_fallback() {
+        let default = spawn_marker_upstream("default").await;
+        let site_a = spawn_marker_upstream("a").await;
+        let site_b = spawn_marker_upstream("b").await;
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, _dec_rx) = mpsc::channel(8);
+        let mut state = proxy_state(runtime, format!("http://{default}"), dec_tx);
+        state.router = router_with_vhosts(default, vec![("a.test", site_a), ("*.b.test", site_b)]);
+        let app = Router::new().fallback(any(proxy_handler)).with_state(state);
+
+        let resp = request_with_host(app.clone(), "a.test").await;
+        assert_eq!(body_string(resp).await, "a");
+        let resp = request_with_host(app.clone(), "A.TEST:8443").await;
+        assert_eq!(body_string(resp).await, "a", "case and port are normalized");
+        let resp = request_with_host(app.clone(), "sub.b.test").await;
+        assert_eq!(body_string(resp).await, "b", "wildcard matches subdomains");
+        let resp = request_with_host(app.clone(), "b.test").await;
+        assert_eq!(
+            body_string(resp).await,
+            "default",
+            "bare domain does not match *.b.test (nginx semantics)"
+        );
+        let resp = request_with_host(app.clone(), "unknown.test").await;
+        assert_eq!(body_string(resp).await, "default");
+    }
+
+    #[tokio::test]
+    async fn connect_failure_fails_over_to_the_next_server() {
+        let healthy = spawn_marker_upstream("healthy").await;
+        use sentry_core::config::BalanceMode;
+        let router = Arc::new(crate::upstream::VhostRouter::new(
+            crate::upstream::UpstreamGroup::new(
+                "",
+                &[
+                    "http://127.0.0.1:9".to_string(),
+                    format!("http://{healthy}"),
+                ],
+                BalanceMode::RoundRobin,
+                2,
+                30,
+            ),
+            vec![],
+        ));
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, _dec_rx) = mpsc::channel(8);
+        let mut state = proxy_state(runtime, "http://127.0.0.1:9".to_string(), dec_tx);
+        state.router = router;
+        let app = Router::new().fallback(any(proxy_handler)).with_state(state);
+
+        // Round-robin starts on the dead server; the request must still be
+        // served by the healthy one.
+        for _ in 0..2 {
+            let resp = request_with_host(app.clone(), "app.test").await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            assert_eq!(body_string(resp).await, "healthy");
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_group_answers_502() {
+        use sentry_core::config::BalanceMode;
+        let router = Arc::new(crate::upstream::VhostRouter::new(
+            crate::upstream::UpstreamGroup::new(
+                "",
+                &[
+                    "http://127.0.0.1:9".to_string(),
+                    "http://127.0.0.1:9".to_string(),
+                ],
+                BalanceMode::RoundRobin,
+                2,
+                30,
+            ),
+            vec![],
+        ));
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, _dec_rx) = mpsc::channel(8);
+        let mut state = proxy_state(runtime, "http://127.0.0.1:9".to_string(), dec_tx);
+        state.router = router;
+        let app = Router::new().fallback(any(proxy_handler)).with_state(state);
+        let resp = request_with_host(app, "app.test").await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn buffering_off_streams_and_skips_compression() {
+        let upstream = spawn_html_upstream().await;
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, _dec_rx) = mpsc::channel(8);
+        let state =
+            proxy_state(runtime, format!("http://{upstream}"), dec_tx).with_buffering(false);
+        let compressor = Arc::new(crate::compression::Compressor::new(
+            sentry_core::config::EdgeCompressConfig::default(),
+            None,
+            None,
+        ));
+        let app = build_router(state, compressor);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .header("host", "app.test")
+                    .header("accept-encoding", "gzip")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.extensions()
+                .get::<crate::compression::StreamedResponse>()
+                .is_some(),
+            "buffering off must mark the response as streamed"
+        );
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_ENCODING)
+                .is_none(),
+            "streamed responses skip compression"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_content_type_streams_even_with_buffering_on() {
+        let upstream = spawn_sse_upstream().await;
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, _dec_rx) = mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(proxy_state(runtime, format!("http://{upstream}"), dec_tx));
+        let resp = request_with_host(app, "app.test").await;
+        assert!(
+            resp.extensions()
+                .get::<crate::compression::StreamedResponse>()
+                .is_some(),
+            "text/event-stream always streams"
+        );
+    }
+
+    /// Raw WebSocket-style upstream: answers the h1 upgrade with 101 and
+    /// echoes every byte afterwards.
+    async fn spawn_raw_ws_upstream() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                head.extend_from_slice(&tmp[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            sock.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: testproto\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            loop {
+                match sock.read(&mut tmp).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&tmp[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_passes_through_bidirectionally() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let upstream = spawn_raw_ws_upstream().await;
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, mut dec_rx) = mpsc::channel(8);
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(proxy_state(runtime, format!("http://{upstream}"), dec_tx));
+
+        // A real listener: upgrades need hyper's connection machinery, not
+        // tower oneshot.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let edge_addr = listener.local_addr().unwrap();
+        tokio::spawn(accept_loop(listener, app, crate::net::TcpTuning::default()));
+
+        let mut client = tokio::net::TcpStream::connect(edge_addr).await.unwrap();
+        client
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: app.test\r\nConnection: Upgrade\r\nUpgrade: testproto\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut tmp = [0u8; 512];
+        loop {
+            let n = client.read(&mut tmp).await.unwrap();
+            head.extend_from_slice(&tmp[..n]);
+            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(
+            head.starts_with(b"HTTP/1.1 101"),
+            "expected 101 from the pass-through, got: {}",
+            String::from_utf8_lossy(&head)
+        );
+        // Bidirectional echo over the upgraded pipe.
+        client.write_all(b"ping").await.unwrap();
+        let mut echo = [0u8; 4];
+        client.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"ping");
+
+        // The decided event carries the 101 status.
+        let pe = dec_rx.try_recv().expect("decided event");
+        if let sentry_core::ProtocolData::Http(h) = &pe.event.protocol {
+            assert_eq!(h.status, Some(101));
+        } else {
+            panic!("expected an http event");
+        }
     }
 }

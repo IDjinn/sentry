@@ -99,6 +99,9 @@ pub struct SentryConfig {
     /// Binary self-update (F13): daemon version check + `sentry update`.
     #[serde(default)]
     pub update: UpdateConfig,
+    /// Tokio runtime tuning (F14): worker threads, CPU pinning, priority.
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
     /// Event sources.
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
@@ -1188,23 +1191,40 @@ impl SentryConfig {
             return out;
         }
         let tls = self.edge.tls_cert.is_some() && self.edge.tls_key.is_some();
-        let upstream_https = self.edge.upstream.starts_with("https://");
-        if tls && upstream_https {
-            out.push(
-                "[edge] TLS terminates at the edge but upstream is https:// — double TLS \
-                 costs CPU and a second certificate to manage; serve the backend over \
-                 plain http:// (ideally on 127.0.0.1)"
-                    .to_string(),
-            );
+        // Every upstream group is graded: the default (catch-all) group and
+        // each vhost's own servers (F14).
+        let default_servers = self.edge.default_group_servers();
+        let mut groups: Vec<(&str, &str)> =
+            default_servers.iter().map(|u| ("", u.as_str())).collect();
+        for vhost in &self.edge.vhosts {
+            for url in &vhost.upstreams {
+                groups.push((vhost.host.as_str(), url.as_str()));
+            }
         }
-        if let Some(host) = upstream_host(&self.edge.upstream) {
-            let loopback = host == "127.0.0.1" || host == "::1" || host == "localhost";
-            if !loopback && !upstream_https {
+        for (label, url) in &groups {
+            let upstream_https = url.starts_with("https://");
+            let site = if label.is_empty() {
+                String::new()
+            } else {
+                format!(" (vhost {label})")
+            };
+            if tls && upstream_https {
                 out.push(format!(
-                    "[edge] upstream {host} is off-loopback over plain http — \
-                     edge→backend traffic crosses the network unencrypted; \
-                     prefer 127.0.0.1 or a tunnel"
+                    "[edge]{site} TLS terminates at the edge but upstream is https:// — \
+                     double TLS costs CPU and a second certificate to manage; serve the \
+                     backend over plain http:// (ideally on 127.0.0.1)"
                 ));
+            }
+            if let Some(host) = upstream_host(url) {
+                let loopback = host == "127.0.0.1" || host == "::1" || host == "localhost";
+                if !loopback && !upstream_https {
+                    out.push(format!(
+                        "[edge]{site} upstream {host} is off-loopback over plain http — \
+                         edge→backend traffic crosses the network unencrypted (container \
+                         names included: the Docker bridge is cleartext); prefer \
+                         127.0.0.1 or a tunnel"
+                    ));
+                }
             }
         }
         out
@@ -1650,9 +1670,42 @@ pub struct EdgeConfig {
     /// Public HTTP listen address (default `0.0.0.0:80`).
     #[serde(default = "default_edge_listen")]
     pub listen: String,
-    /// Protected upstream base URL (`http://127.0.0.1:8080`).
+    /// Protected upstream base URL (`http://127.0.0.1:8080`). The host part
+    /// may be a hostname (`http://web:3000`, e.g. a Docker container name) —
+    /// it resolves through the system resolver. Stays as the default
+    /// (catch-all) backend for requests whose Host matches no vhost.
     #[serde(default)]
     pub upstream: String,
+    /// Additional default-group backends (F14). When set, they replace
+    /// `upstream` as the catch-all group and requests are load-balanced
+    /// across them with `balance` + passive health checks.
+    #[serde(default)]
+    pub upstreams: Vec<String>,
+    /// Load-balancing strategy for upstream groups (F14).
+    #[serde(default)]
+    pub balance: BalanceMode,
+    /// Passive health check (F14): consecutive failures within
+    /// `fail_timeout_secs` before a server is ejected (0 = never eject).
+    #[serde(default = "default_edge_max_fails")]
+    pub max_fails: u32,
+    /// Window for counting failures AND the ejection duration (F14,
+    /// nginx `fail_timeout` semantics — default 30).
+    #[serde(default = "default_edge_fail_timeout")]
+    pub fail_timeout_secs: u64,
+    /// Buffer upstream responses before forwarding (default true). `false`
+    /// streams them through (SSE/WebSocket-friendly payloads) at the cost
+    /// of response compression and full posture grading.
+    #[serde(default = "default_edge_response_buffering")]
+    pub response_buffering: bool,
+    /// Total per-request upstream budget in seconds (connect + read + write,
+    /// default 300). A hung backend fails the request instead of hanging
+    /// the edge worker.
+    #[serde(default = "default_edge_upstream_timeout")]
+    pub upstream_timeout_secs: u64,
+    /// Nginx-style virtual hosts (F14): route by Host header to per-site
+    /// upstream groups (each with its own balancer/health settings).
+    #[serde(default)]
+    pub vhosts: Vec<EdgeVhostConfig>,
     /// Path used for the mandatory startup health check (default `/`).
     #[serde(default = "default_edge_health_path")]
     pub health_path: String,
@@ -1740,6 +1793,277 @@ pub struct EdgeConfig {
     /// immediate 503 (custom error pages apply) instead of being buffered.
     #[serde(default = "default_edge_max_concurrent")]
     pub max_concurrent_requests: usize,
+    /// Accept-loop workers bound to the same port with `SO_REUSEPORT`
+    /// (F14, unix only; Windows ignores this). 1 = off (single listener).
+    /// Each worker gets its own kernel accept queue — less lock contention
+    /// under bursty accepts.
+    #[serde(default = "default_edge_reuseport_workers")]
+    pub reuseport_workers: usize,
+    /// Listen backlog for the edge listeners (F14). 0 = `SOMAXCONN`.
+    #[serde(default)]
+    pub tcp_backlog: u32,
+    /// `TCP_NODELAY` on client-facing connections (F14, default true):
+    /// request/response payloads are written immediately instead of
+    /// waiting on Nagle coalescing.
+    #[serde(default = "default_edge_tcp_nodelay")]
+    pub tcp_nodelay: bool,
+    /// Keepalive idle time in seconds for client-facing connections
+    /// (F14, default 60; 0 = off). Probes every 10s × 5 detect dead
+    /// peers within ~2 minutes of silence.
+    #[serde(default = "default_edge_tcp_keepalive")]
+    pub tcp_keepalive_secs: u64,
+    /// `SO_SNDBUF` on the client-facing sockets, KiB (F14, 0 = system
+    /// default). Larger buffers absorb bursty upstreams on lossy links.
+    #[serde(default)]
+    pub tcp_send_buffer_kb: u32,
+    /// `SO_RCVBUF` on the client-facing sockets, KiB (F14, 0 = system
+    /// default).
+    #[serde(default)]
+    pub tcp_recv_buffer_kb: u32,
+}
+
+/// Load-balancing strategy for an upstream group (F14, nginx `upstream`
+/// semantics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BalanceMode {
+    /// Each new request goes to the next server in order (default).
+    #[default]
+    RoundRobin,
+    /// The in-flight request counter decides: fewest concurrent requests
+    /// wins — fits uneven request durations (large uploads next to pings).
+    LeastConn,
+    /// Same client IP always lands on the same server while it is up
+    /// (sticky backends, server-local sessions).
+    IpHash,
+}
+
+impl BalanceMode {
+    /// Stable lowercase name for logs and config summaries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RoundRobin => "round_robin",
+            Self::LeastConn => "least_conn",
+            Self::IpHash => "ip_hash",
+        }
+    }
+}
+
+/// One nginx-like virtual host (F14): requests whose Host header matches
+/// `host` are load-balanced across `upstreams` instead of the default
+/// group. Per-vhost settings omitted here inherit the `[edge]` globals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeVhostConfig {
+    /// Host header to match (case-insensitive; the `:port` suffix is
+    /// ignored). `*.example.com` matches any subdomain (multi-label, but
+    /// not the bare `example.com` — nginx wildcard semantics).
+    pub host: String,
+    /// Backend base URLs for this site — IP or hostname (`http://web:3000`).
+    #[serde(default)]
+    pub upstreams: Vec<String>,
+    /// Load-balancing strategy (default: `[edge] balance`).
+    #[serde(default)]
+    pub balance: Option<BalanceMode>,
+    /// Passive health check failures before ejection (default: `[edge] max_fails`).
+    #[serde(default)]
+    pub max_fails: Option<u32>,
+    /// Failure window / ejection duration in seconds (default:
+    /// `[edge] fail_timeout_secs`).
+    #[serde(default)]
+    pub fail_timeout_secs: Option<u64>,
+    /// Startup health-check path override (default: `[edge] health_path`).
+    #[serde(default)]
+    pub health_path: Option<String>,
+    /// TLS certificate served for this hostname via SNI (feature
+    /// `edge-tls`); both paths together. Requires the global TLS front.
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+    /// TLS private key for this hostname.
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+}
+
+impl EdgeVhostConfig {
+    /// Effective balancer, resolving the inheritance from `[edge]`.
+    pub fn effective_balance(&self, global: BalanceMode) -> BalanceMode {
+        self.balance.unwrap_or(global)
+    }
+
+    /// Effective `max_fails`, resolving the inheritance from `[edge]`.
+    pub fn effective_max_fails(&self, global: u32) -> u32 {
+        self.max_fails.unwrap_or(global)
+    }
+
+    /// Effective `fail_timeout`, resolving the inheritance from `[edge]`.
+    pub fn effective_fail_timeout(&self, global: u64) -> u64 {
+        self.fail_timeout_secs.unwrap_or(global)
+    }
+
+    /// Effective health-check path, resolving the inheritance from `[edge]`.
+    pub fn effective_health_path<'a>(&'a self, global: &'a str) -> &'a str {
+        self.health_path.as_deref().unwrap_or(global)
+    }
+}
+
+impl EdgeConfig {
+    /// Servers of the default (catch-all) group: `upstreams` when set,
+    /// otherwise the single legacy `upstream` string.
+    pub fn default_group_servers(&self) -> Vec<String> {
+        if self.upstreams.is_empty() {
+            if self.upstream.is_empty() {
+                Vec::new()
+            } else {
+                vec![self.upstream.clone()]
+            }
+        } else {
+            self.upstreams.clone()
+        }
+    }
+
+    /// Config errors for `[edge]` (F14): bad vhost hosts, upstreams without
+    /// scheme, duplicate hosts, TLS-cert pairing. Pure — `sentry config
+    /// validate` fails on them and the daemon refuses to start inline.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let servers = self.default_group_servers();
+        for url in &servers {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                errors.push(format!(
+                    "[edge] upstream `{url}` must start with http:// or https://"
+                ));
+            }
+        }
+        let mut seen: Vec<String> = Vec::new();
+        for vhost in &self.vhosts {
+            let host = vhost.host.trim();
+            if host.is_empty() {
+                errors.push("[edge.vhosts] `host` must not be empty".to_string());
+                continue;
+            }
+            if host != host.to_ascii_lowercase() {
+                errors.push(format!(
+                    "[edge.vhosts] host `{host}` must be lowercase (matching is case-insensitive)"
+                ));
+            }
+            if host.starts_with("*.") && host[2..].is_empty() {
+                errors.push("[edge.vhosts] wildcard `*.` needs a domain suffix".to_string());
+            } else if host.contains('*') && !host.starts_with("*.") {
+                errors.push(format!(
+                    "[edge.vhosts] host `{host}`: `*` is only valid as a leading `*.` wildcard"
+                ));
+            }
+            if seen.iter().any(|h| h == host) {
+                errors.push(format!("[edge.vhosts] duplicate host `{host}`"));
+            } else {
+                seen.push(host.to_string());
+            }
+            if vhost.upstreams.is_empty() {
+                errors.push(format!(
+                    "[edge.vhosts] `{host}` needs at least one entry in `upstreams`"
+                ));
+            }
+            for url in &vhost.upstreams {
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    errors.push(format!(
+                        "[edge.vhosts] `{host}` upstream `{url}` must start with http:// or https://"
+                    ));
+                }
+            }
+            let cert = vhost.tls_cert.is_some();
+            let key = vhost.tls_key.is_some();
+            if cert != key {
+                errors.push(format!(
+                    "[edge.vhosts] `{host}`: tls_cert and tls_key must be configured together"
+                ));
+            }
+            if cert && (self.tls_cert.is_none() || self.tls_key.is_none()) {
+                errors.push(format!(
+                    "[edge.vhosts] `{host}`: per-vhost tls_cert requires the global [edge] \
+                     tls_cert/tls_key front (the certificate is served via SNI on the same listener)"
+                ));
+            }
+        }
+        errors
+    }
+}
+
+/// Tokio runtime tuning (F14): worker count, CPU pinning and thread
+/// priority for the whole process. Applied when the binary builds its
+/// runtime (before any command runs); every knob is optional.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeConfig {
+    /// Tokio worker threads (default 0 = tokio auto, one per core).
+    /// Pinning + fewer-than-core workers is the classic dedication recipe
+    /// for a protection daemon that must never starve.
+    #[serde(default)]
+    pub worker_threads: usize,
+    /// Pin the workers to these CPU core ids (in order; workers cycle
+    /// through the list when there are more workers than cores). Empty =
+    /// let the OS scheduler place threads.
+    #[serde(default)]
+    pub pin_cores: Vec<usize>,
+    /// Thread priority class for the worker threads.
+    #[serde(default)]
+    pub thread_priority: ThreadPriority,
+}
+
+impl RuntimeConfig {
+    /// Config errors for `[runtime]` (F14). Pure; checked by
+    /// `sentry config validate`.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.worker_threads > 1024 {
+            errors.push(format!(
+                "[runtime] worker_threads = {} is unreasonable (max 1024)",
+                self.worker_threads
+            ));
+        }
+        let mut seen: Vec<usize> = Vec::new();
+        for core in &self.pin_cores {
+            if *core > 65535 {
+                errors.push(format!(
+                    "[runtime] pin_cores: core id {core} is out of range (0..=65535)"
+                ));
+            }
+            if seen.contains(core) {
+                errors.push(format!("[runtime] pin_cores: duplicate core id {core}"));
+            } else {
+                seen.push(*core);
+            }
+        }
+        errors
+    }
+}
+
+/// Thread priority class for `[runtime] thread_priority` (F14). Mapped to
+/// nice values on unix and priority classes on Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadPriority {
+    /// Yield to everything else (nice +15 / IDLE) — for co-located boxes.
+    Idle,
+    /// Slightly below normal (nice +5 / BELOW_NORMAL).
+    BelowNormal,
+    /// The default: no change from the OS default (nice 0 / NORMAL).
+    #[default]
+    Normal,
+    /// Slightly above normal (nice -5 / ABOVE_NORMAL).
+    AboveNormal,
+    /// Elevated (nice -10 / HIGH) — needs privileges on unix.
+    High,
+}
+
+impl ThreadPriority {
+    /// Stable lowercase name for logs and config summaries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::BelowNormal => "below_normal",
+            Self::Normal => "normal",
+            Self::AboveNormal => "above_normal",
+            Self::High => "high",
+        }
+    }
 }
 
 /// Response compression at the edge (F12). Bodies are already buffered in
@@ -1887,6 +2211,13 @@ impl Default for EdgeConfig {
         Self {
             listen: default_edge_listen(),
             upstream: String::new(),
+            upstreams: Vec::new(),
+            balance: BalanceMode::default(),
+            max_fails: default_edge_max_fails(),
+            fail_timeout_secs: default_edge_fail_timeout(),
+            response_buffering: default_edge_response_buffering(),
+            upstream_timeout_secs: default_edge_upstream_timeout(),
+            vhosts: Vec::new(),
             health_path: default_edge_health_path(),
             health_timeout_secs: default_edge_health_timeout(),
             body_capture_kb: 0,
@@ -1907,6 +2238,12 @@ impl Default for EdgeConfig {
             upstream_connect_timeout_secs: default_edge_upstream_connect_timeout(),
             upstream_pool_idle: default_edge_upstream_pool_idle(),
             max_concurrent_requests: default_edge_max_concurrent(),
+            reuseport_workers: default_edge_reuseport_workers(),
+            tcp_backlog: 0,
+            tcp_nodelay: default_edge_tcp_nodelay(),
+            tcp_keepalive_secs: default_edge_tcp_keepalive(),
+            tcp_send_buffer_kb: 0,
+            tcp_recv_buffer_kb: 0,
         }
     }
 }
@@ -1922,6 +2259,27 @@ fn default_edge_health_timeout() -> u64 {
 }
 fn default_tls_handshake_events() -> bool {
     true
+}
+fn default_edge_max_fails() -> u32 {
+    2
+}
+fn default_edge_fail_timeout() -> u64 {
+    30
+}
+fn default_edge_response_buffering() -> bool {
+    true
+}
+fn default_edge_upstream_timeout() -> u64 {
+    300
+}
+fn default_edge_reuseport_workers() -> usize {
+    1
+}
+fn default_edge_tcp_nodelay() -> bool {
+    true
+}
+fn default_edge_tcp_keepalive() -> u64 {
+    60
 }
 
 /// Background route learner config.
@@ -2587,6 +2945,186 @@ mod tests {
         assert!(advisories[0].contains("not inline"));
         cfg.edge.compress.enabled = false;
         assert!(cfg.edge_advisories().is_empty());
+    }
+
+    #[test]
+    fn edge_advisories_grade_vhost_upstreams() {
+        let toml = r#"
+            [deployment]
+            mode = "inline"
+            [edge]
+            upstream = "http://127.0.0.1:8080"
+            [[edge.vhosts]]
+            host = "app.example.com"
+            upstreams = ["http://web:3000", "https://api.internal:8443"]
+            "#;
+        let cfg: SentryConfig = toml::from_str(toml).unwrap();
+        let advisories = cfg.edge_advisories();
+        // `web` (container name, plain http) trips the off-loopback note
+        // labeled with the vhost; `127.0.0.1` stays silent.
+        assert!(
+            advisories
+                .iter()
+                .any(|a| a.contains("(vhost app.example.com)") && a.contains("off-loopback")),
+            "{advisories:?}"
+        );
+        // https upstream without TLS at the edge is not a double-TLS issue.
+        assert!(!advisories.iter().any(|a| a.contains("double TLS")));
+
+        // With TLS at the edge, the https vhost upstream becomes double TLS.
+        let mut cfg = cfg.clone();
+        cfg.edge.tls_cert = Some("/c.pem".into());
+        cfg.edge.tls_key = Some("/k.pem".into());
+        assert!(cfg
+            .edge_advisories()
+            .iter()
+            .any(|a| a.contains("double TLS")));
+    }
+
+    #[test]
+    fn edge_vhosts_parse_with_inheritance_defaults() {
+        let toml = r#"
+            [edge]
+            upstream = "http://127.0.0.1:8080"
+            balance = "least_conn"
+            max_fails = 5
+            [[edge.vhosts]]
+            host = "App.Example.com"
+            upstreams = ["http://web-a:3000", "http://web-b:3000"]
+            [[edge.vhosts]]
+            host = "*.api.example.com"
+            upstreams = ["http://api:8080"]
+            balance = "ip_hash"
+            max_fails = 1
+            fail_timeout_secs = 10
+            health_path = "/healthz"
+            "#;
+        let cfg: SentryConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.edge.balance, BalanceMode::LeastConn);
+        assert_eq!(cfg.edge.max_fails, 5);
+        assert_eq!(cfg.edge.vhosts.len(), 2);
+
+        let first = &cfg.edge.vhosts[0];
+        assert_eq!(first.host, "App.Example.com");
+        assert_eq!(first.upstreams, ["http://web-a:3000", "http://web-b:3000"]);
+        assert_eq!(
+            first.effective_balance(cfg.edge.balance),
+            BalanceMode::LeastConn
+        );
+        assert_eq!(first.effective_max_fails(cfg.edge.max_fails), 5);
+        assert_eq!(first.effective_fail_timeout(cfg.edge.fail_timeout_secs), 30);
+        assert_eq!(first.effective_health_path(&cfg.edge.health_path), "/");
+
+        let second = &cfg.edge.vhosts[1];
+        assert_eq!(
+            second.effective_balance(BalanceMode::RoundRobin),
+            BalanceMode::IpHash
+        );
+        assert_eq!(second.effective_max_fails(2), 1);
+        assert_eq!(second.effective_fail_timeout(30), 10);
+        assert_eq!(second.effective_health_path("/"), "/healthz");
+    }
+
+    #[test]
+    fn edge_validate_flags_bad_vhosts_and_upstreams() {
+        let vhost = |host: &str, upstreams: &[&str]| EdgeVhostConfig {
+            host: host.to_string(),
+            upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
+            balance: None,
+            max_fails: None,
+            fail_timeout_secs: None,
+            health_path: None,
+            tls_cert: None,
+            tls_key: None,
+        };
+        let mut cfg = EdgeConfig::default();
+        assert!(cfg.validate().is_empty(), "defaults validate cleanly");
+
+        cfg.upstream = "127.0.0.1:8080".to_string();
+        assert!(cfg.validate().iter().any(|e| e.contains("http://")));
+        cfg.upstream = "http://127.0.0.1:8080".to_string();
+
+        cfg.vhosts
+            .push(vhost("app.example.com", &["http://web:3000"]));
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+
+        // Duplicate host.
+        cfg.vhosts
+            .push(vhost("app.example.com", &["http://other:80"]));
+        assert!(cfg.validate().iter().any(|e| e.contains("duplicate")));
+
+        // Uppercase host + missing upstreams.
+        cfg.vhosts.clear();
+        cfg.vhosts.push(vhost("App.Example.com", &[]));
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.contains("lowercase")), "{errors:?}");
+        assert!(errors.iter().any(|e| e.contains("upstreams")), "{errors:?}");
+
+        // `*` only as a leading `*.` wildcard.
+        cfg.vhosts[0].host = "a*b.example.com".to_string();
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|e| e.contains("`*` is only valid")));
+        cfg.vhosts[0].host = "*.example.com".to_string();
+        cfg.vhosts[0].upstreams = vec!["http://api:8080".to_string()];
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+
+        // Cert pairing; per-vhost cert requires the global TLS front.
+        cfg.vhosts[0].host = "app.example.com".to_string();
+        cfg.vhosts[0].upstreams = vec!["http://web:3000".to_string()];
+        cfg.vhosts[0].tls_cert = Some("/c.pem".into());
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|e| e.contains("tls_cert and tls_key")));
+        cfg.vhosts[0].tls_key = Some("/k.pem".into());
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|e| e.contains("requires the global [edge] tls_cert")));
+        cfg.tls_cert = Some("/gc.pem".into());
+        cfg.tls_key = Some("/gk.pem".into());
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn runtime_config_defaults_and_validate() {
+        let cfg = RuntimeConfig::default();
+        assert_eq!(cfg.worker_threads, 0);
+        assert!(cfg.pin_cores.is_empty());
+        assert_eq!(cfg.thread_priority, ThreadPriority::Normal);
+        assert!(cfg.validate().is_empty());
+
+        let parsed: RuntimeConfig = toml::from_str(
+            r#"
+            worker_threads = 4
+            pin_cores = [0, 2]
+            thread_priority = "high"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(parsed.worker_threads, 4);
+        assert_eq!(parsed.pin_cores, [0, 2]);
+        assert_eq!(parsed.thread_priority, ThreadPriority::High);
+
+        let bad = RuntimeConfig {
+            worker_threads: 9999,
+            pin_cores: vec![3, 3, 999999],
+            thread_priority: ThreadPriority::Normal,
+        };
+        let errors = bad.validate();
+        assert_eq!(errors.len(), 3, "{errors:?}");
+    }
+
+    #[test]
+    fn edge_defaults_group_servers_merge_legacy_upstream() {
+        let mut cfg = EdgeConfig::default();
+        assert!(cfg.default_group_servers().is_empty());
+        cfg.upstream = "http://a:1".to_string();
+        assert_eq!(cfg.default_group_servers(), ["http://a:1"]);
+        cfg.upstreams = vec!["http://b:2".to_string(), "http://c:3".to_string()];
+        assert_eq!(cfg.default_group_servers(), ["http://b:2", "http://c:3"]);
     }
 
     #[test]

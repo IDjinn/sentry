@@ -33,44 +33,25 @@ use crate::{EdgeRuntime, TlsTerminated};
 /// slowloris-style stalls at the TLS layer are dropped, not queued.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Serve the inline HTTPS edge until the process stops.
+/// Serve the inline HTTPS edge until the process stops. `opts` carries the
+/// F14 listener tuning (backlog, `SO_REUSEADDR`, client TCP flags); the TLS
+/// acceptor keeps a single accept loop (the handshake work dominates, so a
+/// reuseport fan-out adds nothing here).
 pub async fn serve_tls(
     runtime: EdgeRuntime,
     cfg: TlsEdgeConfig,
     app: Router,
     decided: mpsc::Sender<sentry_core::ProcessedEvent>,
+    opts: crate::net::ListenerOptions,
 ) -> sentry_core::error::Result<()> {
     let server = load_server_config(&cfg)?;
     let addr: SocketAddr = cfg.listen.parse().map_err(|e| {
         sentry_core::error::CoreError::Config(format!("invalid edge tls listen address: {e}"))
     })?;
-    let listener = TcpListener::bind(addr).await.map_err(|e| {
+    let listener = crate::net::bind_listener(addr, opts).map_err(|e| {
         sentry_core::error::CoreError::Config(format!("edge tls bind on {addr} failed: {e}"))
     })?;
-    info!(
-        addr = %addr,
-        cert = %cfg.cert.display(),
-        "edge (inline) listening on https"
-    );
-    let acceptor: TlsAcceptor = TlsAcceptor::from(server);
-    loop {
-        let Ok((tcp, peer)) = listener.accept().await else {
-            continue;
-        };
-        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
-        // Sticky blocks deny before any TLS bytes flow — the client only
-        // sees a closed connection, no handshake, no event.
-        if runtime.is_hard_blocked(peer.ip()) {
-            debug!(ip = %peer.ip(), "edge-tls: blocked ip dropped before handshake");
-            continue;
-        }
-        let runtime = runtime.clone();
-        let cfg = cfg.clone();
-        let app = app.clone();
-        let acceptor = acceptor.clone();
-        let decided = decided.clone();
-        tokio::spawn(handle_conn(runtime, cfg, app, acceptor, decided, tcp, peer));
-    }
+    serve_tls_on(runtime, cfg, server, listener, app, decided).await
 }
 
 /// Serve on an already-bound listener (testable variant of [`serve_tls`]).
@@ -90,10 +71,12 @@ pub async fn serve_tls_on(
         "edge (inline) listening on https"
     );
     let acceptor: TlsAcceptor = TlsAcceptor::from(server);
+    let tuning = crate::net::TcpTuning::default();
     loop {
         let Ok((tcp, peer)) = listener.accept().await else {
             continue;
         };
+        crate::net::tune_accepted(&tcp, &tuning);
         let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
         // Sticky blocks deny before any TLS bytes flow — the client only
         // sees a closed connection, no handshake, no event.
@@ -320,19 +303,47 @@ fn version_name(v: rustls::ProtocolVersion) -> String {
     }
 }
 
-fn load_server_config(
-    cfg: &TlsEdgeConfig,
-) -> Result<Arc<rustls::ServerConfig>, sentry_core::error::CoreError> {
-    let cert_pem = std::fs::File::open(&cfg.cert).map_err(|e| {
+/// SNI-based certificate selection (F14): per-vhost certs answer their
+/// exact names and `*.wildcard` suffixes; the global cert chain is the
+/// default for everything else (nginx default-server semantics). rustls
+/// calls this with the SNI it parsed from the replayed ClientHello.
+#[derive(Debug)]
+struct SniCertResolver {
+    default: Arc<rustls::sign::CertifiedKey>,
+    exact: std::collections::HashMap<String, Arc<rustls::sign::CertifiedKey>>,
+    /// `".suffix"` → cert (a `*.sfx` pattern matches multi-label names but
+    /// not the bare `sfx`).
+    wildcards: Vec<(String, Arc<rustls::sign::CertifiedKey>)>,
+}
+
+impl rustls::server::ResolvesServerCert for SniCertResolver {
+    fn resolve(
+        &self,
+        hello: rustls::server::ClientHello,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let name = hello.server_name()?.to_ascii_lowercase();
+        if let Some(key) = self.exact.get(&name) {
+            return Some(key.clone());
+        }
+        for (suffix, key) in &self.wildcards {
+            if name.ends_with(suffix) {
+                return Some(key.clone());
+            }
+        }
+        Some(self.default.clone())
+    }
+}
+
+/// Parse one cert/key PEM pair into a rustls `CertifiedKey`.
+fn load_certified_key(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<rustls::sign::CertifiedKey>, sentry_core::error::CoreError> {
+    let cert_pem = std::fs::File::open(cert).map_err(|e| {
         sentry_core::error::CoreError::Config(format!(
             "edge tls: opening cert {}: {e}",
-            cfg.cert.display()
-        ))
-    })?;
-    let key_pem = std::fs::File::open(&cfg.key).map_err(|e| {
-        sentry_core::error::CoreError::Config(format!(
-            "edge tls: opening key {}: {e}",
-            cfg.key.display()
+            cert.display()
         ))
     })?;
     let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem))
@@ -340,7 +351,7 @@ fn load_server_config(
         .map_err(|e| {
             sentry_core::error::CoreError::Config(format!(
                 "edge tls: parsing cert {}: {e}",
-                cfg.cert.display()
+                cert.display()
             ))
         })?;
     if certs.is_empty() {
@@ -348,30 +359,83 @@ fn load_server_config(
             "edge tls: no certificates found in the cert file".to_string(),
         ));
     }
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_pem))
+    let key_pem = std::fs::File::open(key).map_err(|e| {
+        sentry_core::error::CoreError::Config(format!(
+            "edge tls: opening key {}: {e}",
+            key.display()
+        ))
+    })?;
+    let private_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_pem))
         .map_err(|e| {
             sentry_core::error::CoreError::Config(format!(
                 "edge tls: parsing key {}: {e}",
-                cfg.key.display()
+                key.display()
             ))
         })?
         .ok_or_else(|| {
             sentry_core::error::CoreError::Config(format!(
                 "edge tls: no private key found in {}",
-                cfg.key.display()
+                key.display()
             ))
         })?;
+    let signing_key = provider
+        .key_provider
+        .load_private_key(private_key)
+        .map_err(|e| {
+            sentry_core::error::CoreError::Config(format!(
+                "edge tls: loading key {}: {e}",
+                key.display()
+            ))
+        })?;
+    Ok(Arc::new(rustls::sign::CertifiedKey::new(
+        certs,
+        signing_key,
+    )))
+}
+
+fn load_server_config(
+    cfg: &TlsEdgeConfig,
+) -> Result<Arc<rustls::ServerConfig>, sentry_core::error::CoreError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let default_key = load_certified_key(&cfg.cert, &cfg.key, &provider)?;
+    let mut exact = std::collections::HashMap::new();
+    let mut wildcards: Vec<(String, Arc<rustls::sign::CertifiedKey>)> = Vec::new();
+    for vhost in &cfg.extra_certs {
+        let key = load_certified_key(&vhost.cert, &vhost.key, &provider)?;
+        for host in &vhost.hosts {
+            let host = host.trim().to_ascii_lowercase();
+            if let Some(suffix) = host.strip_prefix("*.") {
+                if suffix.is_empty() {
+                    return Err(sentry_core::error::CoreError::Config(
+                        "edge tls: wildcard vhost cert needs a domain suffix".to_string(),
+                    ));
+                }
+                wildcards.push((format!(".{suffix}"), key.clone()));
+            } else if host.is_empty() {
+                return Err(sentry_core::error::CoreError::Config(
+                    "edge tls: vhost cert with an empty host".to_string(),
+                ));
+            } else {
+                if exact.contains_key(&host) {
+                    return Err(sentry_core::error::CoreError::Config(format!(
+                        "edge tls: duplicate vhost cert for host `{host}`"
+                    )));
+                }
+                exact.insert(host, key.clone());
+            }
+        }
+    }
     let config = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(|e| {
             sentry_core::error::CoreError::Config(format!("edge tls: protocol versions: {e}"))
         })?
         .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| {
-            sentry_core::error::CoreError::Config(format!("edge tls: cert/key mismatch: {e}"))
-        })?;
+        .with_cert_resolver(Arc::new(SniCertResolver {
+            default: default_key,
+            exact,
+            wildcards,
+        }));
     let mut config = config;
     // ALPN (F12): h2 + HTTP/1.1 by default — the hyper-util auto builder
     // serves whichever protocol the handshake negotiates, so both share the
@@ -474,9 +538,9 @@ mod tests {
     }
 
     /// Self-signed PEM pair written to a temp dir (per-test unique names).
-    fn write_test_cert(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    fn write_test_cert_for(tag: &str, host: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let key = rcgen::KeyPair::generate().unwrap();
-        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        let cert = rcgen::CertificateParams::new(vec![host.to_string()])
             .unwrap()
             .self_signed(&key)
             .unwrap();
@@ -486,6 +550,10 @@ mod tests {
         std::fs::write(&cert_path, cert.pem()).unwrap();
         std::fs::write(&key_path, key.serialize_pem()).unwrap();
         (cert_path, key_path)
+    }
+
+    fn write_test_cert(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        write_test_cert_for(tag, "localhost")
     }
 
     fn test_tls_cfg(tag: &str) -> TlsEdgeConfig {
@@ -498,6 +566,7 @@ mod tests {
             allowed_hosts: vec![],
             handshake_events: true,
             http2: false,
+            extra_certs: Vec::new(),
         }
     }
 
@@ -594,6 +663,74 @@ mod tests {
             alpn.get_metric_with_label_values(&["h2"]).unwrap().get(),
             1.0,
             "h2 negotiation counted"
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn sni_selects_the_per_vhost_certificate() {
+        // Default chain for `localhost`; vhost cert for `api.test` (F14).
+        let (api_cert, api_key) = write_test_cert_for("sni-api", "api.test");
+        let cfg = TlsEdgeConfig {
+            extra_certs: vec![crate::proxy::VhostCert {
+                hosts: vec!["api.test".to_string()],
+                cert: api_cert.clone(),
+                key: api_key,
+            }],
+            ..test_tls_cfg("sni")
+        };
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, _dec_rx) = mpsc::channel(8);
+        let app = Router::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = load_server_config(&cfg).unwrap();
+        let server_task = tokio::spawn(serve_tls_on(
+            runtime,
+            cfg.clone(),
+            server,
+            listener,
+            app,
+            dec_tx,
+        ));
+
+        // Client trusting ONLY the default cert (localhost).
+        let cert_pem = std::fs::read(&cfg.cert).unwrap();
+        let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_pem[..])
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(certs);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+
+        // SNI `localhost` → default cert → handshake verifies.
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let name: rustls_pki_types::ServerName<'static> =
+            "localhost".to_string().try_into().unwrap();
+        connector
+            .connect(name, tcp)
+            .await
+            .expect("default cert served for localhost");
+
+        // SNI `api.test` → vhost cert (unknown to this client) → the
+        // handshake must FAIL verification, proving SNI selection served a
+        // different chain.
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let name: rustls_pki_types::ServerName<'static> =
+            "api.test".to_string().try_into().unwrap();
+        assert!(
+            connector.connect(name, tcp).await.is_err(),
+            "api.test must be served the vhost cert (untrusted by this client)"
         );
         server_task.abort();
     }

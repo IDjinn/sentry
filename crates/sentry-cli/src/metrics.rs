@@ -50,6 +50,7 @@ pub struct Metrics {
     pub edge_tls_alpn: prometheus::CounterVec,
     pub edge_tls_cert_not_after: prometheus::Gauge,
     pub edge_compressed: prometheus::CounterVec,
+    pub edge_upstream_failovers: prometheus::CounterVec,
     pub protocol_violations: prometheus::CounterVec,
     pub protocol_frames: prometheus::CounterVec,
     pub block_table_size: prometheus::Gauge,
@@ -254,6 +255,15 @@ impl Metrics {
             &["algo"],
         )
         .unwrap();
+        let edge_upstream_failovers = prometheus::CounterVec::new(
+            prometheus::Opts::new(
+                "sentry_edge_upstream_failovers_total",
+                "Requests retried on another upstream server after a \
+                 connection-level failure, by vhost group (F14).",
+            ),
+            &["vhost"],
+        )
+        .unwrap();
         let block_table_size = prometheus::Gauge::new(
             "sentry_block_table_size",
             "IPs currently held in the in-memory block table.",
@@ -434,6 +444,10 @@ impl Metrics {
             .register(Box::new(edge_tls_handshakes.clone()))
             .map_err(|e| warn!(error = %e, "register edge tls handshakes"))
             .ok();
+        registry
+            .register(Box::new(edge_upstream_failovers.clone()))
+            .map_err(|e| warn!(error = %e, "register edge upstream failovers"))
+            .ok();
         for m in [&edge_tls_failures, &edge_tls_sni_mismatches] {
             registry.register(Box::new(m.clone())).ok();
         }
@@ -515,6 +529,7 @@ impl Metrics {
             edge_tls_sni_mismatches,
             edge_tls_alpn,
             edge_compressed,
+            edge_upstream_failovers,
             edge_tls_cert_not_after,
             protocol_violations,
             protocol_frames,

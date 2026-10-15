@@ -1,8 +1,7 @@
 use clap::Parser;
 use std::path::PathBuf;
 
-#[tokio::main]
-async fn main() -> color_eyre::Result<()> {
+fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
     let cli = sentry_cli::Cli::parse();
@@ -26,5 +25,8 @@ async fn main() -> color_eyre::Result<()> {
 
     sentry_cli::logging::init(cli.verbose);
 
-    sentry_cli::cmd::dispatch_with_config(cli, cfg).await
+    // The runtime is built AFTER the config loads so `[runtime]` (worker
+    // threads, CPU pinning, priority — F14) applies to every command.
+    let runtime = sentry_cli::runtime::build(cfg.as_ref().map(|c| &c.runtime));
+    runtime.block_on(sentry_cli::cmd::dispatch_with_config(cli, cfg))
 }

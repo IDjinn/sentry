@@ -23,12 +23,14 @@ pub mod challenge;
 pub mod clienthello;
 pub mod compression;
 pub mod middleware;
+pub mod net;
 pub mod pages;
 pub mod protocol;
 pub mod proxy;
 pub mod tcp_listener;
 #[cfg(feature = "edge-tls")]
 pub mod tls;
+pub mod upstream;
 
 /// Marker request extension: the edge itself terminated TLS on this
 /// connection (F8). Distinguishes a real HTTPS connection from a spoofable
@@ -125,6 +127,7 @@ pub struct EdgeRuntime {
     posture_findings: Option<prometheus::CounterVec>,
     error_pages: Option<Arc<pages::ErrorPages>>,
     compressed: Option<prometheus::CounterVec>,
+    upstream_failovers: Option<prometheus::CounterVec>,
 }
 
 impl EdgeRuntime {
@@ -157,6 +160,7 @@ impl EdgeRuntime {
             posture_findings: None,
             error_pages: None,
             compressed: None,
+            upstream_failovers: None,
         }
     }
 
@@ -192,6 +196,19 @@ impl EdgeRuntime {
     /// Compression counter, when attached.
     pub fn compressed(&self) -> Option<&prometheus::CounterVec> {
         self.compressed.as_ref()
+    }
+
+    /// `sentry_edge_upstream_failovers_total{vhost}` counter (F14) —
+    /// requests retried on another upstream server after a connection
+    /// failure.
+    pub fn with_upstream_failovers(mut self, counter: prometheus::CounterVec) -> Self {
+        self.upstream_failovers = Some(counter);
+        self
+    }
+
+    /// Upstream failover counter, when attached.
+    pub fn upstream_failovers(&self) -> Option<&prometheus::CounterVec> {
+        self.upstream_failovers.as_ref()
     }
 
     /// Arm request-body inspection (F10): bodies are buffered up to the

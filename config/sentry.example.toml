@@ -585,9 +585,27 @@ mode = "none"                      # keep "none" only on loopback
 mode = "passive"             # passive | inline
 # instance_id = "node-1"     # metrics label for multi-node setups (F4.7)
 
+# ── Runtime tuning (F14) ──────────────────────────────────────────────────
+# Tokio worker threads, CPU pinning and thread priority. Everything is
+# optional — an empty section means stock tokio behavior (one worker per
+# core, OS placement, default priority). Useful when the protection daemon
+# shares a box with the app it protects: dedicate cores instead of letting
+# the scheduler fight the application.
+# worker_threads: cap the async worker pool (default 0 = one per core).
+# pin_cores: pin workers to these core ids in order (workers cycle through
+#   the list when there are more workers than cores).
+# thread_priority: idle | below_normal | normal | above_normal | high.
+#   Above-normal levels need privileges on unix (nice < 0) — a failure logs
+#   a warning and keeps going.
+[runtime]
+# worker_threads = 4
+# pin_cores = [0, 1]
+# thread_priority = "normal"
+
 # ── Inline edge (used when [deployment] mode = "inline") ──────────────────
-# Chain: client → sentry-edge → nginx → app. The startup health check
-# against the upstream is mandatory; verdicts apply BEFORE proxying
+# Chain: client → sentry-edge → backends. The startup health check requires
+# at least one healthy server PER upstream group (a down secondary is a
+# warning — failover covers it); verdicts apply BEFORE proxying
 # (Block→403 · RateLimit→429 · Challenge→challenge page · Allow→proxy).
 # Blocked IPs (blocklist action, dashboard/CLI, pipeline Block verdicts)
 # are denied by a fast-path BEFORE the pipeline runs and stay blocked
@@ -595,7 +613,31 @@ mode = "passive"             # passive | inline
 # sentry_blocks_changed — siblings enforce them too).
 [edge]
 listen = "0.0.0.0:80"
+# Default (catch-all) backend: requests whose Host matches no vhost land
+# here. The host may be an IP or a HOSTNAME (`http://web:3000` — Docker
+# container names resolve through the Docker DNS on the compose network;
+# Kubernetes service names work the same). For more than one server, use
+# the `upstreams` list below instead — nginx `upstream {}` semantics:
 upstream = "http://127.0.0.1:8080"
+# upstreams = ["http://web-a:3000", "http://web-b:3000"]
+# Load balancing across a group (F14, nginx semantics):
+#   round_robin — each request to the next server (default)
+#   least_conn  — fewest in-flight requests wins
+#   ip_hash     — same client IP sticks to the same server
+balance = "round_robin"
+# Passive health checks (F14, nginx max_fails/fail_timeout): a server that
+# fails `max_fails` connections (connect error/timeout) inside
+# `fail_timeout_secs` is skipped for that window, then given another
+# chance. max_fails = 0 never ejects.
+max_fails = 2
+fail_timeout_secs = 30
+# Stream upstream responses instead of buffering them (F14). `false`
+# serves Server-Sent Events and other endless payloads correctly (they are
+# also auto-detected via content-type text/event-stream) — at the cost of
+# response compression, which needs the whole body.
+response_buffering = true
+# Total per-request upstream budget in seconds (connect + read + write).
+upstream_timeout_secs = 300
 health_path = "/"
 health_timeout_secs = 5
 body_capture_kb = 0          # request-body bytes kept for inspection (KiB)
@@ -611,7 +653,8 @@ challenge_backend = "sentry"
 # together enable TLS and require the build feature `edge-tls`:
 #   cargo build --release --features sentry-cli/edge-tls
 # The plain `listen` above stays up at the same time, so both 80 and 443 are
-# monitored; blocked IPs are denied on both.
+# monitored; blocked IPs are denied on both. This cert is also the DEFAULT
+# chain for hostnames without a vhost cert (see [[edge.vhosts]]).
 # tls_cert = "/etc/sentry/edge.crt"
 # tls_key = "/etc/sentry/edge.key"
 # tls_listen = "0.0.0.0:443"        # HTTPS bind address (default when TLS is on)
@@ -637,7 +680,10 @@ challenge_backend = "sentry"
 # forwarded_headers = true
 # Upstream hop tuning (F12): connect timeout fails fast on a hung backend;
 # the keepalive pool reuses warm connections so the edge → backend hop pays
-# no TCP handshake per request.
+# no TCP handshake per request. `https://` upstreams always verify
+# certificates — for self-signed backends, serve plain http:// on the
+# private network instead (unverified TLS only hides traffic from passive
+# sniffing).
 # upstream_connect_timeout_secs = 5
 # upstream_pool_idle = 32
 # Max requests served concurrently (default 1024; 0 = unlimited). Each
@@ -645,9 +691,40 @@ challenge_backend = "sentry"
 # flood this cap bounds edge memory — excess requests get an immediate
 # 503 (custom error pages apply) instead of another buffered body.
 # max_concurrent_requests = 1024
-# Inline TCP front for non-HTTP services (verdict on connect):
+# Listener/socket tuning (F14, nginx listen flags):
+# reuseport_workers = 1      # accept loops sharing the port via
+#                            # SO_REUSEPORT (unix; each has its own kernel
+#                            # accept queue). Windows caps this at 1.
+# tcp_backlog = 0            # listen backlog; 0 = kernel maximum (somaxconn)
+# tcp_nodelay = true         # write responses immediately (no Nagle)
+# tcp_keepalive_secs = 60    # client-facing keepalive idle time (0 = off)
+# tcp_send_buffer_kb = 0     # SO_SNDBUF in KiB (0 = system default)
+# tcp_recv_buffer_kb = 0     # SO_RCVBUF in KiB (0 = system default)
+# Inline TCP front for non-HTTP services (verdict on connect; the upstream
+# may be a hostname):
 # tcp_listen = "0.0.0.0:2222"
 # tcp_upstream = "127.0.0.1:22"
+
+# Nginx-style virtual hosts (F14): route by Host header to per-site
+# upstream groups — nginx `server_name` + `proxy_pass`. `host` matches
+# case-insensitively (the :port suffix is ignored); `*.domain` matches any
+# subdomain (multi-label) but not the bare domain. Omitted balance/
+# max_fails/fail_timeout_secs/health_path inherit the [edge] globals.
+# Each vhost may carry its own tls_cert/tls_key, served via SNI on the
+# shared HTTPS listener (the global tls_cert/tls_key stays as the default
+# chain; requires the edge-tls feature).
+# [[edge.vhosts]]
+# host = "app.example.com"
+# upstreams = ["http://web-a:3000", "http://web-b:3000"]   # hostnames OK
+# balance = "least_conn"
+# max_fails = 3
+# fail_timeout_secs = 15
+# health_path = "/healthz"
+# tls_cert = "/etc/sentry/app.example.com.crt"
+# tls_key = "/etc/sentry/app.example.com.key"
+# [[edge.vhosts]]
+# host = "*.api.example.com"
+# upstreams = ["http://api-gateway:8080"]
 
 # Edge response compression (F12) — on by default. Compressible responses
 # (HTML/JSON/CSS/JS/SVG/wasm…) are negotiated against the request's

@@ -967,7 +967,95 @@ telemetria de handshake + provider de appliance
     corrente, defaults do UpdateOpts, UpdateConfig serde/validação, parse
     de `sc query`)
 
-Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4; §27 F12 idem; §28 F13 idem; §3 subprojeto auto — v1 entregue, A.5/A.7/A.12 restantes).
+# F14 (concluída): Edge proxy nível nginx — vhost multi-upstream, LB,
+# health checks passivos, failover, WebSocket + tuning de SO/runtime
+  - ✅ Vhost routing (`[[edge.vhosts]]`, nginx `server_name` + `proxy_pass`):
+    `VhostRouter` (upstream.rs novo) roteia por Host header (normaliza
+    lowercase/porta, cobre h1 `Host` e h2 `:authority`); match exato >
+    wildcard `*.sufixo` (multi-label, domínio nu não casa — semântica
+    nginx, longest-suffix vence); `upstream` escalar continua como grupo
+    default (catch-all); `EdgeConfig::validate()` (pura, roda no `config
+    validate` e no daemon) rejeita host vazio/duplicado/uppercase, `*` no
+    meio, upstream sem scheme, par de certs quebrado, vhost-cert sem TLS
+    global; advisories (double-TLS/off-loopback) iteram todos os grupos —
+    container names seguem gerando o warn honesto de http puro na bridge
+  - ✅ Grupos de upstream + LB (`UpstreamGroup`): `round_robin` (default) |
+    `least_conn` (in-flight atômico) | `ip_hash` (hash determinístico do
+    IP); `[edge] upstreams` (lista) substitui o `upstream` escalar;
+    balance/max_fails/fail_timeout_secs/health_path por vhost herdam os
+    globals quando omitidos
+  - ✅ Health check passivo (nginx `max_fails`/`fail_timeout`): servidor
+    que falha `max_fails` conexões (connect/timeout) na janela é ejectado
+    pela janela e retestado depois; sucesso limpa o histórico; seleção
+    lock-free (atomics; lock só na falha); failover `proxy_next_upstream
+    error timeout` — `serve_allow` tenta cada servidor saudável 1× por
+    request (corpo bufferizado = replay seguro; 5xx NÃO é retryable),
+    grupo exausto → 502; métrica `sentry_edge_upstream_failovers_total
+    {vhost}`; health-check de startup muda de semântica: exige ≥1 saudável
+    POR GRUPO (secundário morto = warn; grupo todo morto = não sobe)
+  - ✅ Upstream por hostname: nomes de container Docker/k8s resolvem via
+    resolver do sistema (reqwest + `TcpStream::connect`) — hops HTTP e TCP;
+    `https://` upstream SEMPRE verifica certificado (`verify_tls = false`
+    não foi implementado de propósito — TLS sem verificação só protege de
+    sniffing passivo; backend self-signed deve usar http:// na rede
+    privada)
+  - ✅ WebSocket/h1 upgrade pass-through: `proxy_upgrade` detecta
+    `Connection: upgrade` + `Upgrade` (h1 only), replays com client raw
+    hyper-util legacy (reqwest não tem API de upgrade; strip hop-by-hop
+    removeria Connection/Upgrade), responde 101 e pipeia os dois upgraded
+    IOs com `copy_bidirectional` (a `Response` upstream vai INTEIRA para a
+    task — dropar o body cedo cancela o handoff); resposta não-101 do
+    backend passa bufferizada normal; Block/RateLimit/Challenge continuam
+    valendo (pipeline roda antes); limitação v1: upgrade sobre upstream
+    https → 502 explicado; hyper/hyper-util/http-body-util viraram deps
+    não-opcionais do sentry-edge (+ feature `stream` no reqwest)
+  - ✅ Response streaming (`[edge] response_buffering = false`, ou
+    `text/event-stream` auto-detectado): `Body::from_stream(bytes_stream)`
+    em vez de `resp.bytes()` — SSE não trava mais a edge; resposta marcada
+    `StreamedResponse` e o compressor F12 passa reto (corpo não é
+    coletável)
+  - ✅ TLS por vhost (SNI): `TlsEdgeConfig.extra_certs` (daemon agrupa
+    vhosts por paths de cert idênticos) → `SniCertResolver` implementa
+    `rustls::server::ResolvesServerCert` (exato + wildcard por sufixo +
+    default chain global); rustls resolve com o SNI do ClientHello
+    re-parseado; gauge `sentry_edge_tls_cert_not_after` = MENOR notAfter
+    entre todos os certs; `cert_not_after` inalterado (daemon itera paths)
+  - ✅ Tuning de listener (`crates/sentry-edge/src/net.rs`, socket2):
+    `SO_REUSEADDR` sempre; `[edge] reuseport_workers` (SO_REUSEPORT × N
+    accept loops no plain listener, unix; Windows caps 1 com warn);
+    `[edge] tcp_backlog` (0 = lê somaxconn no Linux); `tcp_nodelay`,
+    `tcp_keepalive_secs` (0 = off), `tcp_send_buffer_kb`/`tcp_recv_buffer_kb`
+    aplicados por conexão aceita (`tune_accepted`); accept loop manual com
+    `serve_connection_with_upgrades` (upgrades + ConnectInfo injetado);
+    TLS com bind socket2 + tuning; TCP_DEFER_ACCEPT/QUICKACK fora de
+    propósito (forbid(unsafe) sem wrapper safe; QUICKACK reseta por ACK) —
+    epoll/kqueue/IOCP já são o tokio/mio; sendfile/splice N/A ao caminho
+    proxy (socket→socket; volta com proxy_cache)
+  - ✅ `[runtime]` (F14): `worker_threads` (0 = auto), `pin_cores`
+    (workers fixados em ordem via `core_affinity`, ciclam a lista) e
+    `thread_priority` (`idle|below_normal|normal|above_normal|high` via
+    `thread-priority`, mapeado para nice/priority-class; níveis elevados
+    precisam de privilégio no unix — falha loga warn e segue); runtime
+    construído manualmente em `main.rs` (runtime.rs novo) DEPOIS de ler o
+    config, vale para todo comando; `RuntimeConfig::validate()` no
+    `config validate`
+  - ✅ Daemon: gating inline exige `upstream`/`upstreams` OU vhosts; 
+    `edge_advisories()`/`validate()`/projeção novas; `sentry config
+    validate` mostra contagem de vhosts/balance e o resumo do runtime;
+    log final traz `vhosts = N` e `balance`; novo counter registrado em
+    metrics.rs
+  - ✅ 20 testes novos: upstream.rs (host_key, roteamento exato/wildcard/
+    longest-suffix, rr/least_conn/ip_hash, janela de falha/recuperação,
+    exclusão no pick, groups()), proxy.rs (vhost routing + fallback +
+    porta/case, failover em connect failure, grupo exausto → 502,
+    streaming sem compressão, SSE auto-stream, WS end-to-end bidirecional
+    com evento 101, health-check por grupo), net.rs (reuseport no mesmo
+    porto — unix, backlog 0 → somaxconn), tls.rs (SNI multi-cert: default
+    para localhost, cert do vhost para api.test provado pela falha de
+    verificação do cliente), config.rs (serde de vhosts + herança,
+    validate, advisories por vhost, RuntimeConfig, default_group_servers)
+
+Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4; §27 F12 idem; §28 F13 idem; §29 F14 idem; §3 subprojeto auto — v1 entregue, A.5/A.7/A.12 restantes).
 
 ### Status atual (verificação contínua)
 
@@ -976,9 +1064,9 @@ Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
-# Resultado esperado: 746 testes passando sem features (748 com
+# Resultado esperado: 766+ testes passando sem features (768 com
 # --features sentry-cli/onnx — os 2 testes de inferência ONNX; com
-# edge-tls/edge-zstd entram os testes de TLS/h2/compressão zstd)
+# edge-tls/edge-zstd entram os testes de TLS/h2/SNI/compressão zstd)
 ```
 
 ## 8. Convenões de código
