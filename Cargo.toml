@@ -140,7 +140,7 @@ self_update = { version = "1.3", default-features = false, features = [
 
 # Edge listener tuning (F14): SO_REUSEPORT / backlog socket options and
 # worker CPU pinning / thread priority for `[runtime]`.
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 core_affinity = "0.8"
 thread-priority = "3"
 

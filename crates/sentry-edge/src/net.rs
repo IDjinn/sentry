@@ -119,6 +119,8 @@ fn apply_buffers(socket: &Socket, tuning: &TcpTuning) {
 }
 
 /// Apply the client-facing TCP flags to a freshly accepted connection.
+/// Keepalive probe count stays at the system default off-Windows: socket2
+/// only exposes it per-socket on Windows.
 pub fn tune_accepted(stream: &tokio::net::TcpStream, tuning: &TcpTuning) {
     let sock: socket2::SockRef<'_> = stream.into();
     if tuning.nodelay {
@@ -138,10 +140,6 @@ pub fn tune_accepted(stream: &tokio::net::TcpStream, tuning: &TcpTuning) {
     #[cfg(not(windows))]
     {
         ka = ka.with_interval(Duration::from_secs(10));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        ka = ka.with_retries(5);
     }
     let _ = sock.set_tcp_keepalive(&ka);
 }

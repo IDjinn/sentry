@@ -425,14 +425,17 @@ async fn serve_plain(
     let addr: SocketAddr = listen.parse().map_err(|e| {
         sentry_core::error::CoreError::Config(format!("invalid edge listen address: {e}"))
     })?;
-    let mut workers = workers.max(1);
+    #[cfg(unix)]
+    let workers = workers.max(1);
     #[cfg(not(unix))]
-    if workers > 1 {
-        workers = 1;
-        warn!(
-            "edge: reuseport_workers > 1 requires SO_REUSEPORT (unix) — using a single accept loop"
-        );
-    }
+    let workers = {
+        if workers > 1 {
+            warn!(
+                "edge: reuseport_workers > 1 requires SO_REUSEPORT (unix) — using a single accept loop"
+            );
+        }
+        1
+    };
     let mut listeners = Vec::with_capacity(workers);
     for _ in 0..workers {
         listeners.push(crate::net::bind_listener(addr, opts).map_err(|e| {
