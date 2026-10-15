@@ -96,6 +96,9 @@ pub struct SentryConfig {
     /// `sentry auto` command settings (framework scan).
     #[serde(default)]
     pub auto: AutoConfig,
+    /// Binary self-update (F13): daemon version check + `sentry update`.
+    #[serde(default)]
+    pub update: UpdateConfig,
     /// Event sources.
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
@@ -124,6 +127,74 @@ pub struct AutoSensitiveConfig {
     /// `config`).
     #[serde(default)]
     pub enable: Vec<String>,
+}
+
+/// Binary self-update settings (F13).
+///
+/// `[update] enabled = false` only turns off the daemon's periodic version
+/// check; the manual `sentry update` command always works regardless.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    /// Periodic version check in the daemon (logs only — never downloads or
+    /// applies anything).
+    #[serde(default = "default_update_enabled")]
+    pub enabled: bool,
+    /// Seconds between daemon checks (clamped to a 300s floor by
+    /// `validate`).
+    #[serde(default = "default_update_interval_secs")]
+    pub interval_secs: u64,
+    /// GitHub repository (`owner/name`) releases are fetched from.
+    #[serde(default = "default_update_repo")]
+    pub repo: String,
+    /// `sentry update` restarts the OS service after swapping the binary.
+    #[serde(default)]
+    pub auto_restart: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_update_enabled(),
+            interval_secs: default_update_interval_secs(),
+            repo: default_update_repo(),
+            auto_restart: false,
+        }
+    }
+}
+
+impl UpdateConfig {
+    /// Cross-field validation surfaced by `sentry config validate`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.repo.is_empty() {
+            return Err("[update] repo must not be empty".to_string());
+        }
+        let slashes = self.repo.matches('/').count();
+        if slashes != 1 || self.repo.split('/').any(|p| p.is_empty()) {
+            return Err(format!(
+                "[update] repo must be `owner/name`, got {:?}",
+                self.repo
+            ));
+        }
+        if self.enabled && self.interval_secs < 300 {
+            return Err(
+                "[update] interval_secs must be >= 300 (protect the GitHub API rate limit)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn default_update_enabled() -> bool {
+    true
+}
+
+fn default_update_interval_secs() -> u64 {
+    86_400
+}
+
+fn default_update_repo() -> String {
+    "IDjinn/sentry".to_string()
 }
 
 /// Core runtime settings.
@@ -2254,6 +2325,46 @@ mod tests {
         let cfg: SentryConfig = toml::from_str("").unwrap();
         assert!(cfg.auto.sensitive.skip.is_empty());
         assert!(cfg.auto.sensitive.enable.is_empty());
+    }
+
+    #[test]
+    fn update_section_parses_with_defaults() {
+        let cfg: SentryConfig = toml::from_str("").unwrap();
+        assert!(cfg.update.enabled);
+        assert_eq!(cfg.update.interval_secs, 86_400);
+        assert_eq!(cfg.update.repo, "IDjinn/sentry");
+        assert!(!cfg.update.auto_restart);
+        assert!(cfg.update.validate().is_ok());
+
+        let cfg: SentryConfig = toml::from_str(
+            "[update]\nenabled = false\ninterval_secs = 3600\nrepo = \"me/fork\"\nauto_restart = true\n",
+        )
+        .unwrap();
+        assert!(!cfg.update.enabled);
+        assert_eq!(cfg.update.interval_secs, 3600);
+        assert_eq!(cfg.update.repo, "me/fork");
+        assert!(cfg.update.auto_restart);
+        assert!(cfg.update.validate().is_ok());
+    }
+
+    #[test]
+    fn update_validation_rejects_bad_repo_and_interval() {
+        let mut cfg = UpdateConfig::default();
+        cfg.repo = "just-a-name".to_string();
+        assert!(cfg.validate().is_err());
+        cfg.repo = "a/b/c".to_string();
+        assert!(cfg.validate().is_err());
+        cfg.repo = "owner/".to_string();
+        assert!(cfg.validate().is_err());
+        cfg.repo = String::new();
+        assert!(cfg.validate().is_err());
+
+        cfg = UpdateConfig::default();
+        cfg.interval_secs = 299;
+        assert!(cfg.validate().is_err());
+        // A disabled check is never rate-limited, so the floor does not apply.
+        cfg.enabled = false;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

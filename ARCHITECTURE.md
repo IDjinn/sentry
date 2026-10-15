@@ -2037,3 +2037,85 @@ hsts_min_max_age = 31536000
   topologies: TLS terminated at the edge while the upstream is `https://`
   (double TLS — serve the backend plain on loopback), and an off-loopback
   plain-http upstream (unencrypted hop).
+
+## 28. F13 — Binary self-update (`sentry update`) + release channel
+
+> Binaries deployed from GitHub Releases (systemd / launchd / Windows
+> Service hosts) need a first-class update path. Containers keep updating
+> by image pull — the update machinery detects them and stays out of the
+> way. Security posture: HTTPS + SHA-256 (the digest GitHub publishes per
+> release asset is verified before anything is installed); artifact
+> signing is roadmap.
+
+### 28.1 Release channel (`.github/workflows/release.yml`)
+
+- Triggered by a `v*` tag push; the `publish` job fails unless the tag
+  equals the workspace version (`v` + `[workspace.package] version`).
+- Matrix builds `x86_64-unknown-linux-gnu` (ubuntu), `aarch64-apple-darwin`
+  (macos), `x86_64-pc-windows-msvc` (windows) with `--release --locked
+  --features sentry-cli/edge-tls` and publishes `sentry-<triple>.tar.gz`
+  (unix) / `.zip` (Windows), binary at the archive root — the naming
+  contract the update backend matches on (target-triple substring).
+- `pcap` is intentionally absent from release binaries (Npcap is not
+  installable on hosted Windows runners); images built by
+  `docker-publish.yml` carry it.
+- Without a published release, `sentry update` fails with an actionable
+  message (push a tag), never a stacktrace.
+
+### 28.2 Mechanics (`crates/sentry-cli/src/update.rs`)
+
+- Backend: `self_update` 1.3 (GitHub Releases). `check_available()` uses
+  the async API (`build_async()` + `is_update_available_async()`) — no
+  runtime blocking. Comparison is strict semver-newer (`v` prefix is
+  trimmed by the backend). `--version <tag>` pins the install through
+  `release_tag(..)`, which fetches exactly that tag; downgrades are
+  refused (a pinned tag older than the running binary prints and exits).
+- Integrity chain: the `checksums` feature verifies the downloaded
+  artifact against the `sha256:<hex>` digest from the releases API before
+  extraction; mismatch aborts with nothing installed.
+- Install: `self_replace` under the hood — atomic rename over the running
+  binary on POSIX; rename-dance (running exe → backup name) on Windows.
+  The running process keeps executing the old image until restarted,
+  which is why restart handling exists.
+- Errors from the backend are mapped to actionable hints: no release yet,
+  repo not found, rate limited (export `GH_TOKEN` to move to 5000/h —
+  the token is also picked up automatically), checksum mismatch, install
+  path not writable.
+- `in_container()` (`/.dockerenv` or `KUBERNETES_SERVICE_HOST`): the
+  daemon check skips silently (debug) and `sentry update` warns — image
+  deployments would overwrite the swapped binary.
+
+### 28.3 `sentry update` (manual path — always available)
+
+- `--check` compares only. `--repo owner/name` overrides `[update] repo`.
+- Restart policy: `--restart` / `--no-restart` override
+  `[update] auto_restart` (default **false** — swap only, print the
+  follow-up: `sentry service restart` or flip `auto_restart`).
+- When restarting: `service::stop()` (error-propagating; on Windows it
+  polls until the SCM releases the image file lock, 30s budget — the swap
+  cannot succeed while the service holds it), swap, `service::start()`.
+  If stop fails on Windows the update aborts with the exact recovery
+  command; on unix it warns and swaps anyway (rename works on a running
+  binary). `sentry service restart` (new) is the manual counterpart.
+
+### 28.4 Daemon periodic check (`[update]`, default on, 1×/day)
+
+- `enabled = true`, `interval_secs = 86_400` (floor 300 — GitHub's
+  anonymous budget is 60 req/h per IP), `repo` (`owner/name`),
+  `auto_restart = false`.
+- Task sleeps a full period first, checks, and logs **once per discovered
+  version** (`announced` dedupe): level, current → available, the
+  `sentry update` hint, the `[update] enabled = false` off switch and the
+  `auto_restart` opt-in. Network errors are debug-level and retried next
+  period. It never downloads or applies anything.
+- `[update] enabled = false` does **not** affect the manual command.
+
+### 28.5 Limitations / roadmap
+
+- Signing (minisign/zipsign via the crate's `signatures` feature) is not
+  wired: release assets are verified by digest only, over HTTPS — a
+  compromised release publish could still swap a binary. Signing keys in
+  CI is the prerequisite.
+- Restart requires service-manager privileges (root/admin); the update
+  flow surfaces the failure instead of elevating.
+- Channels (beta/stable) would be a second `tag_prefix` release family.

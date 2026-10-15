@@ -1,0 +1,95 @@
+# release.yml — build per-platform release binaries on a `v*` tag push and
+# publish them to a GitHub Release. These are the artifacts `sentry update`
+# downloads (F13): the self_update GitHub backend matches the asset by
+# target-triple substring, so names MUST stay `sentry-<triple>.tar.gz`
+# (unix) / `sentry-<triple>.zip` (Windows) with the binary at the archive
+# root. The tag must equal the workspace version (`v` + `0.1.0`).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ matrix.target }})
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+
+      # `pcap` is intentionally absent from release binaries: Npcap is not
+      # available on hosted Windows runners (see ARCHITECTURE.md F13).
+      - name: Build
+        run: cargo build --release --locked --features sentry-cli/edge-tls --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf "sentry-${{ matrix.target }}.tar.gz" sentry
+          mv "sentry-${{ matrix.target }}.tar.gz" ../../..
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/sentry.exe" `
+            -DestinationPath "sentry-${{ matrix.target }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: sentry-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match the workspace version
+        run: |
+          VERSION="$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+          if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${VERSION} — bump [workspace.package] version and re-tag"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

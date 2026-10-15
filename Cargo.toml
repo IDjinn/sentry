@@ -111,6 +111,22 @@ maxminddb = "0.24"
 # Config
 figment = { version = "0.10", features = ["toml", "env"] }
 
+# Binary self-update (F13): GitHub Releases backend, tar.gz/zip assets,
+# SHA-256 verification via the per-asset digest from the releases API,
+# async API for the daemon's periodic version check.
+self_update = { version = "1.3", default-features = false, features = [
+    "reqwest",
+    "native-tls",
+    "github",
+    "archive-tar",
+    "archive-zip",
+    "compression-tar-gz",
+    "compression-zip-deflate",
+    "checksums",
+    "progress-bar",
+    "async",
+] }
+
 # File watching (nginx log tail)
 notify = "6"
 

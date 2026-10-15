@@ -108,6 +108,29 @@ pub enum Command {
         #[command(subcommand)]
         action: ServiceCmd,
     },
+    /// Check GitHub Releases for a newer sentry binary and swap it in.
+    ///
+    /// Works regardless of `[update] enabled` (which only gates the
+    /// daemon's periodic check).
+    Update {
+        /// Only compare versions; never download or install.
+        #[arg(long)]
+        check: bool,
+        /// Pin the target release tag (e.g. `v0.2.0`); only applies when
+        /// newer than the running binary — no downgrades.
+        #[arg(long, value_name = "TAG")]
+        version: Option<String>,
+        /// GitHub repository override, `owner/name` (default: `[update] repo`).
+        #[arg(long, value_name = "OWNER/NAME")]
+        repo: Option<String>,
+        /// Restart the OS service after the swap (overrides
+        /// `[update] auto_restart`).
+        #[arg(long, conflicts_with = "no_restart")]
+        restart: bool,
+        /// Never restart the service (overrides `[update] auto_restart`).
+        #[arg(long)]
+        no_restart: bool,
+    },
     /// Generate aggregate reports.
     Report {
         /// Time window (e.g. `24h`, `7d`).
@@ -494,6 +517,8 @@ pub enum ServiceCmd {
     Uninstall,
     /// Show service install paths + best-effort live status.
     Status,
+    /// Stop and start the system service (picks up a swapped binary).
+    Restart,
     /// Internal entry point: run under the Windows Service Control Manager.
     #[command(hide = true)]
     Run,

@@ -25,5 +25,6 @@ pub mod server;
 pub mod service;
 pub mod siem;
 mod tui;
+pub mod update;
 
 pub use cli::Cli;

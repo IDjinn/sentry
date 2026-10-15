@@ -916,7 +916,58 @@ telemetria de handshake + provider de appliance
     tipo de entrada, walk com exclusões, render/preset, parse do
     `[auto.sensitive]`, summary_lines)
 
-Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4; §27 F12 idem; §3 subprojeto auto — v1 entregue, A.5/A.7/A.12 restantes).
+# F13 (concluída): Auto-update de binários — `sentry update` + release
+# channel + checagem periódica no daemon (detalhes em `ARCHITECTURE.md` §28)
+  - ✅ Release channel (`.github/workflows/release.yml`): push de tag `v*`
+    → matrix linux/mac/windows (`x86_64-unknown-linux-gnu`,
+    `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`) com
+    `--release --locked --features sentry-cli/edge-tls`, publica
+    `sentry-<triple>.tar.gz|.zip` (binário na raiz do archive) num GitHub
+    Release; job de publish falha se a tag ≠ versão do workspace; `pcap`
+    fica de fora (Npcap indisponível nos runners)
+  - ✅ Crate `self_update` 1.3 (workspace dep, features `github` +
+    `checksums` + `async` + `native-tls` + archives): backend GitHub
+    Releases; o digest `sha256:<hex>` que a API publica por asset é
+    verificado antes da instalação (mismatch aborta sem instalar);
+    `GH_TOKEN`/`GITHUB_TOKEN` respeitados automaticamente (rate limit 60/h
+    anônimo → 5000/h)
+  - ✅ `[update]` no config (`UpdateConfig` em sentry-core): `enabled`
+    (default **true** — só a checagem periódica do daemon), `interval_secs`
+    (default 86400, floor 300), `repo` (default `IDjinn/sentry`),
+    `auto_restart` (default false); `sentry config validate` rejeita repo
+    malformado e interval < 300
+  - ✅ `sentry update` (`update.rs`): manual e **sempre disponível**
+    (independe de `enabled`); `--check` só compara; `--version <tag>` fixa
+    o alvo via `release_tag` (sem downgrade); `--repo owner/name` override;
+    `--restart`/`--no-restart` override do `auto_restart`; API async do
+    backend (nada de blocking no runtime tokio); erros mapeados para
+    mensagens acionáveis (sem release, repo não encontrado, rate limit,
+    checksum, path não gravável); `in_container()` (/.dockerenv /
+    KUBERNETES_SERVICE_HOST) avisa e segue — update de container é por
+    imagem
+  - ✅ Integração com o service manager (F4.1): `service::running()` /
+    `stop()` / `start()` / `restart()` novos (systemctl is-active/stop/
+    start, launchctl list/unload/load, `sc query|stop|start Sentry` com
+    poll até STOPPED — 30s — porque o Windows segura lock do .exe em
+    execução); parse de `sc query` extraído em fn pura testável; nova
+    variante `sentry service restart`; fluxo do update: se serviço rodando
+    e restart desejado → stop → swap → start; stop falhando no Windows
+    aborta com comando de recuperação, no unix só warn (rename funciona
+    com binário em execução)
+  - ✅ Checagem periódica no daemon (task tokio): dorme um período, checa,
+    loga **uma vez por versão descoberta** (dedupe por versão) com hint
+    `sentry update` + chaves de config; erro de rede → debug, retry no
+    próximo ciclo; nunca baixa nem aplica
+  - ✅ Instalação via `self_replace` (interno da crate): rename atômico no
+    POSIX, dance de rename no Windows — o processo em execução continua na
+    imagem antiga até o restart (motivo do `auto_restart`); `sentry
+    update` no Windows NÃO reinicia o próprio processo (o restart explícito
+    da crate não é usado)
+  - ✅ 12 testes novos (parse_repo, asset_name por plataforma, versão
+    corrente, defaults do UpdateOpts, UpdateConfig serde/validação, parse
+    de `sc query`)
+
+Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4; §27 F12 idem; §28 F13 idem; §3 subprojeto auto — v1 entregue, A.5/A.7/A.12 restantes).
 
 ### Status atual (verificação contínua)
 

@@ -914,3 +914,13 @@ dir = "schemas"              # watched for add/modify/remove (live reload)
 safety_poll_secs = 60        # safety rescan catching lost fs events
 debounce_ms = 500            # fs-event coalescing window
 max_schemas = 64
+
+# ── Binary self-update (F13) ─────────────────────────────────────────────
+# Periodic version check in the daemon (logs only — it never downloads or
+# applies anything) and defaults for the manual `sentry update` command,
+# which always works regardless of `enabled`.
+[update]
+enabled = true
+interval_secs = 86400       # check cadence (min 300; protects the GitHub API rate limit)
+repo = "IDjinn/sentry"      # GitHub releases source (owner/name)
+auto_restart = false        # `sentry update` restarts the OS service after the swap

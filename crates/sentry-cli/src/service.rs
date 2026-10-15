@@ -17,6 +17,7 @@ use std::path::{Component, Path, PathBuf};
 
 const SERVICE_NAME: &str = "sentry";
 const WINDOWS_SERVICE_NAME: &str = "Sentry";
+const LAUNCHD_LABEL: &str = "com.sentry.daemon";
 
 /// Absolute path of the running sentry executable, normalized.
 ///
@@ -270,6 +271,160 @@ pub fn status() {
     }
 }
 
+/// Whether the OS service is currently running (best-effort: `false` when
+/// the platform has no service manager or the query fails). Used by the
+/// update flow to decide stop/restart around the binary swap.
+pub fn running() -> bool {
+    match std::env::consts::OS {
+        "linux" => std::process::Command::new("systemctl")
+            .args(["is-active", "--quiet", SERVICE_NAME])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        "macos" => std::process::Command::new("launchctl")
+            .arg("list")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(LAUNCHD_LABEL))
+            .unwrap_or(false),
+        "windows" => std::process::Command::new("sc.exe")
+            .args(["query", WINDOWS_SERVICE_NAME])
+            .output()
+            .map(|o| parse_sc_query_state(&String::from_utf8_lossy(&o.stdout)) == Some("RUNNING"))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Extract the state token (`RUNNING`, `STOPPED`, …) from `sc.exe query`
+/// output. The `STATE` line reads `STATE  : 4  RUNNING`; the numeric code
+/// and separator are skipped so localized codes never leak through.
+fn parse_sc_query_state(output: &str) -> Option<&str> {
+    let line = output.lines().find(|l| {
+        l.split_whitespace()
+            .next()
+            .is_some_and(|first| first.eq_ignore_ascii_case("STATE"))
+    })?;
+    // Tokens read `STATE : 4 RUNNING` — skip past the label, separator and
+    // numeric state code, then take the first textual token after them.
+    line.split_whitespace()
+        .skip_while(|t| t.parse::<u32>().is_err())
+        .find(|t| !t.eq_ignore_ascii_case(":") && t.parse::<u32>().is_err())
+}
+
+/// Stop the service. Error-propagating variant for the update flow (the
+/// install/uninstall paths stay best-effort). On Windows this waits until
+/// the SCM reports the service stopped, releasing the binary file lock
+/// before the swap.
+pub fn stop() -> color_eyre::Result<()> {
+    match std::env::consts::OS {
+        "linux" => systemctl_checked(&["stop", SERVICE_NAME]),
+        "macos" => {
+            let path = home_plist_path()?;
+            launchctl_checked(&["unload", sanitize_arg(&path.display().to_string())?])
+        }
+        "windows" => {
+            sc_checked(&["stop".into(), WINDOWS_SERVICE_NAME.into()])?;
+            if !wait_stopped() {
+                return Err(color_eyre::eyre::eyre!(
+                    "service did not reach STOPPED within 30s"
+                ));
+            }
+            Ok(())
+        }
+        other => Err(color_eyre::eyre::eyre!(
+            "unsupported platform for `sentry service stop`: {other}"
+        )),
+    }
+}
+
+/// Start the service.
+pub fn start() -> color_eyre::Result<()> {
+    match std::env::consts::OS {
+        "linux" => systemctl_checked(&["start", SERVICE_NAME]),
+        "macos" => {
+            let path = home_plist_path()?;
+            launchctl_checked(&["load", sanitize_arg(&path.display().to_string())?])
+        }
+        "windows" => sc_checked(&["start".into(), WINDOWS_SERVICE_NAME.into()]),
+        other => Err(color_eyre::eyre::eyre!(
+            "unsupported platform for `sentry service start`: {other}"
+        )),
+    }
+}
+
+/// Stop + start the service (`sentry service restart`).
+pub fn restart() -> color_eyre::Result<()> {
+    if running() {
+        stop()?;
+    }
+    start()
+}
+
+/// Poll until [`running`] turns false (Windows keeps the image file locked
+/// until the SCM is done stopping the process). Gives up after 30s.
+fn wait_stopped() -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if !running() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// Fixed-binary `systemctl` runner that propagates failure — the update
+/// flow must know when stop/start did not happen. Argument list only, no
+/// shell, same guard as [`systemctl`].
+fn systemctl_checked(args: &[&str]) -> color_eyre::Result<()> {
+    for a in args {
+        sanitize_arg(a)?;
+    }
+    let status = std::process::Command::new("systemctl")
+        .args(args)
+        .status()
+        .map_err(|e| color_eyre::eyre::eyre!("could not run systemctl: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(color_eyre::eyre::eyre!("systemctl exited with {status}"))
+    }
+}
+
+/// Fixed-binary `launchctl` variant of [`systemctl_checked`].
+fn launchctl_checked(args: &[&str]) -> color_eyre::Result<()> {
+    for a in args {
+        sanitize_arg(a)?;
+    }
+    let status = std::process::Command::new("launchctl")
+        .args(args)
+        .status()
+        .map_err(|e| color_eyre::eyre::eyre!("could not run launchctl: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(color_eyre::eyre::eyre!("launchctl exited with {status}"))
+    }
+}
+
+/// Fixed-binary `sc.exe` variant of [`systemctl_checked`].
+fn sc_checked(args: &[String]) -> color_eyre::Result<()> {
+    for a in args {
+        sanitize_arg(a)?;
+    }
+    let status = std::process::Command::new("sc.exe")
+        .args(args)
+        .status()
+        .map_err(|e| color_eyre::eyre::eyre!("could not run sc.exe: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(color_eyre::eyre::eyre!("sc.exe exited with {status}"))
+    }
+}
+
 /// Entry point for `sentry service run` — Windows SCM only (feature `service`).
 #[cfg(all(windows, feature = "service"))]
 pub fn run_windows_service() -> color_eyre::Result<()> {
@@ -407,6 +562,20 @@ mod tests {
             .any(|a| a.contains("service run") && a.contains("sentry.exe")));
         assert!(cmds[1].contains(&"failure".to_string()));
         assert!(cmds[2].contains(&"start".to_string()));
+    }
+
+    #[test]
+    fn sc_query_state_parsing() {
+        let running = "SERVICE_NAME: Sentry\r\n        TYPE               : 10  WIN32_OWN_PROCESS\r\n        STATE              : 4  RUNNING\r\n";
+        assert_eq!(parse_sc_query_state(running), Some("RUNNING"));
+        let stopped = "SERVICE_NAME: Sentry\r\n        STATE              : 1  STOPPED\r\n";
+        assert_eq!(parse_sc_query_state(stopped), Some("STOPPED"));
+        // No STATE line at all / garbage in, nothing out.
+        assert_eq!(parse_sc_query_state("FAILED 1060"), None);
+        assert_eq!(parse_sc_query_state(""), None);
+        // The numeric state code and the separator are never returned.
+        let numeric_only = "STATE : 4";
+        assert_eq!(parse_sc_query_state(numeric_only), None);
     }
 
     #[test]

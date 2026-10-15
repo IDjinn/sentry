@@ -30,7 +30,7 @@ use sentry_core::rules::{shared, RuleSet, SharedRuleSet};
 use sentry_core::throttle::DropLogThrottle;
 use sentry_core::{ActionDispatch, RiskLevel, RuleLogLevel, Signal};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// A challenge action paired with its concrete provider handles (when the
 /// providers are built locally — Cloudflare edge rules, local firewall,
@@ -706,6 +706,38 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 pipeline.prune_pending();
             }
         });
+    }
+    // Periodic binary version check (F13): logs once per discovered
+    // version — `sentry update` is the explicit install path. Skipped in
+    // container images, where updates are image pulls.
+    if cfg.update.enabled {
+        if crate::update::in_container() {
+            debug!("update check skipped: running inside a container image");
+        } else {
+            let update_cfg = cfg.update.clone();
+            tokio::spawn(async move {
+                let period = Duration::from_secs(update_cfg.interval_secs.max(300));
+                let mut announced = String::new();
+                loop {
+                    tokio::time::sleep(period).await;
+                    match crate::update::check_available(&update_cfg, None).await {
+                        Ok(Some(release)) if release.version() != announced => {
+                            announced = release.version().to_string();
+                            warn!(
+                                current = crate::update::current_version(),
+                                available = announced,
+                                "new sentry version available — run `sentry update` \
+                                 to install; disable this check with [update] \
+                                 enabled = false; set [update] auto_restart = true to \
+                                 restart the service during updates"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => debug!(error = %e, "update check failed"),
+                    }
+                }
+            });
+        }
     }
     {
         let table = Arc::clone(&block_table);

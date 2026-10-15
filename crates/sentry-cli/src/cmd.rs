@@ -685,10 +685,35 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
             ServiceCmd::Status => {
                 crate::service::status();
             }
+            ServiceCmd::Restart => {
+                crate::service::restart()?;
+                println!("service restarted");
+            }
             ServiceCmd::Run => {
                 crate::service::run_windows_service()?;
             }
         },
+        Command::Update {
+            check,
+            version,
+            repo,
+            restart,
+            no_restart,
+        } => {
+            let opts = crate::update::UpdateOpts {
+                check,
+                version,
+                repo,
+                restart: if restart {
+                    Some(true)
+                } else if no_restart {
+                    Some(false)
+                } else {
+                    None
+                },
+            };
+            crate::update::run(cfg.as_ref(), opts).await?;
+        }
         Command::Export {
             from,
             format,
@@ -914,6 +939,9 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                     &cfg.auto.sensitive.skip,
                 ) {
                     color_eyre::eyre::bail!("config INVALID: [auto.sensitive]: {e}");
+                }
+                if let Err(e) = cfg.update.validate() {
+                    color_eyre::eyre::bail!("config INVALID: {e}");
                 }
                 if !errors.is_empty() {
                     for e in &errors {
