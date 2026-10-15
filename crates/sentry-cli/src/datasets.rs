@@ -93,10 +93,12 @@ pub fn preset_names(categories: &[String]) -> color_eyre::Result<Vec<String>> {
                     names.push(c.name.to_string());
                 }
             }
-            None => color_eyre::eyre::bail!(
-                "unknown sensitive-file category `{requested}` — valid: {}",
-                sentry_core::sensitive_files::category_names().join(", ")
-            ),
+            None => {
+                return Err(color_eyre::eyre::eyre!(
+                    "unknown sensitive-file category `{requested}` — valid: {}",
+                    sentry_core::sensitive_files::category_names().join(", ")
+                ));
+            }
         }
     }
     Ok(names)
