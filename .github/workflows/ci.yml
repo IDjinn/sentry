@@ -34,6 +34,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --all --locked
+
+  # Release-profile validation on a single runner: the published per-platform
+  # binaries are built by release.yml on tags (F13) and the container image by
+  # docker-publish on main — building release on every OS here duplicated both.
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build release
         run: cargo build --release --locked
 
