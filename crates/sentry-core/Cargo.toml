@@ -20,7 +20,7 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = { workspace = true }
+sentry-conf = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -33,6 +33,7 @@ aho-corasick = { workspace = true }
 arc-swap = { workspace = true }
 
 [dev-dependencies]
+toml = { workspace = true }
 pretty_assertions = "1"
 proptest = { workspace = true }
 criterion = { workspace = true }

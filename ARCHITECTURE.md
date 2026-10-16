@@ -2219,3 +2219,93 @@ kernel/runtime tuning knobs.
 Disk proxy cache (+ `sendfile` on hits), active health checks, UDP stream
 proxying, rewrite/`proxy_redirect`, forward proxy, WebSocket over
 `https://` upstreams.
+
+## 30. F15 — `sentry.conf`: nginx-like configuration + location routing
+
+`sentry.toml` is replaced by `sentry.conf`, an nginx-like language that
+splits naturally across files and lets the inline edge route like nginx
+(host, path, query, headers…), with per-location security.
+
+### 30.1 Language (`crates/sentry-conf`, pure)
+
+- `key: value` directives (several values on one line: `return: 301 "…"`),
+  `name [label…] { … }` blocks, `[a, b]` lists, `"…"` strings with
+  `${VAR}` / `${VAR:-default}` expansion, `'…'` raw strings (regex, DSL),
+  bare words (`0.0.0.0:80`, `http://x:3000` — a `:` followed by a non-space
+  stays inside the word), `#` / `//` / `/* */` comments, `;`/`,`/newline
+  separators.
+- `include: "glob"` at any depth, relative to the including file; cycle and
+  depth guards. Directory loading (`conf_files_in`) is sorted.
+- serde `Deserializer` over the tree: a repeated statement becomes a list
+  (a `Vec` field accepts one value, `[…]` or repeated directives); repeated
+  **unlabeled** blocks requested as a struct are merged (that is what makes
+  `detect {}` in `detect.conf` + `server {}` in `sentry.conf` work); a scalar
+  given twice is an error naming both positions. Labels surface as the
+  synthetic `$labels` key. Errors carry `file:line:col`, the block path and a
+  "did you mean" suggestion.
+- `values`: `Secs`/`Millis` (`250ms`, `24h`; bare numbers are seconds),
+  `Bytes` (`4k`, `10mb`), `OneOrMany`, `OrderedMap`, `RawBlock`, `ConfValue`.
+- `ser`: `Serialize` → text; `to_string_diff` prunes values equal to a
+  reference (defaults) — used by `config show`, `config migrate` and
+  `sentry auto`.
+
+### 30.2 Mapping (`sentry_core::conf`)
+
+`schema.rs` is what users write (every field `Option`, `deny_unknown_fields`);
+`lower.rs` lowers it onto the unchanged runtime model `SentryConfig` and
+raises it back. Top-level blocks: `sentry` (mode, instance, runtime, update,
+auto), `server` (engine core + geo, policy, scorer, escalation, overload),
+`storage`, `detect` (scan, behavior, correlation, bot_verification, uploads,
+posture, protocol, route_learner, ai, llm, ip_lookup), `trust` (real IP),
+`rules` (packs, pack, rule, feed, rate_limit), `routes`, `source TYPE`,
+`action TYPE [PROVIDER]`, `dashboard`, `metrics`, `http`, `tcp`. The
+`SentryConfig` serde shape still backs the `SENTRY_<A>__<B>` env overlay and
+the legacy TOML reader of `sentry config migrate`.
+
+### 30.3 Routing (`sentry_core::edge_routes`, `sentry-edge/src/routing.rs`)
+
+- Model: `UpstreamGroupConfig` (named), `SiteConfig` (hosts, default, SNI
+  cert, locations, header ops, security), `LocationConfig` (kind, path,
+  conditions, proxy_pass | respond, rewrites, headers, timeout, buffering,
+  security). Legacy `upstream`/`upstreams`/`vhosts` normalize into
+  equivalent groups + sites (`edge_routes::normalized`).
+- `RouteTable` (replaces `VhostRouter`): host → site (exact > longest
+  `*.suffix` > `~regex` > default site); path → location in nginx order:
+  `=` exact, then the longest prefix — when it is `^~` regexes are skipped —
+  then `~`/`~*` regexes in declaration order, then plain prefixes longest
+  first. Candidates whose `match {}` fails are skipped (same path, different
+  backends by query/header/cookie/method/IP). No route → 404 page.
+- Actions: `proxy_pass` to a group or a URL (anonymous one-server group; a
+  URI path replaces the matched prefix unless a `rewrite` changed the path),
+  `return status ["text"]`, `redirect [code] "url"`; `$host`, `$uri`,
+  `$request_uri`, `$args`, `$arg_NAME`, `$http_NAME`, `$1…` expansion;
+  request/response header set/remove; per-location upstream timeout and
+  response buffering.
+- Syntax: `http { proxy_pass: URL }` for a single backend; `site host… {
+  "/path": target }` where target is an upstream name, a URL, a `[URL, URL]`
+  list (anonymous balanced group), `status ["text"]` or `redirect [code]
+  "url"` — expanded into `location` blocks on the tree (`conf/sugar.rs`)
+  before deserialization. `location` blocks carry `match {}`, `rewrite`,
+  `request_headers {}` / `response_headers {}` (`off` removes) and the
+  security directives inline (`inspect`, `rate_limit`, `allow`, `deny`,
+  `challenge`, `policy {}`, `packs {}`).
+- Security (`EffectiveSecurity`, merged http → site → location): allow/deny
+  and the per-(location, IP) fixed-window rate limit run before the
+  pipeline; `inspect: off` skips it (no event); `shadow` records the would-be
+  verdict in `override_reason` and serves; `challenge: always` runs the
+  challenge gate for clean requests without turning the event into a
+  Challenge (so no CDN action fires); `policy {}` and `packs {}` become a
+  `RequestScope` for `Pipeline::process_scoped` — `RuleSet::evaluate_scoped`
+  skips (`off`), demotes (`shadow`) or promotes (`enforce`, via the
+  `promotions` table built from the enforce variant of shadow packs) the
+  default-pack rules.
+
+### 30.4 Loading (`sentry-cli/src/config.rs`)
+
+`--config` file or directory, else `./sentry.conf`, else
+`/etc/sentry/sentry.conf`; then `conf.d/*.conf`; `include:` anywhere;
+`sentry.auto.conf` (only `routes`/`rules`, appended + deduped); `.env`;
+`SENTRY_*` overlay (field-level JSON merge). A legacy `sentry.toml` fails
+with the `sentry config migrate` command to run. `sentry config files` lists
+what a load reads; `config show [--full]` prints the effective config.
+

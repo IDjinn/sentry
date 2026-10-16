@@ -3,5 +3,5 @@ target/
 .github/
 docs/
 *.md
-!config/sentry.example.toml
+!config/sentry.example.conf
 deploy/k8s/

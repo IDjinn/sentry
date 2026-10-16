@@ -54,7 +54,7 @@ pub struct TailOptions {
 /// Run the TUI. Requires a loaded config with `storage.postgres.url`.
 pub async fn run(cfg: Option<&SentryConfig>, opts: TailOptions) -> io::Result<()> {
     let Some(cfg) = cfg else {
-        println!("TUI needs a config — pass --config or create sentry.toml");
+        println!("TUI needs a config — pass --config or create sentry.conf");
         return Ok(());
     };
     if cfg.storage.postgres.url.is_empty() {

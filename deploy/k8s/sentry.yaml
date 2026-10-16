@@ -28,7 +28,7 @@ spec:
           args: ["run"]
           env:
             - name: SENTRY_CONFIG
-              value: /etc/sentry/sentry.toml
+              value: /etc/sentry/sentry.conf
             - name: SENTRY_STORAGE__POSTGRES__URL
               value: postgres://sentry@postgres.sentry.svc.cluster.local:5432/sentry
             - name: SENTRY_CF_TOKEN

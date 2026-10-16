@@ -21,7 +21,7 @@ Leia-o antes de tocar na arquitetura ou adicionar fases.
 - **Async**: tokio
 - **CLI**: clap (derive) + ratatui (TUI) + crossterm
 - **Storage**: Postgres (sqlx, migrations em `crates/sentry-storage/migrations/`)
-- **Config**: figment (TOML + env overlay, prefixo `SENTRY_`)
+- **Config**: `sentry.conf` nginx-like (crate `sentry-conf`: parser, `include:`, multi-arquivo, serde) mapeado para `SentryConfig` em `sentry_core::conf`; env overlay `SENTRY_*` por cima (figment só para o `Env`)
 - **HTTP client**: reqwest (native-tls no Windows / rustls em containers)
 - **IA**: ort (ONNX, feature `onnx` opcional) + trait `LlmProvider` (OpenRouter default)
 - **Geo**: maxminddb (GeoLite2 local)
@@ -72,6 +72,7 @@ sentry/
 ├── AGENTS.md                  # este arquivo
 ├── crates/
 │   ├── sentry-core/           # lib: Event, ProtocolData, Signal, traits, rules engine
+│   ├── sentry-conf/           # linguagem de config nginx-like (parser, includes, serde de/ser) — pura
 │   ├── sentry-storage/        # Postgres (sqlx) + migrations/*.sql
 │   ├── sentry-ai/             # trait ThreatModel (ONNX) + trait LlmProvider
 │   ├── sentry-geo/            # maxminddb geo/ASN enrichment
@@ -92,7 +93,7 @@ sentry/
 ├── deploy/
 │   ├── docker/               # Dockerfile + docker-compose
 │   └── k8s/                  # manifests Kubernetes
-└── config/sentry.example.toml
+└── config/sentry.example.conf
 ```
 
 ### Convenões de crates
@@ -500,7 +501,7 @@ não em runtime.
     "path"`): listas uma-por-linha → regra sintética `feed:<name>`
     (alternation literal case-insensitive, cap 5000; action default
     `log`); `parse_string_list`/`dataset_rule`/`MAX_DATASET_ENTRIES` no
-    core; exemplo bad-bot-blocker no `sentry.example.toml`. Params de
+    core; exemplo bad-bot-blocker no `sentry.example.conf`. Params de
     packs agora são achatados (`<pack>__<param>`) no daemon — corrigindo
     `country_blocklist__countries`, que nunca chegava ao builder
   - ✅ F7.10 Verificação de bots via rDNS (`botverify.rs` no core +
@@ -802,7 +803,7 @@ telemetria de handshake + provider de appliance
     heurísticas (allowlist enforce/shadow, dupla extensão, extensionless,
     oversize sintético)
   - ✅ F12.4 TUI: labels `UpDeny` (upload_disallowed) e `UpOversize`
-    (upload_oversize) em `tui/agg.rs`; `sentry.example.toml` documenta
+    (upload_oversize) em `tui/agg.rs`; `sentry.example.conf` documenta
     `[edge.error_pages]`, `oversize` e `allowed_extensions` (o rate limit
     de uploads já existia: `[uploads.flood]` 60s/30 arquivos/50 MiB →
     `UploadFlood` 25)
@@ -882,7 +883,7 @@ telemetria de handshake + provider de appliance
     verbosidade via `-v` global (árvore/resumo ≥1, detalhe ≥2). **Sem
     rotas → nada impresso, nada escrito, exit 0**; achando → tabela
     `METHODS | PATH` + `sentry.auto.toml` gravado atomicamente ao lado do
-    sentry.toml resolvido
+    sentry.conf resolvido
   - ✅ Cascade loader (`config.rs`): `sentry.auto.toml` no dir do config
     principal é mergeado em todo load — `routes.known`, `rules.pack` e
     `rules.custom` append + dedupe (case-insensitive; entrada existente
@@ -1055,6 +1056,54 @@ telemetria de handshake + provider de appliance
     verificação do cliente), config.rs (serde de vhosts + herança,
     validate, advisories por vhost, RuntimeConfig, default_group_servers)
 
+# F15 (concluída): `sentry.conf` nginx-like + roteamento por location na
+# edge (detalhes em `ARCHITECTURE.md` §30)
+  - ✅ Crate `sentry-conf` (pura): `key: value`, blocos `nome [label…] {}`,
+    listas, strings `"…"` (com `${ENV:-default}`) e `'…'` (raw), comentários
+    `#`/`//`/`/* */`, durações/tamanhos (`24h`, `10mb`), `include:` com glob
+    em qualquer nível; deserializer serde com erro `arquivo:linha:col` +
+    caminho de blocos + sugestão "did you mean"; blocos sem label repetidos
+    (inclusive em arquivos diferentes) são mesclados, escalar repetido é erro
+    com as duas posições; emissor (`ser`) com diff contra defaults
+  - ✅ `sentry_core::conf`: schema (`schema.rs`, tudo `Option`) ⇄
+    `SentryConfig` (`lower.rs`: lower + raise); blocos `sentry`, `server`,
+    `storage`, `detect`, `trust`, `rules`, `routes`, `source`, `action`,
+    `dashboard`, `metrics`, `http`, `tcp`; TOML removido do caminho de load
+    (`toml` só no `sentry config migrate` e nos testes legados do core);
+    options de source/action viram `serde_json::Value` (`ttl: 24h` →
+    `ttl_secs`)
+  - ✅ Roteamento (`sentry_core::edge_routes` + `sentry-edge/src/routing.rs`,
+    substitui o `VhostRouter`): `upstream NAME {}`, `site host… {}` (exato >
+    `*.sufixo` mais longo > `~regex` > default), `location [=|^~|~|~*]`
+    com prioridade nginx, `match {}` (method/query/header/cookie/host/
+    scheme/ip/args/path, operadores `~ ~* !~ != present absent`; location
+    que não casa cai para a próxima candidata), `proxy_pass` (grupo ou URL;
+    path na URL substitui o prefixo), `return`/`redirect`, `rewrite` (com
+    `$1`, `$host`, `$request_uri`, `$arg_x`, `$http_x`…), set/remove de
+    headers de request/response, `timeout` e `response_buffering` por
+    location; sem rota → 404
+  - ✅ Sintaxe enxuta: `http { proxy_pass: URL }` para um backend só;
+    `site dominio… { "/path": alvo }` (alvo = upstream, URL, `[URL, URL]`
+    balanceado, `status "texto"` ou `redirect [code] "url"`) — açúcar
+    expandido na AST (`sentry_core::conf::sugar`) antes do serde; `tls:
+    cert key`; headers como mapa (`request_headers { X: v, Cookie: off }`);
+    segurança direto na location (sem bloco `security {}`); emissor
+    imprime blocos pequenos numa linha
+  - ✅ Segurança herdada http → site → location: `inspect` (on/
+    shadow/off — off pula o pipeline, shadow registra "would block" e nunca
+    age), `policy {}` (mapa de nível por location), `challenge: always`,
+    `rate_limit: 100/1m` (janela fixa por location+IP), `allow`/`deny`
+    (CIDR), `packs { x: off|shadow|enforce }` via `Pipeline::process_scoped`
+    + `RuleSet::evaluate_scoped` (packs em shadow global guardam as ações
+    de enforce em `promotions` para serem promovidos por location)
+  - ✅ CLI: busca `sentry.conf` (cwd → /etc/sentry), `--config` aceita
+    diretório, `conf.d/*.conf` automático, `sentry.auto.conf` (cascade de
+    routes/rules), `.env`, overlay `SENTRY_*`; `sentry.toml` legado é
+    recusado com dica; `sentry config show [--full]`, `config files`,
+    `config migrate <toml> [--out]`; `sentry auto` grava `sentry.auto.conf`
+  - ✅ Exemplos/deploy convertidos (`config/sentry.example.conf`,
+    `config/sentry.aaPanel.conf`, honeypot, Docker, k8s, CI)
+
 Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4; §27 F12 idem; §28 F13 idem; §29 F14 idem; §3 subprojeto auto — v1 entregue, A.5/A.7/A.12 restantes).
 
 ### Status atual (verificação contínua)
@@ -1084,7 +1133,7 @@ cargo test --all
 
 - Segredos (tokens Cloudflare, LLM, DB) **nunca** em config commitada. Via
   env (`SENTRY_CF_TOKEN`, `SENTRY_LLM_KEY`, `SENTRY_STORAGE__POSTGRES__URL`).
-- `sentry.example.toml` tem placeholders, não valores reais.
+- `sentry.example.conf` tem placeholders, não valores reais (segredos via `${ENV}` ou overlay `SENTRY_*`).
 - O `sensitive_paths` pack bloqueia `.env`, `.git/`, `.ssh/`, etc. por
   default — ao expor uma rota allowlistada, justifique no PR.
 

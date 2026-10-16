@@ -1,6 +1,6 @@
 //! `sentry auto` orchestration: filesystem framework scan, on-disk server
 //! config detection and a bounded live HTTP probe of the local web
-//! service, merged into `sentry.auto.toml`.
+//! service, merged into `sentry.auto.conf`.
 //!
 //! Module flags are opt-in: no flags runs everything (`--probe` + `--disk`
 //! equivalent); passing one or more restricts the run to those modules.
@@ -334,33 +334,37 @@ fn nginx_extra_dirs() -> Vec<PathBuf> {
     .collect()
 }
 
-/// Where `sentry.auto.toml` goes: next to the resolved main config, or the
-/// best config directory available.
+/// Where `sentry.auto.conf` goes: next to the resolved main config (or
+/// inside a config directory), else the best config directory available.
 fn auto_file_path(config_path: Option<&str>) -> PathBuf {
+    let auto = crate::config::AUTO_FILE;
     if let Some(main) = config_path {
         let main = Path::new(main);
+        if main.is_dir() {
+            return main.join(auto);
+        }
         if let Some(parent) = main.parent() {
             if parent.as_os_str().is_empty() {
-                return PathBuf::from("sentry.auto.toml");
+                return PathBuf::from(auto);
             }
-            return parent.join("sentry.auto.toml");
+            return parent.join(auto);
         }
     }
-    if Path::new("sentry.toml").exists() {
-        return PathBuf::from("sentry.auto.toml");
+    if Path::new(crate::config::MAIN_FILE).exists() {
+        return PathBuf::from(auto);
     }
     let etc = PathBuf::from("/etc/sentry");
-    if etc.join("sentry.toml").exists() {
-        return etc.join("sentry.auto.toml");
+    if etc.join(crate::config::MAIN_FILE).exists() {
+        return etc.join(auto);
     }
-    PathBuf::from("sentry.auto.toml")
+    PathBuf::from(auto)
 }
 
 /// Write via temp file + rename so a crash never leaves a truncated auto
 /// config.
 fn write_atomic(path: &Path, artifacts: &AutoArtifacts) -> color_eyre::Result<()> {
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, artifacts.to_toml())?;
+    let tmp = path.with_extension("conf.tmp");
+    std::fs::write(&tmp, artifacts.to_conf())?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -484,10 +488,10 @@ mod tests {
 
     #[test]
     fn auto_file_path_prefers_config_parent() {
-        let path = auto_file_path(Some("/etc/sentry/sentry.toml"));
-        assert_eq!(path, PathBuf::from("/etc/sentry/sentry.auto.toml"));
-        let bare = auto_file_path(Some("sentry.toml"));
-        assert_eq!(bare, PathBuf::from("sentry.auto.toml"));
+        let path = auto_file_path(Some("/etc/sentry/sentry.conf"));
+        assert_eq!(path, PathBuf::from("/etc/sentry/sentry.auto.conf"));
+        let bare = auto_file_path(Some("sentry.conf"));
+        assert_eq!(bare, PathBuf::from("sentry.auto.conf"));
     }
 
     #[test]
@@ -504,7 +508,7 @@ mod tests {
     fn write_atomic_leaves_no_tmp() {
         let dir = std::env::temp_dir().join(format!("sentry-auto-write-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("sentry.auto.toml");
+        let target = dir.join("sentry.auto.conf");
         std::fs::write(&target, "old").unwrap();
         let artifacts = AutoArtifacts {
             routes: vec![sentry_core::config::RouteDefConfig {
@@ -515,8 +519,9 @@ mod tests {
         };
         write_atomic(&target, &artifacts).unwrap();
         let content = std::fs::read_to_string(&target).unwrap();
-        assert!(content.contains("[[routes.known]]"));
-        assert!(!dir.join("sentry.auto.toml.tmp").exists());
+        assert!(content.contains("routes {"), "{content}");
+        assert!(content.contains("\"/x\": GET"), "{content}");
+        assert!(!dir.join("sentry.auto.conf.tmp").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -62,6 +62,51 @@ pub fn build_default_ruleset_with(
     pack_modes: &std::collections::HashMap<String, String>,
     bot_verify_enabled: bool,
 ) -> RuleSet {
+    let mut set = build_pack_rules(pack_modes, bot_verify_enabled);
+    // Shadow packs run as `Log`; remember their enforce actions so an edge
+    // location can promote them (`packs { x: enforce }`).
+    let mut enforced_modes = pack_modes.clone();
+    let mut any_shadow = false;
+    for name in PackMode::all_pack_names() {
+        let mode = pack_modes
+            .get(*name)
+            .map(|s| PackMode::parse(s))
+            .unwrap_or_else(|| default_mode(name));
+        if mode == PackMode::Shadow {
+            enforced_modes.insert((*name).to_string(), "enforce".to_string());
+            any_shadow = true;
+        }
+    }
+    if any_shadow {
+        let shadow_ids: std::collections::HashMap<&str, RuleAction> =
+            set.iter().map(|r| (r.id.as_str(), r.action)).collect();
+        let promotions = build_pack_rules(&enforced_modes, bot_verify_enabled)
+            .iter()
+            .filter(|r| {
+                shadow_ids
+                    .get(r.id.as_str())
+                    .is_some_and(|a| *a == RuleAction::Log && r.action != RuleAction::Log)
+            })
+            .map(|r| (r.id.clone(), r.action))
+            .collect();
+        set.set_promotions(promotions);
+    }
+    set
+}
+
+/// Mode a pack runs in when the config does not mention it.
+fn default_mode(name: &str) -> PackMode {
+    match name {
+        "sensitive_paths" => PackMode::Enforce,
+        "crawlers_good" | "country_blocklist" | "host_allowlist" => PackMode::Off,
+        _ => PackMode::Shadow,
+    }
+}
+
+fn build_pack_rules(
+    pack_modes: &std::collections::HashMap<String, String>,
+    bot_verify_enabled: bool,
+) -> RuleSet {
     let mut rules = Vec::new();
 
     let sp_mode = pack_modes

@@ -106,7 +106,7 @@ pub type RuleId = String;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleSource {
-    /// Defined in `sentry.toml`.
+    /// Defined in `sentry.conf` (`rules { rule … }`).
     Config,
     /// Created via CLI / dashboard, stored in Postgres.
     Db,
@@ -188,6 +188,17 @@ pub struct Rule {
 pub struct RuleSet {
     /// Rules sorted by priority ascending.
     rules: Vec<Rule>,
+    /// Enforce action of default-pack rules that run in `shadow` (as `Log`)
+    /// — lets a location scope promote a shadow pack to enforce.
+    promotions: std::collections::HashMap<RuleId, RuleAction>,
+}
+
+/// Pack a default-pack rule belongs to (its first tag).
+fn rule_pack(rule: &Rule) -> Option<&str> {
+    match rule.source {
+        RuleSource::DefaultPack => rule.tags.first().map(String::as_str),
+        _ => None,
+    }
 }
 
 /// A hot-reloadable handle to a [`RuleSet`].
@@ -278,7 +289,67 @@ impl RuleSet {
     /// Build a ruleset from an unsorted collection of rules.
     pub fn new(mut rules: Vec<Rule>) -> Self {
         rules.sort_by_key(|r| r.priority);
-        Self { rules }
+        Self {
+            rules,
+            promotions: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record the enforce actions of shadow-pack rules (see
+    /// [`evaluate_scoped`](Self::evaluate_scoped)).
+    pub fn set_promotions(&mut self, promotions: std::collections::HashMap<RuleId, RuleAction>) {
+        self.promotions = promotions;
+    }
+
+    /// Evaluate with per-request pack overrides (location `packs {}`):
+    /// `off` skips the pack's rules, `shadow` turns its short-circuits into
+    /// annotations, `enforce` promotes a shadow pack's `Log` rules to their
+    /// enforce action. Returns the matching rule (with the effective action)
+    /// and whether it short-circuits.
+    pub fn evaluate_scoped(
+        &self,
+        evt: &Event,
+        backend: Option<&dyn RateLimitBackend>,
+        packs: &std::collections::HashMap<String, crate::packs::PackMode>,
+    ) -> Option<(Rule, bool)> {
+        use crate::packs::PackMode;
+        if packs.is_empty() {
+            return self
+                .evaluate_with(evt, backend)
+                .map(|(r, sc)| (r.clone(), sc));
+        }
+        for rule in &self.rules {
+            if !rule.enabled {
+                continue;
+            }
+            let mode = rule_pack(rule).and_then(|p| packs.get(p)).copied();
+            if mode == Some(PackMode::Off) {
+                continue;
+            }
+            if !rule.match_.matches_with(evt, backend) {
+                continue;
+            }
+            let action = match mode {
+                Some(PackMode::Shadow) => RuleAction::Log,
+                Some(PackMode::Enforce) => self
+                    .promotions
+                    .get(&rule.id)
+                    .copied()
+                    .unwrap_or(rule.action),
+                _ => rule.action,
+            };
+            let short_circuit = matches!(
+                action,
+                RuleAction::Allow
+                    | RuleAction::Block
+                    | RuleAction::Challenge
+                    | RuleAction::RateLimit
+            );
+            let mut effective = rule.clone();
+            effective.action = action;
+            return Some((effective, short_circuit));
+        }
+        None
     }
 
     /// Number of rules in the set.

@@ -55,13 +55,13 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      SENTRY_CONFIG: /etc/sentry/sentry.toml
+      SENTRY_CONFIG: /etc/sentry/sentry.conf
       SENTRY_STORAGE__POSTGRES__URL: postgres://sentry:${SENTRY_PG_PASSWORD:?set in .env}@127.0.0.1:5432/sentry
       SENTRY_DISCORD_WEBHOOK_URL: ${SENTRY_DISCORD_WEBHOOK_URL:-}
       SENTRY_JEV_KEY: ${SENTRY_JEV_KEY:-}
       RUST_LOG: info,sentry=info
     volumes:
-      - ./sentry.toml:/etc/sentry/sentry.toml:ro
+      - ./sentry.conf:/etc/sentry/sentry.conf:ro
       # TLS certificate/key for the edge 443 listener (F8).
       - ./certs:/etc/sentry/certs:ro
       - nginxlogs:/var/log/nginx:ro
@@ -81,13 +81,13 @@ services:
       sentry:
         condition: service_started
     environment:
-      SENTRY_CONFIG: /etc/sentry/sentry.toml
+      SENTRY_CONFIG: /etc/sentry/sentry.conf
       SENTRY_STORAGE__POSTGRES__URL: postgres://sentry:${SENTRY_PG_PASSWORD:?set in .env}@postgres:5432/sentry
       SENTRY_SERVER__HOST: 0.0.0.0
       SENTRY_SESSION_SECRET: ${SENTRY_SESSION_SECRET:?set in .env}
       RUST_LOG: info,sentry=info
     volumes:
-      - ./sentry.toml:/etc/sentry/sentry.toml:ro
+      - ./sentry.conf:/etc/sentry/sentry.conf:ro
     ports:
       # Loopback for SSH tunneling + the WireGuard host address.
       - "127.0.0.1:8080:8080"

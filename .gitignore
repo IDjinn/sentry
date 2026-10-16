@@ -5,11 +5,15 @@
 *.swo
 .env
 sentry.toml
+sentry.conf
+sentry.auto.conf
+conf.d/
 config/sentry.toml
+config/sentry.conf
 dataset.csv
 
 # Honeypot deploy: local-only files
-!deploy/honeypot/sentry.toml
+!deploy/honeypot/sentry.conf
 deploy/honeypot/certs/
 
 # Local agent/tooling state (never commit)

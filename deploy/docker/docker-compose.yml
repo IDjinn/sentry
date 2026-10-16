@@ -31,7 +31,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      SENTRY_CONFIG: /etc/sentry/sentry.toml
+      SENTRY_CONFIG: /etc/sentry/sentry.conf
       SENTRY_STORAGE__POSTGRES__URL: postgres://sentry:${SENTRY_PG_PASSWORD:-changeme}@postgres:5432/sentry
       # Secrets via env, never in config:
       SENTRY_CF_TOKEN: ${SENTRY_CF_TOKEN:-}
@@ -39,7 +39,7 @@ services:
       SENTRY_LLM_KEY: ${SENTRY_LLM_KEY:-}
       RUST_LOG: info,sentry=debug
     volumes:
-      - ../../config/sentry.example.toml:/etc/sentry/sentry.toml:ro
+      - ../../config/sentry.example.conf:/etc/sentry/sentry.conf:ro
       # Mount nginx log if monitoring host nginx:
       # - /var/log/nginx:/var/log/nginx:ro
       - sentrydata:/var/lib/sentry

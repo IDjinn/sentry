@@ -27,6 +27,7 @@ windows-service = { version = "0.7", optional = true }
 
 [dependencies]
 sentry-core = { workspace = true }
+sentry-conf = { workspace = true }
 sentry-storage = { workspace = true }
 sentry-ai = { workspace = true }
 sentry-geo = { workspace = true }

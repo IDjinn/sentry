@@ -106,7 +106,7 @@ impl ErrorPages {
     pub fn from_dir(dir: &Path) -> Self {
         let mut out = Self::default();
         let Ok(entries) = std::fs::read_dir(dir) else {
-            tracing::warn!(dir = %dir.display(), "[edge.error_pages] dir unreadable — built-in pages only");
+            tracing::warn!(dir = %dir.display(), "http › error_pages: dir unreadable — built-in pages only");
             return out;
         };
         for entry in entries.flatten() {
@@ -132,12 +132,12 @@ impl ErrorPages {
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::warn!(file = %path.display(), error = %e, "[edge.error_pages] stat failed — skipped");
+                    tracing::warn!(file = %path.display(), error = %e, "http › error_pages: stat failed — skipped");
                     continue;
                 }
             };
             if meta.len() > MAX_PAGE_BYTES {
-                tracing::warn!(file = %path.display(), cap_kb = MAX_PAGE_BYTES / 1024, "[edge.error_pages] page too large — skipped");
+                tracing::warn!(file = %path.display(), cap_kb = MAX_PAGE_BYTES / 1024, "http › error_pages: page too large — skipped");
                 continue;
             }
             match std::fs::read_to_string(&path) {
@@ -149,7 +149,7 @@ impl ErrorPages {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(file = %path.display(), error = %e, "[edge.error_pages] page unreadable — skipped");
+                    tracing::warn!(file = %path.display(), error = %e, "http › error_pages: page unreadable — skipped");
                 }
             }
         }
@@ -342,6 +342,31 @@ fn base64(input: &[u8]) -> String {
         });
     }
     out
+}
+
+/// 404 when no site/location matches the request.
+pub fn not_found_page(custom: Option<&ErrorPages>, trace: Option<Uuid>) -> Response {
+    page_with(
+        custom,
+        StatusCode::NOT_FOUND,
+        "404 - Not Found",
+        "No site or location is configured for this request.",
+        trace,
+    )
+}
+
+/// Page for a location `return: <status>` without a body.
+pub fn status_page(
+    custom: Option<&ErrorPages>,
+    status: StatusCode,
+    trace: Option<Uuid>,
+) -> Response {
+    let title = format!(
+        "{} - {}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("Response")
+    );
+    page_with(custom, status, &title, "", trace)
 }
 
 #[cfg(test)]

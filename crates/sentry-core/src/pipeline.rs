@@ -329,6 +329,80 @@ const PENDING_TTL: Duration = Duration::from_secs(60);
 /// Per-IP cap on queued response signals (drop-oldest beyond it).
 const PENDING_MAX_PER_IP: usize = 16;
 
+/// Per-request overrides an edge location applies to the pipeline
+/// (`packs {…}` / `policy {…}` in a location).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RequestScope {
+    /// Pack mode overrides (`off` / `shadow` / `enforce`).
+    pub packs: HashMap<String, crate::packs::PackMode>,
+    /// Verdict per risk level (Info..Critical) replacing the global mapping.
+    pub levels: [Option<Verdict>; 5],
+}
+
+impl RequestScope {
+    /// Build from the config maps; invalid names are skipped (validation
+    /// reports them at load time).
+    pub fn from_maps(packs: &HashMap<String, String>, policy: &HashMap<String, String>) -> Self {
+        let mut scope = RequestScope {
+            packs: packs
+                .iter()
+                .map(|(k, v)| (k.clone(), crate::packs::PackMode::parse(v)))
+                .collect(),
+            ..Default::default()
+        };
+        for (level, verdict) in policy {
+            let idx = match level.as_str() {
+                "info" => 0,
+                "low" => 1,
+                "medium" => 2,
+                "high" => 3,
+                "critical" => 4,
+                _ => continue,
+            };
+            if let Ok(v) = crate::policy::parse_verdict(verdict) {
+                scope.levels[idx] = Some(v);
+            }
+        }
+        scope
+    }
+
+    /// No override.
+    pub fn is_empty(&self) -> bool {
+        self.packs.is_empty() && self.levels.iter().all(Option::is_none)
+    }
+
+    fn level_verdict(&self, level: RiskLevel) -> Option<Verdict> {
+        let idx = match level {
+            RiskLevel::Info => 0,
+            RiskLevel::Low => 1,
+            RiskLevel::Medium => 2,
+            RiskLevel::High => 3,
+            RiskLevel::Critical => 4,
+        };
+        self.levels[idx]
+    }
+}
+
+fn level_name(level: RiskLevel) -> &'static str {
+    match level {
+        RiskLevel::Info => "info",
+        RiskLevel::Low => "low",
+        RiskLevel::Medium => "medium",
+        RiskLevel::High => "high",
+        RiskLevel::Critical => "critical",
+    }
+}
+
+fn verdict_name(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Allow => "allow",
+        Verdict::RateLimit => "rate_limit",
+        Verdict::Challenge => "challenge",
+        Verdict::Block => "block",
+        Verdict::Quarantine => "quarantine",
+    }
+}
+
 /// Output of processing a single event.
 #[derive(Debug, Clone)]
 pub struct ProcessedEvent {
@@ -463,6 +537,12 @@ impl Pipeline {
     /// Process a single event through the full pipeline.
     #[tracing::instrument(skip(self, evt), fields(id = %evt.id, ip = %evt.client_ip))]
     pub fn process(&self, evt: &Event) -> ProcessedEvent {
+        self.process_scoped(evt, &RequestScope::default())
+    }
+
+    /// [`process`](Self::process) with per-request overrides from an edge
+    /// location (`packs {}`, `policy {}`).
+    pub fn process_scoped(&self, evt: &Event, scope: &RequestScope) -> ProcessedEvent {
         // Trusted IPs (F7.2 `[real_ip] trusted_ips`) are exempt from every
         // detector and verdict — the "you can't lock yourself out" guard.
         if let Some(trust) = &self.trust {
@@ -532,7 +612,7 @@ impl Pipeline {
         let ruleset = self.rules.read().unwrap();
 
         if let Some((rule, short_circuit)) =
-            ruleset.evaluate_with(evt, self.rate_limiter.as_deref())
+            ruleset.evaluate_scoped(evt, self.rate_limiter.as_deref(), &scope.packs)
         {
             let action = rule.action;
             if short_circuit {
@@ -698,7 +778,19 @@ impl Pipeline {
             self.score_with_weights(signals, bonus)
         };
 
-        let (action, override_reason) = self.policy.decide(analysis.risk_level, evt);
+        let (mut action, mut override_reason) = self.policy.decide(analysis.risk_level, evt);
+        if override_reason.is_none() {
+            if let Some(v) = scope.level_verdict(analysis.risk_level) {
+                if v != action {
+                    override_reason = Some(format!(
+                        "location policy: {} → {}",
+                        level_name(analysis.risk_level),
+                        verdict_name(v)
+                    ));
+                }
+                action = v;
+            }
+        }
         let decision = Decision {
             analysis: analysis.clone(),
             action,
@@ -1093,6 +1185,66 @@ mod tests {
 
     fn pipeline() -> Pipeline {
         Pipeline::new(RuleSet::default(), RouteValidator::default())
+    }
+
+    fn pack_pipeline(mode: &str) -> Pipeline {
+        let modes = HashMap::from([("sensitive_paths".to_string(), mode.to_string())]);
+        Pipeline::new(
+            crate::packs::build_default_ruleset(&modes),
+            RouteValidator::default(),
+        )
+    }
+
+    #[test]
+    fn scope_promotes_shadow_pack_and_disables_enforced_pack() {
+        let evt = http_evt("/.env");
+        let shadow = pack_pipeline("shadow");
+        assert_ne!(
+            shadow
+                .process(&evt)
+                .rule_hit
+                .as_deref()
+                .map(|r| r.starts_with("sensitive_path")),
+            Some(true)
+        );
+        let enforce_here = RequestScope::from_maps(
+            &HashMap::from([("sensitive_paths".to_string(), "enforce".to_string())]),
+            &HashMap::new(),
+        );
+        let pe = shadow.process_scoped(&evt, &enforce_here);
+        assert_eq!(pe.decision.action, Verdict::Block, "{:?}", pe.decision);
+
+        let enforced = pack_pipeline("enforce");
+        assert_eq!(enforced.process(&evt).decision.action, Verdict::Block);
+        let off_here = RequestScope::from_maps(
+            &HashMap::from([("sensitive_paths".to_string(), "off".to_string())]),
+            &HashMap::new(),
+        );
+        assert!(enforced.process_scoped(&evt, &off_here).rule_hit.is_none());
+    }
+
+    #[test]
+    fn scope_level_policy_replaces_the_global_mapping() {
+        let p = pipeline();
+        let evt = http_evt("/search?q=' OR 1=1--");
+        let base = p.process(&evt);
+        assert!(
+            base.analysis.risk_level >= RiskLevel::Medium,
+            "{:?}",
+            base.analysis
+        );
+        let mut policy = HashMap::new();
+        for level in ["medium", "high", "critical"] {
+            policy.insert(level.to_string(), "allow".to_string());
+        }
+        let scope = RequestScope::from_maps(&HashMap::new(), &policy);
+        let pe = p.process_scoped(&evt, &scope);
+        assert_eq!(pe.decision.action, Verdict::Allow);
+        assert!(pe
+            .decision
+            .override_reason
+            .unwrap()
+            .starts_with("location policy"));
     }
 
     #[test]

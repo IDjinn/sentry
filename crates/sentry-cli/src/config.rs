@@ -1,87 +1,146 @@
-//! Config loading: figment (TOML + env overlay).
+//! Config loading: `sentry.conf` (nginx-like format, see
+//! [`sentry_core::conf`]) plus the env overlay.
 //!
-//! Env vars override config values using the `SENTRY_` prefix with nested
-//! keys separated by `__` (e.g. `SENTRY_STORAGE__POSTGRES__URL`). Overrides
-//! are field-level: setting `SENTRY_SERVER__HOST` replaces `server.host` and
-//! leaves the rest of `[server]` (auth, users, …) untouched.
+//! Files, in load order:
+//! 1. the main config — `--config`/`SENTRY_CONFIG` (a file, or a directory:
+//!    every `*.conf` in it, sorted), else `./sentry.conf`, else
+//!    `/etc/sentry/sentry.conf`;
+//! 2. `conf.d/*.conf` next to the main file (sorted) — split configs such
+//!    as `detect.conf`, `sites/…` work the same through `include:`;
+//! 3. `sentry.auto.conf` next to it (written by `sentry auto`): its routes
+//!    and rules are appended and deduped, existing entries win;
+//! 4. `.env` next to the config (dotenv-style, never overrides real env
+//!    vars), then the `SENTRY_*` env overlay: nested keys separated by `__`
+//!    (`SENTRY_STORAGE__POSTGRES__URL`) override single fields of the
+//!    runtime model and leave their siblings untouched.
 //!
-//! A `.env` file next to the resolved config (the same file the systemd unit
-//! uses as `EnvironmentFile`) is loaded dotenv-style before the overlay, so
-//! CLI commands run from a plain shell see the same secrets the daemon does.
-//! Vars already present in the environment always win.
+//! The same unlabeled block may appear in several files (`detect {}` in
+//! `detect.conf`); its contents merge, and a scalar set twice is an error
+//! naming both places. A legacy `sentry.toml` is rejected with a pointer to
+//! `sentry config migrate`.
 
 use std::path::{Path, PathBuf};
 
-use figment::providers::{Env, Format, Serialized, Toml};
-use figment::{Figment, Provider};
+use figment::providers::Env;
+use figment::Provider;
 use sentry_core::config::SentryConfig;
+
+/// Main config file name.
+pub const MAIN_FILE: &str = "sentry.conf";
 
 /// Generated config cascaded into every load (routes/rules are appended,
 /// never replaced).
-pub const AUTO_FILE: &str = "sentry.auto.toml";
+pub const AUTO_FILE: &str = "sentry.auto.conf";
+
+/// Directory of extra config files loaded after the main file.
+pub const CONF_DIR: &str = "conf.d";
 
 /// Secrets file looked up next to the resolved config (systemd
 /// `EnvironmentFile` companion); fed into the env overlay, non-override.
 const ENV_FILE: &str = ".env";
 
-/// Load config from the default search path, merging TOML + env.
-pub fn load(path: Option<&Path>) -> color_eyre::Result<SentryConfig> {
-    let figment = Figment::from(Serialized::defaults(SentryConfig::default()));
+/// The config files a load resolves to.
+#[derive(Debug, Clone, Default)]
+pub struct Resolved {
+    /// Main file or directory (`None` = defaults only).
+    pub main: Option<PathBuf>,
+    /// Directory holding the main config (auto file, `.env`, `conf.d`).
+    pub dir: Option<PathBuf>,
+    /// Files parsed, in order (auto file excluded).
+    pub files: Vec<PathBuf>,
+}
 
-    // Try explicit path, then cwd, then /etc/sentry/sentry.toml.
-    let main_path = match path {
+fn is_legacy_toml(p: &Path) -> bool {
+    p.extension().is_some_and(|e| e == "toml")
+}
+
+/// Resolve which files a load reads.
+pub fn resolve(path: Option<&Path>) -> color_eyre::Result<Resolved> {
+    let main = match path {
         Some(p) => Some(PathBuf::from(p)),
-        None => {
-            let cwd = PathBuf::from("sentry.toml");
-            let etc = PathBuf::from("/etc/sentry/sentry.toml");
-            if cwd.exists() {
-                Some(cwd)
-            } else if etc.exists() {
-                Some(etc)
-            } else {
-                None
+        None => [
+            PathBuf::from(MAIN_FILE),
+            PathBuf::from("/etc/sentry").join(MAIN_FILE),
+        ]
+        .into_iter()
+        .find(|p| p.exists()),
+    };
+    let Some(main) = main else {
+        if path.is_none() {
+            for legacy in ["sentry.toml", "/etc/sentry/sentry.toml"] {
+                if Path::new(legacy).exists() {
+                    color_eyre::eyre::bail!(
+                        "found legacy {legacy} but no sentry.conf — convert it with \
+                         `sentry config migrate {legacy} --out sentry.conf`"
+                    );
+                }
             }
         }
+        return Ok(Resolved::default());
     };
-    let figment = match &main_path {
-        Some(p) => figment.merge(Toml::file(p)),
-        None => figment,
-    };
-
-    // Cascade: sentry.auto.toml sits next to the main config (`sentry auto`
-    // writes it); its routes/rules are appended to the user's own values.
-    let auto_path = main_path
-        .as_ref()
-        .and_then(|p| p.parent())
-        .map(|dir| dir.join(AUTO_FILE))
-        .unwrap_or_else(|| PathBuf::from(AUTO_FILE));
-    let figment = if auto_path.exists() {
-        merge_auto_file(figment, &auto_path)?
+    if !main.exists() {
+        return Ok(Resolved::default());
+    }
+    if is_legacy_toml(&main) {
+        color_eyre::eyre::bail!(
+            "{} is a legacy TOML config — sentry now reads sentry.conf; convert it with \
+             `sentry config migrate {} --out sentry.conf`",
+            main.display(),
+            main.display()
+        );
+    }
+    let (dir, mut files) = if main.is_dir() {
+        let files: Vec<PathBuf> = sentry_conf::conf_files_in(&main)
+            .into_iter()
+            .filter(|f| f.file_name().is_some_and(|n| n != AUTO_FILE))
+            .collect();
+        (main.clone(), files)
     } else {
-        figment
+        let dir = main
+            .parent()
+            .map(Path::to_path_buf)
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or_else(|| PathBuf::from("."));
+        (dir, vec![main.clone()])
     };
+    files.extend(sentry_conf::conf_files_in(&dir.join(CONF_DIR)));
+    Ok(Resolved {
+        main: Some(main),
+        dir: Some(dir),
+        files,
+    })
+}
 
-    // Dotenv cascade: `.env` sits next to the main config and carries the
-    // secrets the daemon gets via `EnvironmentFile=`; loading it here gives
-    // interactive CLI commands the same view. Real env vars win.
-    if let Some(p) = &main_path {
-        if let Some(dir) = p.parent() {
-            load_env_file(dir);
+/// Load config from the default search path, merging files + env.
+pub fn load(path: Option<&Path>) -> color_eyre::Result<SentryConfig> {
+    let resolved = resolve(path)?;
+    let loader = sentry_conf::Loader::default();
+    let body = loader
+        .load_files(&resolved.files)
+        .map_err(|e| color_eyre::eyre::eyre!("config error: {e}"))?;
+    let mut cfg =
+        sentry_core::conf::from_body(&body).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+
+    if let Some(dir) = &resolved.dir {
+        let auto_path = dir.join(AUTO_FILE);
+        if auto_path.exists() {
+            merge_auto_file(&mut cfg, &auto_path)?;
         }
+        load_env_file(dir);
     }
 
-    // Env overlay: SENTRY_STORAGE__POSTGRES__URL=...
-    let figment = deep_merge_env(figment, Env::prefixed("SENTRY_").split("__"))?;
-
-    let mut cfg: SentryConfig = figment
-        .extract()
-        .map_err(|e| color_eyre::eyre::eyre!("config load error: {}", e))?;
-
+    let mut cfg = apply_env_overlay(cfg, Env::prefixed("SENTRY_").split("__"))?;
     for unknown in cfg.resolve_feed_presets() {
         eprintln!("warning: unknown feed preset `{unknown}` (see `sentry feeds list`)");
     }
-
     Ok(cfg)
+}
+
+/// Parse a legacy `sentry.toml` (for `sentry config migrate`).
+pub fn load_legacy_toml(path: &Path) -> color_eyre::Result<SentryConfig> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| color_eyre::eyre::eyre!("{}: {e}", path.display()))?;
+    toml::from_str(&text).map_err(|e| color_eyre::eyre::eyre!("{}: {e}", path.display()))
 }
 
 /// Load `<dir>/.env` into the process environment, dotenv-style: vars that
@@ -127,152 +186,90 @@ fn parse_env_file(content: &str) -> Vec<(String, String)> {
     pairs
 }
 
-/// Top-level sections the auto config may contribute to.
+/// Top-level blocks the auto config may contribute to.
 const AUTO_SECTIONS: &[&str] = &["routes", "rules"];
 
-/// Merge `sentry.auto.toml` into the figment: `routes.known`,
-/// `rules.pack` and `rules.custom` are appended and deduped (existing
-/// entries win); anything else in the file is warned about and ignored.
-fn merge_auto_file(figment: Figment, path: &Path) -> color_eyre::Result<Figment> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| color_eyre::eyre::eyre!("{}: {e}", path.display()))?;
-    let auto: toml::Value =
-        toml::from_str(&content).map_err(|e| color_eyre::eyre::eyre!("{}: {e}", path.display()))?;
-    let auto_json = serde_json::to_value(auto)
-        .map_err(|e| color_eyre::eyre::eyre!("{}: {e}", path.display()))?;
-
-    let mut merged: serde_json::Value = figment
-        .extract()
-        .map_err(|e| color_eyre::eyre::eyre!("config data: {e}"))?;
-    let ignored = merge_auto_json(&mut merged, auto_json);
-    for section in ignored {
+/// Merge `sentry.auto.conf`: `routes`, rule packs and custom rules are
+/// appended and deduped (existing entries win); any other block is warned
+/// about and ignored.
+fn merge_auto_file(cfg: &mut SentryConfig, path: &Path) -> color_eyre::Result<()> {
+    let body = sentry_conf::Loader::default()
+        .load_file(path)
+        .map_err(|e| color_eyre::eyre::eyre!("config error: {e}"))?;
+    let (kept, ignored): (Vec<_>, Vec<_>) = body
+        .into_iter()
+        .partition(|stmt| AUTO_SECTIONS.contains(&stmt.name()));
+    for stmt in ignored {
         eprintln!(
-            "warning: ignoring `{section}` in {} — only {} are merged",
+            "warning: ignoring `{}` in {} — only {} are merged",
+            stmt.name(),
             path.display(),
             AUTO_SECTIONS.join("/")
         );
     }
-
-    Ok(Figment::from(JsonOverlay(
-        merged,
-        "sentry.auto.toml (cascade)",
-    )))
+    let auto = sentry_core::conf::from_body(&kept).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+    merge_auto(cfg, auto);
+    Ok(())
 }
 
-/// Append the auto config's routes/rules onto the merged config. Returns
-/// the ignored top-level sections.
-fn merge_auto_json(base: &mut serde_json::Value, auto: serde_json::Value) -> Vec<String> {
-    let mut ignored = Vec::new();
-    let serde_json::Value::Object(auto) = auto else {
-        return ignored;
-    };
-    for (key, value) in auto {
-        match key.as_str() {
-            "routes" => merge_auto_arrays(base, "routes", "known", &["path"], &value),
-            "rules" => {
-                merge_auto_arrays(base, "rules", "pack", &["name"], &value);
-                merge_auto_arrays(base, "rules", "custom", &["name"], &value);
-            }
-            other => ignored.push(other.to_string()),
+/// Append the auto config's routes/packs/custom rules, skipping entries
+/// whose path/name (case-insensitive) already exists.
+fn merge_auto(cfg: &mut SentryConfig, auto: SentryConfig) {
+    for route in auto.routes.known {
+        if !cfg
+            .routes
+            .known
+            .iter()
+            .any(|r| r.path.eq_ignore_ascii_case(&route.path))
+        {
+            cfg.routes.known.push(route);
         }
     }
-    ignored
-}
-
-/// Append `auto[section][array_key]` entries onto
-/// `base[section][array_key]`, skipping entries whose `dedupe_keys` values
-/// already exist (case-insensitive). Other keys inside the section are
-/// skipped.
-fn merge_auto_arrays(
-    base: &mut serde_json::Value,
-    section: &str,
-    array_key: &str,
-    dedupe_keys: &[&str],
-    auto_section: &serde_json::Value,
-) {
-    let Some(entries) = auto_section.get(array_key).and_then(|v| v.as_array()) else {
-        return;
-    };
-    let entry = base
-        .as_object_mut()
-        .expect("merged config is an object")
-        .entry(section.to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    if !entry.is_object() {
-        *entry = serde_json::json!({});
-    }
-    let list = entry
-        .as_object_mut()
-        .expect("section is an object")
-        .entry(array_key.to_string())
-        .or_insert_with(|| serde_json::json!([]));
-    if !list.is_array() {
-        *list = serde_json::json!([]);
-    }
-    let arr = list.as_array_mut().expect("array key is an array");
-    for item in entries {
-        if entry_key(item, dedupe_keys).is_some_and(|key| {
-            arr.iter()
-                .any(|e| entry_key(e, dedupe_keys).as_deref() == Some(key.as_str()))
-        }) {
-            continue;
+    for pack in auto.rules.packs {
+        if !cfg
+            .rules
+            .packs
+            .iter()
+            .any(|p| p.name.eq_ignore_ascii_case(&pack.name))
+        {
+            cfg.rules.packs.push(pack);
         }
-        arr.push(item.clone());
+    }
+    for rule in auto.rules.custom {
+        if !cfg
+            .rules
+            .custom
+            .iter()
+            .any(|r| r.name.eq_ignore_ascii_case(&rule.name))
+        {
+            cfg.rules.custom.push(rule);
+        }
     }
 }
 
-/// Lowercased composite key of an entry over `keys` (dedupe identity).
-fn entry_key(entry: &serde_json::Value, keys: &[&str]) -> Option<String> {
-    let mut key = String::new();
-    for k in keys {
-        let value = entry.get(*k)?.as_str()?.to_ascii_lowercase();
-        key.push_str(&value);
-        key.push('\u{1}');
-    }
-    Some(key)
-}
-
-/// Deep-merge an env provider into `figment`.
-///
-/// `Figment::merge` replaces a collided top-level key wholesale, so a single
-/// `SENTRY_SERVER__HOST` would silently wipe the rest of the `[server]` table
-/// (auth included). Both layers are flattened to JSON, merged field-by-field,
-/// and the result is served back as a default-profile provider: only the
-/// referenced leaf is overridden.
-fn deep_merge_env(figment: Figment, env: Env) -> color_eyre::Result<Figment> {
-    let mut merged: serde_json::Value = figment
-        .extract()
-        .map_err(|e| color_eyre::eyre::eyre!("config data: {e}"))?;
-
+/// Apply the env overlay field by field: the config is flattened to JSON,
+/// env keys are merged leaf-by-leaf (a single `SENTRY_SERVER__HOST` never
+/// wipes the rest of `server`), and the result is deserialized back.
+fn apply_env_overlay(cfg: SentryConfig, env: Env) -> color_eyre::Result<SentryConfig> {
+    let mut merged =
+        serde_json::to_value(&cfg).map_err(|e| color_eyre::eyre::eyre!("config data: {e}"))?;
     let env_data = env
         .data()
         .map_err(|e| color_eyre::eyre::eyre!("env overlay: {e}"))?;
+    let mut touched = false;
     for (_profile, dict) in env_data {
+        if dict.is_empty() {
+            continue;
+        }
         let overlay =
             serde_json::to_value(&dict).map_err(|e| color_eyre::eyre::eyre!("env overlay: {e}"))?;
         merge_json(&mut merged, overlay);
+        touched = true;
     }
-
-    Ok(Figment::from(JsonOverlay(merged, "env overlay (deep)")))
-}
-
-/// Provider serving a whole resolved config under the default profile
-/// (used by the env deep-merge and the `sentry.auto.toml` cascade).
-struct JsonOverlay(serde_json::Value, &'static str);
-
-impl figment::Provider for JsonOverlay {
-    fn metadata(&self) -> figment::Metadata {
-        figment::Metadata::named(self.1)
+    if !touched {
+        return Ok(cfg);
     }
-
-    fn data(
-        &self,
-    ) -> Result<figment::value::Map<figment::Profile, figment::value::Dict>, figment::Error> {
-        let dict = figment::value::Value::serialize(&self.0)?
-            .into_dict()
-            .ok_or_else(|| figment::Error::from("env overlay: expected a dictionary"))?;
-        Ok(figment::Profile::Default.collect(dict))
-    }
+    serde_json::from_value(merged).map_err(|e| color_eyre::eyre::eyre!("env overlay: {e}"))
 }
 
 fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
@@ -298,12 +295,19 @@ mod tests {
     use super::*;
 
     /// Serializes tests that mutate the process environment or call
-    /// `load()` (which reads it): figment reads `SENTRY_*` vars at load
+    /// `load()` (which reads it): the overlay reads `SENTRY_*` vars at load
     /// time, so parallel tests race on `set_var`/`remove_var` windows.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sentry_cfg_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -327,30 +331,21 @@ mod tests {
         let _env = env_lock();
         std::env::set_var("SENTRY_METRICS__PORT", "9999");
         // Explicit (absent) path skips the cwd//etc search — defaults only.
-        let cfg = load(Some(Path::new("/nonexistent/sentry.toml"))).unwrap();
+        let cfg = load(Some(Path::new("/nonexistent/sentry.conf"))).unwrap();
         std::env::remove_var("SENTRY_METRICS__PORT");
         assert_eq!(cfg.metrics.port, 9999);
-        // Sibling keys of [metrics] survive the override.
+        // Sibling keys of metrics survive the override.
         assert!(cfg.metrics.enabled);
     }
 
     #[test]
     fn env_override_keeps_file_auth_section() {
         let _env = env_lock();
-        let path = std::env::temp_dir().join("sentry_cfg_env_test.toml");
+        let dir = tmp("env_auth");
+        let path = dir.join(MAIN_FILE);
         std::fs::write(
             &path,
-            "[server]\n\
-             host = \"127.0.0.1\"\n\
-             port = 8080\n\
-             \n\
-             [server.auth]\n\
-             mode = \"password\"\n\
-             \n\
-             [[server.auth.users]]\n\
-             username = \"admin\"\n\
-             password_hash = \"argon2-here\"\n\
-             role = \"admin\"\n",
+            "dashboard {\n  listen: 127.0.0.1:8080\n  auth {\n    mode: password\n    user admin {\n      password_hash: \"argon2-here\"\n      role: admin\n    }\n  }\n}\n",
         )
         .unwrap();
         std::env::set_var("SENTRY_SERVER__HOST", "0.0.0.0");
@@ -392,9 +387,9 @@ mod tests {
     #[test]
     fn env_file_next_to_config_feeds_overlay() {
         let _env = env_lock();
-        let dir = std::env::temp_dir().join(format!("sentry_cfg_dotenv_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let main_path = write_config(&dir, "", None);
+        let dir = tmp("dotenv");
+        let main_path = dir.join(MAIN_FILE);
+        std::fs::write(&main_path, "").unwrap();
         std::fs::write(
             dir.join(ENV_FILE),
             "SENTRY_STORAGE__POSTGRES__URL=postgres://fromfile/db\n",
@@ -411,106 +406,99 @@ mod tests {
             cfg.storage.postgres.url, "postgres://fromenv/db",
             "real env wins over the .env file"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    fn write_config(dir: &Path, main: &str, auto: Option<&str>) -> PathBuf {
-        let main_path = dir.join("sentry.toml");
-        std::fs::write(&main_path, main).unwrap();
-        if let Some(auto) = auto {
-            std::fs::write(dir.join(AUTO_FILE), auto).unwrap();
-        }
-        main_path
     }
 
     #[test]
-    fn auto_config_appends_routes_and_packs() {
+    fn split_files_conf_d_and_directory_loading() {
         let _env = env_lock();
-        let dir = std::env::temp_dir().join(format!("sentry_cfg_auto_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let main_path = write_config(
-            &dir,
-            "[[routes.known]]\npath = \"/mine\"\nmethods = [\"GET\"]\n",
-            Some(
-                "[[routes.known]]\npath = \"/api/*\"\n\n\
-                 [[rules.pack]]\nname = \"rate_scan\"\nmode = \"enforce\"\n\n\
-                 [[rules.custom]]\nname = \"auto_rule\"\npriority = 40\nmatch = 'path == \"/x\"'\naction = \"block\"\n",
-            ),
-        );
+        let dir = tmp("split");
+        std::fs::create_dir_all(dir.join(CONF_DIR)).unwrap();
+        std::fs::create_dir_all(dir.join("sites")).unwrap();
+        std::fs::write(
+            dir.join(MAIN_FILE),
+            "sentry { mode: inline }\ninclude: detect.conf\nhttp {\n  upstream app { server: http://127.0.0.1:1 }\n  include: \"sites/*.conf\"\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("detect.conf"), "detect { scan { window: 2m } }\n").unwrap();
+        std::fs::write(
+            dir.join("sites/a.conf"),
+            "site { host: a.test, proxy_pass: app }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(CONF_DIR).join("storage.conf"),
+            "storage { max_connections: 3 }\n",
+        )
+        .unwrap();
+        let cfg = load(Some(&dir.join(MAIN_FILE))).unwrap();
+        assert!(cfg.deployment.is_inline());
+        assert_eq!(cfg.scan.window_secs, 120);
+        assert_eq!(cfg.edge.sites[0].hosts, ["a.test"]);
+        assert_eq!(cfg.storage.postgres.max_connections, 3, "conf.d loaded");
+
+        let flat = tmp("flatdir");
+        std::fs::write(
+            flat.join("10-server.conf"),
+            "server { channel_buffer: 7 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            flat.join("20-detect.conf"),
+            "detect { scan { enabled: off } }\n",
+        )
+        .unwrap();
+        let cfg = load(Some(&flat)).unwrap();
+        assert_eq!(cfg.core.channel_buffer, 7);
+        assert!(!cfg.scan.enabled);
+    }
+
+    #[test]
+    fn legacy_toml_is_rejected_with_migration_hint() {
+        let dir = tmp("legacy");
+        let path = dir.join("sentry.toml");
+        std::fs::write(&path, "[core]\nchannel_buffer = 1\n").unwrap();
+        let err = load(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains("sentry config migrate"), "{err}");
+        let cfg = load_legacy_toml(&path).unwrap();
+        assert_eq!(cfg.core.channel_buffer, 1);
+    }
+
+    #[test]
+    fn auto_config_appends_and_dedupes() {
+        let _env = env_lock();
+        let dir = tmp("auto");
+        let main_path = dir.join(MAIN_FILE);
+        std::fs::write(
+            &main_path,
+            "routes { \"/Mine\": GET }\nrules { packs { tor: shadow } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(AUTO_FILE),
+            "routes {\n  \"/mine\": POST\n  \"/api/*\": any\n}\n\
+             rules {\n  packs { TOR: enforce, rate_scan: enforce }\n  rule auto_rule { priority: 40, match: 'path == \"/x\"', action: block }\n}\n\
+             dashboard { listen: 9.9.9.9:1 }\n",
+        )
+        .unwrap();
         let cfg = load(Some(&main_path)).unwrap();
         let paths: Vec<&str> = cfg.routes.known.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(
             paths,
-            vec!["/mine", "/api/*"],
-            "main route kept, auto appended"
+            ["/Mine", "/api/*"],
+            "existing path wins, new appended"
         );
-        assert_eq!(cfg.rules.packs[0].name, "rate_scan");
+        assert_eq!(cfg.routes.known[0].methods, ["GET"]);
+        let packs: Vec<(&str, &str)> = cfg
+            .rules
+            .packs
+            .iter()
+            .map(|p| (p.name.as_str(), p.mode.as_str()))
+            .collect();
+        assert_eq!(packs, [("tor", "shadow"), ("rate_scan", "enforce")]);
         assert_eq!(cfg.rules.custom[0].name, "auto_rule");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn auto_config_dedupes_by_path_and_name() {
-        let _env = env_lock();
-        let dir =
-            std::env::temp_dir().join(format!("sentry_cfg_auto_dedupe_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let main_path = write_config(
-            &dir,
-            "[[routes.known]]\npath = \"/Mine\"\nmethods = [\"GET\"]\n\n\
-             [[rules.pack]]\nname = \"tor\"\nmode = \"shadow\"\n",
-            Some(
-                "[[routes.known]]\npath = \"/mine\"\nmethods = [\"POST\"]\n\n\
-                 [[rules.pack]]\nname = \"TOR\"\nmode = \"enforce\"\n",
-            ),
-        );
-        let cfg = load(Some(&main_path)).unwrap();
-        assert_eq!(cfg.routes.known.len(), 1, "existing path wins over auto");
-        assert_eq!(cfg.routes.known[0].methods, vec!["GET"]);
-        assert_eq!(cfg.rules.packs.len(), 1);
-        assert_eq!(cfg.rules.packs[0].mode, "shadow");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn auto_config_ignores_unknown_sections() {
-        let _env = env_lock();
-        let dir =
-            std::env::temp_dir().join(format!("sentry_cfg_auto_unknown_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let main_path = write_config(
-            &dir,
-            "",
-            Some("[[routes.known]]\npath = \"/a\"\n\n[server]\nhost = \"9.9.9.9\"\n"),
-        );
-        let cfg = load(Some(&main_path)).unwrap();
-        assert_eq!(cfg.routes.known.len(), 1);
         assert_eq!(
             cfg.server.host, "127.0.0.1",
-            "auto file cannot touch server"
+            "auto file cannot touch dashboard"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn merge_auto_arrays_appends_and_dedupes() {
-        let mut base =
-            serde_json::json!({"routes": {"known": [{"path": "/a", "methods": ["GET"]}]}});
-        merge_auto_arrays(
-            &mut base,
-            "routes",
-            "known",
-            &["path"],
-            &serde_json::json!({
-                "known": [
-                    {"path": "/A", "methods": ["POST"]},
-                    {"path": "/b"},
-                ]
-            }),
-        );
-        let known = base["routes"]["known"].as_array().unwrap();
-        assert_eq!(known.len(), 2);
-        assert_eq!(known[0]["methods"][0], "GET", "existing entry untouched");
-        assert_eq!(known[1]["path"], "/b");
     }
 }

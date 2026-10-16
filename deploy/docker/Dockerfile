@@ -35,12 +35,12 @@ RUN groupadd -r sentry && useradd -r -g sentry -d /var/lib/sentry -s /usr/sbin/n
 RUN mkdir -p /var/lib/sentry /etc/sentry && chown -R sentry:sentry /var/lib/sentry /etc/sentry
 
 COPY --from=builder /usr/local/bin/sentry /usr/local/bin/sentry
-COPY config/sentry.example.toml /etc/sentry/sentry.example.toml
+COPY config/sentry.example.conf /etc/sentry/sentry.example.conf
 
 USER sentry
 WORKDIR /var/lib/sentry
 
-ENV SENTRY_CONFIG=/etc/sentry/sentry.toml
+ENV SENTRY_CONFIG=/etc/sentry/sentry.conf
 EXPOSE 8080
 
 ENTRYPOINT ["tini", "--", "sentry"]

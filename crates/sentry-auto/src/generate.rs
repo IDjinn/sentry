@@ -1,9 +1,8 @@
 //! Profile → config artifacts: routes, packs and rules in the shapes the
-//! main config uses, plus the `sentry.auto.toml` serialization.
+//! main config uses, plus the `sentry.auto.conf` serialization.
 
 use sentry_core::config::{RouteDefConfig, RuleDefConfig, RulePackConfig};
 use sentry_core::routes_learn::normalize_routes;
-use serde::Serialize;
 
 use crate::FrameworkProfile;
 
@@ -86,94 +85,18 @@ impl AutoArtifacts {
         self.routes.is_empty() && self.packs.is_empty() && self.rules.is_empty()
     }
 
-    /// Serialize as `sentry.auto.toml` — only the `routes` and `rules`
-    /// sections the cascade loader merges. Empty fields are omitted so the
-    /// generated file stays reviewable.
-    pub fn to_toml(&self) -> String {
-        #[derive(Serialize)]
-        struct RouteOut<'a> {
-            path: &'a str,
-            #[serde(skip_serializing_if = "slice_is_empty")]
-            methods: &'a [String],
+    /// Serialize as `sentry.auto.conf` — only the `routes` and `rules`
+    /// blocks the cascade loader merges.
+    pub fn to_conf(&self) -> String {
+        if self.is_empty() {
+            return String::new();
         }
-        #[derive(Serialize)]
-        struct PackOut<'a> {
-            name: &'a str,
-            mode: &'a str,
-            #[serde(skip_serializing_if = "params_is_empty")]
-            params: &'a std::collections::HashMap<String, toml::Value>,
-        }
-        #[derive(Serialize)]
-        struct RuleOut<'a> {
-            name: &'a str,
-            priority: i32,
-            r#match: &'a str,
-            action: &'a str,
-            #[serde(skip_serializing_if = "slice_is_empty")]
-            tags: &'a [String],
-        }
-        #[derive(Serialize)]
-        struct RoutesSection<'a> {
-            known: Vec<RouteOut<'a>>,
-        }
-        #[derive(Serialize)]
-        struct RulesSection<'a> {
-            #[serde(rename = "pack", skip_serializing_if = "Vec::is_empty")]
-            packs: Vec<PackOut<'a>>,
-            #[serde(skip_serializing_if = "Vec::is_empty")]
-            custom: Vec<RuleOut<'a>>,
-        }
-        #[derive(Serialize)]
-        struct AutoToml<'a> {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            routes: Option<RoutesSection<'a>>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            rules: Option<RulesSection<'a>>,
-        }
-        let file = AutoToml {
-            routes: (!self.routes.is_empty()).then(|| RoutesSection {
-                known: self
-                    .routes
-                    .iter()
-                    .map(|r| RouteOut {
-                        path: &r.path,
-                        methods: &r.methods,
-                    })
-                    .collect(),
-            }),
-            rules: (!self.packs.is_empty() || !self.rules.is_empty()).then(|| RulesSection {
-                packs: self
-                    .packs
-                    .iter()
-                    .map(|p| PackOut {
-                        name: &p.name,
-                        mode: &p.mode,
-                        params: &p.params,
-                    })
-                    .collect(),
-                custom: self
-                    .rules
-                    .iter()
-                    .map(|r| RuleOut {
-                        name: &r.name,
-                        priority: r.priority,
-                        r#match: &r.r#match,
-                        action: &r.action,
-                        tags: &r.tags,
-                    })
-                    .collect(),
-            }),
-        };
-        toml::to_string_pretty(&file).unwrap_or_default()
+        let mut cfg = sentry_core::config::SentryConfig::default();
+        cfg.routes.known = self.routes.clone();
+        cfg.rules.packs = self.packs.clone();
+        cfg.rules.custom = self.rules.clone();
+        sentry_core::conf::to_text(&cfg)
     }
-}
-
-fn params_is_empty(map: &std::collections::HashMap<String, toml::Value>) -> bool {
-    map.is_empty()
-}
-
-fn slice_is_empty(slice: &&[String]) -> bool {
-    slice.is_empty()
 }
 
 #[cfg(test)]
@@ -245,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn toml_round_trip_through_config() {
+    fn conf_round_trip_through_config() {
         let mut profile = profile(
             "nginx",
             vec![
@@ -264,26 +187,25 @@ mod tests {
             action: "block".to_string(),
             tags: vec!["auto".to_string()],
         });
-        let toml_text = from_profiles(&[profile]).to_toml();
+        let text = from_profiles(&[profile]).to_conf();
 
-        assert!(toml_text.contains("[[routes.known]]"));
-        assert!(toml_text.contains("path = \"/admin/*\""));
-        assert!(toml_text.contains("[[rules.pack]]"));
-        assert!(toml_text.contains("name = \"rate_scan\""));
-        assert!(toml_text.contains("[[rules.custom]]"));
-        assert!(toml_text.contains("path = \"/xmlrpc.php\""));
+        assert!(text.contains("routes {"), "{text}");
+        assert!(text.contains("\"/admin/*\": any"), "{text}");
+        assert!(text.contains("rate_scan: enforce"), "{text}");
+        assert!(text.contains("rule wp_xmlrpc_block {"), "{text}");
 
-        let parsed: sentry_core::config::SentryConfig =
-            toml::from_str(&toml_text).expect("generated TOML loads as config fragments");
+        let parsed = sentry_core::conf::from_str(&text, "sentry.auto.conf")
+            .expect("generated conf loads as config fragments");
         assert_eq!(parsed.routes.known.len(), 2);
         assert_eq!(parsed.rules.packs[0].name, "rate_scan");
         assert_eq!(parsed.rules.custom[0].action, "block");
+        assert_eq!(parsed.rules.custom[0].r#match, r#"path = "/xmlrpc.php""#);
     }
 
     #[test]
     fn empty_artifacts_serialize_to_empty_string() {
         let artifacts = from_profiles(&[]);
         assert!(artifacts.is_empty());
-        assert_eq!(artifacts.to_toml(), "");
+        assert_eq!(artifacts.to_conf(), "");
     }
 }

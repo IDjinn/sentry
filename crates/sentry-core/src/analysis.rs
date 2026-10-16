@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// Discrete risk bucket derived from the numeric score.
 ///
-/// Bucket boundaries are configurable in `sentry.toml` but the five levels
+/// Bucket boundaries are configurable in `sentry.conf` but the five levels
 /// themselves are fixed so dashboards and alerts stay stable.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,

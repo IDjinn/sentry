@@ -204,7 +204,7 @@ pub fn install(user: Option<&str>, workdir: Option<&str>) -> color_eyre::Result<
                 println!("  sc.exe {}", argv.join(" "));
                 sc(&argv);
             }
-            println!("\nconfig: set the machine-wide SENTRY_CONFIG env var (or rely on ./sentry.toml in the WorkingDirectory).");
+            println!("\nconfig: set the machine-wide SENTRY_CONFIG env var (or rely on ./sentry.conf in the WorkingDirectory).");
         }
         other => {
             return Err(color_eyre::eyre::eyre!(

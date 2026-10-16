@@ -143,9 +143,43 @@ development workflow.
 
 ### Configuration
 
-`config/sentry.example.toml` documents every section (`[edge]`, `[rules]`,
-`[action]`, `[ai]`, `[uploads]`, …). Any TOML field can be overridden via
-env: `SENTRY_<SECTION>__<KEY>` (e.g. `SENTRY_EDGE__LISTEN`).
+Sentry reads `sentry.conf`, an nginx-like file: `key: value` directives,
+`name [label] { … }` blocks, `include:` and `${ENV}` expansion.
+[`config/sentry.example.conf`](./config/sentry.example.conf) documents every
+block (`sentry`, `server`, `storage`, `detect`, `trust`, `rules`, `routes`,
+`source`, `action`, `dashboard`, `metrics`, `http`, `tcp`).
+
+The inline edge routes like nginx. A single backend is one line:
+`http { proxy_pass: http://127.0.0.1:8080 }`. With several domains and paths:
+
+```nginx
+http {
+    site example.com *.example.com {
+        "/": http://app:8080
+        "/api/": [http://api-1:9000, http://api-2:9000]   # balanced
+        "/old/": redirect "https://blog.example.com$request_uri"
+
+        location /admin/ { proxy_pass: http://app:8080, allow: [10.0.0.0/8] }
+        location /api/ { match { query.version: "2" }, proxy_pass: http://api-v2:9000/ }
+        location = /health { return: 200 ok, inspect: off }
+    }
+}
+```
+
+`"/path": target` covers the common case. A `location [=|^~|~|~*]` block adds
+`match {}` (query, header, cookie, method, IP), `rewrite`, `request_headers {}`
+and `response_headers {}`, plus security settings written inline: `inspect`
+(on/shadow/off), `rate_limit`, `allow`/`deny`, `challenge: always`,
+`policy {}` and `packs {}`.
+
+The config can be split across files: `include: "sites/*.conf"` works
+anywhere, `conf.d/*.conf` next to `sentry.conf` loads automatically, and
+`--config <dir>` loads every `*.conf` in a directory. Unlabeled blocks such
+as `detect {}` merge across files. Env still overrides any field:
+`SENTRY_<SECTION>__<KEY>` (e.g. `SENTRY_STORAGE__POSTGRES__URL`).
+`sentry config files` lists what a load reads, `sentry config show` prints
+the effective config, and `sentry config migrate sentry.toml --out sentry.conf`
+converts an old TOML config.
 
 **Production rollout**: start rule packs in `shadow` (log only), watch the
 logs, then switch to `enforce`.

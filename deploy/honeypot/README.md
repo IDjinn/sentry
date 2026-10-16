@@ -74,7 +74,7 @@ sudo mkdir -p /opt/sentry && sudo chown ubuntu /opt/sentry
 cd /opt/sentry
 
 # self-signed cert for the edge TLS listener (mounted into the sentry
-# container at /etc/sentry/certs — see [edge] tls_cert/tls_key in sentry.toml)
+# container at /etc/sentry/certs — see `http { tls { cert, key } }` in sentry.conf)
 mkdir -p certs
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout certs/decoy.key -out certs/decoy.crt -days 3650 -nodes \
@@ -87,8 +87,8 @@ openssl rand -base64 32   # → SENTRY_SESSION_SECRET
 openssl rand -base64 18   # → GF_SECURITY_ADMIN_PASSWORD, and SENTRY_DASH_ADMIN_PASSWORD comment
 docker compose pull
 docker run --rm ghcr.io/idjinn/sentry:latest sentry auth hash-password '<DASH_PASSWORD>'
-# put the hash into sentry.toml, replacing __ADMIN_PASSWORD_HASH__
-sed -i "s|__ADMIN_PASSWORD_HASH__|<HASH>|" sentry.toml
+# put the hash into sentry.conf, replacing __ADMIN_PASSWORD_HASH__
+sed -i "s|__ADMIN_PASSWORD_HASH__|<HASH>|" sentry.conf
 
 docker compose up -d        # base stack (ssh-decoy stays behind a profile)
 ```

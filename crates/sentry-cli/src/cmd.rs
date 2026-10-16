@@ -868,7 +868,7 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
             println!("Web security posture (F11) — configuration:");
             if !cfg.deployment.is_inline() {
                 println!(
-                    "  [!] [deployment] mode is not \"inline\" — origin responses are \
+                    "  [!] the sentry mode is not inline — origin responses are \
                      never observed, so advisory checks stay silent"
                 );
             }
@@ -938,13 +938,20 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                     &cfg.auto.sensitive.enable,
                     &cfg.auto.sensitive.skip,
                 ) {
-                    color_eyre::eyre::bail!("config INVALID: [auto.sensitive]: {e}");
+                    color_eyre::eyre::bail!("config INVALID: sentry › auto: {e}");
                 }
                 if let Err(e) = cfg.update.validate() {
                     color_eyre::eyre::bail!("config INVALID: {e}");
                 }
-                if let Some(e) = cfg.edge.validate().first() {
-                    color_eyre::eyre::bail!("config INVALID: {e}");
+                let edge_errors = cfg.edge.validate();
+                if !edge_errors.is_empty() {
+                    for e in &edge_errors {
+                        eprintln!("invalid http config: {e}");
+                    }
+                    color_eyre::eyre::bail!(
+                        "config INVALID: {} http/routing error(s)",
+                        edge_errors.len()
+                    );
                 }
                 if let Some(e) = cfg.runtime.validate().first() {
                     color_eyre::eyre::bail!("config INVALID: {e}");
@@ -980,15 +987,15 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 }
                 if cfg.posture.mode.is_enforce() {
                     color_eyre::eyre::bail!(
-                        "config INVALID: [posture] mode = \"enforce\" is not implemented \
+                        "config INVALID: detect › posture › mode: enforce is not implemented \
                          yet — header injection without per-site knowledge would break \
-                         pages; use \"shadow\" (roadmap: BACKLOG.md §5.4)"
+                         pages; use shadow (roadmap: BACKLOG.md §5.4)"
                     );
                 }
                 let unknown = cfg.posture.unknown_checks();
                 if !unknown.is_empty() {
                     eprintln!(
-                        "warning: unknown [posture] checks ids: {}",
+                        "warning: unknown detect › posture checks ids: {}",
                         unknown.join(", ")
                     );
                 }
@@ -1022,9 +1029,12 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                     cfg.edge.forwarded_headers
                 );
                 if cfg.deployment.is_inline() {
+                    let (groups, sites) = sentry_core::edge_routes::normalized(&cfg.edge);
                     println!(
-                        "  vhosts:    {} (balance = {})",
-                        cfg.edge.vhosts.len(),
+                        "  http:      {} upstream(s) | {} site(s) | {} location(s) | balance = {}",
+                        groups.len(),
+                        sites.len(),
+                        sites.iter().map(|s| s.locations.len()).sum::<usize>(),
                         cfg.edge.balance.as_str()
                     );
                 }
@@ -1061,9 +1071,57 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                     }
                 );
             }
-            ConfigCmd::Show => {
+            ConfigCmd::Show { full } => {
                 let cfg = require_config(&cfg)?;
-                println!("{}", toml::to_string_pretty(&cfg)?);
+                let text = if full {
+                    sentry_core::conf::to_text_full(cfg)
+                } else {
+                    sentry_core::conf::to_text(cfg)
+                };
+                print!("{text}");
+            }
+            ConfigCmd::Files => {
+                let resolved =
+                    crate::config::resolve(config_path.as_deref().map(std::path::Path::new))?;
+                if resolved.files.is_empty() {
+                    println!("no config file found — defaults only (looked for ./sentry.conf and /etc/sentry/sentry.conf)");
+                }
+                for f in &resolved.files {
+                    println!("{}", f.display());
+                    for inc in included_files(f) {
+                        println!("  include {}", inc.display());
+                    }
+                }
+                if let Some(dir) = &resolved.dir {
+                    let auto = dir.join(crate::config::AUTO_FILE);
+                    if auto.exists() {
+                        println!("{} (auto: routes/rules only)", auto.display());
+                    }
+                }
+            }
+            ConfigCmd::Migrate { input, out } => {
+                let legacy = crate::config::load_legacy_toml(std::path::Path::new(&input))?;
+                let text = format!(
+                    "# Converted from {input} by `sentry config migrate`.\n\
+                     # Only values that differ from the defaults are listed; see\n\
+                     # config/sentry.example.conf for every directive.\n\n{}",
+                    sentry_core::conf::to_text(&legacy)
+                );
+                sentry_core::conf::from_str(&text, "migrated.conf").map_err(|e| {
+                    color_eyre::eyre::eyre!("internal: migrated config does not load back: {e}")
+                })?;
+                match out {
+                    None => print!("{text}"),
+                    Some(path) => {
+                        if std::path::Path::new(&path).exists() {
+                            color_eyre::eyre::bail!(
+                                "{path} already exists — refusing to overwrite"
+                            );
+                        }
+                        std::fs::write(&path, text)?;
+                        eprintln!("wrote {path} — review it, then remove {input}");
+                    }
+                }
             }
         },
         Command::Model { action } => match action {
@@ -1358,7 +1416,7 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
 
 fn require_config(cfg: &Option<SentryConfig>) -> color_eyre::Result<&SentryConfig> {
     cfg.as_ref().ok_or_else(|| {
-        color_eyre::eyre::eyre!("config required — pass --config or create sentry.toml")
+        color_eyre::eyre::eyre!("config required — pass --config or create sentry.conf")
     })
 }
 
@@ -1387,7 +1445,7 @@ fn posture_advice(check: &str) -> &'static str {
 async fn connect_storage(cfg: &SentryConfig) -> color_eyre::Result<sentry_storage::Repo> {
     if cfg.storage.postgres.url.is_empty() {
         return Err(color_eyre::eyre::eyre!(
-            "storage.postgres.url is not configured — set it in sentry.toml or via SENTRY_STORAGE__POSTGRES__URL env"
+            "storage url is not configured — set `storage {{ url: … }}` in sentry.conf or SENTRY_STORAGE__POSTGRES__URL"
         ));
     }
     let pool = sentry_storage::PgPool::connect(&cfg.storage.postgres)
@@ -1399,7 +1457,7 @@ async fn connect_storage(cfg: &SentryConfig) -> color_eyre::Result<sentry_storag
 fn list_feeds(cfg: &SentryConfig) {
     let feeds: Vec<_> = cfg.rules.feeds.iter().filter(|f| f.enabled).collect();
     if feeds.is_empty() {
-        println!("No reputation feeds configured (see [rules.feeds] in sentry.example.toml).");
+        println!("No reputation feeds configured (see `rules {{ feed NAME {{…}} }}` in sentry.example.conf).");
     }
     println!(
         "{:<14} {:<11} {:<11} {:<9} {:<8} URL",
@@ -1423,7 +1481,7 @@ fn list_feeds(cfg: &SentryConfig) {
         );
     }
 
-    println!("\nBuilt-in presets (enable with [rules] feed_presets = [\"…\"]):");
+    println!("\nBuilt-in presets (enable with `rules {{ feed_presets: [...] }}`):");
     println!("{:<22} {:<8} {:<7} DESCRIPTION", "NAME", "FEEDS", "ACTIVE");
     for p in sentry_core::feed_presets::PRESETS {
         let active = cfg.rules.feed_presets.iter().any(|n| n == p.name);
@@ -1459,7 +1517,7 @@ fn list_trusted_lists(cfg: &SentryConfig) {
         );
     }
     println!();
-    println!("approve by name in [real_ip] trusted_lists = [\"paypal\", \"googlebot\", ...]");
+    println!("approve by name in `trust {{ trusted_lists: [paypal, googlebot, ...] }}`");
 }
 
 /// `sentry firewall status` — probe the local ban backends (F7.3).
@@ -1587,7 +1645,7 @@ async fn check_feed_ip(cfg: &SentryConfig, ip: &str) -> color_eyre::Result<()> {
     let presets = sentry_core::trusted_lists::matching_presets(ip);
     if !presets.is_empty() {
         println!(
-            "{ip}: in trusted preset(s) {} — never-ban when approved in [real_ip] trusted_lists",
+            "{ip}: in trusted preset(s) {} — never-ban when approved in trust › trusted_lists",
             presets.join(", ")
         );
     }
@@ -2177,4 +2235,59 @@ fn test_payload(payload: &str, path: &str, method: &str) -> color_eyre::Result<(
     println!("└────────────────────────────────────────────────────────");
 
     Ok(())
+}
+
+/// Files pulled in by `include:` directives of `file` (recursively, for
+/// `sentry config files`). Unreadable files are skipped — `config validate`
+/// reports them.
+fn included_files(file: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn walk(
+        body: &[sentry_conf::Stmt],
+        base: &std::path::Path,
+        out: &mut Vec<std::path::PathBuf>,
+        depth: usize,
+    ) {
+        if depth > 16 {
+            return;
+        }
+        for stmt in body {
+            match stmt {
+                sentry_conf::Stmt::Directive(d) if d.key == sentry_conf::load::INCLUDE => {
+                    for v in &d.values {
+                        let Some(pattern) = v.as_text() else { continue };
+                        for f in sentry_conf::load::expand_glob(base, &pattern).unwrap_or_default()
+                        {
+                            if let Ok(src) = std::fs::read_to_string(&f) {
+                                out.push(f.clone());
+                                if let Ok(inner) =
+                                    sentry_conf::parse_str(&src, &f.display().to_string())
+                                {
+                                    let dir = f
+                                        .parent()
+                                        .map(std::path::Path::to_path_buf)
+                                        .unwrap_or_default();
+                                    walk(&inner, &dir, out, depth + 1);
+                                }
+                            }
+                        }
+                    }
+                }
+                sentry_conf::Stmt::Block(b) => walk(&b.body, base, out, depth),
+                sentry_conf::Stmt::Directive(_) => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let Ok(src) = std::fs::read_to_string(file) else {
+        return out;
+    };
+    let Ok(body) = sentry_conf::parse_str(&src, &file.display().to_string()) else {
+        return out;
+    };
+    let base = file
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    walk(&body, &base, &mut out, 0);
+    out
 }

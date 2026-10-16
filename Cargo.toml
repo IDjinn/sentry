@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/sentry-core",
+    "crates/sentry-conf",
     "crates/sentry-storage",
     "crates/sentry-ai",
     "crates/sentry-geo",
@@ -25,7 +26,7 @@ members = [
 default-members = ["crates/sentry-cli"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -120,7 +121,7 @@ reqwest = { version = "0.12", default-features = false, features = ["native-tls"
 maxminddb = "0.24"
 
 # Config
-figment = { version = "0.10", features = ["toml", "env"] }
+figment = { version = "0.10", features = ["env"] }
 
 # Binary self-update (F13): GitHub Releases backend, tar.gz/zip assets,
 # SHA-256 verification via the per-asset digest from the releases API,
@@ -162,6 +163,7 @@ insta = "1"
 
 # Internal crates (path deps)
 sentry-core = { path = "crates/sentry-core" }
+sentry-conf = { path = "crates/sentry-conf" }
 sentry-storage = { path = "crates/sentry-storage" }
 sentry-ai = { path = "crates/sentry-ai" }
 sentry-geo = { path = "crates/sentry-geo" }

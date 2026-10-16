@@ -47,9 +47,15 @@ pub struct EdgeProxyConfig {
     pub health_timeout_secs: u64,
     /// HTTPS front (F8): `None` serves plain HTTP only.
     pub tls: Option<TlsEdgeConfig>,
-    /// Nginx-style virtual hosts (F14): Host-header routing to per-site
-    /// upstream groups.
+    /// Legacy vhosts (F14) — only used when `groups`/`sites` are empty.
     pub vhosts: Vec<sentry_core::config::EdgeVhostConfig>,
+    /// Named upstream groups (`http { upstream NAME {} }`).
+    pub groups: Vec<sentry_core::edge_routes::UpstreamGroupConfig>,
+    /// Sites and locations (`http { site { location … } }`). When empty
+    /// with `groups`, `upstreams`/`vhosts` are normalized into sites.
+    pub sites: Vec<sentry_core::edge_routes::SiteConfig>,
+    /// Security defaults set directly in `http {}`.
+    pub security: sentry_core::edge_routes::SecurityConfig,
     /// Response compression settings (F12) — projected from
     /// `[edge.compress]`.
     pub compress: sentry_core::config::EdgeCompressConfig,
@@ -125,6 +131,9 @@ impl Default for EdgeProxyConfig {
             health_timeout_secs: 5,
             tls: None,
             vhosts: Vec::new(),
+            groups: Vec::new(),
+            sites: Vec::new(),
+            security: sentry_core::edge_routes::SecurityConfig::default(),
             compress: sentry_core::config::EdgeCompressConfig::default(),
             forwarded_headers: true,
             response_buffering: true,
@@ -218,35 +227,29 @@ fn default_upgrade_client() -> UpgradeClient {
     hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build_http()
 }
 
-/// Build the host-routing table (F14) from the proxy config: one default
-/// (catch-all) group plus one group per vhost, each with the effective
-/// balancer/health settings resolved from the globals.
-fn build_vhost_router(cfg: &EdgeProxyConfig) -> crate::upstream::VhostRouter {
-    use sentry_core::config::EdgeVhostConfig;
-    let default = crate::upstream::UpstreamGroup::new(
-        "",
-        &cfg.upstreams,
-        cfg.balance,
-        cfg.max_fails,
-        cfg.fail_timeout_secs,
-    );
-    let entries: Vec<(String, crate::upstream::UpstreamGroup)> = cfg
-        .vhosts
-        .iter()
-        .map(|v: &EdgeVhostConfig| {
-            (
-                v.host.clone(),
-                crate::upstream::UpstreamGroup::new(
-                    v.host.clone(),
-                    &v.upstreams,
-                    v.effective_balance(cfg.balance),
-                    v.effective_max_fails(cfg.max_fails),
-                    v.effective_fail_timeout(cfg.fail_timeout_secs),
-                ),
-            )
-        })
-        .collect();
-    crate::upstream::VhostRouter::new(default, entries)
+/// Compile the routing table (sites → locations → upstream groups) from
+/// the proxy config; legacy `upstreams`/`vhosts` are normalized first.
+pub fn build_route_table(
+    cfg: &EdgeProxyConfig,
+) -> sentry_core::error::Result<crate::routing::RouteTable> {
+    let defaults = crate::routing::GroupDefaults {
+        balance: cfg.balance,
+        max_fails: cfg.max_fails,
+        fail_timeout_secs: cfg.fail_timeout_secs,
+        health_path: cfg.health_path.clone(),
+    };
+    let (groups, sites) = if cfg.groups.is_empty() && cfg.sites.is_empty() {
+        let legacy = sentry_core::config::EdgeConfig {
+            upstreams: cfg.upstreams.clone(),
+            vhosts: cfg.vhosts.clone(),
+            ..Default::default()
+        };
+        sentry_core::edge_routes::normalized(&legacy)
+    } else {
+        (cfg.groups.clone(), cfg.sites.clone())
+    };
+    crate::routing::RouteTable::build(&groups, &sites, &cfg.security, &defaults)
+        .map_err(sentry_core::error::CoreError::Config)
 }
 
 /// Verify the upstreams answer before the edge starts accepting traffic.
@@ -257,12 +260,12 @@ fn build_vhost_router(cfg: &EdgeProxyConfig) -> crate::upstream::VhostRouter {
 /// exactly what failover exists for), a group with no healthy server is
 /// fatal.
 pub async fn health_check(cfg: &EdgeProxyConfig) -> sentry_core::error::Result<()> {
-    let router = build_vhost_router(cfg);
-    health_check_router(&router, cfg).await
+    let table = build_route_table(cfg)?;
+    health_check_router(&table, cfg).await
 }
 
 async fn health_check_router(
-    router: &crate::upstream::VhostRouter,
+    table: &crate::routing::RouteTable,
     cfg: &EdgeProxyConfig,
 ) -> sentry_core::error::Result<()> {
     let client = reqwest::Client::builder()
@@ -270,17 +273,9 @@ async fn health_check_router(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| sentry_core::error::CoreError::Config(format!("edge http client: {e}")))?;
-    let checks = router.groups().map(|group| {
+    let checks = table.groups().map(|(group, health_path)| {
         let client = client.clone();
-        let health_path = match group.name.is_empty() {
-            true => cfg.health_path.clone(),
-            false => cfg
-                .vhosts
-                .iter()
-                .find(|v| v.host == group.name)
-                .and_then(|v| v.health_path.clone())
-                .unwrap_or_else(|| cfg.health_path.clone()),
-        };
+        let health_path = health_path.to_string();
         async move {
             let mut failures: Vec<String> = Vec::new();
             let mut healthy = 0usize;
@@ -298,8 +293,8 @@ async fn health_check_router(
     let mut errors: Vec<String> = Vec::new();
     for (name, healthy, failures) in results {
         let label = match name.is_empty() {
-            true => "default".to_string(),
-            false => format!("vhost {name}"),
+            true => "upstream default".to_string(),
+            false => format!("upstream {name}"),
         };
         for f in failures {
             warn!(group = %label, "edge upstream failed the startup health check: {f}");
@@ -329,8 +324,18 @@ pub async fn serve(
     cfg: EdgeProxyConfig,
     decided: mpsc::Sender<sentry_core::ProcessedEvent>,
 ) -> sentry_core::error::Result<()> {
-    let router = Arc::new(build_vhost_router(&cfg));
+    let router = Arc::new(build_route_table(&cfg)?);
     let clients = UpstreamClients::build(&cfg)?;
+    {
+        let router = router.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                router.prune();
+            }
+        });
+    }
     health_check_router(&router, &cfg).await?;
 
     // Response compression (F12): one middleware around the router covers
@@ -513,9 +518,9 @@ async fn accept_loop(
 struct ProxyState {
     runtime: EdgeRuntime,
     clients: UpstreamClients,
-    /// Host-header routing table (F14): default group + vhost groups with
-    /// their balancers and passive-health state.
-    router: Arc<crate::upstream::VhostRouter>,
+    /// Routing table: sites → locations → upstream groups (balancers and
+    /// passive-health state live in the groups).
+    router: Arc<crate::routing::RouteTable>,
     decided: mpsc::Sender<sentry_core::ProcessedEvent>,
     /// 301 plain-HTTP requests to HTTPS (F8, TLS front only).
     redirect_https: bool,
@@ -728,6 +733,56 @@ async fn proxy_inspected(
         tracing::info!(ip = %client_ip, trace_id = %trace, elapsed = ?start.elapsed(), "edge fast-path: blocked ip denied before pipeline (no event persisted)");
         return pages::block_page(error_pages, Some(trace));
     }
+
+    // Route first: the matched location decides the security scope
+    // (allow/deny, rate limit, mode, pipeline overrides) for this request.
+    let route = {
+        let host = original_host(&parts);
+        let view = crate::routing::RequestView {
+            method: parts.method.as_str(),
+            path: parts.uri.path(),
+            query: parts.uri.query(),
+            headers: &parts.headers,
+            host: host.as_deref(),
+            scheme: if is_tls { "https" } else { "http" },
+            client_ip,
+        };
+        state.router.route(&view)
+    };
+    let security = route
+        .as_ref()
+        .map(|r| &r.location.security)
+        .unwrap_or(&state.router.fallback_security);
+    let route_label = route
+        .as_ref()
+        .map(|r| r.location.label.as_str())
+        .unwrap_or("-");
+    if !security.ip_permitted(client_ip) {
+        let trace = Uuid::new_v4();
+        tracing::info!(ip = %client_ip, location = route_label, trace_id = %trace, "edge: client ip not allowed for this location (allow/deny)");
+        return pages::block_page(error_pages, Some(trace));
+    }
+    if let (Some(rule), Some(r)) = (security.rate_limit, route.as_ref()) {
+        if !state.router.rate_allow(r.location.id, client_ip, rule) {
+            let trace = Uuid::new_v4();
+            tracing::info!(ip = %client_ip, location = route_label, trace_id = %trace, "edge: location rate limit exceeded");
+            return pages::rate_limit_page(error_pages, Some(trace));
+        }
+    }
+    if security.mode == sentry_core::edge_routes::SecurityMode::Off {
+        let client_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
+        return serve_route(
+            state,
+            &parts,
+            &body_bytes,
+            is_tls,
+            client_ip,
+            client_upgrade,
+            route.as_ref(),
+        )
+        .await;
+    }
+
     let http = sentry_core::event::HttpData {
         method: Some(sentry_core::event::HttpMethod::from_str_lossy(
             parts.method.as_str(),
@@ -760,11 +815,21 @@ async fn proxy_inspected(
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
         .map(|c| c.0.port());
 
-    let mut processed = runtime.process(evt);
+    let mut processed = runtime.process_scoped(evt, &security.scope);
     // Restore the persistence semantics of `HttpData.body` (capture cap only
     // — the analysis prefix above never lands in the published event).
     if let Some(http) = processed.event.http_mut() {
         http.body = captured.clone();
+    }
+    // `inspect: shadow`: analyzed and recorded, never acted on —
+    // the event keeps what would have happened, actions see an Allow.
+    if security.mode == sentry_core::edge_routes::SecurityMode::Shadow
+        && processed.decision.action != sentry_core::analysis::Verdict::Allow
+    {
+        let would = format!("{:?}", processed.decision.action).to_ascii_lowercase();
+        processed.decision.override_reason =
+            Some(format!("location shadow ({route_label}): would {would}"));
+        processed.decision.action = sentry_core::analysis::Verdict::Allow;
     }
     let ua = processed.event.http().and_then(|h| h.user_agent.clone());
     let path = processed
@@ -775,16 +840,33 @@ async fn proxy_inspected(
 
     let resp = match processed.decision.action {
         sentry_core::analysis::Verdict::Allow => {
-            let client_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
-            serve_allow(
-                state,
-                &parts,
-                &body_bytes,
-                is_tls,
-                client_ip,
-                client_upgrade,
-            )
-            .await
+            let trusted = processed.decision.override_reason.as_deref() == Some("trusted ip");
+            let gate = if security.force_challenge && !trusted {
+                Some(runtime.challenge_gate(&parts.headers, client_ip, Some(processed.event.id)))
+            } else {
+                None
+            };
+            match gate {
+                None | Some(crate::ChallengeGate::Pass) => {
+                    let client_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
+                    serve_route(
+                        state,
+                        &parts,
+                        &body_bytes,
+                        is_tls,
+                        client_ip,
+                        client_upgrade,
+                        route.as_ref(),
+                    )
+                    .await
+                }
+                Some(crate::ChallengeGate::Page(page) | crate::ChallengeGate::Blocked(page)) => {
+                    page
+                }
+                Some(crate::ChallengeGate::Disabled) => {
+                    pages::challenge_required_page(error_pages, Some(processed.event.id))
+                }
+            }
         }
         sentry_core::analysis::Verdict::RateLimit => {
             pages::rate_limit_page(error_pages, Some(processed.event.id))
@@ -793,13 +875,14 @@ async fn proxy_inspected(
             match runtime.challenge_gate(&parts.headers, client_ip, Some(processed.event.id)) {
                 crate::ChallengeGate::Pass => {
                     let client_upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
-                    serve_allow(
+                    serve_route(
                         state,
                         &parts,
                         &body_bytes,
                         is_tls,
                         client_ip,
                         client_upgrade,
+                        route.as_ref(),
                     )
                     .await
                 }
@@ -869,24 +952,25 @@ async fn proxy_inspected(
     resp
 }
 
-/// Allow path (and challenge-passed requests): plain-HTTP → HTTPS redirect
-/// (F8) when configured, otherwise resolve the Host's upstream group (F14)
-/// and forward with load balancing, passive health checks and failover
+/// Serve a routed request (Allow, challenge-passed, or `inspect: off`):
+/// plain-HTTP → HTTPS redirect (F8) when configured; otherwise the
+/// matched location's action — a direct `return`/`redirect`, or the
+/// upstream group with rewrites, `proxy_pass` URI, header operations and
+/// timeout applied, load-balanced with passive health checks and failover
 /// (a connection-level failure retries the next server — nginx
 /// `proxy_next_upstream error timeout`; the buffered body makes retrying
 /// safe). With `forwarded_headers` (F12) the client's own
-/// `X-Forwarded-*`/`X-Real-IP` are stripped and replaced with the edge's
-/// resolved view: `X-Forwarded-For`/`X-Real-IP` carry the client IP,
-/// `X-Forwarded-Proto` the real scheme, `X-Forwarded-Host` the requested
-/// host — so backend `real_ip` modules and virtual hosts work unchanged.
+/// `X-Forwarded-*`/`X-Real-IP` are replaced with the edge's resolved view.
 /// h1 upgrade requests (WebSocket, F14) take the raw pass-through path.
-async fn serve_allow(
+/// No matching site/location answers 404.
+async fn serve_route(
     state: &ProxyState,
     parts: &axum::http::request::Parts,
     body_bytes: &[u8],
     is_tls: bool,
     client_ip: std::net::IpAddr,
     client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    route: Option<&crate::routing::Route<'_>>,
 ) -> Response {
     let error_pages = state.runtime.error_pages_handle();
     // Plain-HTTP → HTTPS redirect (F8): port-80 traffic stays monitored and
@@ -919,19 +1003,50 @@ async fn serve_allow(
     }
 
     let host = original_host(parts);
-    let group = state.router.resolve(host.as_deref());
+    let Some(route) = route else {
+        let trace = Uuid::new_v4();
+        tracing::info!(ip = %client_ip, host = ?host, path = %parts.uri.path(), trace_id = %trace, "edge: no site/location matches the request");
+        return pages::not_found_page(error_pages.as_deref(), Some(trace));
+    };
+    let location = route.location;
+    let view = crate::routing::RequestView {
+        method: parts.method.as_str(),
+        path: parts.uri.path(),
+        query: parts.uri.query(),
+        headers: &parts.headers,
+        host: host.as_deref(),
+        scheme: if is_tls { "https" } else { "http" },
+        client_ip,
+    };
+    let group = match &location.target {
+        crate::routing::Target::Respond(ret) => {
+            return respond_direct(
+                ret,
+                &view,
+                &route.captures,
+                location,
+                error_pages.as_deref(),
+            );
+        }
+        crate::routing::Target::Upstream { group, .. } => group.as_ref(),
+    };
+    let path_qs = location.upstream_uri(&view, &route.captures);
     let client = &state.clients.verified;
 
     // WebSocket / h1 upgrade: bypass the buffered forward and pipe the two
     // upgraded connections bidirectionally (F14).
     if is_upgrade_request(parts) {
-        return proxy_upgrade(state, group, parts, host.as_deref(), client_upgrade).await;
+        return proxy_upgrade(
+            state,
+            group,
+            parts,
+            host.as_deref(),
+            client_upgrade,
+            &path_qs,
+        )
+        .await;
     }
 
-    let path_qs = match parts.uri.query() {
-        Some(q) => format!("{}?{q}", parts.uri.path()),
-        None => parts.uri.path().to_string(),
-    };
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
     let now = crate::upstream::now_ms();
@@ -941,7 +1056,8 @@ async fn serve_allow(
             // Every server is down or was already tried this request.
             let trace = Uuid::new_v4();
             warn!(
-                vhost = %group.name,
+                upstream = %group.name,
+                location = %location.label,
                 trace_id = %trace,
                 "edge: upstream group exhausted — all servers down or failing"
             );
@@ -956,6 +1072,9 @@ async fn serve_allow(
             is_tls,
             host: host.as_deref(),
             client_ip,
+            headers: &location.headers,
+            view: &view,
+            timeout: location.timeout,
         };
         let outcome =
             forward_once(client, method.clone(), &url, &hop, state.forwarded_headers).await;
@@ -963,7 +1082,8 @@ async fn serve_allow(
         match outcome {
             Ok(resp) => {
                 group.record_success(idx);
-                return finalize_upstream_response(state, resp, &url).await;
+                return finalize_upstream_response(state, resp, &url, Some((location, &view)))
+                    .await;
             }
             Err(ForwardError::Retryable(e)) => {
                 let ejected = group.record_failure(idx, crate::upstream::now_ms());
@@ -991,6 +1111,56 @@ async fn serve_allow(
     }
 }
 
+/// `return`/`redirect` locations: a 3xx with `Location`, a plain-text body,
+/// or the edge's HTML status page when no text is given.
+fn respond_direct(
+    ret: &sentry_core::edge_routes::ReturnConfig,
+    view: &crate::routing::RequestView<'_>,
+    captures: &[String],
+    location: &crate::routing::Location,
+    error_pages: Option<&crate::pages::ErrorPages>,
+) -> Response {
+    let status = axum::http::StatusCode::from_u16(ret.status)
+        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let text = ret
+        .text
+        .as_deref()
+        .map(|t| crate::routing::expand_vars(t, view, captures));
+    let mut resp = match (status.is_redirection(), text) {
+        (true, Some(target)) => Response::builder()
+            .status(status)
+            .header(header::LOCATION, target)
+            .body(axum::body::Body::empty())
+            .unwrap_or_default(),
+        (_, Some(body)) => Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(axum::body::Body::from(body))
+            .unwrap_or_default(),
+        (_, None) if status.as_u16() >= 400 => {
+            pages::status_page(error_pages, status, Some(Uuid::new_v4()))
+        }
+        (_, None) => Response::builder()
+            .status(status)
+            .body(axum::body::Body::empty())
+            .unwrap_or_default(),
+    };
+    let ops = &location.headers;
+    for name in &ops.response_remove {
+        resp.headers_mut().remove(name.as_str());
+    }
+    for (name, value) in &ops.response_set {
+        let value = crate::routing::expand_vars(value, view, captures);
+        if let (Ok(n), Ok(v)) = (
+            axum::http::HeaderName::from_bytes(name.as_bytes()),
+            axum::http::HeaderValue::from_str(&value),
+        ) {
+            resp.headers_mut().insert(n, v);
+        }
+    }
+    resp
+}
+
 /// Why a forward attempt ended: a connection-level failure is retryable on
 /// the next server (nginx `proxy_next_upstream error timeout`); anything
 /// else aborts the request.
@@ -1007,6 +1177,20 @@ struct HopRequest<'a> {
     is_tls: bool,
     host: Option<&'a str>,
     client_ip: std::net::IpAddr,
+    /// Location header operations (values expanded against `view`).
+    headers: &'a sentry_core::edge_routes::HeaderOps,
+    view: &'a crate::routing::RequestView<'a>,
+    /// Location timeout override.
+    timeout: Option<Duration>,
+}
+
+/// Whether `name` is in a header list (case-insensitive).
+fn header_listed(list: &[String], name: &str) -> bool {
+    list.iter().any(|h| h.eq_ignore_ascii_case(name))
+}
+
+fn header_set(list: &[(String, String)], name: &str) -> bool {
+    list.iter().any(|(h, _)| h.eq_ignore_ascii_case(name))
 }
 
 /// One attempt against one upstream server. The request body is already in
@@ -1019,6 +1203,7 @@ async fn forward_once(
     forwarded_headers: bool,
 ) -> Result<reqwest::Response, ForwardError> {
     let mut fwd = client.request(method, url);
+    let ops = hop.headers;
     for (k, v) in hop.parts.headers.iter() {
         let name = k.as_str();
         if HOP_BY_HOP.contains(&name) {
@@ -1027,9 +1212,21 @@ async fn forward_once(
         if forwarded_headers && FORWARDED_STRIP.contains(&name) {
             continue;
         }
+        if header_listed(&ops.request_remove, name) || header_set(&ops.request_set, name) {
+            continue;
+        }
         if let Ok(val) = v.to_str() {
             fwd = fwd.header(name, val);
         }
+    }
+    for (name, value) in &ops.request_set {
+        fwd = fwd.header(
+            name.as_str(),
+            crate::routing::expand_vars(value, hop.view, &[]),
+        );
+    }
+    if let Some(t) = hop.timeout {
+        fwd = fwd.timeout(t);
     }
     if let Some(host) = hop.host {
         fwd = fwd.header(header::HOST, host);
@@ -1063,18 +1260,32 @@ async fn finalize_upstream_response(
     state: &ProxyState,
     resp: reqwest::Response,
     url: &str,
+    location: Option<(&crate::routing::Location, &crate::routing::RequestView<'_>)>,
 ) -> Response {
     let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
         .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
     let mut out = Response::builder().status(status).extension(UpstreamServed);
+    let no_ops = sentry_core::edge_routes::HeaderOps::default();
+    let ops = location.map(|(l, _)| &l.headers).unwrap_or(&no_ops);
     for (k, v) in resp.headers().iter() {
         let name = k.as_str();
         if HOP_BY_HOP.contains(&name) {
             continue;
         }
+        if header_listed(&ops.response_remove, name) || header_set(&ops.response_set, name) {
+            continue;
+        }
         out = out.header(name, v);
     }
-    let streaming = !state.response_buffering
+    if let Some((_, view)) = location {
+        for (name, value) in &ops.response_set {
+            out = out.header(name.as_str(), crate::routing::expand_vars(value, view, &[]));
+        }
+    }
+    let buffering = location
+        .and_then(|(l, _)| l.response_buffering)
+        .unwrap_or(state.response_buffering);
+    let streaming = !buffering
         || resp.headers().get(header::CONTENT_TYPE).is_some_and(|v| {
             v.to_str()
                 .map(|ct| {
@@ -1139,6 +1350,7 @@ async fn proxy_upgrade(
     parts: &axum::http::request::Parts,
     host: Option<&str>,
     client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    path_qs: &str,
 ) -> Response {
     let error_pages = state.runtime.error_pages_handle();
     let bad_gateway = |why: &str| {
@@ -1166,10 +1378,6 @@ async fn proxy_upgrade(
         );
     }
 
-    let path_qs = match parts.uri.query() {
-        Some(q) => format!("{}?{q}", parts.uri.path()),
-        None => parts.uri.path().to_string(),
-    };
     let uri: hyper::Uri = match format!("{}{}", group.url(0).trim_end_matches('/'), path_qs).parse()
     {
         Ok(u) => u,
@@ -1348,7 +1556,10 @@ mod tests {
             ..Default::default()
         };
         let err = health_check(&cfg).await.expect_err("dead vhost");
-        assert!(err.to_string().contains("vhost app.example.com"), "{err}");
+        assert!(
+            err.to_string().contains("upstream app.example.com"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -1484,7 +1695,7 @@ mod tests {
     }
 
     /// Single-upstream state baseline for the proxy tests (F14: wraps the
-    /// URL in a one-server `VhostRouter`).
+    /// URL in a one-location `RouteTable`).
     fn proxy_state(
         runtime: crate::EdgeRuntime,
         upstream: String,
@@ -1493,7 +1704,7 @@ mod tests {
         ProxyState {
             runtime,
             clients: UpstreamClients::verified_only(reqwest::Client::new()),
-            router: Arc::new(crate::upstream::VhostRouter::single(upstream)),
+            router: Arc::new(crate::routing::RouteTable::single(upstream)),
             decided: dec_tx,
             redirect_https: false,
             forwarded_headers: true,
@@ -2427,9 +2638,9 @@ mod tests {
     fn router_with_vhosts(
         default: std::net::SocketAddr,
         entries: Vec<(&'static str, std::net::SocketAddr)>,
-    ) -> Arc<crate::upstream::VhostRouter> {
+    ) -> Arc<crate::routing::RouteTable> {
         use sentry_core::config::BalanceMode;
-        Arc::new(crate::upstream::VhostRouter::new(
+        Arc::new(crate::routing::RouteTable::from_groups(
             crate::upstream::UpstreamGroup::new(
                 "",
                 &[format!("http://{default}")],
@@ -2509,7 +2720,7 @@ mod tests {
     async fn connect_failure_fails_over_to_the_next_server() {
         let healthy = spawn_marker_upstream("healthy").await;
         use sentry_core::config::BalanceMode;
-        let router = Arc::new(crate::upstream::VhostRouter::new(
+        let router = Arc::new(crate::routing::RouteTable::from_groups(
             crate::upstream::UpstreamGroup::new(
                 "",
                 &[
@@ -2544,7 +2755,7 @@ mod tests {
     #[tokio::test]
     async fn exhausted_group_answers_502() {
         use sentry_core::config::BalanceMode;
-        let router = Arc::new(crate::upstream::VhostRouter::new(
+        let router = Arc::new(crate::routing::RouteTable::from_groups(
             crate::upstream::UpstreamGroup::new(
                 "",
                 &[
@@ -2723,5 +2934,227 @@ mod tests {
         } else {
             panic!("expected an http event");
         }
+    }
+    // ── nginx-like locations (sentry.conf `http { site { location } }`) ──
+
+    async fn spawn_uri_echo_upstream() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().fallback(|req: axum::extract::Request| async move {
+            let pick = |name: &str| {
+                req.headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("-")
+                    .to_string()
+            };
+            let body = format!("{}|{}|{}", req.uri(), pick("x-tenant"), pick("cookie"));
+            axum::response::Response::builder()
+                .header("server", "echo")
+                .header("x-powered-by", "php")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    fn location_app(
+        conf: &str,
+        pipeline: sentry_core::pipeline::Pipeline,
+    ) -> (Router, mpsc::Receiver<sentry_core::ProcessedEvent>) {
+        let cfg = sentry_core::conf::from_str(conf, "test.conf").unwrap();
+        assert!(cfg.edge.validate().is_empty(), "{:?}", cfg.edge.validate());
+        let table = crate::routing::RouteTable::build(
+            &cfg.edge.upstream_groups,
+            &cfg.edge.sites,
+            &cfg.edge.security,
+            &crate::routing::GroupDefaults::default(),
+        )
+        .unwrap();
+        let runtime = crate::EdgeRuntime::new(std::sync::Arc::new(pipeline), None, 0);
+        let (dec_tx, dec_rx) = mpsc::channel(64);
+        let mut state = proxy_state(runtime, "http://127.0.0.1:9".to_string(), dec_tx);
+        state.router = Arc::new(table);
+        (
+            Router::new().fallback(any(proxy_handler)).with_state(state),
+            dec_rx,
+        )
+    }
+
+    async fn get(
+        app: &Router,
+        host: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let mut req = axum::http::Request::builder().uri(uri).header("host", host);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        app.clone()
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn plain_pipeline() -> sentry_core::pipeline::Pipeline {
+        sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        )
+    }
+
+    #[tokio::test]
+    async fn locations_return_redirect_rewrite_headers_and_404() {
+        let up = spawn_uri_echo_upstream().await;
+        let conf = format!(
+            r#"http {{
+                site example.test {{
+                    location = /health {{ return: 200 ok }}
+                    "/old/": redirect "https://$host/new$request_uri"
+                    location /api/ {{
+                        proxy_pass: http://{up}/v2/
+                        request_headers {{ X-Tenant: "acme-$arg_t", Cookie: off }}
+                        response_headers {{ Server: off, X-Powered-By: off, X-Edge: sentry }}
+                    }}
+                    location ~ '^/r/(\w+)$' {{
+                        proxy_pass: http://{up}
+                        rewrite: '^/r/(\w+)$' '/rewritten/$1'
+                    }}
+                    location / {{ match {{ header.x-beta: present }}, return: 418 }}
+                    proxy_pass: http://{up}
+                }}
+            }}"#
+        );
+        let (app, _rx) = location_app(&conf, plain_pipeline());
+
+        let resp = get(&app, "example.test", "/health", &[]).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_string(resp).await, "ok");
+
+        let resp = get(&app, "example.test", "/old/x?a=1", &[]).await;
+        assert_eq!(resp.status(), 301);
+        assert_eq!(
+            resp.headers().get("location").unwrap(),
+            "https://example.test/new/old/x?a=1"
+        );
+
+        let resp = get(
+            &app,
+            "example.test",
+            "/api/users?t=7",
+            &[("cookie", "sid=1")],
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert!(resp.headers().get("server").is_none());
+        assert!(resp.headers().get("x-powered-by").is_none());
+        assert_eq!(resp.headers().get("x-edge").unwrap(), "sentry");
+        assert_eq!(body_string(resp).await, "/v2/users?t=7|acme-7|-");
+
+        let resp = get(&app, "example.test", "/r/abc", &[]).await;
+        assert_eq!(body_string(resp).await, "/rewritten/abc|-|-");
+
+        let resp = get(&app, "example.test", "/anything", &[("x-beta", "1")]).await;
+        assert_eq!(resp.status(), 418, "match {{}} selects the location");
+        let resp = get(&app, "example.test", "/anything", &[]).await;
+        assert_eq!(
+            body_string(resp).await,
+            "/anything|-|-",
+            "site-level fallback"
+        );
+
+        let resp = get(&app, "other.test", "/health", &[]).await;
+        assert_eq!(resp.status(), 404, "no site for the host");
+    }
+
+    #[tokio::test]
+    async fn location_security_scopes() {
+        let up = spawn_uri_echo_upstream().await;
+        let conf = format!(
+            r#"http {{
+                upstream app {{ server: http://{up} }}
+                site {{
+                    location /admin/ {{ proxy_pass: app, allow: [10.0.0.0/8] }}
+                    location /limited/ {{ proxy_pass: app, rate_limit: 2/1m }}
+                    location /static/ {{ proxy_pass: app, inspect: off }}
+                    location /shadow/ {{ proxy_pass: app, inspect: shadow }}
+                    location /verify/ {{ proxy_pass: app, challenge: always }}
+                    location /dotfiles/ {{
+                        proxy_pass: app
+                        packs {{ sensitive_paths: off }}
+                        policy {{ medium: allow }}
+                    }}
+                    "/": app
+                }}
+            }}"#
+        );
+        let modes = std::collections::HashMap::from([(
+            "sensitive_paths".to_string(),
+            "enforce".to_string(),
+        )]);
+        let pipeline = sentry_core::pipeline::Pipeline::new(
+            sentry_core::packs::build_default_ruleset(&modes),
+            sentry_core::RouteValidator::new(vec![]),
+        );
+        let (app, mut rx) = location_app(&conf, pipeline);
+
+        // First request from this IP: no repetition bonus yet.
+        assert_eq!(
+            get(&app, "x", "/dotfiles/.env", &[]).await.status(),
+            200,
+            "pack off + level policy for this location only"
+        );
+        assert_eq!(
+            get(&app, "x", "/admin/", &[]).await.status(),
+            403,
+            "allowlist"
+        );
+
+        assert_eq!(get(&app, "x", "/limited/a", &[]).await.status(), 200);
+        assert_eq!(get(&app, "x", "/limited/a", &[]).await.status(), 200);
+        assert_eq!(
+            get(&app, "x", "/limited/a", &[]).await.status(),
+            429,
+            "rate limit"
+        );
+
+        assert_eq!(
+            get(&app, "x", "/.env", &[]).await.status(),
+            403,
+            "pack enforces elsewhere"
+        );
+
+        while rx.try_recv().is_ok() {}
+        assert_eq!(
+            get(&app, "x", "/static/.env", &[]).await.status(),
+            200,
+            "mode off"
+        );
+        assert!(rx.try_recv().is_err(), "mode off publishes no event");
+
+        assert_eq!(
+            get(&app, "x", "/shadow/.env", &[]).await.status(),
+            200,
+            "shadow never acts"
+        );
+        let pe = rx.try_recv().expect("shadow still records");
+        assert_eq!(pe.decision.action, sentry_core::analysis::Verdict::Allow);
+        assert!(pe
+            .decision
+            .override_reason
+            .as_deref()
+            .unwrap()
+            .contains("would block"));
+
+        assert_eq!(
+            get(&app, "x", "/verify/", &[]).await.status(),
+            403,
+            "forced challenge (disabled → 403)"
+        );
+        assert_eq!(get(&app, "x", "/", &[]).await.status(), 200);
     }
 }

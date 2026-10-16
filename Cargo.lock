@@ -1137,7 +1137,6 @@ dependencies = [
  "atomic",
  "pear",
  "serde",
- "toml",
  "uncased",
  "version_check",
 ]
@@ -3408,7 +3407,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "sentry-action-blocklist"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "sentry-core",
@@ -3418,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-action-cloudflare"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "ipnet",
@@ -3433,7 +3432,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-action-firewall"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "sentry-core",
@@ -3444,7 +3443,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-action-nginx"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "sentry-core",
@@ -3454,7 +3453,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-action-opnsense"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "reqwest 0.12.28",
@@ -3466,7 +3465,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-action-report"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "reqwest 0.12.28",
@@ -3479,7 +3478,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-action-webhook"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "hmac",
@@ -3495,7 +3494,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-ai"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3511,19 +3510,18 @@ dependencies = [
 
 [[package]]
 name = "sentry-auto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "regex",
  "sentry-core",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "toml",
 ]
 
 [[package]]
 name = "sentry-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3556,6 +3554,7 @@ dependencies = [
  "sentry-action-webhook",
  "sentry-ai",
  "sentry-auto",
+ "sentry-conf",
  "sentry-core",
  "sentry-edge",
  "sentry-geo",
@@ -3583,8 +3582,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentry-conf"
+version = "0.3.0"
+dependencies = [
+ "pretty_assertions",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "sentry-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3598,6 +3606,7 @@ dependencies = [
  "pretty_assertions",
  "proptest",
  "regex",
+ "sentry-conf",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3610,7 +3619,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-edge"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "brotli",
@@ -3622,9 +3631,11 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ipnet",
  "md-5",
  "prometheus",
  "rcgen",
+ "regex",
  "reqwest 0.12.28",
  "rustls",
  "rustls-pemfile",
@@ -3646,7 +3657,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-geo"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "maxminddb",
  "sentry-core",
@@ -3656,7 +3667,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -3671,7 +3682,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-reputation"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "futures",
@@ -3685,7 +3696,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-source-cloudflare"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3699,7 +3710,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-source-nginx"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3714,7 +3725,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-source-syslog"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3726,7 +3737,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-source-tcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3738,7 +3749,7 @@ dependencies = [
 
 [[package]]
 name = "sentry-storage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",

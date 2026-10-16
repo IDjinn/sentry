@@ -2,7 +2,7 @@
 //! groups — load balancing (`round_robin` / `least_conn` / `ip_hash`),
 //! passive health checks (`max_fails` / `fail_timeout` semantics: eject a
 //! server after enough failures inside the window, let it back in when the
-//! window elapses) and vhost routing by Host header.
+//! window elapses). Host/path routing lives in [`crate::routing`].
 //!
 //! The state is lock-free on the selection path: `down_until` and the
 //! in-flight counters are atomics; the failure timestamps only lock on
@@ -225,88 +225,6 @@ impl UpstreamGroup {
     }
 }
 
-/// One vhost routing entry: a normalized host pattern and its group.
-struct VhostEntry {
-    pattern: String,
-    group: UpstreamGroup,
-}
-
-/// Host-header router (F14): the nginx `server_name` table. Exact matches
-/// win over wildcards; among wildcards the longest suffix wins. A request
-/// with no usable Host (HTTP/1.0) falls back to the default group.
-pub struct VhostRouter {
-    default: UpstreamGroup,
-    entries: Vec<VhostEntry>,
-}
-
-impl VhostRouter {
-    pub fn new(default: UpstreamGroup, entries: Vec<(String, UpstreamGroup)>) -> Self {
-        Self {
-            default,
-            entries: entries
-                .into_iter()
-                .map(|(host, group)| VhostEntry {
-                    pattern: host.to_ascii_lowercase(),
-                    group,
-                })
-                .collect(),
-        }
-    }
-
-    /// A router with only the default group — the classic single-upstream
-    /// edge (and the test baseline).
-    pub fn single(upstream: String) -> Self {
-        Self::new(
-            UpstreamGroup::new("", &[upstream], BalanceMode::RoundRobin, 0, 30),
-            Vec::new(),
-        )
-    }
-
-    /// The catch-all group (requests with no Host or no matching vhost).
-    pub fn default_group(&self) -> &UpstreamGroup {
-        &self.default
-    }
-
-    /// Resolve the group serving `host` (a raw Host header value; the port
-    /// suffix is stripped by [`host_key`]).
-    pub fn resolve(&self, host: Option<&str>) -> &UpstreamGroup {
-        let Some(key) = host_key(host) else {
-            return &self.default;
-        };
-        let mut wildcard: Option<(&VhostEntry, usize)> = None;
-        for entry in &self.entries {
-            if entry.pattern == key {
-                return &entry.group;
-            }
-            let Some(suffix) = wildcard_pattern_suffix(&entry.pattern) else {
-                continue;
-            };
-            if !key.ends_with(suffix) {
-                continue;
-            }
-            let takes_over = match wildcard {
-                None => true,
-                Some((_, best_len)) => suffix.len() > best_len,
-            };
-            if takes_over {
-                wildcard = Some((entry, suffix.len()));
-            }
-        }
-        wildcard.map_or(&self.default, |(e, _)| &e.group)
-    }
-
-    /// Every group (default first), for startup health checks and logs.
-    pub fn groups(&self) -> impl Iterator<Item = &UpstreamGroup> {
-        std::iter::once(&self.default).chain(self.entries.iter().map(|e| &e.group))
-    }
-}
-
-/// The suffix a wildcard pattern matches (`*.example.com` → `.example.com`),
-/// `None` for exact patterns.
-fn wildcard_pattern_suffix(pattern: &str) -> Option<&str> {
-    pattern.strip_prefix('*')
-}
-
 /// Normalize a raw Host header value for matching: lowercase, strip the
 /// `:port` suffix, unwrap `[IPv6]:port`. `None` when there is nothing to
 /// match (HTTP/1.0 without Host, or an empty header).
@@ -379,72 +297,6 @@ mod tests {
         assert!(host_key(Some("")).is_none());
         assert!(host_key(None).is_none());
         assert!(host_key(Some(":8080")).is_none());
-    }
-
-    #[test]
-    fn router_exact_match_wins_over_wildcard() {
-        let entries = vec![
-            (
-                "app.example.com".to_string(),
-                group(&["http://exact:1"], BalanceMode::RoundRobin),
-            ),
-            (
-                "*.example.com".to_string(),
-                group(&["http://wild:2"], BalanceMode::RoundRobin),
-            ),
-        ];
-        let router = VhostRouter::new(
-            group(&["http://default:0"], BalanceMode::RoundRobin),
-            entries,
-        );
-        assert_eq!(
-            router.resolve(Some("app.example.com")).servers[0].url,
-            "http://exact:1"
-        );
-        assert_eq!(
-            router.resolve(Some("App.Example.COM")).servers[0].url,
-            "http://exact:1"
-        );
-        assert_eq!(
-            router.resolve(Some("sub.example.com")).servers[0].url,
-            "http://wild:2"
-        );
-        // Bare domain does not match `*.example.com` (nginx semantics).
-        assert_eq!(
-            router.resolve(Some("example.com")).servers[0].url,
-            "http://default:0"
-        );
-        assert_eq!(router.resolve(None).servers[0].url, "http://default:0");
-        assert_eq!(
-            router.resolve(Some("other.org:8080")).servers[0].url,
-            "http://default:0"
-        );
-    }
-
-    #[test]
-    fn router_longest_wildcard_suffix_wins() {
-        let entries = vec![
-            (
-                "*.example.com".to_string(),
-                group(&["http://wide:1"], BalanceMode::RoundRobin),
-            ),
-            (
-                "*.api.example.com".to_string(),
-                group(&["http://narrow:2"], BalanceMode::RoundRobin),
-            ),
-        ];
-        let router = VhostRouter::new(
-            group(&["http://default:0"], BalanceMode::RoundRobin),
-            entries,
-        );
-        assert_eq!(
-            router.resolve(Some("v1.api.example.com")).servers[0].url,
-            "http://narrow:2"
-        );
-        assert_eq!(
-            router.resolve(Some("www.example.com")).servers[0].url,
-            "http://wide:1"
-        );
     }
 
     #[test]
@@ -550,25 +402,5 @@ mod tests {
         assert_eq!(g.pick_excluding(&[0], ip(), 2_000), None);
         // ...and the ejection expires.
         assert_eq!(g.pick_excluding(&[0], ip(), 31_001), Some(1));
-    }
-
-    #[test]
-    fn router_exposes_all_groups_for_health_checks() {
-        let entries = vec![(
-            "app.example.com".to_string(),
-            UpstreamGroup::new(
-                "app.example.com",
-                &["http://a:1".to_string()],
-                BalanceMode::RoundRobin,
-                2,
-                30,
-            ),
-        )];
-        let router = VhostRouter::new(
-            group(&["http://default:0"], BalanceMode::RoundRobin),
-            entries,
-        );
-        let names: Vec<&str> = router.groups().map(|g| g.name.as_str()).collect();
-        assert_eq!(names, ["", "app.example.com"]);
     }
 }

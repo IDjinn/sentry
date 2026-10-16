@@ -104,7 +104,7 @@ fn friendly(e: self_update::Error) -> color_eyre::Report {
              .github/workflows/release.yml"
             .to_string(),
         E::NotFound { .. } => {
-            "release repository not found — check `--repo` / [update] repo".to_string()
+            "release repository not found — check `--repo` / sentry › update › repo".to_string()
         }
         E::Unauthorized { .. } => {
             "GitHub rejected the auth token (GH_TOKEN / GITHUB_TOKEN)".to_string()
