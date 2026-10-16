@@ -162,8 +162,8 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             let mut entries = vec![(p.name.clone(), p.mode.clone())];
             for (key, value) in &p.params {
                 let rendered = match value {
-                    toml::Value::String(s) => Some(s.clone()),
-                    toml::Value::Array(arr) => Some(
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Array(arr) => Some(
                         arr.iter()
                             .filter_map(|v| v.as_str())
                             .collect::<Vec<_>>()
@@ -425,7 +425,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
 
     // Build the pipeline with config-driven scorer + verdict policy.
     let policy = sentry_core::VerdictPolicy::from_config(&cfg.policy)
-        .map_err(|e| color_eyre::eyre::eyre!("invalid [policy] config: {e}"))?;
+        .map_err(|e| color_eyre::eyre::eyre!("invalid server › policy: {e}"))?;
 
     // Behavioral scan tracker (per-IP 4xx windows → RandomScan/ScanBehavior).
     let scan_tracker = cfg.scan.enabled.then(|| {
@@ -450,7 +450,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     });
     if cfg.uploads.enabled && !cfg.deployment.is_inline() {
         warn!(
-            "[uploads] enabled but [deployment] mode is not \"inline\" — request \
+            "detect › uploads is enabled but the sentry mode is not inline — request \
              bodies never reach passive sources (log tails), so upload inspection \
              has nothing to analyze; switch to inline to enforce it"
         );
@@ -461,18 +461,18 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     // (roadmap) and is rejected here so the config never lies.
     if cfg.posture.mode.is_enforce() {
         return Err(color_eyre::eyre::eyre!(
-            "[posture] mode = \"enforce\" is not implemented yet — header \
+            "detect › posture › mode: enforce is not implemented yet — header \
              injection without per-site knowledge would break pages; use \
-             \"shadow\" (roadmap: BACKLOG.md §5.4)"
+             shadow (roadmap: BACKLOG.md §5.4)"
         ));
     }
     if cfg.posture.enabled {
         for id in cfg.posture.unknown_checks() {
-            warn!(check = %id, "unknown [posture] checks id — ignoring");
+            warn!(check = %id, "unknown detect › posture checks id — ignoring");
         }
         if !cfg.deployment.is_inline() {
             warn!(
-                "[posture] enabled but [deployment] mode is not \"inline\" — \
+                "detect › posture is enabled but the sentry mode is not inline — \
                  origin responses never reach passive sources, so no security \
                  header is ever observed; advisory checks stay silent"
             );
@@ -503,7 +503,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     // never-ban clients (`[real_ip] trusted_ips`).
     let shared_trust = sentry_core::SharedTrustSet::new(
         sentry_core::TrustSet::from_config(&cfg.real_ip)
-            .map_err(|e| color_eyre::eyre::eyre!("[real_ip] {e}"))?,
+            .map_err(|e| color_eyre::eyre::eyre!("trust: {e}"))?,
     );
     if cfg.real_ip.cloudflare && cfg.real_ip.refresh_secs > 0 {
         spawn_cloudflare_refresh(cfg.real_ip.clone(), shared_trust.clone());
@@ -876,7 +876,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     let ip_lookup_fork = build_ip_lookup_fork(&cfg, &metrics);
 
     if registry.source_count() == 0 {
-        warn!("no sources configured — daemon will idle. Add [[source]] entries in sentry.toml");
+        warn!("no sources configured — daemon will idle. Add `source <type> {{ … }}` blocks to sentry.conf");
     }
 
     // Cloudflare startup reconcile: verifies the token, re-adopts edge rules
@@ -991,34 +991,47 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         let edge_errors = cfg.edge.validate();
         if !edge_errors.is_empty() {
             return Err(color_eyre::eyre::eyre!(
-                "[edge] invalid configuration:\n  - {}",
+                "http: invalid configuration:\n  - {}",
                 edge_errors.join("\n  - ")
             ));
         }
-        let default_servers = cfg.edge.default_group_servers();
-        if default_servers.is_empty() && cfg.edge.vhosts.is_empty() {
+        if !cfg.edge.has_routes() {
             return Err(color_eyre::eyre::eyre!(
-                "[deployment] mode = \"inline\" requires [edge] upstream (or [[edge.vhosts]])"
+                "sentry {{ mode: inline }} requires an http {{ upstream … site {{ location … }} }} route \
+                 (or `http {{ proxy_pass: http://127.0.0.1:8080 }}`)"
             ));
         }
+        let (route_groups, route_sites) = sentry_core::edge_routes::normalized(&cfg.edge);
         let enricher = make_enricher(&geo, &reputation, &shared_trust);
         let (dec_tx, mut dec_rx) = mpsc::channel::<sentry_core::ProcessedEvent>(buffer);
         let mut extra_certs: Vec<sentry_edge::proxy::VhostCert> = Vec::new();
         let tls_cfg = match (&cfg.edge.tls_cert, &cfg.edge.tls_key) {
             (Some(cert), Some(key)) => {
-                // Per-vhost certificates (F14): group vhosts that declare
-                // their own cert/key by identical paths.
-                for vhost in &cfg.edge.vhosts {
-                    let (Some(vcert), Some(vkey)) = (&vhost.tls_cert, &vhost.tls_key) else {
+                // Per-site certificates (F14): served via SNI for the site's
+                // hosts; sites sharing cert/key paths share one entry.
+                for site in &route_sites {
+                    let (Some(vcert), Some(vkey)) = (&site.tls_cert, &site.tls_key) else {
                         continue;
                     };
+                    let hosts: Vec<String> = site
+                        .hosts
+                        .iter()
+                        .filter(|h| {
+                            let regex = h.starts_with('~');
+                            if regex {
+                                warn!(host = %h, "http: regex site hosts cannot select a TLS certificate via SNI — the default certificate is served");
+                            }
+                            !regex
+                        })
+                        .cloned()
+                        .collect();
                     match extra_certs
                         .iter_mut()
                         .find(|c| &c.cert == vcert && &c.key == vkey)
                     {
-                        Some(entry) => entry.hosts.push(vhost.host.clone()),
+                        Some(entry) => entry.hosts.extend(hosts),
                         None => extra_certs.push(sentry_edge::proxy::VhostCert {
-                            hosts: vec![vhost.host.clone()],
+                            hosts,
                             cert: vcert.clone(),
                             key: vkey.clone(),
                         }),
@@ -1042,7 +1055,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             (None, None) => None,
             _ => {
                 return Err(color_eyre::eyre::eyre!(
-                    "[edge] tls_cert and tls_key must be configured together"
+                    "http › tls: cert and key must be configured together"
                 ));
             }
         };
@@ -1057,14 +1070,14 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         match &tls_cfg {
             None => {
                 warn!(
-                    "[edge] no tls_cert configured — the site is served over plain \
-                     HTTP and browsers flag it as \"not using HTTPS\"; see [edge] \
-                     tls_cert/tls_key (F8)"
+                    "http: no tls cert configured — the site is served over plain \
+                     HTTP and browsers flag it as \"not using HTTPS\"; see \
+                     http › tls › cert/key (F8)"
                 );
             }
             Some(tls) if !tls.redirect_https => {
                 warn!(
-                    "[edge] tls_redirect_https = false — HTTP traffic is not \
+                    "http › tls › redirect_https is off — HTTP traffic is not \
                      redirected to HTTPS; browsers report \"HTTP traffic is not \
                      redirected\" and first visits stay cleartext"
                 );
@@ -1073,14 +1086,17 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         }
         let proxy_cfg = sentry_edge::proxy::EdgeProxyConfig {
             listen: cfg.edge.listen.clone(),
-            upstreams: default_servers,
+            upstreams: Vec::new(),
             balance: cfg.edge.balance,
             max_fails: cfg.edge.max_fails,
             fail_timeout_secs: cfg.edge.fail_timeout_secs,
             health_path: cfg.edge.health_path.clone(),
             health_timeout_secs: cfg.edge.health_timeout_secs,
             tls: tls_cfg.clone(),
-            vhosts: cfg.edge.vhosts.clone(),
+            vhosts: Vec::new(),
+            groups: route_groups.clone(),
+            sites: route_sites.clone(),
+            security: cfg.edge.security.clone(),
             compress: cfg.edge.compress.clone(),
             forwarded_headers: cfg.edge.forwarded_headers,
             response_buffering: cfg.edge.response_buffering,
@@ -1180,13 +1196,13 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             let secret = std::env::var(&cfg.edge.challenge.secret_env)
                 .map_err(|_| {
                     color_eyre::eyre::eyre!(
-                        "[edge.challenge] enabled but env `{}` is not set (generate one with `openssl rand -hex 32`)",
+                        "http › challenge is enabled but env `{}` is not set (generate one with `openssl rand -hex 32`)",
                         cfg.edge.challenge.secret_env
                     )
                 })?;
             if secret.len() < 16 {
                 return Err(color_eyre::eyre::eyre!(
-                    "[edge.challenge] secret in `{}` is too short (use 32+ random bytes)",
+                    "http › challenge: secret in `{}` is too short (use 32+ random bytes)",
                     cfg.edge.challenge.secret_env
                 ));
             }
@@ -1216,22 +1232,17 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                 );
             } else {
                 warn!(
-                    "[edge] challenge_backend = \"cloudflare\" but no [[action]] with provider \
-                     = \"cloudflare\" is configured — Challenge verdicts will be held with a \
+                    "http › challenge › backend is cloudflare but no `action challenge cloudflare` \
+                     block is configured — Challenge verdicts will be held with a \
                      403 retry page instead of becoming Cloudflare rules"
                 );
             }
         }
-        let edge_summary = {
-            let mut servers = cfg.edge.default_group_servers();
-            servers.extend(
-                cfg.edge
-                    .vhosts
-                    .iter()
-                    .map(|v| format!("{}→{}", v.host, v.upstreams.join(","))),
-            );
-            servers.join(" ")
-        };
+        let edge_summary = route_groups
+            .iter()
+            .map(|g| format!("{}→{}", g.name, g.servers.join(",")))
+            .collect::<Vec<_>>()
+            .join(" ");
         tokio::spawn(async move {
             if let Err(e) = sentry_edge::proxy::serve(runtime, proxy_cfg, dec_tx).await {
                 error!(error = %e, upstreams = %edge_summary, "edge proxy terminated");
@@ -1369,10 +1380,11 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         }
         info!(
             listen = %cfg.edge.listen,
-            upstream = %cfg.edge.default_group_servers().join(","),
-            vhosts = cfg.edge.vhosts.len(),
+            upstreams = route_groups.len(),
+            sites = route_sites.len(),
+            locations = route_sites.iter().map(|s| s.locations.len()).sum::<usize>(),
             balance = cfg.edge.balance.as_str(),
-            "inline edge enabled (deployment.mode = inline)"
+            "inline edge enabled (sentry {{ mode: inline }})"
         );
     }
     // The overload monitor measures fan-in occupancy from the receiver side
@@ -3411,13 +3423,13 @@ fn build_registry(
                 let channel_buffer = src
                     .options
                     .get("channel_buffer")
-                    .and_then(|v| v.as_integer())
+                    .and_then(|v| v.as_i64())
                     .map(|v| v.max(64) as usize)
                     .unwrap_or(sentry_source_tcp::DEFAULT_CHANNEL_BUFFER);
                 let syn_window_ms = src
                     .options
                     .get("syn_window_ms")
-                    .and_then(|v| v.as_integer())
+                    .and_then(|v| v.as_i64())
                     .map(|v| v.max(0) as u64)
                     .unwrap_or(sentry_source_tcp::DEFAULT_SYN_WINDOW_MS);
                 let ts =
@@ -3638,15 +3650,15 @@ fn blocklist_ttl_secs(cfg: &SentryConfig) -> u64 {
         .unwrap_or(86_400)
 }
 
-fn parse_ttl_secs(opts: &HashMap<String, toml::Value>, default_secs: u64) -> u64 {
+fn parse_ttl_secs(opts: &HashMap<String, serde_json::Value>, default_secs: u64) -> u64 {
     opts.get("ttl_secs")
         .or_else(|| opts.get("timeout_secs"))
-        .and_then(|v| v.as_integer())
+        .and_then(|v| v.as_i64())
         .map(|i| i.max(0) as u64)
         .unwrap_or(default_secs)
 }
 
-fn parse_edge_mode(opts: &HashMap<String, toml::Value>) -> Option<EdgeMode> {
+fn parse_edge_mode(opts: &HashMap<String, serde_json::Value>) -> Option<EdgeMode> {
     let raw = opts.get("mode")?.as_str()?;
     match EdgeMode::parse(raw) {
         Some(m) => Some(m),
@@ -3660,10 +3672,10 @@ fn parse_edge_mode(opts: &HashMap<String, toml::Value>) -> Option<EdgeMode> {
     }
 }
 
-fn parse_max_failures(opts: &HashMap<String, toml::Value>) -> u32 {
+fn parse_max_failures(opts: &HashMap<String, serde_json::Value>) -> u32 {
     match opts
         .get("max_failures")
-        .and_then(|v| v.as_integer())
+        .and_then(|v| v.as_i64())
         .and_then(|i| u32::try_from(i).ok())
     {
         Some(n) if n > 0 => n,
@@ -3674,8 +3686,8 @@ fn parse_max_failures(opts: &HashMap<String, toml::Value>) -> u32 {
 /// Parse the opt-in `ipv6_prefix` option (F2.14): block/rate-limit verdicts
 /// for IPv6 clients go to a /<prefix> Cloudflare IP List item instead of an
 /// exact /128 access rule. 128 (exact) is the default and disables it.
-fn parse_ipv6_prefix(opts: &HashMap<String, toml::Value>) -> Option<u8> {
-    let raw = opts.get("ipv6_prefix")?.as_integer()?;
+fn parse_ipv6_prefix(opts: &HashMap<String, serde_json::Value>) -> Option<u8> {
+    let raw = opts.get("ipv6_prefix")?.as_i64()?;
     match u8::try_from(raw) {
         Ok(p) if (1..128).contains(&p) => Some(p),
         Ok(128) => None,
@@ -3720,7 +3732,7 @@ type ProviderHandles = (
 
 fn build_challenge_action(
     provider_name: &str,
-    options: &HashMap<String, toml::Value>,
+    options: &HashMap<String, serde_json::Value>,
     trust: &sentry_core::SharedTrustSet,
     dispatch: ActionDispatch,
 ) -> color_eyre::Result<Option<ChallengeActionWithProvider>> {

@@ -54,7 +54,7 @@ struct AppState {
 pub async fn run(cfg: &SentryConfig) -> color_eyre::Result<()> {
     if cfg.storage.postgres.url.is_empty() {
         return Err(color_eyre::eyre::eyre!(
-            "`sentry serve` requires Postgres — set storage.postgres.url in sentry.toml or via SENTRY_STORAGE__POSTGRES__URL env"
+            "`sentry serve` requires Postgres — set `storage {{ url: … }}` in sentry.conf or SENTRY_STORAGE__POSTGRES__URL"
         ));
     }
     let auth = AuthLayer::from_config(cfg)
@@ -62,7 +62,7 @@ pub async fn run(cfg: &SentryConfig) -> color_eyre::Result<()> {
     if auth.disabled() && !is_loopback(&cfg.server.host) {
         warn!(
             host = %cfg.server.host,
-            "server binds off-loopback with [server.auth] mode=none — anyone who can reach this address can mutate state; set mode = \"both\" and configure users/tokens"
+            "server binds off-loopback with dashboard › auth mode none — anyone who can reach this address can mutate state; set `mode: both` and configure users/tokens"
         );
     }
     let pool = sentry_storage::PgPool::connect(&cfg.storage.postgres)

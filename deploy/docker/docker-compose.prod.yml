@@ -8,7 +8,7 @@
 #   - sentry runs as root (to read /www/wwwlogs owned by www user, mode 700)
 #   - postgres NOT exposed to host (no ports)
 #   - mounts aaPanel nginx logs read-only
-#   - mounts a real sentry.toml (gitignored) instead of the example
+#   - mounts a real sentry.conf (gitignored) instead of the example
 #   - restart: always
 
 services:
@@ -25,6 +25,6 @@ services:
       SENTRY_LLM_KEY: "${SENTRY_LLM_KEY:-}"
       SENTRY_STORAGE__POSTGRES__URL: "${SENTRY_STORAGE__POSTGRES__URL:-}"
     volumes:
-      - ../../config/sentry.toml:/etc/sentry/sentry.toml:ro
+      - ../../config/sentry.conf:/etc/sentry/sentry.conf:ro
       - /www/wwwlogs:/var/log/nginx:ro
       - sentrydata:/var/lib/sentry

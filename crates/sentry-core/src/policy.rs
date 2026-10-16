@@ -4,7 +4,7 @@
 //! we found*; the policy says *what to do about it*. The default policy keeps
 //! the historical mapping (Info/Low → Allow, Medium → RateLimit, High →
 //! Challenge, Critical → Block) but every level can be remapped in
-//! `sentry.toml` and ordered `[[policy.override]]` entries (DSL match +
+//! `sentry.conf` (`server { policy {} }`) and ordered `override` entries (DSL match +
 //! verdict) can force a verdict for specific traffic.
 
 use crate::analysis::{RiskLevel, Verdict};
@@ -83,7 +83,9 @@ fn level_index(level: RiskLevel) -> usize {
     }
 }
 
-fn parse_verdict(s: &str) -> Result<Verdict> {
+/// Parse a verdict name (`allow`, `rate_limit`, `challenge`, `block`,
+/// `quarantine`).
+pub fn parse_verdict(s: &str) -> Result<Verdict> {
     match s.to_ascii_lowercase().as_str() {
         "allow" => Ok(Verdict::Allow),
         "rate_limit" | "ratelimit" => Ok(Verdict::RateLimit),

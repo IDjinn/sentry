@@ -1,4 +1,8 @@
-//! Configuration schema (serde structs) for `sentry.toml`.
+//! Runtime configuration model (serde structs).
+//!
+//! `sentry.conf` (nginx-like, see `crate::conf`) is lowered onto these
+//! structs; their serde shape also backs the `SENTRY_*` env overlay and the
+//! legacy `sentry.toml` reader used by `sentry config migrate`.
 //!
 //! Loading (figment, env overlay) lives in `sentry-cli`; this module only
 //! defines the typed shape so it can be shared with tests and the daemon
@@ -174,13 +178,13 @@ impl UpdateConfig {
         let slashes = self.repo.matches('/').count();
         if slashes != 1 || self.repo.split('/').any(|p| p.is_empty()) {
             return Err(format!(
-                "[update] repo must be `owner/name`, got {:?}",
+                "sentry › update › repo must be `owner/name`, got {:?}",
                 self.repo
             ));
         }
         if self.enabled && self.interval_secs < 300 {
             return Err(
-                "[update] interval_secs must be >= 300 (protect the GitHub API rate limit)"
+                "sentry › update › interval must be >= 5m (protect the GitHub API rate limit)"
                     .to_string(),
             );
         }
@@ -1183,7 +1187,7 @@ impl SentryConfig {
         if !self.deployment.is_inline() {
             if self.edge.compress.enabled {
                 out.push(
-                    "[edge.compress] enabled but [deployment] mode is not inline — \
+                    "http › compress is enabled but sentry { mode } is not inline — \
                      compression only applies to the reverse proxy"
                         .to_string(),
                 );
@@ -1191,26 +1195,32 @@ impl SentryConfig {
             return out;
         }
         let tls = self.edge.tls_cert.is_some() && self.edge.tls_key.is_some();
-        // Every upstream group is graded: the default (catch-all) group and
-        // each vhost's own servers (F14).
-        let default_servers = self.edge.default_group_servers();
-        let mut groups: Vec<(&str, &str)> =
-            default_servers.iter().map(|u| ("", u.as_str())).collect();
-        for vhost in &self.edge.vhosts {
-            for url in &vhost.upstreams {
-                groups.push((vhost.host.as_str(), url.as_str()));
+        // Every upstream is graded: named groups and the URLs locations
+        // proxy to directly.
+        let (route_groups, sites) = crate::edge_routes::normalized(&self.edge);
+        let mut groups: Vec<(String, String)> = route_groups
+            .iter()
+            .flat_map(|g| {
+                g.servers
+                    .iter()
+                    .map(|u| (format!("upstream {}", g.name), u.clone()))
+            })
+            .collect();
+        for site in &sites {
+            for loc in &site.locations {
+                if let Some(target) = &loc.proxy_pass {
+                    if target.starts_with("http://") || target.starts_with("https://") {
+                        groups.push((format!("location {}", loc.path), target.clone()));
+                    }
+                }
             }
         }
         for (label, url) in &groups {
             let upstream_https = url.starts_with("https://");
-            let site = if label.is_empty() {
-                String::new()
-            } else {
-                format!(" (vhost {label})")
-            };
+            let site = format!(" ({label})");
             if tls && upstream_https {
                 out.push(format!(
-                    "[edge]{site} TLS terminates at the edge but upstream is https:// — \
+                    "http{site}: TLS terminates at the edge but upstream is https:// — \
                      double TLS costs CPU and a second certificate to manage; serve the \
                      backend over plain http:// (ideally on 127.0.0.1)"
                 ));
@@ -1219,7 +1229,7 @@ impl SentryConfig {
                 let loopback = host == "127.0.0.1" || host == "::1" || host == "localhost";
                 if !loopback && !upstream_https {
                     out.push(format!(
-                        "[edge]{site} upstream {host} is off-loopback over plain http — \
+                        "http{site}: upstream {host} is off-loopback over plain http — \
                          edge→backend traffic crosses the network unencrypted (container \
                          names included: the Docker bridge is cleartext); prefer \
                          127.0.0.1 or a tunnel"
@@ -1674,12 +1684,12 @@ pub struct EdgeConfig {
     /// may be a hostname (`http://web:3000`, e.g. a Docker container name) —
     /// it resolves through the system resolver. Stays as the default
     /// (catch-all) backend for requests whose Host matches no vhost.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub upstream: String,
     /// Additional default-group backends (F14). When set, they replace
     /// `upstream` as the catch-all group and requests are load-balanced
     /// across them with `balance` + passive health checks.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upstreams: Vec<String>,
     /// Load-balancing strategy for upstream groups (F14).
     #[serde(default)]
@@ -1704,8 +1714,19 @@ pub struct EdgeConfig {
     pub upstream_timeout_secs: u64,
     /// Nginx-style virtual hosts (F14): route by Host header to per-site
     /// upstream groups (each with its own balancer/health settings).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vhosts: Vec<EdgeVhostConfig>,
+    /// Named upstream groups (`http { upstream NAME {} }`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_groups: Vec<crate::edge_routes::UpstreamGroupConfig>,
+    /// Sites with their locations (`http { site { location … } }`). When
+    /// empty, the legacy `upstream`/`upstreams`/`vhosts` fields are
+    /// normalized into equivalent sites (see [`crate::edge_routes::normalized`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sites: Vec<crate::edge_routes::SiteConfig>,
+    /// Security defaults inherited by every site and location.
+    #[serde(default)]
+    pub security: crate::edge_routes::SecurityConfig,
     /// Path used for the mandatory startup health check (default `/`).
     #[serde(default = "default_edge_health_path")]
     pub health_path: String,
@@ -1920,70 +1941,18 @@ impl EdgeConfig {
         }
     }
 
-    /// Config errors for `[edge]` (F14): bad vhost hosts, upstreams without
-    /// scheme, duplicate hosts, TLS-cert pairing. Pure — `sentry config
-    /// validate` fails on them and the daemon refuses to start inline.
+    /// Config errors for the edge routing table: upstream groups, sites,
+    /// locations, conditions, security overrides and TLS pairing. Pure —
+    /// `sentry config validate` fails on them and the daemon refuses to
+    /// start inline.
     pub fn validate(&self) -> Vec<String> {
-        let mut errors = Vec::new();
-        let servers = self.default_group_servers();
-        for url in &servers {
-            if !url.starts_with("http://") && !url.starts_with("https://") {
-                errors.push(format!(
-                    "[edge] upstream `{url}` must start with http:// or https://"
-                ));
-            }
-        }
-        let mut seen: Vec<String> = Vec::new();
-        for vhost in &self.vhosts {
-            let host = vhost.host.trim();
-            if host.is_empty() {
-                errors.push("[edge.vhosts] `host` must not be empty".to_string());
-                continue;
-            }
-            if host != host.to_ascii_lowercase() {
-                errors.push(format!(
-                    "[edge.vhosts] host `{host}` must be lowercase (matching is case-insensitive)"
-                ));
-            }
-            if host.starts_with("*.") && host[2..].is_empty() {
-                errors.push("[edge.vhosts] wildcard `*.` needs a domain suffix".to_string());
-            } else if host.contains('*') && !host.starts_with("*.") {
-                errors.push(format!(
-                    "[edge.vhosts] host `{host}`: `*` is only valid as a leading `*.` wildcard"
-                ));
-            }
-            if seen.iter().any(|h| h == host) {
-                errors.push(format!("[edge.vhosts] duplicate host `{host}`"));
-            } else {
-                seen.push(host.to_string());
-            }
-            if vhost.upstreams.is_empty() {
-                errors.push(format!(
-                    "[edge.vhosts] `{host}` needs at least one entry in `upstreams`"
-                ));
-            }
-            for url in &vhost.upstreams {
-                if !url.starts_with("http://") && !url.starts_with("https://") {
-                    errors.push(format!(
-                        "[edge.vhosts] `{host}` upstream `{url}` must start with http:// or https://"
-                    ));
-                }
-            }
-            let cert = vhost.tls_cert.is_some();
-            let key = vhost.tls_key.is_some();
-            if cert != key {
-                errors.push(format!(
-                    "[edge.vhosts] `{host}`: tls_cert and tls_key must be configured together"
-                ));
-            }
-            if cert && (self.tls_cert.is_none() || self.tls_key.is_none()) {
-                errors.push(format!(
-                    "[edge.vhosts] `{host}`: per-vhost tls_cert requires the global [edge] \
-                     tls_cert/tls_key front (the certificate is served via SNI on the same listener)"
-                ));
-            }
-        }
-        errors
+        crate::edge_routes::validate(self)
+    }
+
+    /// Whether any upstream/site is configured (inline mode needs one).
+    pub fn has_routes(&self) -> bool {
+        let (groups, sites) = crate::edge_routes::normalized(self);
+        !groups.is_empty() || !sites.is_empty()
     }
 }
 
@@ -2014,7 +1983,7 @@ impl RuntimeConfig {
         let mut errors = Vec::new();
         if self.worker_threads > 1024 {
             errors.push(format!(
-                "[runtime] worker_threads = {} is unreasonable (max 1024)",
+                "sentry › runtime › worker_threads = {} is unreasonable (max 1024)",
                 self.worker_threads
             ));
         }
@@ -2022,11 +1991,13 @@ impl RuntimeConfig {
         for core in &self.pin_cores {
             if *core > 65535 {
                 errors.push(format!(
-                    "[runtime] pin_cores: core id {core} is out of range (0..=65535)"
+                    "sentry › runtime › pin_cores: core id {core} is out of range (0..=65535)"
                 ));
             }
             if seen.contains(core) {
-                errors.push(format!("[runtime] pin_cores: duplicate core id {core}"));
+                errors.push(format!(
+                    "sentry › runtime › pin_cores: duplicate core id {core}"
+                ));
             } else {
                 seen.push(*core);
             }
@@ -2218,6 +2189,9 @@ impl Default for EdgeConfig {
             response_buffering: default_edge_response_buffering(),
             upstream_timeout_secs: default_edge_upstream_timeout(),
             vhosts: Vec::new(),
+            upstream_groups: Vec::new(),
+            sites: Vec::new(),
+            security: crate::edge_routes::SecurityConfig::default(),
             health_path: default_edge_health_path(),
             health_timeout_secs: default_edge_health_timeout(),
             body_capture_kb: 0,
@@ -2418,7 +2392,7 @@ pub struct RulePackConfig {
     pub mode: String,
     /// Extra parameters (e.g. `countries = ["RU","CN"]`).
     #[serde(default)]
-    pub params: HashMap<String, toml::Value>,
+    pub params: HashMap<String, serde_json::Value>,
 }
 
 impl Default for RulePackConfig {
@@ -2558,7 +2532,7 @@ pub struct SourceConfig {
     pub kind: String,
     /// Arbitrary plugin-specific fields.
     #[serde(default)]
-    pub options: HashMap<String, toml::Value>,
+    pub options: HashMap<String, serde_json::Value>,
 }
 
 /// An action plugin entry.
@@ -2582,7 +2556,7 @@ pub struct ActionConfig {
     pub dispatch: Option<crate::action::ActionDispatch>,
     /// Arbitrary plugin-specific fields.
     #[serde(default)]
-    pub options: HashMap<String, toml::Value>,
+    pub options: HashMap<String, serde_json::Value>,
 }
 
 /// Type-safe discriminator for action plugins.
@@ -2965,7 +2939,7 @@ mod tests {
         assert!(
             advisories
                 .iter()
-                .any(|a| a.contains("(vhost app.example.com)") && a.contains("off-loopback")),
+                .any(|a| a.contains("(upstream app.example.com)") && a.contains("off-loopback")),
             "{advisories:?}"
         );
         // https upstream without TLS at the edge is not a double-TLS issue.
@@ -3051,14 +3025,20 @@ mod tests {
         // Duplicate host.
         cfg.vhosts
             .push(vhost("app.example.com", &["http://other:80"]));
-        assert!(cfg.validate().iter().any(|e| e.contains("duplicate")));
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|e| e.contains("used by another site")));
 
         // Uppercase host + missing upstreams.
         cfg.vhosts.clear();
         cfg.vhosts.push(vhost("App.Example.com", &[]));
         let errors = cfg.validate();
         assert!(errors.iter().any(|e| e.contains("lowercase")), "{errors:?}");
-        assert!(errors.iter().any(|e| e.contains("upstreams")), "{errors:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("at least one `server`")),
+            "{errors:?}"
+        );
 
         // `*` only as a leading `*.` wildcard.
         cfg.vhosts[0].host = "a*b.example.com".to_string();
@@ -3077,12 +3057,12 @@ mod tests {
         assert!(cfg
             .validate()
             .iter()
-            .any(|e| e.contains("tls_cert and tls_key")));
+            .any(|e| e.contains("cert and key must be configured together")));
         cfg.vhosts[0].tls_key = Some("/k.pem".into());
         assert!(cfg
             .validate()
             .iter()
-            .any(|e| e.contains("requires the global [edge] tls_cert")));
+            .any(|e| e.contains("needs the global")));
         cfg.tls_cert = Some("/gc.pem".into());
         cfg.tls_key = Some("/gk.pem".into());
         assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());

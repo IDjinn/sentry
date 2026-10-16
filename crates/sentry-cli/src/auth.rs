@@ -1,6 +1,6 @@
 //! Authentication + RBAC for the dashboard and JSON API (F4.4).
 //!
-//! Two mechanisms, combinable via `[server.auth] mode`:
+//! Two mechanisms, combinable via `dashboard › auth mode`:
 //!
 //! - **password**: Argon2id login (`POST /api/login`) issuing an HMAC-SHA256
 //!   signed session cookie (`sentry_session`).
@@ -93,7 +93,7 @@ impl AuthMode {
             "token" => Ok(AuthMode::Token),
             "both" => Ok(AuthMode::Both),
             other => Err(color_eyre::eyre::eyre!(
-                "invalid [server.auth] mode `{other}` (expected none | password | token | both)"
+                "invalid dashboard › auth mode `{other}` (expected none | password | token | both)"
             )),
         }
     }
@@ -132,7 +132,7 @@ pub struct AuthLayer {
 }
 
 impl AuthLayer {
-    /// Build the auth layer from `[server]` / `[server.auth]` config.
+    /// Build the auth layer from `[server]` / `dashboard › auth` config.
     ///
     /// Fails when the selected mode is unusable (no users/tokens configured,
     /// malformed hashes, or a missing session secret env var).
@@ -144,12 +144,12 @@ impl AuthLayer {
         for u in &auth.users {
             if u.username.is_empty() {
                 return Err(color_eyre::eyre::eyre!(
-                    "[server.auth] user with empty username"
+                    "dashboard › auth user with empty username"
                 ));
             }
             PasswordHash::new(&u.password_hash).map_err(|e| {
                 color_eyre::eyre::eyre!(
-                    "[server.auth] user `{}` has an invalid Argon2 hash: {e} (generate one with `sentry auth hash-password`)",
+                    "dashboard › auth user `{}` has an invalid Argon2 hash: {e} (generate one with `sentry auth hash-password`)",
                     u.username
                 )
             })?;
@@ -165,21 +165,21 @@ impl AuthLayer {
             let raw = if !t.token_sha256.is_empty() {
                 parse_sha256_hex(&t.token_sha256).ok_or_else(|| {
                     color_eyre::eyre::eyre!(
-                        "[server.auth] token #{idx}: token_sha256 must be 64 hex chars (sha256 of the raw token)"
+                        "dashboard › auth token #{idx}: token_sha256 must be 64 hex chars (sha256 of the raw token)"
                     )
                 })?
             } else if !t.token_env.is_empty() {
                 let val = std::env::var(&t.token_env).unwrap_or_default();
                 if val.trim().is_empty() {
                     return Err(color_eyre::eyre::eyre!(
-                        "[server.auth] token #{idx}: env var {} is not set",
+                        "dashboard › auth token #{idx}: env var {} is not set",
                         t.token_env
                     ));
                 }
                 Sha256::digest(val.trim().as_bytes()).into()
             } else {
                 return Err(color_eyre::eyre::eyre!(
-                    "[server.auth] token #{idx}: set either token_sha256 or token_env"
+                    "dashboard › auth token #{idx}: set either token_sha256 or token_env"
                 ));
             };
             tokens.push(AuthToken {
@@ -192,27 +192,27 @@ impl AuthLayer {
         if mode.accepts_password() {
             if users.is_empty() {
                 return Err(color_eyre::eyre::eyre!(
-                    "[server.auth] mode `{}` requires at least one [[server.auth.users]] entry",
+                    "dashboard › auth mode `{}` requires at least one `user NAME` block",
                     auth.mode
                 ));
             }
             let secret = std::env::var(&auth.session_secret_env).unwrap_or_default();
             if secret.trim().is_empty() {
                 return Err(color_eyre::eyre::eyre!(
-                    "[server.auth] password mode requires the session secret env var `{}` (32+ random bytes)",
+                    "dashboard › auth password mode requires the session secret env var `{}` (32+ random bytes)",
                     auth.session_secret_env
                 ));
             }
             if secret.trim().len() < 16 {
                 tracing::warn!(
-                    "[server.auth] session secret is short (<16 chars); use 32+ random bytes"
+                    "dashboard › auth session secret is short (<16 chars); use 32+ random bytes"
                 );
             }
         }
 
         if mode.accepts_token() && tokens.is_empty() {
             return Err(color_eyre::eyre::eyre!(
-                "[server.auth] mode `{}` requires at least one [[server.auth.tokens]] entry",
+                "dashboard › auth mode `{}` requires at least one `token` block",
                 auth.mode
             ));
         }
@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn invalid_mode_fails_at_startup() {
         let err = AuthLayer::from_config(&server_cfg(auth_config("magic", None))).unwrap_err();
-        assert!(err.to_string().contains("invalid [server.auth] mode"));
+        assert!(err.to_string().contains("invalid dashboard › auth mode"));
     }
 
     #[test]

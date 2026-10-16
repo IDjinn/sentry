@@ -226,8 +226,8 @@ impl Metrics {
         .unwrap();
         let edge_tls_sni_mismatches = prometheus::Counter::new(
             "sentry_edge_tls_sni_mismatch_total",
-            "Handshakes whose SNI is missing or not in [edge] \
-             tls_allowed_hosts (F8).",
+            "Handshakes whose SNI is missing or not in http › tls › \
+             allowed_hosts (F8).",
         )
         .unwrap();
         let edge_tls_alpn = prometheus::CounterVec::new(

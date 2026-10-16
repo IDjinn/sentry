@@ -73,4 +73,4 @@ jobs:
       - name: Storage crate build + test
         run: cargo test -p sentry-storage --all-features
       - name: Validate example config
-        run: cargo build --locked && ./target/debug/sentry --config config/sentry.example.toml config validate
+        run: cargo build --locked && ./target/debug/sentry --config config/sentry.example.conf config validate

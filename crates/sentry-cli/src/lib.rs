@@ -1,6 +1,6 @@
 //! Sentry — access monitor with AI-powered threat detection.
 //!
-//! Multi-platform CLI. Reads `sentry.toml` (or env overrides), wires up
+//! Multi-platform CLI. Reads `sentry.conf` (nginx-like, split files allowed; env overrides on top), wires up
 //! sources, the pipeline, rules engine and actions, then streams events.
 
 #![forbid(unsafe_code)]

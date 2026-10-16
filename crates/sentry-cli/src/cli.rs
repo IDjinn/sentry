@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "sentry", version, about, long_about = None)]
 pub struct Cli {
-    /// Path to the config file (default: `sentry.toml` in cwd or `/etc/sentry/sentry.toml`).
+    /// Path to the config file or directory (default: `sentry.conf` in cwd or `/etc/sentry/sentry.conf`).
     #[arg(long, global = true, env = "SENTRY_CONFIG")]
     pub config: Option<String>,
 
@@ -526,10 +526,25 @@ pub enum ServiceCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCmd {
-    /// Validate the config file.
+    /// Validate the config files (syntax, schema, routing, references).
     Validate,
-    /// Print the resolved config.
-    Show,
+    /// Print the resolved config in `sentry.conf` syntax (non-default
+    /// values only; `--full` prints every value).
+    Show {
+        /// Include default values.
+        #[arg(long)]
+        full: bool,
+    },
+    /// List the files a load reads (main, conf.d, includes, auto file).
+    Files,
+    /// Convert a legacy `sentry.toml` into `sentry.conf` syntax.
+    Migrate {
+        /// Legacy TOML file.
+        input: String,
+        /// Write here instead of stdout (refuses to overwrite).
+        #[arg(long)]
+        out: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

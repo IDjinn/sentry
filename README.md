@@ -143,9 +143,42 @@ development workflow.
 
 ### Configuration
 
-`config/sentry.example.toml` documents every section (`[edge]`, `[rules]`,
-`[action]`, `[ai]`, `[uploads]`, …). Any TOML field can be overridden via
-env: `SENTRY_<SECTION>__<KEY>` (e.g. `SENTRY_EDGE__LISTEN`).
+Sentry reads `sentry.conf`, an nginx-like file: `key: value` directives,
+`name [label] { … }` blocks, `include:` and `${ENV}` expansion.
+[`config/sentry.example.conf`](./config/sentry.example.conf) documents every
+block (`sentry`, `server`, `storage`, `detect`, `trust`, `rules`, `routes`,
+`source`, `action`, `dashboard`, `metrics`, `http`, `tcp`).
+
+The inline edge routes like nginx: `upstream` groups, `site`s by host, and
+`location`s by path (`=`, `^~`, `~`, `~*`). A `match {}` block adds query,
+header, cookie, method and IP conditions. A location can `proxy_pass`,
+`return`, `redirect` or `rewrite`, set or remove headers, and carry its own
+`security {}` overrides (mode, policy, rate limit, allow/deny, forced
+challenge, pack modes):
+
+```nginx
+http {
+    upstream api { server: [http://api-1:9000, http://api-2:9000], balance: least_conn }
+    site {
+        host: [example.com, "*.example.com"]
+        location "/api/" {
+            match { query.version: "2" }
+            proxy_pass: http://api-v2:9000/
+        }
+        location "/api/" { proxy_pass: api; security { rate_limit: 100/1m } }
+        location "/admin/" { proxy_pass: api; security { allow: [10.0.0.0/8] } }
+    }
+}
+```
+
+The config can be split across files: `include: "sites/*.conf"` works
+anywhere, `conf.d/*.conf` next to `sentry.conf` loads automatically, and
+`--config <dir>` loads every `*.conf` in a directory. Unlabeled blocks such
+as `detect {}` merge across files. Env still overrides any field:
+`SENTRY_<SECTION>__<KEY>` (e.g. `SENTRY_STORAGE__POSTGRES__URL`).
+`sentry config files` lists what a load reads, `sentry config show` prints
+the effective config, and `sentry config migrate sentry.toml --out sentry.conf`
+converts an old TOML config.
 
 **Production rollout**: start rule packs in `shadow` (log only), watch the
 logs, then switch to `enforce`.

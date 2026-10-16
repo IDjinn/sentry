@@ -27,6 +27,7 @@ pub mod net;
 pub mod pages;
 pub mod protocol;
 pub mod proxy;
+pub mod routing;
 pub mod tcp_listener;
 #[cfg(feature = "edge-tls")]
 pub mod tls;
@@ -559,10 +560,20 @@ impl EdgeRuntime {
     }
 
     /// Run the pipeline on an already-built event (enrich → process).
-    pub fn process(&self, mut evt: Event) -> sentry_core::ProcessedEvent {
+    pub fn process(&self, evt: Event) -> sentry_core::ProcessedEvent {
+        self.process_scoped(evt, &sentry_core::RequestScope::default())
+    }
+
+    /// [`process`](Self::process) with a location's pipeline overrides
+    /// (`security { packs, policy }`).
+    pub fn process_scoped(
+        &self,
+        mut evt: Event,
+        scope: &sentry_core::RequestScope,
+    ) -> sentry_core::ProcessedEvent {
         let start = std::time::Instant::now();
         self.enrich(&mut evt);
-        let mut processed = self.pipeline.process(&evt);
+        let mut processed = self.pipeline.process_scoped(&evt, scope);
         // Inline overhead is part of the contract: the console line for edge
         // events shows it even when the pipeline itself costs microseconds.
         processed.process_us = Some(start.elapsed().as_micros() as u64);

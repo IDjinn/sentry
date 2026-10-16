@@ -1137,7 +1137,6 @@ dependencies = [
  "atomic",
  "pear",
  "serde",
- "toml",
  "uncased",
  "version_check",
 ]
@@ -3518,7 +3517,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "toml",
 ]
 
 [[package]]
@@ -3556,6 +3554,7 @@ dependencies = [
  "sentry-action-webhook",
  "sentry-ai",
  "sentry-auto",
+ "sentry-conf",
  "sentry-core",
  "sentry-edge",
  "sentry-geo",
@@ -3583,6 +3582,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentry-conf"
+version = "0.2.0"
+dependencies = [
+ "pretty_assertions",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "sentry-core"
 version = "0.2.0"
 dependencies = [
@@ -3598,6 +3606,7 @@ dependencies = [
  "pretty_assertions",
  "proptest",
  "regex",
+ "sentry-conf",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3622,9 +3631,11 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ipnet",
  "md-5",
  "prometheus",
  "rcgen",
+ "regex",
  "reqwest 0.12.28",
  "rustls",
  "rustls-pemfile",

@@ -31,7 +31,7 @@ Features are off by default to keep builds fast and deps lean.
 ## Run
 
 ```bash
-cp config/sentry.example.toml sentry.toml   # then edit
+cp config/sentry.example.conf sentry.conf   # then edit (or split it: conf.d/*.conf, include:)
 ./target/release/sentry config validate
 ./target/release/sentry run
 ```

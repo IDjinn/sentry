@@ -4,7 +4,7 @@
 //! framework anchor files (`composer.json`, `package.json`, `wp-config.php`,
 //! `nginx.conf`, …) under a project root and extract the routes they
 //! declare. The `sentry auto` command (sentry-cli) orchestrates the scan,
-//! adds live HTTP probing and generates `sentry.auto.toml` via
+//! adds live HTTP probing and generates `sentry.auto.conf` via
 //! [`generate`].
 
 #![forbid(unsafe_code)]

@@ -39,7 +39,7 @@ pub(crate) async fn run(args: BenchArgs<'_>, cfg: Option<SentryConfig>) -> color
                 .iter()
                 .find(|s| s.kind == "nginx")
                 .and_then(|s| s.options.get("format"))
-                .and_then(toml::Value::as_str)
+                .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
         ),
         None => (sentry_core::config::LlmConfig::default(), None),

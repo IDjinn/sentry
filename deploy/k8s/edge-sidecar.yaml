@@ -67,23 +67,28 @@ kind: ConfigMap
 metadata:
   name: sentry-edge-config
 data:
-  sentry.toml: |
-    [deployment]
-    mode = "inline"
+  sentry.conf: |
+    sentry { mode: inline }
 
-    [edge]
-    listen = "0.0.0.0:80"
-    upstream = "http://127.0.0.1:8080"
-    health_path = "/"
-    health_timeout_secs = 5
-    body_capture_kb = 0
+    http {
+      listen: 0.0.0.0:80
+      health_timeout: 5s
+      body_capture: 0
+      upstream app {
+        server: http://127.0.0.1:8080
+        health_path: /
+      }
+      site {
+        location "/" { proxy_pass: app }
+      }
+    }
 
     # Storage is shared with the daemon so rules/incidents stay in sync.
-    [storage.postgres]
-    url = ""            # injected via SENTRY_STORAGE__POSTGRES__URL env
+    storage {
+      url: ""            # injected via SENTRY_STORAGE__POSTGRES__URL env
+    }
 
-    [[action]]
-    type = "log"
+    action log {}
 ---
 apiVersion: v1
 kind: Service

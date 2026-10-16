@@ -26,7 +26,7 @@ pub struct StreamOptions {
 /// Follow the events table, printing one line per new event.
 pub async fn run(cfg: Option<&SentryConfig>, opts: StreamOptions) -> color_eyre::Result<()> {
     let Some(cfg) = cfg else {
-        color_eyre::eyre::bail!("--stream needs a config — pass --config or create sentry.toml");
+        color_eyre::eyre::bail!("--stream needs a config — pass --config or create sentry.conf");
     };
     if cfg.storage.postgres.url.is_empty() {
         color_eyre::eyre::bail!("--stream needs storage.postgres.url configured");
