@@ -997,8 +997,8 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         }
         if !cfg.edge.has_routes() {
             return Err(color_eyre::eyre::eyre!(
-                "sentry {{ mode: inline }} requires an http {{ upstream … site {{ location … }} }} route \
-                 (or `http {{ proxy_pass: http://127.0.0.1:8080 }}`)"
+                "sentry {{ mode: inline }} needs a route — e.g. `http {{ proxy_pass: http://127.0.0.1:8080 }}` \
+                 or `site example.com {{ \"/\": http://app:8080 }}`"
             ));
         }
         let (route_groups, route_sites) = sentry_core::edge_routes::normalized(&cfg.edge);

@@ -11,6 +11,7 @@
 
 pub mod lower;
 pub mod schema;
+pub mod sugar;
 
 use crate::config::SentryConfig;
 use crate::error::{CoreError, Result};
@@ -19,8 +20,9 @@ pub use lower::split_listen;
 
 /// Lower parsed statements onto a [`SentryConfig`].
 pub fn from_body(body: &sentry_conf::Body) -> Result<SentryConfig> {
+    let body = sugar::desugar(body);
     let file: schema::ConfFile =
-        sentry_conf::from_body(body).map_err(|e| CoreError::Config(e.to_string()))?;
+        sentry_conf::from_body(&body).map_err(|e| CoreError::Config(e.to_string()))?;
     lower::lower(file).map_err(|errors| CoreError::Config(errors.join("\n")))
 }
 
@@ -32,13 +34,24 @@ pub fn from_str(src: &str, name: &str) -> Result<SentryConfig> {
 
 /// Render the non-default part of a config as `.conf` text.
 pub fn to_text(cfg: &SentryConfig) -> String {
-    let base = lower::raise(&SentryConfig::default());
-    sentry_conf::ser::to_string_diff(&lower::raise(cfg), &base).unwrap_or_default()
+    let render = || -> sentry_conf::Result<String> {
+        let mut tree = sentry_conf::ser::to_tree(&lower::raise(cfg))?;
+        let base = sentry_conf::ser::to_tree(&lower::raise(&SentryConfig::default()))?;
+        sentry_conf::ser::prune(&mut tree, &base);
+        sugar::shorten(&mut tree);
+        sentry_conf::ser::render(&tree)
+    };
+    render().unwrap_or_default()
 }
 
 /// Render every value (defaults included).
 pub fn to_text_full(cfg: &SentryConfig) -> String {
-    sentry_conf::ser::to_string(&lower::raise(cfg)).unwrap_or_default()
+    let render = || -> sentry_conf::Result<String> {
+        let mut tree = sentry_conf::ser::to_tree(&lower::raise(cfg))?;
+        sugar::shorten(&mut tree);
+        sentry_conf::ser::render(&tree)
+    };
+    render().unwrap_or_default()
 }
 
 #[cfg(test)]

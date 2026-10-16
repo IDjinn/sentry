@@ -1073,7 +1073,7 @@ telemetria de handshake + provider de appliance
     options de source/action viram `serde_json::Value` (`ttl: 24h` →
     `ttl_secs`)
   - ✅ Roteamento (`sentry_core::edge_routes` + `sentry-edge/src/routing.rs`,
-    substitui o `VhostRouter`): `upstream NAME {}`, `site { host }` (exato >
+    substitui o `VhostRouter`): `upstream NAME {}`, `site host… {}` (exato >
     `*.sufixo` mais longo > `~regex` > default), `location [=|^~|~|~*]`
     com prioridade nginx, `match {}` (method/query/header/cookie/host/
     scheme/ip/args/path, operadores `~ ~* !~ != present absent`; location
@@ -1082,9 +1082,16 @@ telemetria de handshake + provider de appliance
     `$1`, `$host`, `$request_uri`, `$arg_x`, `$http_x`…), set/remove de
     headers de request/response, `timeout` e `response_buffering` por
     location; sem rota → 404
-  - ✅ `security {}` herdado http → site → location: `mode` (enforce/
+  - ✅ Sintaxe enxuta: `http { proxy_pass: URL }` para um backend só;
+    `site dominio… { "/path": alvo }` (alvo = upstream, URL, `[URL, URL]`
+    balanceado, `status "texto"` ou `redirect [code] "url"`) — açúcar
+    expandido na AST (`sentry_core::conf::sugar`) antes do serde; `tls:
+    cert key`; headers como mapa (`request_headers { X: v, Cookie: off }`);
+    segurança direto na location (sem bloco `security {}`); emissor
+    imprime blocos pequenos numa linha
+  - ✅ Segurança herdada http → site → location: `inspect` (on/
     shadow/off — off pula o pipeline, shadow registra "would block" e nunca
-    age), `policy` (mapa de nível por location), `challenge: always`,
+    age), `policy {}` (mapa de nível por location), `challenge: always`,
     `rate_limit: 100/1m` (janela fixa por location+IP), `allow`/`deny`
     (CIDR), `packs { x: off|shadow|enforce }` via `Pipeline::process_scoped`
     + `RuleSet::evaluate_scoped` (packs em shadow global guardam as ações

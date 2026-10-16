@@ -330,7 +330,7 @@ const PENDING_TTL: Duration = Duration::from_secs(60);
 const PENDING_MAX_PER_IP: usize = 16;
 
 /// Per-request overrides an edge location applies to the pipeline
-/// (`security { packs {…} policy {…} }`).
+/// (`packs {…}` / `policy {…}` in a location).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RequestScope {
     /// Pack mode overrides (`off` / `shadow` / `enforce`).
@@ -541,7 +541,7 @@ impl Pipeline {
     }
 
     /// [`process`](Self::process) with per-request overrides from an edge
-    /// location (`security { packs, policy }`).
+    /// location (`packs {}`, `policy {}`).
     pub fn process_scoped(&self, evt: &Event, scope: &RequestScope) -> ProcessedEvent {
         // Trusted IPs (F7.2 `[real_ip] trusted_ips`) are exempt from every
         // detector and verdict — the "you can't lock yourself out" guard.

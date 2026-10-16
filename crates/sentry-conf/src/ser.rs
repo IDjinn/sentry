@@ -163,9 +163,42 @@ fn write_block(out: &mut String, key: &str, entries: &[(String, Tree)], depth: u
         out.push_str(&format!("{pad}{head} {{}}\n"));
         return;
     }
+    if let Some(inline) = inline_body(entries) {
+        let line = format!("{pad}{head} {{ {inline} }}");
+        if line.chars().count() <= 88 {
+            out.push_str(&line);
+            out.push('\n');
+            return;
+        }
+    }
     out.push_str(&format!("{pad}{head} {{\n"));
     write_body(out, entries, depth + 1, false);
     out.push_str(&format!("{pad}}}\n"));
+}
+
+/// `k: v, k: v` for small blocks of plain values (≤ 3 entries, no nested
+/// blocks, no repeated directives) — rendered on the block's own line.
+fn inline_body(entries: &[(String, Tree)]) -> Option<String> {
+    let live: Vec<&(String, Tree)> = entries
+        .iter()
+        .filter(|(k, v)| k != LABELS_KEY && !is_empty(v))
+        .collect();
+    if live.is_empty() || live.len() > 3 {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(live.len());
+    for (k, v) in live {
+        let plain = match v {
+            Tree::Map(_) => false,
+            Tree::Seq(items) => items.iter().all(|i| scalar_text(i).is_some()),
+            _ => true,
+        };
+        if !plain {
+            return None;
+        }
+        parts.push(format!("{}: {}", key_text(k), value_text(v)));
+    }
+    Some(parts.join(", "))
 }
 
 fn scalar_text(t: &Tree) -> Option<String> {
@@ -562,6 +595,6 @@ mod tests {
         let mut changed = base.clone();
         changed.http.listen = "0.0.0.0:8080".into();
         let text = to_string_diff(&changed, &base).unwrap();
-        assert_eq!(text, "http {\n    listen: 0.0.0.0:8080\n}\n");
+        assert_eq!(text, "http { listen: 0.0.0.0:8080 }\n");
     }
 }

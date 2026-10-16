@@ -627,14 +627,19 @@ fn lower_rules(r: RulesBlock, cfg: &mut SentryConfig, errors: &mut Vec<String>) 
     }
 }
 
-fn lower_security(
-    b: Option<SecurityBlock>,
-    where_: &str,
-    errors: &mut Vec<String>,
-) -> SecurityConfig {
-    let Some(b) = b else {
-        return SecurityConfig::default();
-    };
+/// The security directives a `site`/`location`/`http` block may carry.
+#[derive(Default)]
+struct SecFields {
+    inspect: Option<crate::edge_routes::SecurityMode>,
+    policy: Option<LevelPolicyBlock>,
+    challenge: Option<String>,
+    rate_limit: Option<ConfValue>,
+    allow: Option<OneOrMany<String>>,
+    deny: Option<OneOrMany<String>>,
+    packs: Option<OrderedMap<String>>,
+}
+
+fn lower_security(b: SecFields, where_: &str, errors: &mut Vec<String>) -> SecurityConfig {
     let mut policy = HashMap::new();
     if let Some(p) = b.policy {
         for (level, v) in [
@@ -654,9 +659,7 @@ fn lower_security(
         Some(c) if matches!(c.as_str(), "always" | "on" | "true" | "yes") => Some(true),
         Some(c) if matches!(c.as_str(), "off" | "never" | "false" | "no" | "auto") => Some(false),
         Some(c) => {
-            errors.push(format!(
-                "{where_} › security: challenge `{c}` (expected always | off)"
-            ));
+            errors.push(format!("{where_}: challenge `{c}` (expected always | off)"));
             None
         }
     };
@@ -682,7 +685,7 @@ fn lower_security(
                 }
                 _ => {
                     errors.push(format!(
-                        "{where_} › security › rate_limit: needs `requests:` and `window:` (or the `100/1m` form)"
+                        "{where_} › rate_limit: needs `requests:` and `window:` (or the `100/1m` form)"
                     ));
                     None
                 }
@@ -694,7 +697,7 @@ fn lower_security(
                 Some(rl) => Some(rl),
                 None => {
                     errors.push(format!(
-                        "{where_} › security: rate_limit `{text}` (expected e.g. 100/1m, 10/s)"
+                        "{where_}: rate_limit `{text}` (expected e.g. 100/1m, 10/s)"
                     ));
                     None
                 }
@@ -702,7 +705,7 @@ fn lower_security(
         }
     };
     SecurityConfig {
-        mode: b.mode,
+        mode: b.inspect,
         policy,
         force_challenge,
         rate_limit,
@@ -784,23 +787,64 @@ fn match_op(subject: &MatchSubject, v: &ConfValue) -> Result<MatchOp, String> {
     }
 }
 
-fn header_ops(
-    set_req: Vec<(String, String)>,
-    rm_req: Option<OneOrMany<String>>,
-    set_resp: Vec<(String, String)>,
-    rm_resp: Option<OneOrMany<String>>,
-) -> HeaderOps {
-    HeaderOps {
-        request_set: set_req,
-        request_remove: list(rm_req).unwrap_or_default(),
-        response_set: set_resp,
-        response_remove: list(rm_resp).unwrap_or_default(),
+/// Header value meaning "remove this header".
+fn is_remove(v: &str) -> bool {
+    matches!(v, "off" | "-")
+}
+
+/// `request_headers { X-A: v, Cookie: off }` + `response_headers { … }`.
+fn lower_headers(req: Option<OrderedMap<String>>, resp: Option<OrderedMap<String>>) -> HeaderOps {
+    let mut ops = HeaderOps::default();
+    for (name, value) in req.map(|m| m.0).unwrap_or_default() {
+        if is_remove(&value) {
+            ops.request_remove.push(name);
+        } else {
+            ops.request_set.push((name, value));
+        }
+    }
+    for (name, value) in resp.map(|m| m.0).unwrap_or_default() {
+        if is_remove(&value) {
+            ops.response_remove.push(name);
+        } else {
+            ops.response_set.push((name, value));
+        }
+    }
+    ops
+}
+
+/// `proxy_pass: name | url | [url, url…]` — a list becomes an anonymous
+/// round-robin group named after the location.
+fn proxy_target(
+    values: Option<OneOrMany<String>>,
+    name_hint: &str,
+    groups: &mut Vec<UpstreamGroupConfig>,
+) -> Option<String> {
+    let values = values?.into_vec();
+    match values.len() {
+        0 => None,
+        1 => values.into_iter().next(),
+        _ => {
+            let mut name = name_hint.to_string();
+            let mut n = 2;
+            while groups.iter().any(|g| g.name == name) {
+                name = format!("{name_hint}#{n}");
+                n += 1;
+            }
+            groups.push(UpstreamGroupConfig {
+                name: name.clone(),
+                servers: values,
+                ..Default::default()
+            });
+            Some(name)
+        }
     }
 }
 
 fn lower_location(
     l: LocationBlock,
     site: &str,
+    site_hint: &str,
+    groups: &mut Vec<UpstreamGroupConfig>,
     errors: &mut Vec<String>,
 ) -> Option<LocationConfig> {
     let (kind, path) = match l.labels.as_slice() {
@@ -816,7 +860,7 @@ fn lower_location(
         },
         _ => {
             errors.push(format!(
-                "{site} › location: write `location [=|^~|~|~*] \"/path\" {{ … }}`"
+                "{site} › location: write `location [=|^~|~|~*] /path {{ … }}`"
             ));
             return None;
         }
@@ -850,11 +894,25 @@ fn lower_location(
             .ok(),
         (None, None) => None,
     };
+    let hint = format!("{site_hint}{path}");
+    let security = lower_security(
+        SecFields {
+            inspect: l.inspect,
+            policy: l.policy,
+            challenge: l.challenge,
+            rate_limit: l.rate_limit,
+            allow: l.allow,
+            deny: l.deny,
+            packs: l.packs,
+        },
+        &where_,
+        errors,
+    );
     Some(LocationConfig {
         kind,
         path,
         conditions,
-        proxy_pass: l.proxy_pass,
+        proxy_pass: proxy_target(l.proxy_pass, &hint, groups),
         respond,
         rewrites: l
             .rewrite
@@ -864,23 +922,21 @@ fn lower_location(
                 replacement,
             })
             .collect(),
-        headers: header_ops(
-            l.set_request_header,
-            l.remove_request_header,
-            l.set_response_header,
-            l.remove_response_header,
-        ),
+        headers: lower_headers(l.request_headers, l.response_headers),
         timeout_secs: secs(l.timeout),
         response_buffering: l.response_buffering,
-        security: lower_security(l.security, &where_, errors),
+        security,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fallback_location(
-    proxy_pass: Option<String>,
+    proxy_pass: Option<OneOrMany<String>>,
     ret: Option<OneOrMany<ConfValue>>,
     redirect: Option<OneOrMany<ConfValue>>,
     where_: &str,
+    hint: &str,
+    groups: &mut Vec<UpstreamGroupConfig>,
     errors: &mut Vec<String>,
 ) -> Option<LocationConfig> {
     let respond = match (ret, redirect) {
@@ -892,6 +948,7 @@ fn fallback_location(
             .ok(),
         (None, None) => None,
     };
+    let proxy_pass = proxy_target(proxy_pass, hint, groups);
     if proxy_pass.is_none() && respond.is_none() {
         return None;
     }
@@ -901,6 +958,39 @@ fn fallback_location(
         respond,
         ..Default::default()
     })
+}
+
+/// `tls: cert key` or `tls { cert: …, key: … }`.
+fn site_tls(
+    v: Option<ConfValue>,
+    where_: &str,
+    errors: &mut Vec<String>,
+) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    let path = |v: &ConfValue| conf_text(v).map(std::path::PathBuf::from);
+    match v {
+        None => (None, None),
+        Some(ConfValue::List(items)) if items.len() == 2 => (path(&items[0]), path(&items[1])),
+        Some(ConfValue::Map(entries)) => {
+            let get = |k: &str| {
+                entries
+                    .iter()
+                    .find(|(n, _)| n == k)
+                    .and_then(|(_, v)| path(v))
+            };
+            if let Some((bad, _)) = entries.iter().find(|(n, _)| n != "cert" && n != "key") {
+                errors.push(format!(
+                    "{where_} › tls: unknown directive `{bad}` (cert, key)"
+                ));
+            }
+            (get("cert"), get("key"))
+        }
+        Some(_) => {
+            errors.push(format!(
+                "{where_}: write `tls: /path/cert.pem /path/key.pem` (or `tls {{ cert, key }}`)"
+            ));
+            (None, None)
+        }
+    }
 }
 
 fn lower_http(h: HttpBlock, e: &mut EdgeConfig, errors: &mut Vec<String>) {
@@ -978,10 +1068,25 @@ fn lower_http(h: HttpBlock, e: &mut EdgeConfig, errors: &mut Vec<String>) {
             health_path: u.health_path,
         });
     }
-    e.security = lower_security(h.security, "http", errors);
+    e.security = lower_security(
+        SecFields {
+            inspect: h.inspect,
+            policy: h.policy,
+            challenge: None,
+            rate_limit: h.rate_limit,
+            allow: h.allow,
+            deny: h.deny,
+            packs: h.packs,
+        },
+        "http",
+        errors,
+    );
+    let http_headers = lower_headers(h.request_headers, h.response_headers);
+    let mut groups = std::mem::take(&mut e.upstream_groups);
     for s in h.site {
-        let hosts: Vec<String> = list(s.host)
-            .unwrap_or_default()
+        let mut hosts: Vec<String> = s.labels;
+        hosts.extend(list(s.host).unwrap_or_default());
+        let hosts: Vec<String> = hosts
             .into_iter()
             .map(|h| {
                 if h.starts_with('~') {
@@ -996,55 +1101,76 @@ fn lower_http(h: HttpBlock, e: &mut EdgeConfig, errors: &mut Vec<String>) {
         } else {
             format!("site {}", hosts.join(","))
         };
+        let hint = hosts.first().cloned().unwrap_or_else(|| "default".into());
         let mut locations: Vec<LocationConfig> = s
             .location
             .into_iter()
-            .filter_map(|l| lower_location(l, &label, errors))
+            .filter_map(|l| lower_location(l, &label, &hint, &mut groups, errors))
             .collect();
-        if let Some(f) = fallback_location(s.proxy_pass, s.return_, s.redirect, &label, errors) {
+        if let Some(f) = fallback_location(
+            s.proxy_pass,
+            s.return_,
+            s.redirect,
+            &label,
+            &format!("{hint}/"),
+            &mut groups,
+            errors,
+        ) {
             locations.push(f);
         }
-        let (tls_cert, tls_key) = match s.tls {
-            Some(t) => (t.cert, t.key),
-            None => (None, None),
-        };
+        let (tls_cert, tls_key) = site_tls(s.tls, &label, errors);
+        let security = lower_security(
+            SecFields {
+                inspect: s.inspect,
+                policy: s.policy,
+                challenge: s.challenge,
+                rate_limit: s.rate_limit,
+                allow: s.allow,
+                deny: s.deny,
+                packs: s.packs,
+            },
+            &label,
+            errors,
+        );
         e.sites.push(SiteConfig {
             hosts,
             default: s.default.unwrap_or(false),
             tls_cert,
             tls_key,
             locations,
-            headers: header_ops(
-                s.set_request_header,
-                s.remove_request_header,
-                s.set_response_header,
-                s.remove_response_header,
-            ),
-            security: lower_security(s.security, &label, errors),
+            headers: http_headers.merged(&lower_headers(s.request_headers, s.response_headers)),
+            security,
         });
     }
     let mut implicit: Vec<LocationConfig> = h
         .location
         .into_iter()
-        .filter_map(|l| lower_location(l, "http", errors))
+        .filter_map(|l| lower_location(l, "http", "default", &mut groups, errors))
         .collect();
-    if let Some(f) = fallback_location(h.proxy_pass, None, None, "http", errors) {
+    if let Some(f) = fallback_location(
+        h.proxy_pass,
+        None,
+        None,
+        "http",
+        "default/",
+        &mut groups,
+        errors,
+    ) {
         implicit.push(f);
     }
     if !implicit.is_empty() {
         e.sites.push(SiteConfig {
             locations: implicit,
+            headers: http_headers,
             ..Default::default()
         });
     }
+    e.upstream_groups = groups;
 }
 
 // ── Raising: SentryConfig → ConfFile ───────────────────────────────────────
 
-fn raise_security(s: &SecurityConfig) -> Option<SecurityBlock> {
-    if s.is_empty() {
-        return None;
-    }
+fn raise_security(s: &SecurityConfig) -> SecFields {
     let level = |k: &str| s.policy.get(k).cloned();
     let policy = (!s.policy.is_empty()).then(|| LevelPolicyBlock {
         info: level("info"),
@@ -1059,8 +1185,8 @@ fn raise_security(s: &SecurityConfig) -> Option<SecurityBlock> {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     packs.sort();
-    Some(SecurityBlock {
-        mode: s.mode,
+    SecFields {
+        inspect: s.mode,
         policy,
         challenge: s.force_challenge.map(|f| {
             if f {
@@ -1076,10 +1202,16 @@ fn raise_security(s: &SecurityConfig) -> Option<SecurityBlock> {
                 sentry_conf::values::format_duration_ms(r.window_secs * 1000)
             ))
         }),
-        allow: (!s.allow.is_empty()).then(|| OneOrMany(s.allow.clone())),
-        deny: (!s.deny.is_empty()).then(|| OneOrMany(s.deny.clone())),
+        allow: non_empty(&s.allow),
+        deny: non_empty(&s.deny),
         packs: (!packs.is_empty()).then_some(OrderedMap(packs)),
-    })
+    }
+}
+
+fn raise_headers(set: &[(String, String)], remove: &[String]) -> Option<OrderedMap<String>> {
+    let mut entries: Vec<(String, String)> = set.to_vec();
+    entries.extend(remove.iter().map(|h| (h.clone(), "off".to_string())));
+    (!entries.is_empty()).then_some(OrderedMap(entries))
 }
 
 fn raise_return(r: &ReturnConfig) -> (Option<OneOrMany<ConfValue>>, Option<OneOrMany<ConfValue>>) {
@@ -1136,6 +1268,7 @@ fn raise_location(l: &LocationConfig) -> LocationBlock {
         Some(r) => raise_return(r),
         None => (None, None),
     };
+    let sec = raise_security(&l.security);
     LocationBlock {
         labels,
         match_: (!l.conditions.is_empty()).then(|| {
@@ -1146,7 +1279,7 @@ fn raise_location(l: &LocationConfig) -> LocationBlock {
                     .collect(),
             )
         }),
-        proxy_pass: l.proxy_pass.clone(),
+        proxy_pass: l.proxy_pass.clone().map(|p| OneOrMany(vec![p])),
         return_,
         redirect,
         rewrite: l
@@ -1154,18 +1287,35 @@ fn raise_location(l: &LocationConfig) -> LocationBlock {
             .iter()
             .map(|r| (r.pattern.clone(), r.replacement.clone()))
             .collect(),
-        set_request_header: l.headers.request_set.clone(),
-        remove_request_header: non_empty(&l.headers.request_remove),
-        set_response_header: l.headers.response_set.clone(),
-        remove_response_header: non_empty(&l.headers.response_remove),
+        request_headers: raise_headers(&l.headers.request_set, &l.headers.request_remove),
+        response_headers: raise_headers(&l.headers.response_set, &l.headers.response_remove),
         timeout: l.timeout_secs.map(Secs),
         response_buffering: l.response_buffering,
-        security: raise_security(&l.security),
+        inspect: sec.inspect,
+        policy: sec.policy,
+        challenge: sec.challenge,
+        rate_limit: sec.rate_limit,
+        allow: sec.allow,
+        deny: sec.deny,
+        packs: sec.packs,
     }
+}
+
+/// `location / { proxy_pass: x }` with nothing else.
+fn is_bare_fallback(l: &LocationConfig) -> bool {
+    l.kind == LocationKind::Prefix
+        && l.path == "/"
+        && l.conditions.is_empty()
+        && l.rewrites.is_empty()
+        && l.headers.is_empty()
+        && l.timeout_secs.is_none()
+        && l.response_buffering.is_none()
+        && l.security.is_empty()
 }
 
 fn raise_http(e: &EdgeConfig) -> HttpBlock {
     let (groups, sites) = crate::edge_routes::normalized(e);
+    let sec = raise_security(&e.security);
     HttpBlock {
         listen: Some(e.listen.clone()),
         tls: Some(TlsBlock {
@@ -1225,30 +1375,67 @@ fn raise_http(e: &EdgeConfig) -> HttpBlock {
                 health_path: g.health_path.clone(),
             })
             .collect(),
-        security: raise_security(&e.security),
         site: sites
             .iter()
             .map(|s| {
-                let tls = (s.tls_cert.is_some() || s.tls_key.is_some()).then(|| SiteTlsBlock {
-                    cert: s.tls_cert.clone(),
-                    key: s.tls_key.clone(),
-                });
+                let tls = match (&s.tls_cert, &s.tls_key) {
+                    (Some(c), Some(k)) => Some(ConfValue::List(vec![
+                        ConfValue::Str(c.display().to_string()),
+                        ConfValue::Str(k.display().to_string()),
+                    ])),
+                    _ => None,
+                };
+                let sec = raise_security(&s.security);
+                // A trailing bare `location / { proxy_pass | return }` reads
+                // back as the site-level fallback (same matching semantics).
+                let mut locations: Vec<&LocationConfig> = s.locations.iter().collect();
+                let fallback = locations.last().filter(|l| is_bare_fallback(l)).copied();
+                if fallback.is_some() {
+                    locations.pop();
+                }
+                let (return_, redirect) = match fallback.and_then(|l| l.respond.as_ref()) {
+                    Some(r) => raise_return(r),
+                    None => (None, None),
+                };
                 SiteBlock {
-                    host: non_empty(&s.hosts),
-                    default: s.default.then_some(true),
+                    labels: s.hosts.clone(),
+                    default: (s.default && !s.hosts.is_empty()).then_some(true),
                     tls,
-                    location: s.locations.iter().map(raise_location).collect(),
-                    set_request_header: s.headers.request_set.clone(),
-                    remove_request_header: non_empty(&s.headers.request_remove),
-                    set_response_header: s.headers.response_set.clone(),
-                    remove_response_header: non_empty(&s.headers.response_remove),
-                    security: raise_security(&s.security),
+                    location: locations.into_iter().map(raise_location).collect(),
+                    proxy_pass: fallback
+                        .and_then(|l| l.proxy_pass.clone())
+                        .map(|p| OneOrMany(vec![p])),
+                    return_,
+                    redirect,
+                    request_headers: raise_headers(
+                        &s.headers.request_set,
+                        &s.headers.request_remove,
+                    ),
+                    response_headers: raise_headers(
+                        &s.headers.response_set,
+                        &s.headers.response_remove,
+                    ),
+                    inspect: sec.inspect,
+                    policy: sec.policy,
+                    challenge: sec.challenge,
+                    rate_limit: sec.rate_limit,
+                    allow: sec.allow,
+                    deny: sec.deny,
+                    packs: sec.packs,
                     ..Default::default()
                 }
             })
             .collect(),
         location: Vec::new(),
         proxy_pass: None,
+        request_headers: None,
+        response_headers: None,
+        inspect: sec.inspect,
+        policy: sec.policy,
+        rate_limit: sec.rate_limit,
+        allow: sec.allow,
+        deny: sec.deny,
+        packs: sec.packs,
     }
 }
 

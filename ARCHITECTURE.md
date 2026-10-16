@@ -2281,9 +2281,17 @@ the legacy TOML reader of `sentry config migrate`.
   `$request_uri`, `$args`, `$arg_NAME`, `$http_NAME`, `$1…` expansion;
   request/response header set/remove; per-location upstream timeout and
   response buffering.
+- Syntax: `http { proxy_pass: URL }` for a single backend; `site host… {
+  "/path": target }` where target is an upstream name, a URL, a `[URL, URL]`
+  list (anonymous balanced group), `status ["text"]` or `redirect [code]
+  "url"` — expanded into `location` blocks on the tree (`conf/sugar.rs`)
+  before deserialization. `location` blocks carry `match {}`, `rewrite`,
+  `request_headers {}` / `response_headers {}` (`off` removes) and the
+  security directives inline (`inspect`, `rate_limit`, `allow`, `deny`,
+  `challenge`, `policy {}`, `packs {}`).
 - Security (`EffectiveSecurity`, merged http → site → location): allow/deny
   and the per-(location, IP) fixed-window rate limit run before the
-  pipeline; `mode: off` skips it (no event); `shadow` records the would-be
+  pipeline; `inspect: off` skips it (no event); `shadow` records the would-be
   verdict in `override_reason` and serves; `challenge: always` runs the
   challenge gate for clean requests without turning the event into a
   Challenge (so no CDN action fires); `policy {}` and `packs {}` become a

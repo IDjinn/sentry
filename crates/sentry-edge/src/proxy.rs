@@ -54,7 +54,7 @@ pub struct EdgeProxyConfig {
     /// Sites and locations (`http { site { location … } }`). When empty
     /// with `groups`, `upstreams`/`vhosts` are normalized into sites.
     pub sites: Vec<sentry_core::edge_routes::SiteConfig>,
-    /// Security defaults (`http { security {} }`).
+    /// Security defaults set directly in `http {}`.
     pub security: sentry_core::edge_routes::SecurityConfig,
     /// Response compression settings (F12) — projected from
     /// `[edge.compress]`.
@@ -821,7 +821,7 @@ async fn proxy_inspected(
     if let Some(http) = processed.event.http_mut() {
         http.body = captured.clone();
     }
-    // `security { mode: shadow }`: analyzed and recorded, never acted on —
+    // `inspect: shadow`: analyzed and recorded, never acted on —
     // the event keeps what would have happened, actions see an Allow.
     if security.mode == sentry_core::edge_routes::SecurityMode::Shadow
         && processed.decision.action != sentry_core::analysis::Verdict::Allow
@@ -952,8 +952,8 @@ async fn proxy_inspected(
     resp
 }
 
-/// Serve a routed request (Allow, challenge-passed, or `security { mode:
-/// off }`): plain-HTTP → HTTPS redirect (F8) when configured; otherwise the
+/// Serve a routed request (Allow, challenge-passed, or `inspect: off`):
+/// plain-HTTP → HTTPS redirect (F8) when configured; otherwise the
 /// matched location's action — a direct `return`/`redirect`, or the
 /// upstream group with rewrites, `proxy_pass` URI, header operations and
 /// timeout applied, load-balanced with passive health checks and failover
@@ -3012,27 +3012,20 @@ mod tests {
         let up = spawn_uri_echo_upstream().await;
         let conf = format!(
             r#"http {{
-                upstream app {{ server: http://{up} }}
-                site {{
-                    host: example.test
-                    location = "/health" {{ return: 200 "ok" }}
-                    location "/old/" {{ redirect: 301 "https://$host/new$request_uri" }}
-                    location "/api/" {{
+                site example.test {{
+                    location = /health {{ return: 200 ok }}
+                    "/old/": redirect "https://$host/new$request_uri"
+                    location /api/ {{
                         proxy_pass: http://{up}/v2/
-                        set_request_header: X-Tenant "acme-$arg_t"
-                        remove_request_header: Cookie
-                        remove_response_header: [Server, X-Powered-By]
-                        set_response_header: X-Edge "sentry"
+                        request_headers {{ X-Tenant: "acme-$arg_t", Cookie: off }}
+                        response_headers {{ Server: off, X-Powered-By: off, X-Edge: sentry }}
                     }}
                     location ~ '^/r/(\w+)$' {{
-                        proxy_pass: app
+                        proxy_pass: http://{up}
                         rewrite: '^/r/(\w+)$' '/rewritten/$1'
                     }}
-                    location "/" {{
-                        match {{ header.x-beta: present }}
-                        return: 418
-                    }}
-                    proxy_pass: app
+                    location / {{ match {{ header.x-beta: present }}, return: 418 }}
+                    proxy_pass: http://{up}
                 }}
             }}"#
         );
@@ -3085,19 +3078,17 @@ mod tests {
             r#"http {{
                 upstream app {{ server: http://{up} }}
                 site {{
-                    location "/admin/" {{ proxy_pass: app; security {{ allow: [10.0.0.0/8] }} }}
-                    location "/limited/" {{ proxy_pass: app; security {{ rate_limit: 2/1m }} }}
-                    location "/static/" {{ proxy_pass: app; security {{ mode: off }} }}
-                    location "/shadow/" {{ proxy_pass: app; security {{ mode: shadow }} }}
-                    location "/verify/" {{ proxy_pass: app; security {{ challenge: always }} }}
-                    location "/dotfiles/" {{
+                    location /admin/ {{ proxy_pass: app, allow: [10.0.0.0/8] }}
+                    location /limited/ {{ proxy_pass: app, rate_limit: 2/1m }}
+                    location /static/ {{ proxy_pass: app, inspect: off }}
+                    location /shadow/ {{ proxy_pass: app, inspect: shadow }}
+                    location /verify/ {{ proxy_pass: app, challenge: always }}
+                    location /dotfiles/ {{
                         proxy_pass: app
-                        security {{
-                            packs {{ sensitive_paths: off }}
-                            policy {{ medium: allow }}
-                        }}
+                        packs {{ sensitive_paths: off }}
+                        policy {{ medium: allow }}
                     }}
-                    location "/" {{ proxy_pass: app }}
+                    "/": app
                 }}
             }}"#
         );

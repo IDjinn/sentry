@@ -2,7 +2,7 @@
 //! sites (`server_name`) and locations (`location` with `=`, `^~`, `~`,
 //! `~*` modifiers) extended with request conditions (`match {}`), actions
 //! (`proxy_pass`, `return`, `redirect`, `rewrite`), header operations and
-//! per-location security overrides (`security {}`), inherited
+//! per-location security settings (`inspect`, `rate_limit`, `allow`, …), inherited
 //! `http` → site → location.
 //!
 //! Pure config types + validation; request-time matching lives in
@@ -294,12 +294,13 @@ pub struct MatchCondition {
     pub op: MatchOp,
 }
 
-/// `security { mode }`.
+/// `inspect: on | shadow | off`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SecurityMode {
-    /// Analyze and act (default).
+    /// Analyze and act (default; also `on`).
     #[default]
+    #[serde(alias = "on")]
     Enforce,
     /// Analyze and record, never act (the verdict is downgraded to Allow).
     Shadow,

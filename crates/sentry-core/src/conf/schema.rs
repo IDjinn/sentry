@@ -438,10 +438,19 @@ conf_struct!(
         challenge: Option<ChallengeBlock>,
         error_pages: Option<PathBuf>,
         upstream: Vec<UpstreamBlock>,
-        security: Option<SecurityBlock>,
         site: Vec<SiteBlock>,
         location: Vec<LocationBlock>,
-        proxy_pass: Option<String>,
+        proxy_pass: Option<OneOrMany<String>>,
+        request_headers: Option<OrderedMap<String>>,
+        response_headers: Option<OrderedMap<String>>,
+        // Security defaults for every site/location (`challenge` is the
+        // PoW block here, so a forced challenge is site/location-only).
+        inspect: Option<crate::edge_routes::SecurityMode>,
+        policy: Option<LevelPolicyBlock>,
+        rate_limit: Option<ConfValue>,
+        allow: Option<OneOrMany<String>>,
+        deny: Option<OneOrMany<String>>,
+        packs: Option<OrderedMap<String>>,
     }
 );
 
@@ -495,19 +504,6 @@ conf_struct!(
     }
 );
 
-conf_struct!(
-    /// `security {}` at http, site or location level.
-    SecurityBlock {
-        mode: Option<crate::edge_routes::SecurityMode>,
-        policy: Option<LevelPolicyBlock>,
-        challenge: Option<String>,
-        rate_limit: Option<ConfValue>,
-        allow: Option<OneOrMany<String>>,
-        deny: Option<OneOrMany<String>>,
-        packs: Option<OrderedMap<String>>,
-    }
-);
-
 conf_struct!(LevelPolicyBlock {
     info: Option<String>,
     low: Option<String>,
@@ -517,48 +513,54 @@ conf_struct!(LevelPolicyBlock {
 });
 
 conf_struct!(
-    /// `site { host: …, location … }`.
+    /// `site [host…] { "/path": target … location … }`.
     SiteBlock {
+        #[serde(rename = "$labels")]
+        labels: Vec<String>,
         host: Option<OneOrMany<String>>,
         default: Option<bool>,
-        tls: Option<SiteTlsBlock>,
+        /// `tls: cert key` or `tls { cert, key }`.
+        tls: Option<ConfValue>,
         location: Vec<LocationBlock>,
-        proxy_pass: Option<String>,
+        proxy_pass: Option<OneOrMany<String>>,
         #[serde(rename = "return")]
         return_: Option<OneOrMany<ConfValue>>,
         redirect: Option<OneOrMany<ConfValue>>,
-        set_request_header: Vec<(String, String)>,
-        remove_request_header: Option<OneOrMany<String>>,
-        set_response_header: Vec<(String, String)>,
-        remove_response_header: Option<OneOrMany<String>>,
-        security: Option<SecurityBlock>,
+        request_headers: Option<OrderedMap<String>>,
+        response_headers: Option<OrderedMap<String>>,
+        inspect: Option<crate::edge_routes::SecurityMode>,
+        policy: Option<LevelPolicyBlock>,
+        challenge: Option<String>,
+        rate_limit: Option<ConfValue>,
+        allow: Option<OneOrMany<String>>,
+        deny: Option<OneOrMany<String>>,
+        packs: Option<OrderedMap<String>>,
     }
 );
 
-conf_struct!(SiteTlsBlock {
-    cert: Option<PathBuf>,
-    key: Option<PathBuf>,
-});
-
 conf_struct!(
-    /// `location [=|^~|~|~*] "path" { … }`.
+    /// `location [=|^~|~|~*] path { … }`.
     LocationBlock {
         #[serde(rename = "$labels")]
         labels: Vec<String>,
         #[serde(rename = "match")]
         match_: Option<OrderedMap<ConfValue>>,
-        proxy_pass: Option<String>,
+        proxy_pass: Option<OneOrMany<String>>,
         #[serde(rename = "return")]
         return_: Option<OneOrMany<ConfValue>>,
         redirect: Option<OneOrMany<ConfValue>>,
         rewrite: Vec<(String, String)>,
-        set_request_header: Vec<(String, String)>,
-        remove_request_header: Option<OneOrMany<String>>,
-        set_response_header: Vec<(String, String)>,
-        remove_response_header: Option<OneOrMany<String>>,
+        request_headers: Option<OrderedMap<String>>,
+        response_headers: Option<OrderedMap<String>>,
         timeout: Option<Secs>,
         response_buffering: Option<bool>,
-        security: Option<SecurityBlock>,
+        inspect: Option<crate::edge_routes::SecurityMode>,
+        policy: Option<LevelPolicyBlock>,
+        challenge: Option<String>,
+        rate_limit: Option<ConfValue>,
+        allow: Option<OneOrMany<String>>,
+        deny: Option<OneOrMany<String>>,
+        packs: Option<OrderedMap<String>>,
     }
 );
 

@@ -565,7 +565,7 @@ impl EdgeRuntime {
     }
 
     /// [`process`](Self::process) with a location's pipeline overrides
-    /// (`security { packs, policy }`).
+    /// (`packs {}`, `policy {}`).
     pub fn process_scoped(
         &self,
         mut evt: Event,

@@ -149,27 +149,28 @@ Sentry reads `sentry.conf`, an nginx-like file: `key: value` directives,
 block (`sentry`, `server`, `storage`, `detect`, `trust`, `rules`, `routes`,
 `source`, `action`, `dashboard`, `metrics`, `http`, `tcp`).
 
-The inline edge routes like nginx: `upstream` groups, `site`s by host, and
-`location`s by path (`=`, `^~`, `~`, `~*`). A `match {}` block adds query,
-header, cookie, method and IP conditions. A location can `proxy_pass`,
-`return`, `redirect` or `rewrite`, set or remove headers, and carry its own
-`security {}` overrides (mode, policy, rate limit, allow/deny, forced
-challenge, pack modes):
+The inline edge routes like nginx. A single backend is one line:
+`http { proxy_pass: http://127.0.0.1:8080 }`. With several domains and paths:
 
 ```nginx
 http {
-    upstream api { server: [http://api-1:9000, http://api-2:9000], balance: least_conn }
-    site {
-        host: [example.com, "*.example.com"]
-        location "/api/" {
-            match { query.version: "2" }
-            proxy_pass: http://api-v2:9000/
-        }
-        location "/api/" { proxy_pass: api; security { rate_limit: 100/1m } }
-        location "/admin/" { proxy_pass: api; security { allow: [10.0.0.0/8] } }
+    site example.com *.example.com {
+        "/": http://app:8080
+        "/api/": [http://api-1:9000, http://api-2:9000]   # balanced
+        "/old/": redirect "https://blog.example.com$request_uri"
+
+        location /admin/ { proxy_pass: http://app:8080, allow: [10.0.0.0/8] }
+        location /api/ { match { query.version: "2" }, proxy_pass: http://api-v2:9000/ }
+        location = /health { return: 200 ok, inspect: off }
     }
 }
 ```
+
+`"/path": target` covers the common case. A `location [=|^~|~|~*]` block adds
+`match {}` (query, header, cookie, method, IP), `rewrite`, `request_headers {}`
+and `response_headers {}`, plus security settings written inline: `inspect`
+(on/shadow/off), `rate_limit`, `allow`/`deny`, `challenge: always`,
+`policy {}` and `packs {}`.
 
 The config can be split across files: `include: "sites/*.conf"` works
 anywhere, `conf.d/*.conf` next to `sentry.conf` loads automatically, and

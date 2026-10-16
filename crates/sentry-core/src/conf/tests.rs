@@ -72,11 +72,10 @@ fn example_file_loads_and_maps_every_section() {
     assert_eq!(cfg.server.port, 8080);
     assert_eq!(cfg.metrics.port, 9100);
     assert_eq!(cfg.edge.listen, "0.0.0.0:80");
-    assert_eq!(cfg.edge.upstream_groups[0].name, "app");
     assert_eq!(cfg.edge.sites.len(), 1);
     assert_eq!(
         cfg.edge.sites[0].locations[0].proxy_pass.as_deref(),
-        Some("app")
+        Some("http://127.0.0.1:8080")
     );
     assert!(cfg.edge.validate().is_empty(), "{:?}", cfg.edge.validate());
 }
@@ -86,7 +85,7 @@ use crate::config::ActionKind;
 #[test]
 fn commented_example_sites_load_too() {
     let start = EXAMPLE
-        .find("    # site {\n    #     host:")
+        .find("    # site example.com")
         .expect("commented site example");
     let mut block = String::new();
     for line in EXAMPLE[start..].lines() {
@@ -100,60 +99,97 @@ fn commented_example_sites_load_too() {
             break;
         }
     }
-    let src = format!(
-        "http {{\n upstream app {{ server: http://127.0.0.1:1 }}\n upstream api {{ server: http://127.0.0.1:2 }}\n tls {{ cert: /c, key: /k }}\n{block}\n}}\n"
-    );
+    let src = format!("http {{\n tls {{ cert: /c, key: /k }}\n{block}\n}}\n");
     let cfg = load(&src);
     let site = &cfg.edge.sites[0];
     assert_eq!(site.hosts, ["example.com", "www.example.com"]);
-    let kinds: Vec<(LocationKind, &str)> = site
+    assert_eq!(
+        site.tls_cert.as_deref(),
+        Some(std::path::Path::new("/etc/sentry/example.crt"))
+    );
+    let at = |path: &str| site.locations.iter().find(|l| l.path == path).unwrap();
+    assert_eq!(at("/").proxy_pass.as_deref(), Some("http://app:8080"));
+    let api_group = at("/api/").proxy_pass.clone().unwrap();
+    let group = cfg
+        .edge
+        .upstream_groups
+        .iter()
+        .find(|g| g.name == api_group)
+        .unwrap();
+    assert_eq!(
+        group.servers.len(),
+        2,
+        "a list of URLs becomes a balanced group"
+    );
+    assert_eq!(at("/old-blog/").respond.as_ref().unwrap().status, 301);
+    let health = at("/health");
+    assert_eq!(health.kind, LocationKind::Exact);
+    assert_eq!(health.respond.as_ref().unwrap().text.as_deref(), Some("ok"));
+    assert_eq!(health.security.mode, Some(SecurityMode::Off));
+    assert_eq!(at(r"\.(php|aspx?)$").kind, LocationKind::RegexCaseless);
+    let admin = at("/admin/");
+    assert_eq!(admin.security.force_challenge, Some(true));
+    assert_eq!(admin.security.allow, ["10.0.0.0/8"]);
+    let v2 = site
         .locations
         .iter()
-        .map(|l| (l.kind, l.path.as_str()))
-        .collect();
-    assert!(kinds.contains(&(LocationKind::Exact, "/health")));
-    assert!(kinds.contains(&(LocationKind::PriorityPrefix, "/static/")));
-    assert!(kinds.contains(&(LocationKind::RegexCaseless, r"\.(php|asp|aspx)$")));
-    let v2 = &site.locations[3];
+        .find(|l| l.path == "/api/" && !l.conditions.is_empty())
+        .unwrap();
     assert_eq!(
         v2.conditions[0].subject,
         MatchSubject::Query("version".into())
     );
-    assert_eq!(v2.conditions[0].op, MatchOp::In(vec!["2".into()]));
-    let api = &site.locations[4];
-    assert_eq!(api.rewrites[0].replacement, "/$1");
-    assert_eq!(
-        api.headers.request_set,
-        [("X-Tenant".to_string(), "acme".to_string())]
-    );
-    assert_eq!(api.headers.response_remove, ["Server", "X-Powered-By"]);
-    assert_eq!(api.timeout_secs, Some(30));
-    assert_eq!(api.security.rate_limit.unwrap().requests, 100);
-    let admin = &site.locations[5];
-    assert_eq!(admin.security.force_challenge, Some(true));
-    assert_eq!(admin.security.allow.len(), 2);
-    let health = &site.locations[0];
-    assert_eq!(health.security.mode, Some(SecurityMode::Off));
-    assert_eq!(health.respond.as_ref().unwrap().status, 200);
-    let old = site
-        .locations
-        .iter()
-        .find(|l| l.path == "/old-blog/")
-        .unwrap();
-    assert_eq!(old.respond.as_ref().unwrap().status, 301);
-    let beta = site
-        .locations
-        .iter()
-        .rev()
-        .find(|l| l.path == "/" && !l.conditions.is_empty())
-        .unwrap();
-    assert_eq!(beta.conditions[0].op, MatchOp::Present);
-    assert_eq!(
-        site.locations.last().unwrap().proxy_pass.as_deref(),
-        Some("app"),
-        "site-level fallback"
-    );
+    let stat = at("/static/");
+    assert_eq!(stat.headers.response_remove, ["Server"]);
+    assert_eq!(stat.headers.response_set[0].0, "Cache-Control");
+    assert_eq!(at("/events").response_buffering, Some(false));
     assert!(cfg.edge.validate().is_empty(), "{:?}", cfg.edge.validate());
+}
+
+#[test]
+fn proxy_shorthands() {
+    let cfg = load(
+        "http {\n upstream api { server: http://api:1 }\n site a.test *.a.test {\n  \"/\": api\n  \"/x/\": http://x:1/v2/\n  \"/up\": 204\n  \"/go\": redirect 302 \"https://b.test$uri\"\n  location /admin/ { proxy_pass: api, inspect: shadow, rate_limit: 5/s, request_headers { X-A: one, Cookie: off } }\n }\n site { \"/\": [http://d1:1, http://d2:1] }\n}",
+    );
+    let site = &cfg.edge.sites[0];
+    assert_eq!(site.hosts, ["a.test", "*.a.test"]);
+    let paths: Vec<&str> = site.locations.iter().map(|l| l.path.as_str()).collect();
+    assert_eq!(paths, ["/", "/x/", "/up", "/go", "/admin/"]);
+    let admin = &site.locations[4];
+    assert_eq!(admin.security.mode, Some(SecurityMode::Shadow));
+    assert_eq!(admin.security.rate_limit.unwrap().window_secs, 1);
+    assert_eq!(
+        admin.headers.request_set,
+        [("X-A".to_string(), "one".to_string())]
+    );
+    assert_eq!(admin.headers.request_remove, ["Cookie"]);
+    assert_eq!(site.locations[2].respond.as_ref().unwrap().status, 204);
+    let go = site.locations[3].respond.as_ref().unwrap();
+    assert_eq!(
+        (go.status, go.text.as_deref()),
+        (302, Some("https://b.test$uri"))
+    );
+    let default = &cfg.edge.sites[1];
+    let group = default.locations[0].proxy_pass.clone().unwrap();
+    assert!(cfg
+        .edge
+        .upstream_groups
+        .iter()
+        .any(|g| g.name == group && g.servers.len() == 2));
+    assert!(cfg.edge.validate().is_empty(), "{:?}", cfg.edge.validate());
+
+    let back = load(&to_text(&cfg));
+    assert_eq!(json(&back), json(&cfg));
+    let text = to_text(&cfg);
+    assert!(text.contains("site a.test *.a.test {"), "{text}");
+    assert!(text.contains("\"/\": api"), "{text}");
+    assert!(text.contains("\"/up\": 204"), "{text}");
+    assert!(text.contains("\"/go\": redirect 302"), "{text}");
+    assert!(
+        text.contains("site { proxy_pass: [http://d1:1, http://d2:1] }"),
+        "{text}"
+    );
+    assert!(!text.contains("upstream default/"), "{text}");
 }
 
 #[test]
@@ -244,7 +280,7 @@ fn errors_point_at_the_mistake() {
     assert!(e.contains("action: needs a type"), "{e}");
     let e = load_err("action fly {}");
     assert!(e.contains("unknown type"), "{e}");
-    let e = load_err("http { site { location \"/\" { security { rate_limit: lots } } } }");
+    let e = load_err("http { site { location / { proxy_pass: http://a:1, rate_limit: lots } } }");
     assert!(e.contains("rate_limit `lots`"), "{e}");
 }
 
@@ -281,7 +317,10 @@ fn legacy_toml_migrates_to_conf() {
     .unwrap();
     let text = to_text(&legacy);
     assert!(text.contains("upstream default {"), "{text}");
-    assert!(text.contains("host: app.example.com"), "{text}");
+    assert!(
+        text.contains("site app.example.com { proxy_pass: app.example.com }"),
+        "{text}"
+    );
     let back = load(&text);
     assert_eq!(back.core.channel_buffer, 8192);
     assert_eq!(back.edge.sites.len(), 2);

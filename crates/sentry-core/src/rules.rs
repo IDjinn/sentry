@@ -301,7 +301,7 @@ impl RuleSet {
         self.promotions = promotions;
     }
 
-    /// Evaluate with per-request pack overrides (edge `security { packs }`):
+    /// Evaluate with per-request pack overrides (location `packs {}`):
     /// `off` skips the pack's rules, `shadow` turns its short-circuits into
     /// annotations, `enforce` promotes a shadow pack's `Log` rules to their
     /// enforce action. Returns the matching rule (with the effective action)

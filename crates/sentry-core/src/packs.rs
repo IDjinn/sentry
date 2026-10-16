@@ -64,7 +64,7 @@ pub fn build_default_ruleset_with(
 ) -> RuleSet {
     let mut set = build_pack_rules(pack_modes, bot_verify_enabled);
     // Shadow packs run as `Log`; remember their enforce actions so an edge
-    // location can promote them (`security { packs { x: enforce } }`).
+    // location can promote them (`packs { x: enforce }`).
     let mut enforced_modes = pack_modes.clone();
     let mut any_shadow = false;
     for name in PackMode::all_pack_names() {
