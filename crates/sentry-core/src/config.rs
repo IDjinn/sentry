@@ -53,6 +53,10 @@ pub struct SentryConfig {
     /// Cross-IP scan→attack correlation (F3.10).
     #[serde(default)]
     pub correlation: CorrelationConfig,
+    /// Client fingerprinting: passive TLS/header device ids + first-party
+    /// visitor cookie (F18).
+    #[serde(default)]
+    pub fingerprint: FingerprintConfig,
     /// rDNS bot verification (F7.7).
     #[serde(default)]
     pub bot_verification: BotVerificationConfig,
@@ -673,6 +677,85 @@ fn default_correlation_enabled() -> bool {
 }
 fn default_correlation_window() -> u64 {
     900 // 15 minutes — the honeypot shot-calling window
+}
+
+/// Client fingerprinting (F18): a passive device id (TLS JA4 + stable header
+/// shape), a TLS-only id and an optional first-party visitor cookie let the
+/// pipeline recognize the same client across IPs and over time, feed
+/// fingerprint signals into the scorer, match `fingerprint` in rules and ban
+/// by fingerprint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FingerprintConfig {
+    /// Master switch (on by default; `false` makes the whole stage a no-op).
+    #[serde(default = "default_fingerprint_enabled")]
+    pub enabled: bool,
+    /// Inline edge issues the first-party `sentry_vid` visitor cookie so a
+    /// returning client is recognized even when its IP and headers change.
+    #[serde(default = "default_fingerprint_enabled")]
+    pub cookie: bool,
+    /// Visitor cookie lifetime in seconds (default one year).
+    #[serde(default = "default_fingerprint_cookie_max_age")]
+    pub cookie_max_age_secs: u64,
+    /// Sliding window for the per-fingerprint trackers.
+    #[serde(default = "default_fingerprint_window")]
+    pub window_secs: u64,
+    /// Distinct *other* IPs flagged High/Critical under one fingerprint that
+    /// make its next requests carry `FingerprintReputation` (`0` disables).
+    #[serde(default = "default_fingerprint_reputation_ips")]
+    pub reputation_ips: u32,
+    /// Distinct device ids under one visitor cookie within the window that
+    /// raise `VisitorDeviceChurn` (`0` disables).
+    #[serde(default = "default_fingerprint_visitor_devices")]
+    pub visitor_devices: u32,
+    /// Distinct flagged IPs that auto-ban the fingerprint (`0` = never).
+    /// Passive ids are shared by every client running the same browser
+    /// build, so this is opt-in.
+    #[serde(default)]
+    pub auto_ban_ips: u32,
+    /// Lifetime of an automatic ban.
+    #[serde(default = "default_fingerprint_auto_ban_ttl")]
+    pub auto_ban_ttl_secs: u64,
+    /// Cap on tracked fingerprints (oldest are evicted beyond it).
+    #[serde(default = "default_fingerprint_max_entries")]
+    pub max_entries: usize,
+}
+
+impl Default for FingerprintConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_fingerprint_enabled(),
+            cookie: default_fingerprint_enabled(),
+            cookie_max_age_secs: default_fingerprint_cookie_max_age(),
+            window_secs: default_fingerprint_window(),
+            reputation_ips: default_fingerprint_reputation_ips(),
+            visitor_devices: default_fingerprint_visitor_devices(),
+            auto_ban_ips: 0,
+            auto_ban_ttl_secs: default_fingerprint_auto_ban_ttl(),
+            max_entries: default_fingerprint_max_entries(),
+        }
+    }
+}
+
+fn default_fingerprint_enabled() -> bool {
+    true
+}
+fn default_fingerprint_cookie_max_age() -> u64 {
+    31_536_000
+}
+fn default_fingerprint_window() -> u64 {
+    3600
+}
+fn default_fingerprint_reputation_ips() -> u32 {
+    3
+}
+fn default_fingerprint_visitor_devices() -> u32 {
+    4
+}
+fn default_fingerprint_auto_ban_ttl() -> u64 {
+    3600
+}
+fn default_fingerprint_max_entries() -> usize {
+    50_000
 }
 
 /// rDNS forward-confirmed bot verification (F7.7): UA claims of known

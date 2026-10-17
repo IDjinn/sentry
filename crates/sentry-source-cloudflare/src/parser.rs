@@ -88,6 +88,8 @@ impl CfLogLine {
             cookies: None,
             uploads: None,
             upstream_time_ms: None,
+            tls: None,
+            fingerprint: None,
         };
         let evt = RawEvent {
             source: SourceKind::CloudflareLogs,

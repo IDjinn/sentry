@@ -286,6 +286,15 @@ pub async fn run_with_path(
     let block_table = Arc::new(sentry_core::BlockTable::new());
     let block_ttl = Duration::from_secs(blocklist_ttl_secs(&cfg));
 
+    // Client fingerprinting (F18): tracker behind the fingerprint signals
+    // and the ban list the pipeline enforces before any detector.
+    let fp_bans = Arc::new(sentry_core::FingerprintBans::new());
+    let fp_tracker = cfg.fingerprint.enabled.then(|| {
+        Arc::new(std::sync::RwLock::new(
+            sentry_core::FingerprintTracker::from_config(&cfg.fingerprint),
+        ))
+    });
+
     let metrics = crate::metrics::Metrics::new();
     metrics.set_instance(&instance_label(&cfg.deployment.instance_id));
     let event_log = crate::eventlog::EventLog::new();
@@ -348,6 +357,22 @@ pub async fn run_with_path(
                 tokio::spawn(async move {
                     blocks_hot_reload(blocks_pool, reload_blocks).await;
                 });
+
+                if cfg.fingerprint.enabled {
+                    match load_fingerprint_bans(&repo).await {
+                        Ok(entries) => {
+                            let n = entries.len();
+                            fp_bans.reload(entries);
+                            info!(bans = n, "fingerprint bans loaded from db");
+                        }
+                        Err(e) => warn!(error = %e, "failed to load fingerprint bans"),
+                    }
+                    let fp_pool = repo.pool().clone();
+                    let fp_bans_reload = Arc::clone(&fp_bans);
+                    tokio::spawn(async move {
+                        fingerprints_hot_reload(fp_pool, fp_bans_reload).await;
+                    });
+                }
 
                 // DB datasets (F7.7): synthetic rules + dynamic prefilter
                 // literals, applied at startup and hot-reloaded on NOTIFY.
@@ -589,6 +614,13 @@ pub async fn run_with_path(
     if let Some(ref t) = offender_tracker {
         pipeline_builder = pipeline_builder.with_offender(Arc::clone(t), cfg.escalation.clone());
     }
+    if let Some(ref t) = fp_tracker {
+        pipeline_builder = pipeline_builder.with_fingerprint(
+            &cfg.fingerprint,
+            Arc::clone(t),
+            Arc::clone(&fp_bans),
+        );
+    }
     let pipeline = Arc::new(pipeline_builder);
     info!(
         weights = cfg.scorer.weights.len(),
@@ -694,6 +726,19 @@ pub async fn run_with_path(
             loop {
                 interval.tick().await;
                 t.write().unwrap().prune();
+            }
+        });
+    }
+    if let Some(ref t) = fp_tracker {
+        let t = Arc::clone(t);
+        let bans = Arc::clone(&fp_bans);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                t.write().unwrap().prune();
+                bans.prune();
             }
         });
     }
@@ -1175,6 +1220,15 @@ pub async fn run_with_path(
                 })
                 .with_uploads_inspected(metrics.edge_uploads_inspected.clone())
                 .with_uploads_oversize(metrics.edge_uploads_oversize.clone())
+        } else {
+            runtime
+        };
+        let runtime = if fp_tracker.is_some() && cfg.fingerprint.cookie {
+            info!(
+                max_age_secs = cfg.fingerprint.cookie_max_age_secs,
+                "visitor cookie enabled (F18)"
+            );
+            runtime.with_visitor_cookie(cfg.fingerprint.cookie_max_age_secs)
         } else {
             runtime
         };
@@ -3104,6 +3158,57 @@ async fn blocks_hot_reload(pool: sentry_storage::PgPool, table: Arc<sentry_core:
             Err(e) => {
                 warn!(error = %e, "failed to start LISTEN, retrying in 5s…");
             }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// Persisted fingerprint bans as `(id, expiry)` pairs for the in-memory list.
+async fn load_fingerprint_bans(
+    repo: &sentry_storage::Repo,
+) -> Result<Vec<(String, Option<std::time::Instant>)>, sentry_storage::StorageError> {
+    let rows = repo.fingerprints().active(100_000).await?;
+    let now = chrono::Utc::now();
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let exp = match r.expires_at {
+                None => None,
+                Some(ts) => {
+                    let remaining = (ts - now).to_std().ok()?;
+                    Some(std::time::Instant::now() + remaining)
+                }
+            };
+            Some((r.fp, exp))
+        })
+        .collect())
+}
+
+/// Background task: LISTEN for `sentry_fingerprints_changed` and reload the
+/// fingerprint ban list from `fingerprint_bans`.
+async fn fingerprints_hot_reload(
+    pool: sentry_storage::PgPool,
+    bans: Arc<sentry_core::FingerprintBans>,
+) {
+    const CHANNEL: &str = "sentry_fingerprints_changed";
+    loop {
+        match pool.listen(CHANNEL).await {
+            Ok(mut listener) => {
+                info!(channel = CHANNEL, "listening for fingerprint ban changes");
+                while listener.recv().await.is_ok() {
+                    let repo = sentry_storage::Repo::new(pool.clone());
+                    match load_fingerprint_bans(&repo).await {
+                        Ok(entries) => {
+                            let n = entries.len();
+                            bans.reload(entries);
+                            info!(bans = n, "fingerprint bans hot-reloaded from db");
+                        }
+                        Err(e) => warn!(error = %e, "failed to reload fingerprint bans"),
+                    }
+                }
+                warn!("LISTEN connection closed, reconnecting in 5s…");
+            }
+            Err(e) => warn!(error = %e, "failed to start LISTEN, retrying in 5s…"),
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }

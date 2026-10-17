@@ -25,7 +25,7 @@ use axum::http::header;
 use axum::middleware::Next;
 use axum::response::Response;
 use sentry_core::analysis::Verdict;
-use sentry_core::event::{Event, HttpData, ProtocolData, SourceKind, Transport};
+use sentry_core::event::{Event, HttpData, ProtocolData, SourceKind, TlsData, Transport};
 use uuid::Uuid;
 
 use crate::pages;
@@ -186,6 +186,8 @@ async fn handler_inner(
         cookies: Some(crate::challenge::parse_cookies(&parts.headers)),
         uploads: upload_meta,
         upstream_time_ms: None,
+        tls: parts.extensions.get::<TlsData>().cloned().map(Box::new),
+        fingerprint: None,
     };
 
     let mut evt = Event::new(SourceKind::HttpProxy, client_ip, ProtocolData::Http(http));

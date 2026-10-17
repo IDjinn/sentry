@@ -131,6 +131,11 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 }
             }
         },
+        Command::Fingerprint { action } => {
+            let cfg = require_config(&cfg)?;
+            let repo = connect_storage(cfg).await?;
+            run_fingerprint(&repo, action).await?;
+        }
         Command::Ip { ip, action } => {
             let cfg = require_config(&cfg)?;
             let repo = connect_storage(cfg).await?;
@@ -1731,6 +1736,138 @@ pub(crate) fn build_cf_provider() -> color_eyre::Result<sentry_action_cloudflare
 
 async fn notify_rules_changed(repo: &sentry_storage::Repo) {
     let _ = repo.pool().notify("sentry_rules_changed").await;
+}
+
+fn valid_fingerprint_id(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+    id.strip_prefix("d-")
+        .or_else(|| id.strip_prefix("t-"))
+        .is_some_and(|h| hex(h, 16))
+        || id.strip_prefix("v-").is_some_and(|h| hex(h, 32))
+}
+
+async fn run_fingerprint(
+    repo: &sentry_storage::Repo,
+    action: crate::cli::FingerprintCmd,
+) -> color_eyre::Result<()> {
+    use crate::cli::FingerprintCmd;
+    let q = |e: sentry_storage::StorageError| color_eyre::eyre::eyre!("query failed: {e}");
+    match action {
+        FingerprintCmd::List => {
+            let rows = repo.fingerprints().active(1000).await.map_err(q)?;
+            if rows.is_empty() {
+                println!("No active fingerprint bans.");
+            }
+            for r in rows {
+                println!(
+                    "{:<36} expires {:<26} {}",
+                    r.fp,
+                    r.expires_at
+                        .map(|t| t.to_string())
+                        .unwrap_or("never".into()),
+                    r.reason.as_deref().unwrap_or("-")
+                );
+            }
+        }
+        FingerprintCmd::Top { kind, from, limit } => {
+            let since = chrono::Utc::now() - parse_duration(&from)?;
+            let rows = repo
+                .fingerprints()
+                .top(&kind, limit, since)
+                .await
+                .map_err(q)?;
+            println!(
+                "{:<36} {:>9} {:>8} {:>8}",
+                "FINGERPRINT", "EVENTS", "IPS", "FLAGGED"
+            );
+            for (fp, events, ips, flagged) in rows {
+                println!("{fp:<36} {events:>9} {ips:>8} {flagged:>8}");
+            }
+        }
+        FingerprintCmd::Show { id, from } => {
+            let since = chrono::Utc::now() - parse_duration(&from)?;
+            let pop = repo
+                .fingerprints()
+                .population(&id, since)
+                .await
+                .map_err(q)?;
+            let banned = repo
+                .fingerprints()
+                .active(100_000)
+                .await
+                .map_err(q)?
+                .iter()
+                .any(|b| b.fp.eq_ignore_ascii_case(&id));
+            println!("Fingerprint: {id}");
+            println!("Banned:      {banned}");
+            println!("Events:      {}", pop.events);
+            println!(
+                "Distinct IPs: {} ({} flagged High/Critical)",
+                pop.distinct_ips, pop.flagged_ips
+            );
+            println!(
+                "First/last:  {} / {}",
+                pop.first_seen.map(|t| t.to_string()).unwrap_or("-".into()),
+                pop.last_seen.map(|t| t.to_string()).unwrap_or("-".into())
+            );
+        }
+        FingerprintCmd::Ban {
+            id,
+            ttl,
+            note,
+            force,
+        } => {
+            if !valid_fingerprint_id(&id) {
+                return Err(color_eyre::eyre::eyre!(
+                    "invalid fingerprint id `{id}` (expected d-<16 hex>, t-<16 hex> or v-<32 hex>)"
+                ));
+            }
+            let since = chrono::Utc::now() - chrono::Duration::days(7);
+            let pop = repo
+                .fingerprints()
+                .population(&id, since)
+                .await
+                .map_err(q)?;
+            let shared_clean = pop.distinct_ips >= 20 && pop.flagged_ips * 2 < pop.distinct_ips;
+            if shared_clean && !force {
+                return Err(color_eyre::eyre::eyre!(
+                    "{id} is shared by {} IPs in the last 7d and only {} were flagged — banning it would hit mostly clean clients. Re-run with --force to ban anyway.",
+                    pop.distinct_ips,
+                    pop.flagged_ips
+                ));
+            }
+            let expires_at = ttl
+                .as_deref()
+                .map(parse_duration)
+                .transpose()?
+                .map(|d| chrono::Utc::now() + d);
+            repo.fingerprints()
+                .ban(&id, note.as_deref(), expires_at)
+                .await
+                .map_err(q)?;
+            println!(
+                "Banned {id} (expires: {}; {} IPs / {} events in 7d)",
+                expires_at.map(|t| t.to_string()).unwrap_or("never".into()),
+                pop.distinct_ips,
+                pop.events
+            );
+            let _ = repo.pool().notify("sentry_fingerprints_changed").await;
+        }
+        FingerprintCmd::Unban { id } => {
+            let removed = repo.fingerprints().unban(&id).await.map_err(q)?;
+            println!(
+                "{}",
+                if removed {
+                    format!("Unbanned {id}")
+                } else {
+                    format!("{id} was not banned")
+                }
+            );
+            let _ = repo.pool().notify("sentry_fingerprints_changed").await;
+        }
+    }
+    Ok(())
 }
 
 async fn notify_blocks_changed(repo: &sentry_storage::Repo) {

@@ -24,6 +24,7 @@ pub mod email_auth;
 pub mod error;
 pub mod event;
 pub mod feed_presets;
+pub mod fingerprint;
 pub mod heuristics;
 pub mod lists;
 pub mod multipart;
@@ -76,6 +77,7 @@ pub use event::{
     ReputationInfo, SourceKind, SyslogData, TcpData, TcpFlags, TcpStage, TlsData, Transport,
     UdpData, UploadInfo, UploadKind,
 };
+pub use fingerprint::{Fingerprint, FingerprintBans, FingerprintTracker};
 pub use heuristics::{Heuristic, HeuristicEngine};
 pub use offender::OffenderTracker;
 pub use overload::{sample_by_ip, BenignCoalescer, CoalesceKey, Coalesced, OverloadState};

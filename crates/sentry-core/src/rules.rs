@@ -474,6 +474,9 @@ pub enum RuleMatch {
     /// presented; a missing SNI never matches (the edge surfaces that as
     /// a `TlsSniMismatch` signal instead).
     TlsSni(StrOp),
+    /// Any fingerprint id of the request (device `d-…`, TLS `t-…` or
+    /// visitor `v-…`, F18) satisfies the operator.
+    Fingerprint(StrOp),
     /// JA3 set membership (F7.7): DB-backed datasets become one rule with
     /// the whole fingerprint list. Entries are stored lowercase; the event
     /// hash is lowercased before the lookup.
@@ -740,6 +743,13 @@ impl RuleMatch {
                 .and_then(|t| t.sni.as_deref())
                 .map(|sni| match_str_op(op, sni))
                 .unwrap_or(false),
+            Self::Fingerprint(op) => {
+                let fp = evt
+                    .http()
+                    .and_then(|h| h.fingerprint.as_deref().cloned())
+                    .or_else(|| crate::fingerprint::compute(evt));
+                fp.is_some_and(|fp| fp.ids().any(|id| match_str_op(op, id)))
+            }
             Self::Ja3In(list) => evt
                 .tls()
                 .and_then(|t| t.ja3.as_deref())

@@ -1139,6 +1139,35 @@ telemetria de handshake + provider de appliance
     inline (`RouteReloader`/`ArcSwap<RouteTable>` em `sentry-edge`); demais
     seções logam "precisa restart". Ver `ARCHITECTURE.md` §31
 
+# F18 (concluída): Fingerprinting de clientes — ids por dispositivo/TLS/visitante,
+# sinais, regra DSL e ban por fingerprint (`sentry-core/src/fingerprint.rs`)
+  - ✅ Ids sem IP (`compute`, pura): `t-<16hex>` = JA4 (fallback JA3) da
+    conexão; `d-<16hex>` = TLS + ALPN + UA/Accept-Language/Accept-Encoding/
+    Sec-CH-UA* (headers que variam por recurso — Accept, Sec-Fetch-* — ficam
+    de fora); `v-<32hex>` = cookie first-party `sentry_vid` emitido pela edge
+    inline em respostas HTML 2xx/3xx de `GET` (Set-Cookie não vai em assets/
+    API: CDNs deixam de cachear). Vivem em `HttpData.fingerprint` (persistem
+    no `events.protocol`); `HttpData.tls` carrega JA3/JA4/SNI/ALPN da
+    conexão (extension `TlsData` injetada por `tls.rs`)
+  - ✅ `[fingerprint]` / `detect { fingerprint {} }` — **ligado por default**
+    (`enabled: off` desliga o estágio; `cookie: off` mantém só os ids
+    passivos). Sinais: `FingerprintReputation` (35) quando ≥`reputation_ips`
+    outros IPs sob o mesmo id foram flagged High/Critical **e** são ≥50% dos
+    IPs vistos (id popular e limpo, ex.: Chrome stock, nunca ganha
+    reputação), `VisitorDeviceChurn` (30) quando um cookie apresenta
+    ≥`visitor_devices` devices na janela, `FingerprintBanned` (100). Pesos
+    em `[scorer.weights]` (`fingerprint_reputation`, `visitor_device_churn`)
+  - ✅ Ban: `FingerprintBans` (tier persistente = tabela `fingerprint_bans` +
+    NOTIFY `sentry_fingerprints_changed`, pre-warm e hot-reload no daemon;
+    tier automático só em memória, `auto_ban_ips` > 0, sobrevive ao reload)
+    checado no pipeline depois do guard de trusted/blacklist e antes de
+    qualquer detector → Block. `sentry fingerprint list|top|show|ban|unban`;
+    `ban` mostra a população e recusa ids compartilhados por ≥20 IPs com
+    <50% flagged sem `--force` (ids passivos são de classe, não de pessoa)
+  - ✅ DSL: `fingerprint = "d-…"` (qualquer id do request, StrOp)
+  - ✅ Testes: 14 em `fingerprint.rs` + 4 no pipeline (ids no evento, ban
+    pré-detector, auto-ban + taint de IP novo, DSL)
+
 Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4; §27 F12 idem; §28 F13 idem; §29 F14 idem; §3 subprojeto auto — v1 entregue, A.5/A.7/A.12 restantes).
 
 ### Status atual (verificação contínua)

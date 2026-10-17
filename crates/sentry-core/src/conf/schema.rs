@@ -167,6 +167,7 @@ conf_struct!(
         scan: Option<ScanBlock>,
         behavior: Option<BehaviorBlock>,
         correlation: Option<CorrelationBlock>,
+        fingerprint: Option<FingerprintBlock>,
         bot_verification: Option<BotVerificationBlock>,
         uploads: Option<UploadsBlock>,
         posture: Option<PostureBlock>,
@@ -202,6 +203,19 @@ conf_struct!(CorrelationBlock {
     enabled: Option<bool>,
     #[serde(alias = "window_secs")]
     window: Option<Secs>,
+});
+
+conf_struct!(FingerprintBlock {
+    enabled: Option<bool>,
+    cookie: Option<bool>,
+    cookie_max_age: Option<Secs>,
+    #[serde(alias = "window_secs")]
+    window: Option<Secs>,
+    reputation_ips: Option<u32>,
+    visitor_devices: Option<u32>,
+    auto_ban_ips: Option<u32>,
+    auto_ban_ttl: Option<Secs>,
+    max_entries: Option<usize>,
 });
 
 conf_struct!(BotVerificationBlock {

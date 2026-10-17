@@ -69,11 +69,163 @@ impl Repo {
         }
     }
 
+    /// Borrow the fingerprint-bans repo (F18).
+    pub fn fingerprints(&self) -> FingerprintRepo {
+        FingerprintRepo {
+            pool: self.pool.clone(),
+        }
+    }
+
     /// Borrow the datasets repo (F7.7).
     pub fn datasets(&self) -> DatasetRepo {
         DatasetRepo {
             pool: self.pool.clone(),
         }
+    }
+}
+
+// ─── FingerprintRepo ────────────────────────────────────────────────────────
+
+/// Repository for the `fingerprint_bans` table (F18).
+#[derive(Clone)]
+pub struct FingerprintRepo {
+    pool: PgPool,
+}
+
+/// One fingerprint ban.
+#[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
+pub struct FingerprintBanRow {
+    /// Banned id (`d-…` / `t-…` / `v-…`).
+    pub fp: String,
+    /// Why it was banned.
+    pub reason: Option<String>,
+    /// Expiry (`None` = permanent).
+    pub expires_at: Option<DateTime<Utc>>,
+    /// When the ban was created.
+    pub created_at: DateTime<Utc>,
+}
+
+/// What the events table knows about one fingerprint id.
+#[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
+pub struct FingerprintPopulation {
+    /// Matching events.
+    pub events: i64,
+    /// Distinct client IPs.
+    pub distinct_ips: i64,
+    /// Distinct IPs with at least one High/Critical event.
+    pub flagged_ips: i64,
+    /// Earliest sighting.
+    pub first_seen: Option<DateTime<Utc>>,
+    /// Latest sighting.
+    pub last_seen: Option<DateTime<Utc>>,
+}
+
+impl FingerprintRepo {
+    /// Ban `fp` (idempotent; a new call replaces reason/expiry).
+    pub async fn ban(
+        &self,
+        fp: &str,
+        reason: Option<&str>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO fingerprint_bans (fp, reason, expires_at)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (fp) DO UPDATE SET
+                   reason = $2, expires_at = $3, created_at = now()"#,
+        )
+        .bind(fp.to_ascii_lowercase())
+        .bind(reason)
+        .bind(expires_at)
+        .execute(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Lift a ban; whether a row was removed.
+    pub async fn unban(&self, fp: &str) -> Result<bool> {
+        let r = sqlx::query("DELETE FROM fingerprint_bans WHERE fp = $1")
+            .bind(fp.to_ascii_lowercase())
+            .execute(self.pool.inner())
+            .await
+            .map_err(|e| StorageError::Query(e.to_string()))?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Bans that haven't expired.
+    pub async fn active(&self, limit: i64) -> Result<Vec<FingerprintBanRow>> {
+        sqlx::query_as::<_, FingerprintBanRow>(
+            r#"SELECT fp, reason, expires_at, created_at
+               FROM fingerprint_bans
+               WHERE expires_at IS NULL OR expires_at > now()
+               ORDER BY created_at DESC
+               LIMIT $1"#,
+        )
+        .bind(limit)
+        .fetch_all(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))
+    }
+
+    /// Population of `fp` since `since`: how many events/IPs share it, so
+    /// the operator sees the collateral before banning a shared id.
+    pub async fn population(
+        &self,
+        fp: &str,
+        since: DateTime<Utc>,
+    ) -> Result<FingerprintPopulation> {
+        sqlx::query_as::<_, FingerprintPopulation>(
+            r#"SELECT count(*)::bigint AS events,
+                      count(DISTINCT client_ip)::bigint AS distinct_ips,
+                      count(DISTINCT client_ip) FILTER (
+                          WHERE risk_level IN ('high', 'critical'))::bigint AS flagged_ips,
+                      min(timestamp) AS first_seen,
+                      max(timestamp) AS last_seen
+               FROM events
+               WHERE timestamp >= $2
+                 AND (protocol->'fingerprint'->>'device' = $1
+                      OR protocol->'fingerprint'->>'tls' = $1
+                      OR protocol->'fingerprint'->>'visitor' = $1)"#,
+        )
+        .bind(fp.to_ascii_lowercase())
+        .bind(since)
+        .fetch_one(self.pool.inner())
+        .await
+        .map_err(|e| StorageError::Query(e.to_string()))
+    }
+
+    /// Most active fingerprints in the window as `(id, events, distinct_ips,
+    /// flagged_ips)`, ranked by flagged IPs then events.
+    pub async fn top(
+        &self,
+        kind: &str,
+        limit: i64,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<(String, i64, i64, i64)>> {
+        let key = match kind {
+            "tls" => "tls",
+            "visitor" => "visitor",
+            _ => "device",
+        };
+        let sql = format!(
+            r#"SELECT protocol->'fingerprint'->>'{key}' AS fp,
+                      count(*)::bigint,
+                      count(DISTINCT client_ip)::bigint,
+                      count(DISTINCT client_ip) FILTER (
+                          WHERE risk_level IN ('high', 'critical'))::bigint
+               FROM events
+               WHERE timestamp >= $1 AND protocol->'fingerprint'->>'{key}' IS NOT NULL
+               GROUP BY 1
+               ORDER BY 4 DESC, 2 DESC
+               LIMIT $2"#
+        );
+        sqlx::query_as::<_, (String, i64, i64, i64)>(&sql)
+            .bind(since)
+            .bind(limit)
+            .fetch_all(self.pool.inner())
+            .await
+            .map_err(|e| StorageError::Query(e.to_string()))
     }
 }
 

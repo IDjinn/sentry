@@ -872,6 +872,12 @@ async fn proxy_inspected(
         cookies: Some(crate::challenge::parse_cookies(&parts.headers)),
         uploads: upload_meta,
         upstream_time_ms: None,
+        tls: parts
+            .extensions
+            .get::<sentry_core::event::TlsData>()
+            .cloned()
+            .map(Box::new),
+        fingerprint: None,
     };
     let mut evt = sentry_core::event::Event::new(
         sentry_core::event::SourceKind::HttpProxy,
@@ -991,6 +997,8 @@ async fn proxy_inspected(
         );
     }
 
+    issue_visitor_cookie(runtime, &processed, &mut resp, &parts, is_tls);
+
     // Posture advisories (F11): grade only upstream responses (edge pages
     // and redirects are not the site's headers) on successful statuses, and
     // attach weight-0 signals — advisory only, the verdict stands.
@@ -1077,6 +1085,63 @@ fn apply_security_headers(
         if let Ok(value) = axum::http::HeaderValue::from_str(&w.value) {
             resp.headers_mut().insert(w.name, value);
         }
+    }
+}
+
+/// Set the first-party visitor cookie (F18) when the client has no valid
+/// one. Only on successful HTML document responses to `GET`: `Set-Cookie`
+/// makes CDNs treat a response as uncacheable, so assets and API responses
+/// are left alone, and the first page view is enough to seed the id.
+fn issue_visitor_cookie(
+    runtime: &EdgeRuntime,
+    processed: &sentry_core::ProcessedEvent,
+    resp: &mut Response,
+    parts: &axum::http::request::Parts,
+    is_tls: bool,
+) {
+    let Some(max_age) = runtime.visitor_cookie_max_age() else {
+        return;
+    };
+    if parts.method != axum::http::Method::GET
+        || resp.status().as_u16() >= 400
+        || resp.status() == axum::http::StatusCode::SWITCHING_PROTOCOLS
+        || resp.headers().get_all(header::SET_COOKIE).iter().any(|v| {
+            v.to_str()
+                .is_ok_and(|s| s.starts_with(sentry_core::fingerprint::VISITOR_COOKIE))
+        })
+    {
+        return;
+    }
+    let has_visitor = processed
+        .event
+        .http()
+        .and_then(|h| h.fingerprint.as_ref())
+        .is_some_and(|f| f.visitor.is_some());
+    if has_visitor {
+        return;
+    }
+    let is_document = sentry_core::security_headers::is_html(
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+    );
+    if !is_document {
+        return;
+    }
+    let secure = is_tls
+        || parts
+            .headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("https"));
+    let cookie = sentry_core::fingerprint::visitor_set_cookie(
+        &sentry_core::fingerprint::new_visitor_id(),
+        max_age,
+        secure,
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
+        resp.headers_mut().append(header::SET_COOKIE, value);
     }
 }
 

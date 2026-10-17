@@ -300,6 +300,14 @@ impl RepetitionTracker {
     }
 }
 
+/// Fingerprint stage wiring (F18): tracker, ban list and the thresholds the
+/// pipeline itself needs.
+struct FingerprintStage {
+    tracker: Arc<RwLock<crate::fingerprint::FingerprintTracker>>,
+    bans: Arc<crate::fingerprint::FingerprintBans>,
+    auto_ban_ttl: Duration,
+}
+
 /// The analysis pipeline.
 pub struct Pipeline {
     rules: SharedRuleSet,
@@ -317,6 +325,7 @@ pub struct Pipeline {
     correlation: Option<Arc<RwLock<CorrelationTracker>>>,
     trust: Option<crate::trust::SharedTrustSet>,
     bot: Option<crate::botverify::SharedBotVerifier>,
+    fingerprint: Option<FingerprintStage>,
     /// Signals raised by response-phase observations (inline edge): applied
     /// to the next request from the same IP, since request-phase verdicts
     /// are decided before any response exists.
@@ -462,6 +471,7 @@ impl Pipeline {
             correlation: None,
             trust: None,
             bot: None,
+            fingerprint: None,
             pending: RwLock::new(HashMap::new()),
         }
     }
@@ -534,6 +544,23 @@ impl Pipeline {
         self
     }
 
+    /// Enable fingerprinting (F18): ids are derived for every event, the ban
+    /// list is enforced before any detector runs, and the tracker feeds the
+    /// `FingerprintReputation` / `VisitorDeviceChurn` signals.
+    pub fn with_fingerprint(
+        mut self,
+        cfg: &crate::config::FingerprintConfig,
+        tracker: Arc<RwLock<crate::fingerprint::FingerprintTracker>>,
+        bans: Arc<crate::fingerprint::FingerprintBans>,
+    ) -> Self {
+        self.fingerprint = Some(FingerprintStage {
+            tracker,
+            bans,
+            auto_ban_ttl: Duration::from_secs(cfg.auto_ban_ttl_secs.max(1)),
+        });
+        self
+    }
+
     /// Process a single event through the full pipeline.
     #[tracing::instrument(skip(self, evt), fields(id = %evt.id, ip = %evt.client_ip))]
     pub fn process(&self, evt: &Event) -> ProcessedEvent {
@@ -543,6 +570,33 @@ impl Pipeline {
     /// [`process`](Self::process) with per-request overrides from an edge
     /// location (`packs {}`, `policy {}`).
     pub fn process_scoped(&self, evt: &Event, scope: &RequestScope) -> ProcessedEvent {
+        let Some(stage) = &self.fingerprint else {
+            return self.process_core(evt, scope, None);
+        };
+        let fp = crate::fingerprint::compute(evt);
+        let mut pe = self.process_core(evt, scope, fp.as_ref());
+        if let Some(fp) = fp {
+            if pe.analysis.risk_level >= RiskLevel::High {
+                let now = Instant::now();
+                let ban = stage.tracker.write().unwrap().flag(&fp, evt.client_ip, now);
+                for id in ban {
+                    stage.bans.ban_auto(&id, now + stage.auto_ban_ttl);
+                    tracing::warn!(fingerprint = %id, ttl_secs = stage.auto_ban_ttl.as_secs(), "fingerprint auto-banned");
+                }
+            }
+            if let Some(http) = pe.event.http_mut() {
+                http.fingerprint = Some(Box::new(fp));
+            }
+        }
+        pe
+    }
+
+    fn process_core(
+        &self,
+        evt: &Event,
+        scope: &RequestScope,
+        fp: Option<&crate::fingerprint::Fingerprint>,
+    ) -> ProcessedEvent {
         // Trusted IPs (F7.2 `[real_ip] trusted_ips`) are exempt from every
         // detector and verdict — the "you can't lock yourself out" guard.
         if let Some(trust) = &self.trust {
@@ -589,6 +643,35 @@ impl Pipeline {
                         analysis,
                         action: Verdict::Block,
                         override_reason: Some("blacklisted ip".into()),
+                        log_level: None,
+                    },
+                    rule_hit: None,
+                    process_us: None,
+                };
+            }
+        }
+
+        // Fingerprint bans (F18): a banned device/TLS/visitor id is denied
+        // before any detector, like a blacklisted IP.
+        if let (Some(stage), Some(fp)) = (&self.fingerprint, fp) {
+            if let Some(id) = stage.bans.banned(fp) {
+                let analysis = AnalysisResult {
+                    risk_score: 100,
+                    risk_level: RiskLevel::Critical,
+                    signals: vec![Signal {
+                        kind: SignalKind::FingerprintBanned,
+                        weight: crate::fingerprint::FINGERPRINT_BANNED_WEIGHT,
+                        detail: Some(id.clone()),
+                    }],
+                    verdict: Verdict::Block,
+                };
+                return ProcessedEvent {
+                    event: evt.clone(),
+                    analysis: analysis.clone(),
+                    decision: Decision {
+                        analysis,
+                        action: Verdict::Block,
+                        override_reason: Some(format!("fingerprint banned: {id}")),
                         log_level: None,
                     },
                     rule_hit: None,
@@ -684,6 +767,13 @@ impl Pipeline {
             });
         }
         signals.extend(self.routes.read().unwrap().validate(evt));
+        if let (Some(stage), Some(fp)) = (&self.fingerprint, fp) {
+            signals.extend(stage.tracker.write().unwrap().observe(
+                fp,
+                evt.client_ip,
+                Instant::now(),
+            ));
+        }
         // Response-phase feedback (inline edge): scan/behavior trackers key
         // on the HTTP status, which only exists after a response was served —
         // signals they raised on earlier responses apply to this request.
@@ -948,6 +1038,9 @@ impl Pipeline {
             SignalKind::UploadDisallowed => "upload_disallowed",
             SignalKind::UploadOversize => "upload_oversize",
             SignalKind::PostureAdvisory => "posture_advisory",
+            SignalKind::FingerprintBanned => "fingerprint_banned",
+            SignalKind::FingerprintReputation => "fingerprint_reputation",
+            SignalKind::VisitorDeviceChurn => "visitor_device_churn",
             SignalKind::RuleHit => "rule_hit",
             SignalKind::Custom => "custom",
         };
@@ -1004,6 +1097,9 @@ impl Pipeline {
             SignalKind::UploadDisallowed => "upload_disallowed",
             SignalKind::UploadOversize => "upload_oversize",
             SignalKind::PostureAdvisory => "posture_advisory",
+            SignalKind::FingerprintBanned => "fingerprint_banned",
+            SignalKind::FingerprintReputation => "fingerprint_reputation",
+            SignalKind::VisitorDeviceChurn => "visitor_device_churn",
             SignalKind::RuleHit => "rule_hit",
             SignalKind::Custom => "custom",
         };
@@ -2198,5 +2294,100 @@ mod tests {
         }];
         let r = pipeline().rescore_from(&pipeline().process(&http_evt("/api/users")), extra);
         assert_eq!(r.decision.action, Verdict::Block);
+    }
+
+    fn fp_pipeline(auto_ban_ips: u32) -> (Pipeline, Arc<crate::fingerprint::FingerprintBans>) {
+        let cfg = crate::config::FingerprintConfig {
+            auto_ban_ips,
+            ..Default::default()
+        };
+        let bans = Arc::new(crate::fingerprint::FingerprintBans::new());
+        let p = pipeline().with_fingerprint(
+            &cfg,
+            Arc::new(RwLock::new(
+                crate::fingerprint::FingerprintTracker::from_config(&cfg),
+            )),
+            Arc::clone(&bans),
+        );
+        (p, bans)
+    }
+
+    fn fp_evt(ip: IpAddr, path: &str) -> Event {
+        let mut e = http_evt_from_ip(ip, path);
+        let h = e.http_mut().unwrap();
+        h.user_agent = Some("Mozilla/5.0 FarmBot".into());
+        h.headers
+            .insert("user-agent".into(), "Mozilla/5.0 FarmBot".into());
+        e
+    }
+
+    #[test]
+    fn events_carry_their_fingerprint() {
+        let (p, _) = fp_pipeline(0);
+        let r = p.process(&fp_evt(IpAddr::from([203, 0, 113, 1]), "/"));
+        assert!(r
+            .event
+            .http()
+            .unwrap()
+            .fingerprint
+            .as_ref()
+            .unwrap()
+            .device
+            .is_some());
+    }
+
+    #[test]
+    fn banned_fingerprint_blocks_before_detectors() {
+        let (p, bans) = fp_pipeline(0);
+        let e = fp_evt(IpAddr::from([203, 0, 113, 1]), "/clean");
+        let id = p
+            .process(&e)
+            .event
+            .http()
+            .unwrap()
+            .fingerprint
+            .clone()
+            .unwrap()
+            .device
+            .unwrap();
+        assert_eq!(p.process(&e).decision.action, Verdict::Allow);
+        bans.ban(&id, None);
+        let other_ip = fp_evt(IpAddr::from([203, 0, 113, 77]), "/clean");
+        let r = p.process(&other_ip);
+        assert_eq!(r.decision.action, Verdict::Block);
+        assert_eq!(r.analysis.signals[0].kind, SignalKind::FingerprintBanned);
+    }
+
+    #[test]
+    fn flagged_ips_under_one_fingerprint_taint_new_ips_and_auto_ban() {
+        let (p, bans) = fp_pipeline(3);
+        for n in 1..=3u8 {
+            let r = p.process(&fp_evt(
+                IpAddr::from([203, 0, 113, n]),
+                "/?q=1'+union+select+1--",
+            ));
+            assert!(r.analysis.risk_level >= RiskLevel::High);
+        }
+        assert!(!bans.is_empty());
+        let r = p.process(&fp_evt(IpAddr::from([203, 0, 113, 99]), "/"));
+        assert_eq!(r.decision.action, Verdict::Block);
+    }
+
+    #[test]
+    fn dsl_fingerprint_condition_matches() {
+        let (p, _) = fp_pipeline(0);
+        let e = fp_evt(IpAddr::from([203, 0, 113, 1]), "/");
+        let id = p
+            .process(&e)
+            .event
+            .http()
+            .unwrap()
+            .fingerprint
+            .clone()
+            .unwrap()
+            .device
+            .unwrap();
+        let m = crate::rules::dsl::parse(&format!("fingerprint = \"{id}\"")).unwrap();
+        assert!(m.matches(&e));
     }
 }

@@ -300,6 +300,7 @@ impl Parser {
                 })
             }
             "tls_sni" => self.parse_str_op_atom(inline_val, RuleMatch::TlsSni),
+            "fingerprint" => self.parse_str_op_atom(inline_val, RuleMatch::Fingerprint),
             "status" => {
                 let val = self.resolve_value(inline_val)?;
                 let n = val

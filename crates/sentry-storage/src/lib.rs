@@ -13,6 +13,7 @@ pub mod repo;
 pub use error::{Result, StorageError};
 pub use pool::PgPool;
 pub use repo::{
-    DatasetRepo, DatasetRow, EventInsert, EventRepo, EventRow, IncidentRepo, IncidentRow,
-    IpStateRepo, IpStateRow, OffenderRow, Repo, RouteRepo, RouteRow, RuleRepo, RuleRow,
+    DatasetRepo, DatasetRow, EventInsert, EventRepo, EventRow, FingerprintBanRow,
+    FingerprintPopulation, FingerprintRepo, IncidentRepo, IncidentRow, IpStateRepo, IpStateRow,
+    OffenderRow, Repo, RouteRepo, RouteRow, RuleRepo, RuleRow,
 };

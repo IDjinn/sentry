@@ -393,6 +393,7 @@ impl RawEvent {
 /// consumers that don't care simply ignore it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
+#[allow(clippy::large_enum_variant)]
 pub enum ProtocolData {
     /// HTTP/1.x or HTTP/2 request observation.
     Http(HttpData),
@@ -443,6 +444,13 @@ pub struct HttpData {
     /// first value when nginx reports a comma-separated list).
     #[serde(default)]
     pub upstream_time_ms: Option<u64>,
+    /// TLS handshake metadata of the connection that carried this request
+    /// (JA3/JA4/SNI/ALPN), set by the inline HTTPS edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<Box<TlsData>>,
+    /// Client fingerprint (F18), computed by the pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<Box<crate::fingerprint::Fingerprint>>,
 }
 
 /// Metadata about one uploaded file (F10).

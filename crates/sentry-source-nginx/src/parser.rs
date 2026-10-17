@@ -230,6 +230,8 @@ impl LogFormat {
             cookies: None,
             uploads: None,
             upstream_time_ms,
+            tls: None,
+            fingerprint: None,
         });
 
         Ok(RawEvent {
