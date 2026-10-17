@@ -3,8 +3,9 @@
 
 use std::time::Duration;
 
-use hickory_resolver::error::ResolveErrorKind;
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::RData;
+use hickory_resolver::TokioResolver;
 use sentry_core::email_auth::{
     grade_dkim, grade_dmarc, grade_spf, recommended, EmailFinding, COMMON_DKIM_SELECTORS,
 };
@@ -25,32 +26,43 @@ pub struct DomainAudit {
     pub recommended: Vec<String>,
 }
 
-fn resolver() -> TokioAsyncResolver {
-    let mut opts = hickory_resolver::config::ResolverOpts::default();
+fn resolver() -> Result<TokioResolver, String> {
+    let mut builder = TokioResolver::builder_with_config(
+        hickory_resolver::config::ResolverConfig::default(),
+        TokioRuntimeProvider::default(),
+    );
+    let opts = builder.options_mut();
     opts.timeout = Duration::from_secs(4);
     opts.attempts = 2;
-    TokioAsyncResolver::tokio(hickory_resolver::config::ResolverConfig::default(), opts)
+    builder.build().map_err(|e| e.to_string())
 }
 
-async fn txt(r: &TokioAsyncResolver, name: &str) -> Result<Vec<String>, String> {
+async fn txt(r: &TokioResolver, name: &str) -> Result<Vec<String>, String> {
     match r.txt_lookup(name).await {
         Ok(l) => Ok(l
+            .answers()
             .iter()
-            .map(|t| {
-                t.txt_data()
-                    .iter()
-                    .map(|d| String::from_utf8_lossy(d).into_owned())
-                    .collect::<String>()
+            .filter_map(|r| match &r.data {
+                RData::TXT(t) => Some(
+                    t.txt_data
+                        .iter()
+                        .map(|d| String::from_utf8_lossy(d).into_owned())
+                        .collect::<String>(),
+                ),
+                _ => None,
             })
             .collect()),
-        Err(e) if matches!(e.kind(), ResolveErrorKind::NoRecordsFound { .. }) => Ok(Vec::new()),
+        Err(e) if e.is_no_records_found() => Ok(Vec::new()),
         Err(e) => Err(e.to_string()),
     }
 }
 
-async fn has_mx(r: &TokioAsyncResolver, name: &str) -> bool {
+async fn has_mx(r: &TokioResolver, name: &str) -> bool {
     match r.mx_lookup(name).await {
-        Ok(l) => l.iter().any(|m| m.exchange().to_string() != "."),
+        Ok(l) => l.answers().iter().any(|r| match &r.data {
+            RData::MX(m) => m.exchange.to_string() != ".",
+            _ => false,
+        }),
         Err(_) => false,
     }
 }
@@ -58,7 +70,7 @@ async fn has_mx(r: &TokioAsyncResolver, name: &str) -> bool {
 /// Audit one domain. DNS failures are reported as an `Err` string so a
 /// resolver outage is never mistaken for a missing record.
 pub async fn audit_domain(domain: &str) -> Result<DomainAudit, String> {
-    let r = resolver();
+    let r = resolver()?;
     let domain = domain.trim_end_matches('.').to_ascii_lowercase();
     let apex = txt(&r, &domain).await?;
     let sends_mail = has_mx(&r, &domain).await;

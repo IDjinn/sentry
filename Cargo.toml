@@ -50,7 +50,7 @@ toml = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 
 # TUI
-ratatui = "0.28"
+ratatui = "0.30"
 crossterm = "0.28"
 
 # Tracing
@@ -58,7 +58,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Metrics
-prometheus = "0.13"
+prometheus = "0.14"
 # hyper serves the metrics/dashboard server (F4) and — inside sentry-edge —
 # the TLS/h2 listener (F8) and the raw h1 WebSocket-upgrade hop (F14).
 hyper = { version = "1", features = ["server", "client", "http1"] }
@@ -93,7 +93,7 @@ simdutf8 = "0.1"
 arc-swap = "1"
 
 # Bot verification (F7.7): async DNS (PTR + forward-confirm)
-hickory-resolver = "0.24"
+hickory-resolver = "0.26"
 
 # Errors
 thiserror = "1"
@@ -118,7 +118,7 @@ reqwest = { version = "0.12", default-features = false, features = ["native-tls"
 # ML (only pulled when a crate opts in via the `onnx` feature; not a workspace dep)
 
 # Geo
-maxminddb = "0.24"
+maxminddb = "0.27"
 
 # Config
 figment = { version = "0.10", features = ["env"] }

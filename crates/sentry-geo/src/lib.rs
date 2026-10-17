@@ -55,26 +55,16 @@ impl GeoLookup {
     /// Look up the country / subdivision / city for an IP.
     pub fn lookup_geo(&self, ip: IpAddr) -> Option<GeoInfo> {
         let reader = self.city.as_ref()?;
-        let city: maxminddb::geoip2::City = reader.lookup(ip).ok()?;
-        let country = city
-            .country
-            .as_ref()
-            .and_then(|c| c.iso_code)
-            .map(String::from);
+        let city: maxminddb::geoip2::City = reader.lookup(ip).ok()?.decode().ok()??;
+        let country = city.country.iso_code.map(String::from);
         let subdivision = city
             .subdivisions
-            .as_ref()
-            .and_then(|s| s.first())
+            .first()
             .and_then(|d| d.iso_code)
             .map(String::from);
-        let city_name = city
-            .city
-            .as_ref()
-            .and_then(|c| c.names.as_ref())
-            .and_then(|n| n.get("en").copied())
-            .map(String::from);
-        let lat = city.location.as_ref().and_then(|l| l.latitude);
-        let lon = city.location.as_ref().and_then(|l| l.longitude);
+        let city_name = city.city.names.english.map(String::from);
+        let lat = city.location.latitude;
+        let lon = city.location.longitude;
         Some(GeoInfo {
             country,
             subdivision,
@@ -87,7 +77,7 @@ impl GeoLookup {
     /// Look up the ASN for an IP.
     pub fn lookup_asn(&self, ip: IpAddr) -> Option<u32> {
         let reader = self.asn.as_ref()?;
-        let asn: maxminddb::geoip2::Asn = reader.lookup(ip).ok()?;
+        let asn: maxminddb::geoip2::Asn = reader.lookup(ip).ok()?.decode().ok()??;
         asn.autonomous_system_number
     }
 

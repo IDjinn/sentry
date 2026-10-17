@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::RData;
+use hickory_resolver::TokioResolver;
 use sentry_core::botverify::{
     verify_with, BotDnsResolver, BotStatus, DnsOutcome, SharedBotVerifier,
 };
@@ -20,17 +22,20 @@ use crate::metrics::Metrics;
 
 /// [`BotDnsResolver`] backed by hickory (system resolvers, with timeout).
 pub struct HickoryDns {
-    resolver: TokioAsyncResolver,
+    resolver: TokioResolver,
 }
 
 impl HickoryDns {
     /// Build a resolver with the given per-query timeout and 2 attempts.
     pub fn new(timeout: Duration) -> color_eyre::Result<Self> {
-        let mut opts = hickory_resolver::config::ResolverOpts::default();
+        let mut builder = TokioResolver::builder_with_config(
+            hickory_resolver::config::ResolverConfig::default(),
+            TokioRuntimeProvider::default(),
+        );
+        let opts = builder.options_mut();
         opts.timeout = timeout;
         opts.attempts = 2;
-        let resolver =
-            TokioAsyncResolver::tokio(hickory_resolver::config::ResolverConfig::default(), opts);
+        let resolver = builder.build()?;
         Ok(Self { resolver })
     }
 }
@@ -39,7 +44,16 @@ impl HickoryDns {
 impl BotDnsResolver for HickoryDns {
     async fn ptr(&self, ip: IpAddr) -> DnsOutcome<String> {
         match self.resolver.reverse_lookup(ip).await {
-            Ok(lookup) => DnsOutcome::Records(lookup.iter().map(|n| n.to_string()).collect()),
+            Ok(lookup) => DnsOutcome::Records(
+                lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|r| match &r.data {
+                        RData::PTR(ptr) => Some(ptr.0.to_string()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
             Err(e) => {
                 debug!(error = %e, ip = %ip, "bot verify: PTR lookup failed");
                 DnsOutcome::Error
