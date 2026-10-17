@@ -1743,6 +1743,7 @@ fn valid_fingerprint_id(id: &str) -> bool {
     let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
     id.strip_prefix("d-")
         .or_else(|| id.strip_prefix("t-"))
+        .or_else(|| id.strip_prefix("j-"))
         .is_some_and(|h| hex(h, 16))
         || id.strip_prefix("v-").is_some_and(|h| hex(h, 32))
 }
@@ -1820,7 +1821,7 @@ async fn run_fingerprint(
         } => {
             if !valid_fingerprint_id(&id) {
                 return Err(color_eyre::eyre::eyre!(
-                    "invalid fingerprint id `{id}` (expected d-<16 hex>, t-<16 hex> or v-<32 hex>)"
+                    "invalid fingerprint id `{id}` (expected d-/t-/j-<16 hex> or v-<32 hex>)"
                 ));
             }
             let since = chrono::Utc::now() - chrono::Duration::days(7);

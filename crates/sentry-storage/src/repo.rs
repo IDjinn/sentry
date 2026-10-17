@@ -186,6 +186,7 @@ impl FingerprintRepo {
                WHERE timestamp >= $2
                  AND (protocol->'fingerprint'->>'device' = $1
                       OR protocol->'fingerprint'->>'tls' = $1
+                      OR protocol->'fingerprint'->>'client' = $1
                       OR protocol->'fingerprint'->>'visitor' = $1)"#,
         )
         .bind(fp.to_ascii_lowercase())
@@ -206,6 +207,7 @@ impl FingerprintRepo {
         let key = match kind {
             "tls" => "tls",
             "visitor" => "visitor",
+            "client" => "client",
             _ => "device",
         };
         let sql = format!(

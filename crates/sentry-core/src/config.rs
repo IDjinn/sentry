@@ -718,6 +718,39 @@ pub struct FingerprintConfig {
     /// Cap on tracked fingerprints (oldest are evicted beyond it).
     #[serde(default = "default_fingerprint_max_entries")]
     pub max_entries: usize,
+    /// Browser-side collector (F18.2): the inline edge serves `init.js` and
+    /// accepts reports under `js_path`. Needs `cookie` (reports are bound to
+    /// the visitor cookie).
+    #[serde(default = "default_fingerprint_enabled")]
+    pub js: bool,
+    /// Inject the `<script>` tag into HTML responses. Turn off when a strict
+    /// CSP forbids it and include `<js_path>/init.js` manually instead.
+    #[serde(default = "default_fingerprint_enabled")]
+    pub js_inject: bool,
+    /// URL prefix of the collector endpoints (never proxied upstream).
+    #[serde(default = "default_fingerprint_js_path")]
+    pub js_path: String,
+    /// How long a visitor's report is kept.
+    #[serde(default = "default_fingerprint_js_ttl")]
+    pub js_ttl_secs: u64,
+}
+
+impl FingerprintConfig {
+    /// Config-time checks; `Err` carries the message.
+    pub fn validate(&self) -> Result<(), String> {
+        let p = &self.js_path;
+        if !p.starts_with('/')
+            || p.len() < 2
+            || p.ends_with('/')
+            || p.contains(char::is_whitespace)
+            || p.contains(['?', '#', '*'])
+        {
+            return Err(format!(
+                "fingerprint js_path `{p}` must start with `/`, have no trailing `/`, spaces, `?`, `#` or `*`"
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for FingerprintConfig {
@@ -732,6 +765,10 @@ impl Default for FingerprintConfig {
             auto_ban_ips: 0,
             auto_ban_ttl_secs: default_fingerprint_auto_ban_ttl(),
             max_entries: default_fingerprint_max_entries(),
+            js: default_fingerprint_enabled(),
+            js_inject: default_fingerprint_enabled(),
+            js_path: default_fingerprint_js_path(),
+            js_ttl_secs: default_fingerprint_js_ttl(),
         }
     }
 }
@@ -753,6 +790,12 @@ fn default_fingerprint_visitor_devices() -> u32 {
 }
 fn default_fingerprint_auto_ban_ttl() -> u64 {
     3600
+}
+fn default_fingerprint_js_path() -> String {
+    "/challenge-sentry".to_string()
+}
+fn default_fingerprint_js_ttl() -> u64 {
+    86_400
 }
 fn default_fingerprint_max_entries() -> usize {
     50_000

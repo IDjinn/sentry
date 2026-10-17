@@ -153,6 +153,9 @@ pub fn validate(cfg: &SentryConfig) -> color_eyre::Result<()> {
     ) {
         color_eyre::eyre::bail!("config INVALID: sentry › auto: {e}");
     }
+    if let Err(e) = cfg.fingerprint.validate() {
+        color_eyre::eyre::bail!("config INVALID: {e}");
+    }
     if let Err(e) = cfg.update.validate() {
         color_eyre::eyre::bail!("config INVALID: {e}");
     }

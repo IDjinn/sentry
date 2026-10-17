@@ -199,6 +199,12 @@ pub enum SignalKind {
     /// One visitor cookie presented many distinct device fingerprints in the
     /// window (F18): cookie replay or antidetect-browser rotation.
     VisitorDeviceChurn,
+    /// Browser-side probes show an automated/headless browser (F18.2):
+    /// `navigator.webdriver`, headless UA, software WebGL renderer, …
+    HeadlessBrowser,
+    /// The browser's own report contradicts its HTTP headers or itself
+    /// (F18.2): `navigator.userAgent` vs `User-Agent`, UA OS vs platform.
+    ClientInconsistency,
     /// A custom rule matched (the rule id is carried in `detail`).
     RuleHit,
     /// Any other signal not yet cataloged.

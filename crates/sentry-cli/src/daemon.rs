@@ -289,6 +289,13 @@ pub async fn run_with_path(
     // Client fingerprinting (F18): tracker behind the fingerprint signals
     // and the ban list the pipeline enforces before any detector.
     let fp_bans = Arc::new(sentry_core::FingerprintBans::new());
+    let fp_clients = (cfg.fingerprint.enabled && cfg.fingerprint.cookie && cfg.fingerprint.js)
+        .then(|| {
+            Arc::new(sentry_core::ClientStore::new(
+                Duration::from_secs(cfg.fingerprint.js_ttl_secs.max(60)),
+                cfg.fingerprint.max_entries,
+            ))
+        });
     let fp_tracker = cfg.fingerprint.enabled.then(|| {
         Arc::new(std::sync::RwLock::new(
             sentry_core::FingerprintTracker::from_config(&cfg.fingerprint),
@@ -620,6 +627,9 @@ pub async fn run_with_path(
             Arc::clone(t),
             Arc::clone(&fp_bans),
         );
+        if let Some(ref c) = fp_clients {
+            pipeline_builder = pipeline_builder.with_client_store(Arc::clone(c));
+        }
     }
     let pipeline = Arc::new(pipeline_builder);
     info!(
@@ -732,6 +742,7 @@ pub async fn run_with_path(
     if let Some(ref t) = fp_tracker {
         let t = Arc::clone(t);
         let bans = Arc::clone(&fp_bans);
+        let clients = fp_clients.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             interval.tick().await;
@@ -739,6 +750,9 @@ pub async fn run_with_path(
                 interval.tick().await;
                 t.write().unwrap().prune();
                 bans.prune();
+                if let Some(ref c) = clients {
+                    c.prune();
+                }
             }
         });
     }
@@ -1229,6 +1243,21 @@ pub async fn run_with_path(
                 "visitor cookie enabled (F18)"
             );
             runtime.with_visitor_cookie(cfg.fingerprint.cookie_max_age_secs)
+        } else {
+            runtime
+        };
+        let runtime = if let Some(ref store) = fp_clients {
+            info!(
+                path = %cfg.fingerprint.js_path,
+                inject = cfg.fingerprint.js_inject,
+                "browser fingerprint collector enabled (F18.2)"
+            );
+            runtime.with_collector(Arc::new(sentry_edge::collector::Collector::new(
+                &cfg.fingerprint.js_path,
+                Arc::clone(store),
+                cfg.fingerprint.js_inject,
+                cfg.fingerprint.cookie_max_age_secs,
+            )))
         } else {
             runtime
         };

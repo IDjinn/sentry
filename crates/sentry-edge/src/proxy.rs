@@ -685,6 +685,23 @@ async fn proxy_handler_inner(
         .map(|c| c.0.ip().to_canonical())
         .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
 
+    // First-party browser collector (F18.2): answered by the edge itself,
+    // never proxied upstream. Sticky blocks still apply.
+    if let Some(collector) = state.runtime.collector() {
+        if let Some(route) = collector.route(parts.uri.path()) {
+            let ip = crate::real_client_ip_with(&parts.headers, peer, state.runtime.trust());
+            if state.runtime.is_hard_blocked(ip) {
+                return pages::block_page(state.runtime.error_pages(), Some(Uuid::new_v4()));
+            }
+            return match route {
+                crate::collector::CollectorRoute::Script => collector.serve_script(&parts.method),
+                crate::collector::CollectorRoute::Collect => {
+                    collector.collect(&parts, body, ip, is_tls).await
+                }
+            };
+        }
+    }
+
     // While upload inspection is armed, the inspection cap IS the body cap
     // in `reject` mode: bodies beyond it are refused outright (413), and the
     // buffered bytes are what the heuristics analyze. The declared length is
@@ -998,6 +1015,13 @@ async fn proxy_inspected(
     }
 
     issue_visitor_cookie(runtime, &processed, &mut resp, &parts, is_tls);
+    if let Some(collector) = runtime.collector() {
+        if resp.extensions().get::<UpstreamServed>().is_some()
+            && parts.method == axum::http::Method::GET
+        {
+            resp = collector.inject(resp).await;
+        }
+    }
 
     // Posture advisories (F11): grade only upstream responses (edge pages
     // and redirects are not the site's headers) on successful statuses, and

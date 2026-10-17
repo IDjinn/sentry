@@ -460,6 +460,10 @@ fn lower_detect(d: DetectBlock, cfg: &mut SentryConfig) {
         set(&mut k.auto_ban_ips, f.auto_ban_ips);
         set(&mut k.auto_ban_ttl_secs, secs(f.auto_ban_ttl));
         set(&mut k.max_entries, f.max_entries);
+        set(&mut k.js, f.js);
+        set(&mut k.js_inject, f.js_inject);
+        set(&mut k.js_path, f.js_path);
+        set(&mut k.js_ttl_secs, secs(f.js_ttl));
     }
     if let Some(b) = d.bot_verification {
         let k = &mut cfg.bot_verification;
@@ -1775,6 +1779,10 @@ fn raise_detect(c: &SentryConfig) -> DetectBlock {
             auto_ban_ips: Some(c.fingerprint.auto_ban_ips),
             auto_ban_ttl: Some(Secs(c.fingerprint.auto_ban_ttl_secs)),
             max_entries: Some(c.fingerprint.max_entries),
+            js: Some(c.fingerprint.js),
+            js_inject: Some(c.fingerprint.js_inject),
+            js_path: Some(c.fingerprint.js_path.clone()),
+            js_ttl: Some(Secs(c.fingerprint.js_ttl_secs)),
         }),
         bot_verification: Some(BotVerificationBlock {
             enabled: Some(c.bot_verification.enabled),

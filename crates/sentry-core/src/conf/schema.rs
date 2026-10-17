@@ -216,6 +216,10 @@ conf_struct!(FingerprintBlock {
     auto_ban_ips: Option<u32>,
     auto_ban_ttl: Option<Secs>,
     max_entries: Option<usize>,
+    js: Option<bool>,
+    js_inject: Option<bool>,
+    js_path: Option<String>,
+    js_ttl: Option<Secs>,
 });
 
 conf_struct!(BotVerificationBlock {

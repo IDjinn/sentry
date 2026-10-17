@@ -131,6 +131,8 @@ fn signal_label(k: sentry_core::SignalKind) -> &'static str {
         UploadFlood => "upload_flood",
         UploadDisallowed => "upload_disallowed",
         UploadOversize => "upload_oversize",
+        HeadlessBrowser => "headless_browser",
+        ClientInconsistency => "client_inconsistency",
         FingerprintBanned => "fingerprint_banned",
         FingerprintReputation => "fingerprint_reputation",
         VisitorDeviceChurn => "visitor_device_churn",

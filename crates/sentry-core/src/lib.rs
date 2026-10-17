@@ -16,6 +16,7 @@ pub mod behavior;
 pub mod blocks;
 pub mod botverify;
 pub mod challenge;
+pub mod clientsig;
 pub mod conf;
 pub mod config;
 pub mod correlation;
@@ -60,6 +61,7 @@ pub use botverify::{
     BotStatus, BotVerifier, SharedBotVerifier, SPOOFED_BOT_WEIGHT,
 };
 pub use challenge::{ChallengeAction, ChallengeProvider, EdgeMode, EdgeOptions};
+pub use clientsig::{ClientSignals, ClientStore};
 pub use config::{
     ActionConfig, ActionKind, AiConfig, AuthTokenConfig, AuthUserConfig, BehaviorConfig,
     BotVerificationConfig, CoreConfig, CorrelationConfig, DeploymentConfig, EdgeChallengeConfig,
