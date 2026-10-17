@@ -1130,6 +1130,15 @@ telemetria de handshake + provider de appliance
     hosts dos sites, herda DMARC do domínio pai, e imprime o registro a
     publicar (domínio web-only sem MX → `v=spf1 -all`, `p=reject`, null MX)
 
+# F17 (concluída): `config get|set|unset|reload` + reload a quente
+  - ✅ Editor de texto que preserva comentários (`sentry-conf/src/edit.rs`),
+    paths `a.b[label].c`, validação + rollback + `.bak`
+    (`sentry-cli/src/config_edit.rs`)
+  - ✅ Daemon recarrega a quente (`sentry-cli/src/reload.rs`): poll 2 s dos
+    arquivos + SIGHUP → rules (packs/custom), routes e roteamento do edge
+    inline (`RouteReloader`/`ArcSwap<RouteTable>` em `sentry-edge`); demais
+    seções logam "precisa restart". Ver `ARCHITECTURE.md` §31
+
 Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4; §27 F12 idem; §28 F13 idem; §29 F14 idem; §3 subprojeto auto — v1 entregue, A.5/A.7/A.12 restantes).
 
 ### Status atual (verificação contínua)

@@ -145,17 +145,11 @@ async fn persist_write(
 }
 
 /// Run the daemon.
-pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
-    info!(
-        version = env!("CARGO_PKG_VERSION"),
-        "starting sentry daemon"
-    );
-
-    // Build the ruleset from configured packs + custom rules. Pack params
-    // flatten into `<pack>__<param>` keys (e.g. `host_allowlist__domains`);
-    // without this the param-driven packs silently never saw their params.
-    let pack_modes: HashMap<String, String> = cfg
-        .rules
+/// Pack name → mode, with each pack's params flattened into
+/// `<pack>__<param>` keys (e.g. `host_allowlist__domains`); without this
+/// the param-driven packs silently never see their params.
+pub(crate) fn pack_modes_of(cfg: &SentryConfig) -> HashMap<String, String> {
+    cfg.rules
         .packs
         .iter()
         .flat_map(|p| {
@@ -177,7 +171,25 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             }
             entries
         })
-        .collect();
+        .collect()
+}
+
+/// Run the daemon. `config_path` is the `--config` the config was loaded
+/// from (`None` = default search), so the live reload (`reload.rs`)
+/// re-reads the same files.
+pub async fn run_with_path(
+    cfg: SentryConfig,
+    config_path: Option<std::path::PathBuf>,
+) -> color_eyre::Result<()> {
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "starting sentry daemon"
+    );
+
+    // Build the ruleset from configured packs + custom rules. Pack params
+    // flatten into `<pack>__<param>` keys (e.g. `host_allowlist__domains`);
+    // without this the param-driven packs silently never saw their params.
+    let pack_modes = pack_modes_of(&cfg);
 
     // Reputation feeds (F3.7) + datasets (F7.6): fetch once at startup so
     // enrichment is live and dataset rules have content before the ruleset
@@ -753,11 +765,15 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
         });
     }
 
+    // Config-defined routes, shared with the live config reload so a later
+    // DB NOTIFY merges the *current* file routes, not the startup snapshot.
+    let shared_config_routes = Arc::new(std::sync::RwLock::new(cfg.routes.known.clone()));
+
     // Start the routes LISTEN/NOTIFY hot-reload task (only with storage).
     if let Some(ref repo) = repo {
         let reload_pool = repo.pool().clone();
         let reload_pipeline = Arc::clone(&pipeline);
-        let config_routes = cfg.routes.known.clone();
+        let config_routes = Arc::clone(&shared_config_routes);
         tokio::spawn(async move {
             routes_hot_reload(reload_pool, reload_pipeline, config_routes).await;
         });
@@ -985,6 +1001,8 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
     // this process's pipeline — stateful trackers count once — and hand the
     // already-decided events back through the fan-in for persistence and
     // action dispatch.
+    let route_reloader = sentry_edge::proxy::RouteReloader::default();
+    let mut edge_base: Option<sentry_edge::proxy::EdgeProxyConfig> = None;
     if cfg.deployment.is_inline() {
         // Config errors (F14): bad vhost hosts, scheme-less upstreams,
         // duplicate hosts, cert pairing — fail before anything binds.
@@ -1245,8 +1263,13 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             .map(|g| format!("{}→{}", g.name, g.servers.join(",")))
             .collect::<Vec<_>>()
             .join(" ");
+        edge_base = Some(proxy_cfg.clone());
+        let serve_reloader = route_reloader.clone();
         tokio::spawn(async move {
-            if let Err(e) = sentry_edge::proxy::serve(runtime, proxy_cfg, dec_tx).await {
+            if let Err(e) =
+                sentry_edge::proxy::serve_with_reloader(runtime, proxy_cfg, dec_tx, serve_reloader)
+                    .await
+            {
                 error!(error = %e, upstreams = %edge_summary, "edge proxy terminated");
             }
         });
@@ -1389,6 +1412,25 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             "inline edge enabled (sentry {{ mode: inline }})"
         );
     }
+
+    // Live config reload (F17): files + SIGHUP → rules, routes and the
+    // inline edge routing table; the rest reports "restart required".
+    crate::reload::spawn(
+        config_path,
+        cfg.clone(),
+        crate::reload::Handles {
+            shared_rules: Arc::clone(&shared_rules),
+            pipeline: Arc::clone(&pipeline),
+            repo: repo.clone(),
+            config_routes: Arc::clone(&shared_config_routes),
+            edge: edge_base.map(|base| crate::reload::EdgeHandle {
+                reloader: route_reloader.clone(),
+                base,
+            }),
+            bot_verify_enabled: cfg.bot_verification.enabled,
+        },
+    );
+
     // The overload monitor measures fan-in occupancy from the receiver side
     // (shared under a mutex) — no sender clone, so the channel still closes
     // when the last real producer ends and the ingest loop can finish.
@@ -3944,7 +3986,7 @@ async fn cloudflare_reaper(cf: Arc<sentry_action_cloudflare::CloudflareProvider>
 async fn routes_hot_reload(
     pool: sentry_storage::PgPool,
     pipeline: Arc<Pipeline>,
-    config_routes: Vec<sentry_core::config::RouteDefConfig>,
+    config_routes: Arc<std::sync::RwLock<Vec<sentry_core::config::RouteDefConfig>>>,
 ) {
     const CHANNEL: &str = "sentry_routes_changed";
     loop {
@@ -3958,7 +4000,8 @@ async fn routes_hot_reload(
                     let repo = sentry_storage::Repo::new(pool.clone());
                     match repo.routes().list().await {
                         Ok(rows) => {
-                            let merged = RouteValidator::merge(&config_routes, &rows);
+                            let merged =
+                                RouteValidator::merge(&config_routes.read().unwrap(), &rows);
                             let count = merged.routes().count();
                             pipeline.swap_routes(merged);
                             info!(route_count = count, "routes hot-reloaded");

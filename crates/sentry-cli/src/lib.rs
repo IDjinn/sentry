@@ -12,6 +12,7 @@ pub mod botdns;
 pub mod cli;
 pub mod cmd;
 pub mod config;
+pub mod config_edit;
 mod daemon;
 pub mod datasets;
 pub mod emailauth;
@@ -21,6 +22,7 @@ pub mod metrics;
 pub mod protocol_cmd;
 #[cfg(feature = "rate-redis")]
 pub mod rate_redis;
+pub mod reload;
 pub mod routes_import;
 pub mod runtime;
 pub mod server;

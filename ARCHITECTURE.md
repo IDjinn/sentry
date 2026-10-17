@@ -2309,3 +2309,51 @@ the legacy TOML reader of `sentry config migrate`.
 with the `sentry config migrate` command to run. `sentry config files` lists
 what a load reads; `config show [--full]` prints the effective config.
 
+
+## 31. F17 — Config edit commands + live reload
+
+Changing a value no longer means hand-editing `sentry.conf` and restarting the
+service.
+
+**Edit commands** (`config_edit.rs`, text editor in `sentry-conf/src/edit.rs`):
+
+```
+sentry config get  http.compress.enabled
+sentry config set  http.compress.enabled off [--file F] [--dry-run]
+sentry config set  'rules.pack[sensitive_paths].mode' enforce
+sentry config unset http.compress.enabled
+sentry config reload
+```
+
+- Paths are dotted block names ending in a directive; labeled blocks use
+  `name[label]` (`site[example.com].proxy_pass`, dots inside `[…]` stay in the
+  label).
+- Edits work on the source text, so comments and layout survive. The parser
+  locates the directive; a scanner (strings, `#`/`//`/`/* */` comments,
+  brackets) finds where the value or the enclosing block ends. A missing key
+  is inserted into the nearest existing block (one-line blocks are expanded),
+  missing blocks are created, CRLF files stay CRLF.
+- The file that defines the key is edited (includes followed), else the file
+  holding the parent block, else the main file. `--file` overrides.
+- A real write backs up to `<file>.bak`, writes atomically, then reloads and
+  runs `config::validate` (same checks as `config validate`); a config that
+  does not load is rolled back and the error is printed.
+- `config reload` validates and touches the main file to make a running daemon
+  re-read now.
+
+**Live reload** (`reload.rs`): the daemon polls every config file (main,
+`conf.d`, includes, `sentry.auto.conf`, `.env`) every 2 s and also reloads on
+`SIGHUP` (unix). A new config must load and validate or it is rejected and
+the running one stays. `reload::plan` diffs running vs new:
+
+| Applied live | Mechanism |
+|---|---|
+| `rules` packs + custom rules | ruleset rebuilt, DB/feed/dataset rules carried over |
+| `routes` | `RouteValidator::merge(file ∪ db)` swap; the DB NOTIFY task reads the shared file routes |
+| inline `http` routing (sites, locations, upstream groups, location security, balance/health) | `RouteReloader` swaps an `ArcSwap<RouteTable>`; every group must have a healthy server, else the old table stays |
+
+Everything else (listeners, TLS, storage, sources, actions, scorer, AI, …) is
+reported as `config changed but these sections only take effect after a
+restart` and keeps its startup value; the reminder repeats on each reload
+until a restart (the running config is tracked as startup + applied live
+sections). Per-site TLS certificates are restart-only.

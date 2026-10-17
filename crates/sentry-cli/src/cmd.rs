@@ -16,7 +16,8 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
     match cli.command {
         Command::Run => {
             let cfg = cfg.ok_or_else(|| color_eyre::eyre::eyre!("config required for `run`"))?;
-            crate::daemon::run(cfg).await?;
+            crate::daemon::run_with_path(cfg, config_path.as_deref().map(std::path::PathBuf::from))
+                .await?;
         }
         Command::Serve => {
             let cfg = require_config(&cfg)?;
@@ -980,70 +981,7 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
         Command::Config { action } => match action {
             ConfigCmd::Validate => {
                 let cfg = require_config(&cfg)?;
-                let mut errors: Vec<String> = Vec::new();
-                for parsed in sentry_core::rules::rules_from_config(&cfg.rules.custom) {
-                    if let Err(e) = parsed {
-                        errors.push(e);
-                    }
-                }
-                if let Err(e) = sentry_core::sensitive_files::Filter::from_names(
-                    &cfg.auto.sensitive.enable,
-                    &cfg.auto.sensitive.skip,
-                ) {
-                    color_eyre::eyre::bail!("config INVALID: sentry › auto: {e}");
-                }
-                if let Err(e) = cfg.update.validate() {
-                    color_eyre::eyre::bail!("config INVALID: {e}");
-                }
-                let edge_errors = cfg.edge.validate();
-                if !edge_errors.is_empty() {
-                    for e in &edge_errors {
-                        eprintln!("invalid http config: {e}");
-                    }
-                    color_eyre::eyre::bail!(
-                        "config INVALID: {} http/routing error(s)",
-                        edge_errors.len()
-                    );
-                }
-                if let Some(e) = cfg.runtime.validate().first() {
-                    color_eyre::eyre::bail!("config INVALID: {e}");
-                }
-                if !errors.is_empty() {
-                    for e in &errors {
-                        eprintln!("invalid custom rule: {e}");
-                    }
-                    color_eyre::eyre::bail!(
-                        "config INVALID: {} custom rule(s) failed to compile",
-                        errors.len()
-                    );
-                }
-                if cfg.protocol.enabled {
-                    let dir = &cfg.protocol.dir;
-                    match crate::protocol_cmd::compile_dir(dir, cfg.protocol.max_schemas) {
-                        Ok((_, es)) if es.is_empty() => {
-                            println!("  protocol:  OK ({})", dir.display());
-                        }
-                        Ok((_, es)) => {
-                            for e in &es {
-                                eprintln!("invalid protocol schema: {e}");
-                            }
-                            color_eyre::eyre::bail!(
-                                "config INVALID: {} protocol schema(s) failed to compile",
-                                es.len()
-                            );
-                        }
-                        Err(e) => {
-                            color_eyre::eyre::bail!("config INVALID: protocol dir: {e}");
-                        }
-                    }
-                }
-                if cfg.posture.mode.is_enforce() {
-                    color_eyre::eyre::bail!(
-                        "config INVALID: detect › posture › mode: enforce is not implemented \
-                         yet — header injection without per-site knowledge would break \
-                         pages; use shadow (roadmap: BACKLOG.md §5.4)"
-                    );
-                }
+                crate::config::validate(cfg)?;
                 let unknown = cfg.posture.unknown_checks();
                 if !unknown.is_empty() {
                     eprintln!(
@@ -1132,6 +1070,27 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 };
                 print!("{text}");
             }
+            ConfigCmd::Get { path } => crate::config_edit::get(config_path.as_deref(), &path)?,
+            ConfigCmd::Set {
+                path,
+                value,
+                file,
+                dry_run,
+            } => crate::config_edit::set(
+                config_path.as_deref(),
+                &path,
+                &value,
+                file.as_deref(),
+                dry_run,
+            )?,
+            ConfigCmd::Unset {
+                path,
+                file,
+                dry_run,
+            } => {
+                crate::config_edit::unset(config_path.as_deref(), &path, file.as_deref(), dry_run)?
+            }
+            ConfigCmd::Reload => crate::config_edit::reload(config_path.as_deref())?,
             ConfigCmd::Files => {
                 let resolved =
                     crate::config::resolve(config_path.as_deref().map(std::path::Path::new))?;
@@ -2292,7 +2251,7 @@ fn test_payload(payload: &str, path: &str, method: &str) -> color_eyre::Result<(
 /// Files pulled in by `include:` directives of `file` (recursively, for
 /// `sentry config files`). Unreadable files are skipped — `config validate`
 /// reports them.
-fn included_files(file: &std::path::Path) -> Vec<std::path::PathBuf> {
+pub(crate) fn included_files(file: &std::path::Path) -> Vec<std::path::PathBuf> {
     fn walk(
         body: &[sentry_conf::Stmt],
         base: &std::path::Path,
