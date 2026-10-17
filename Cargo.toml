@@ -93,7 +93,7 @@ simdutf8 = "0.1"
 arc-swap = "1"
 
 # Bot verification (F7.7): async DNS (PTR + forward-confirm)
-hickory-resolver = "0.24"
+hickory-resolver = "0.26"
 
 # Errors
 thiserror = "1"
@@ -118,7 +118,7 @@ reqwest = { version = "0.12", default-features = false, features = ["native-tls"
 # ML (only pulled when a crate opts in via the `onnx` feature; not a workspace dep)
 
 # Geo
-maxminddb = "0.24"
+maxminddb = "0.27"
 
 # Config
 figment = { version = "0.10", features = ["env"] }
