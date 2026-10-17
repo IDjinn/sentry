@@ -17,6 +17,10 @@ fn main() -> color_eyre::Result<()> {
                         action,
                         sentry_cli::cli::ConfigCmd::Migrate { .. }
                             | sentry_cli::cli::ConfigCmd::Files
+                            | sentry_cli::cli::ConfigCmd::Get { .. }
+                            | sentry_cli::cli::ConfigCmd::Set { .. }
+                            | sentry_cli::cli::ConfigCmd::Unset { .. }
+                            | sentry_cli::cli::ConfigCmd::Reload
                     ),
                     _ => false,
                 };

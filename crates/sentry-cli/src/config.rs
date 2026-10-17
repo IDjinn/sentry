@@ -136,6 +136,78 @@ pub fn load(path: Option<&Path>) -> color_eyre::Result<SentryConfig> {
     Ok(cfg)
 }
 
+/// Semantic checks the schema cannot express: custom rules compile,
+/// routing/runtime/update/protocol sections are coherent. Prints each
+/// problem to stderr and fails with a one-line summary. Shared by
+/// `sentry config validate`, `config set` and the daemon's live reload.
+pub fn validate(cfg: &SentryConfig) -> color_eyre::Result<()> {
+    let mut errors: Vec<String> = Vec::new();
+    for parsed in sentry_core::rules::rules_from_config(&cfg.rules.custom) {
+        if let Err(e) = parsed {
+            errors.push(e);
+        }
+    }
+    if let Err(e) = sentry_core::sensitive_files::Filter::from_names(
+        &cfg.auto.sensitive.enable,
+        &cfg.auto.sensitive.skip,
+    ) {
+        color_eyre::eyre::bail!("config INVALID: sentry › auto: {e}");
+    }
+    if let Err(e) = cfg.update.validate() {
+        color_eyre::eyre::bail!("config INVALID: {e}");
+    }
+    let edge_errors = cfg.edge.validate();
+    if !edge_errors.is_empty() {
+        for e in &edge_errors {
+            eprintln!("invalid http config: {e}");
+        }
+        color_eyre::eyre::bail!(
+            "config INVALID: {} http/routing error(s)",
+            edge_errors.len()
+        );
+    }
+    if let Some(e) = cfg.runtime.validate().first() {
+        color_eyre::eyre::bail!("config INVALID: {e}");
+    }
+    if !errors.is_empty() {
+        for e in &errors {
+            eprintln!("invalid custom rule: {e}");
+        }
+        color_eyre::eyre::bail!(
+            "config INVALID: {} custom rule(s) failed to compile",
+            errors.len()
+        );
+    }
+    if cfg.protocol.enabled {
+        let dir = &cfg.protocol.dir;
+        match crate::protocol_cmd::compile_dir(dir, cfg.protocol.max_schemas) {
+            Ok((_, es)) if es.is_empty() => {
+                println!("  protocol:  OK ({})", dir.display());
+            }
+            Ok((_, es)) => {
+                for e in &es {
+                    eprintln!("invalid protocol schema: {e}");
+                }
+                color_eyre::eyre::bail!(
+                    "config INVALID: {} protocol schema(s) failed to compile",
+                    es.len()
+                );
+            }
+            Err(e) => {
+                color_eyre::eyre::bail!("config INVALID: protocol dir: {e}");
+            }
+        }
+    }
+    if cfg.posture.mode.is_enforce() {
+        color_eyre::eyre::bail!(
+            "config INVALID: detect › posture › mode: enforce is not implemented \
+                 yet — header injection without per-site knowledge would break \
+                 pages; use shadow (roadmap: BACKLOG.md §5.4)"
+        );
+    }
+    Ok(())
+}
+
 /// Parse a legacy `sentry.toml` (for `sentry config migrate`).
 pub fn load_legacy_toml(path: &Path) -> color_eyre::Result<SentryConfig> {
     let text = std::fs::read_to_string(path)

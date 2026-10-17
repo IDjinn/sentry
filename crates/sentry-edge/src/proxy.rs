@@ -330,7 +330,63 @@ pub async fn serve(
     cfg: EdgeProxyConfig,
     decided: mpsc::Sender<sentry_core::ProcessedEvent>,
 ) -> sentry_core::error::Result<()> {
-    let router = Arc::new(build_route_table(&cfg)?);
+    serve_with_reloader(runtime, cfg, decided, RouteReloader::default()).await
+}
+
+/// Hot-swappable routing table: handlers load the current table once per
+/// request, [`RouteReloader::reload`] installs a new one atomically.
+#[derive(Clone)]
+pub struct SharedRoutes(Arc<arc_swap::ArcSwap<crate::routing::RouteTable>>);
+
+impl SharedRoutes {
+    fn new(table: impl Into<Arc<crate::routing::RouteTable>>) -> Self {
+        Self(Arc::new(arc_swap::ArcSwap::new(table.into())))
+    }
+
+    fn load(&self) -> Arc<crate::routing::RouteTable> {
+        self.0.load_full()
+    }
+
+    fn store(&self, table: crate::routing::RouteTable) {
+        self.0.store(Arc::new(table));
+    }
+}
+
+/// Handle to swap the running edge's routing table (sites, locations,
+/// upstream groups, location security) without restarting the listener.
+/// Filled by [`serve_with_reloader`]; clones share the same slot.
+#[derive(Clone, Default)]
+pub struct RouteReloader {
+    routes: Arc<std::sync::OnceLock<SharedRoutes>>,
+}
+
+impl RouteReloader {
+    /// Compile `cfg`'s routing, require at least one healthy server per
+    /// group (the startup contract) and swap it in. On any error the
+    /// running table stays untouched. Returns the number of upstream groups.
+    pub async fn reload(&self, cfg: &EdgeProxyConfig) -> sentry_core::error::Result<usize> {
+        let routes = self.routes.get().ok_or_else(|| {
+            sentry_core::error::CoreError::Config("edge proxy is not running yet".into())
+        })?;
+        let table = build_route_table(cfg)?;
+        health_check_router(&table, cfg).await?;
+        let groups = table.groups().count();
+        routes.store(table);
+        Ok(groups)
+    }
+}
+
+/// [`serve`] that also publishes its routing table to `reloader`.
+pub async fn serve_with_reloader(
+    runtime: EdgeRuntime,
+    cfg: EdgeProxyConfig,
+    decided: mpsc::Sender<sentry_core::ProcessedEvent>,
+    reloader: RouteReloader,
+) -> sentry_core::error::Result<()> {
+    let table = build_route_table(&cfg)?;
+    health_check_router(&table, &cfg).await?;
+    let router = SharedRoutes::new(table);
+    let _ = reloader.routes.set(router.clone());
     let clients = UpstreamClients::build(&cfg)?;
     {
         let router = router.clone();
@@ -338,11 +394,10 @@ pub async fn serve(
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tick.tick().await;
-                router.prune();
+                router.load().prune();
             }
         });
     }
-    health_check_router(&router, &cfg).await?;
 
     // Response compression (F12): one middleware around the router covers
     // upstream responses and edge-generated pages on both listeners. The
@@ -530,7 +585,7 @@ struct ProxyState {
     clients: UpstreamClients,
     /// Routing table: sites → locations → upstream groups (balancers and
     /// passive-health state live in the groups).
-    router: Arc<crate::routing::RouteTable>,
+    router: SharedRoutes,
     decided: mpsc::Sender<sentry_core::ProcessedEvent>,
     /// 301 plain-HTTP requests to HTTPS (F8, TLS front only).
     redirect_https: bool,
@@ -748,6 +803,7 @@ async fn proxy_inspected(
 
     // Route first: the matched location decides the security scope
     // (allow/deny, rate limit, mode, pipeline overrides) for this request.
+    let router = state.router.load();
     let route = {
         let host = original_host(&parts);
         let view = crate::routing::RequestView {
@@ -759,12 +815,12 @@ async fn proxy_inspected(
             scheme: if is_tls { "https" } else { "http" },
             client_ip,
         };
-        state.router.route(&view)
+        router.route(&view)
     };
     let security = route
         .as_ref()
         .map(|r| &r.location.security)
-        .unwrap_or(&state.router.fallback_security);
+        .unwrap_or(&router.fallback_security);
     let route_label = route
         .as_ref()
         .map(|r| r.location.label.as_str())
@@ -775,7 +831,7 @@ async fn proxy_inspected(
         return pages::block_page(error_pages, Some(trace));
     }
     if let (Some(rule), Some(r)) = (security.rate_limit, route.as_ref()) {
-        if !state.router.rate_allow(r.location.id, client_ip, rule) {
+        if !router.rate_allow(r.location.id, client_ip, rule) {
             let trace = Uuid::new_v4();
             tracing::info!(ip = %client_ip, location = route_label, trace_id = %trace, "edge: location rate limit exceeded");
             return pages::rate_limit_page(error_pages, Some(trace));
@@ -1776,7 +1832,7 @@ mod tests {
         ProxyState {
             runtime,
             clients: UpstreamClients::verified_only(reqwest::Client::new()),
-            router: Arc::new(crate::routing::RouteTable::single(upstream)),
+            router: SharedRoutes::new(crate::routing::RouteTable::single(upstream)),
             decided: dec_tx,
             redirect_https: false,
             security_headers: None,
@@ -2863,7 +2919,10 @@ mod tests {
         let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
         let (dec_tx, _dec_rx) = mpsc::channel(8);
         let mut state = proxy_state(runtime, format!("http://{default}"), dec_tx);
-        state.router = router_with_vhosts(default, vec![("a.test", site_a), ("*.b.test", site_b)]);
+        state.router = SharedRoutes::new(router_with_vhosts(
+            default,
+            vec![("a.test", site_a), ("*.b.test", site_b)],
+        ));
         let app = Router::new().fallback(any(proxy_handler)).with_state(state);
 
         let resp = request_with_host(app.clone(), "a.test").await;
@@ -2906,7 +2965,7 @@ mod tests {
         let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
         let (dec_tx, _dec_rx) = mpsc::channel(8);
         let mut state = proxy_state(runtime, "http://127.0.0.1:9".to_string(), dec_tx);
-        state.router = router;
+        state.router = SharedRoutes::new(router);
         let app = Router::new().fallback(any(proxy_handler)).with_state(state);
 
         // Round-robin starts on the dead server; the request must still be
@@ -2941,7 +3000,7 @@ mod tests {
         let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
         let (dec_tx, _dec_rx) = mpsc::channel(8);
         let mut state = proxy_state(runtime, "http://127.0.0.1:9".to_string(), dec_tx);
-        state.router = router;
+        state.router = SharedRoutes::new(router);
         let app = Router::new().fallback(any(proxy_handler)).with_state(state);
         let resp = request_with_host(app, "app.test").await;
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_GATEWAY);
@@ -3143,7 +3202,7 @@ mod tests {
         let runtime = crate::EdgeRuntime::new(std::sync::Arc::new(pipeline), None, 0);
         let (dec_tx, dec_rx) = mpsc::channel(64);
         let mut state = proxy_state(runtime, "http://127.0.0.1:9".to_string(), dec_tx);
-        state.router = Arc::new(table);
+        state.router = SharedRoutes::new(table);
         (
             Router::new().fallback(any(proxy_handler)).with_state(state),
             dec_rx,

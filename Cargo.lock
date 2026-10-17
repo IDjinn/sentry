@@ -4250,6 +4250,7 @@ dependencies = [
 name = "sentry-edge"
 version = "0.5.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "brotli",
  "bytes",

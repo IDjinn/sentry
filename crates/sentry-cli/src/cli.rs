@@ -544,6 +544,42 @@ pub enum ConfigCmd {
     },
     /// List the files a load reads (main, conf.d, includes, auto file).
     Files,
+    /// Print the value written for a dotted path (`http.compress.enabled`),
+    /// or the names inside a block.
+    Get {
+        /// Dotted path of unlabeled blocks ending in a directive.
+        path: String,
+    },
+    /// Set a value in the config file (keeps comments, validates, backs up
+    /// to `<file>.bak`). A running daemon applies rules, routes and http
+    /// routing live; other sections report "restart required".
+    Set {
+        /// Dotted path, e.g. `http.compress.enabled`.
+        path: String,
+        /// New value (several words are joined; quoted when needed).
+        #[arg(required = true, num_args = 1..)]
+        value: Vec<String>,
+        /// Edit this file instead of the one that defines the key.
+        #[arg(long)]
+        file: Option<String>,
+        /// Show the change without writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove a directive from the config file (the default applies again).
+    Unset {
+        /// Dotted path, e.g. `http.compress.enabled`.
+        path: String,
+        /// Edit this file instead of the one that defines the key.
+        #[arg(long)]
+        file: Option<String>,
+        /// Show the change without writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Validate the files and make a running daemon re-read them now
+    /// (it also polls the files and reloads on SIGHUP).
+    Reload,
     /// Convert a legacy `sentry.toml` into `sentry.conf` syntax.
     Migrate {
         /// Legacy TOML file.

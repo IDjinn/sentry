@@ -29,6 +29,7 @@ sentry-core = { workspace = true }
 sentry-protocol = { workspace = true }
 regex = { workspace = true }
 ipnet = { workspace = true }
+arc-swap = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }

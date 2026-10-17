@@ -15,6 +15,7 @@
 
 pub mod ast;
 pub mod de;
+pub mod edit;
 pub mod error;
 pub mod load;
 pub mod parser;

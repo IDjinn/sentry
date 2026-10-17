@@ -463,7 +463,7 @@ pub fn run_windows_service() -> color_eyre::Result<()> {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let result = rt.block_on(async {
             match crate::config::load(None) {
-                Ok(cfg) => crate::daemon::run(cfg).await,
+                Ok(cfg) => crate::daemon::run_with_path(cfg, None).await,
                 Err(e) => Err(e),
             }
         });
