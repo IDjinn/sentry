@@ -435,6 +435,7 @@ conf_struct!(
         fail_timeout: Option<Secs>,
         socket: Option<SocketBlock>,
         compress: Option<CompressBlock>,
+        security_headers: Option<SecurityHeadersBlock>,
         challenge: Option<ChallengeBlock>,
         error_pages: Option<PathBuf>,
         upstream: Vec<UpstreamBlock>,
@@ -460,6 +461,7 @@ conf_struct!(TlsBlock {
     key: Option<PathBuf>,
     redirect_https: Option<bool>,
     http2: Option<bool>,
+    min_version: Option<String>,
     handshake_events: Option<bool>,
     allowed_hosts: Option<OneOrMany<String>>,
 });
@@ -479,6 +481,23 @@ conf_struct!(CompressBlock {
     level_br: Option<u8>,
     level_gzip: Option<u8>,
     level_zstd: Option<u8>,
+});
+
+conf_struct!(SecurityHeadersBlock {
+    enabled: Option<bool>,
+    override_origin: Option<bool>,
+    hsts: Option<String>,
+    csp: Option<String>,
+    upgrade_insecure_requests: Option<bool>,
+    x_frame_options: Option<String>,
+    x_content_type_options: Option<String>,
+    referrer_policy: Option<String>,
+    permissions_policy: Option<String>,
+    x_xss_protection: Option<String>,
+    coop: Option<String>,
+    corp: Option<String>,
+    coep: Option<String>,
+    strip: Option<OneOrMany<String>>,
 });
 
 conf_struct!(ChallengeBlock {

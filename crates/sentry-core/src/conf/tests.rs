@@ -326,3 +326,32 @@ fn legacy_toml_migrates_to_conf() {
     assert_eq!(back.edge.sites.len(), 2);
     assert_eq!(back.actions[0].options["ttl_secs"], 3600);
 }
+
+#[test]
+fn security_headers_and_tls_min_version_parse_with_safe_defaults() {
+    let defaults = load("http { proxy_pass: http://127.0.0.1:8080 }");
+    assert!(defaults.edge.security_headers.enabled);
+    assert_eq!(defaults.edge.tls_min_version, "1.3");
+    assert_eq!(
+        defaults.edge.tls_min().unwrap(),
+        crate::config::TlsMinVersion::V13
+    );
+
+    let c = load(
+        "http {\n  proxy_pass: http://127.0.0.1:8080\n  tls { cert: /a.crt, key: /a.key, min_version: \"1.2\" }\n  security_headers { x_frame_options: DENY, coep: credentialless, strip: [Server] }\n}",
+    );
+    assert_eq!(c.edge.tls_min().unwrap(), crate::config::TlsMinVersion::V12);
+    assert_eq!(c.edge.security_headers.x_frame_options, "DENY");
+    assert_eq!(
+        c.edge.security_headers.cross_origin_embedder_policy,
+        "credentialless"
+    );
+    assert_eq!(c.edge.security_headers.strip, vec!["Server".to_string()]);
+
+    let bad = load("http { proxy_pass: http://127.0.0.1:8080\n tls { cert: /a, key: /b, min_version: \"1.1\" } }");
+    assert!(bad
+        .edge
+        .validate()
+        .iter()
+        .any(|e| e.contains("tls_min_version")));
+}

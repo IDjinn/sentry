@@ -59,6 +59,9 @@ pub struct EdgeProxyConfig {
     /// Response compression settings (F12) — projected from
     /// `[edge.compress]`.
     pub compress: sentry_core::config::EdgeCompressConfig,
+    /// Native security-header injection (F16) — projected from
+    /// `http { security_headers }`.
+    pub security_headers: sentry_core::config::EdgeSecurityHeadersConfig,
     /// Set `X-Forwarded-*`/`X-Real-IP` on forwarded requests (F12), after
     /// stripping the client's copies.
     pub forwarded_headers: bool,
@@ -102,6 +105,8 @@ pub struct TlsEdgeConfig {
     pub handshake_events: bool,
     /// Negotiate HTTP/2 via ALPN alongside HTTP/1.1 (F12).
     pub http2: bool,
+    /// Lowest TLS version accepted (default TLS 1.3 only).
+    pub min_version: sentry_core::config::TlsMinVersion,
     /// Per-vhost certificates (F14): SNI-selected, `cert`/`key` remain the
     /// default chain for unknown hostnames.
     pub extra_certs: Vec<VhostCert>,
@@ -135,6 +140,7 @@ impl Default for EdgeProxyConfig {
             sites: Vec::new(),
             security: sentry_core::edge_routes::SecurityConfig::default(),
             compress: sentry_core::config::EdgeCompressConfig::default(),
+            security_headers: sentry_core::config::EdgeSecurityHeadersConfig::default(),
             forwarded_headers: true,
             response_buffering: true,
             upstream_connect_timeout_secs: 5,
@@ -361,6 +367,10 @@ pub async fn serve(
             router,
             decided: decided.clone(),
             redirect_https,
+            security_headers: sentry_core::security_headers::SecurityHeaders::from_config(
+                &cfg.security_headers,
+            )
+            .map(Arc::new),
             forwarded_headers: cfg.forwarded_headers,
             response_buffering: cfg.response_buffering,
             gate: (cfg.max_concurrent_requests > 0)
@@ -524,6 +534,8 @@ struct ProxyState {
     decided: mpsc::Sender<sentry_core::ProcessedEvent>,
     /// 301 plain-HTTP requests to HTTPS (F8, TLS front only).
     redirect_https: bool,
+    /// Compiled security-header injector (F16); `None` = disabled.
+    security_headers: Option<Arc<sentry_core::security_headers::SecurityHeaders>>,
     /// Set `X-Forwarded-*`/`X-Real-IP` on forwarded requests (F12).
     forwarded_headers: bool,
     /// Buffer upstream responses before forwarding (F14). `false` streams
@@ -838,7 +850,7 @@ async fn proxy_inspected(
         .map(|h| h.path.clone())
         .unwrap_or_default();
 
-    let resp = match processed.decision.action {
+    let mut resp = match processed.decision.action {
         sentry_core::analysis::Verdict::Allow => {
             let trusted = processed.decision.override_reason.as_deref() == Some("trusted ip");
             let gate = if security.force_challenge && !trusted {
@@ -911,6 +923,18 @@ async fn proxy_inspected(
         .pipeline()
         .observe_response(client_ip, &path, status, ua.as_deref());
 
+    // Native security headers (F16): injected BEFORE posture grading so the
+    // advisories reflect what the browser actually receives.
+    if let Some(sh) = state.security_headers.as_deref() {
+        apply_security_headers(
+            sh,
+            &mut resp,
+            &parts,
+            is_tls,
+            route.as_ref().map(|r| &r.location.headers),
+        );
+    }
+
     // Posture advisories (F11): grade only upstream responses (edge pages
     // and redirects are not the site's headers) on successful statuses, and
     // attach weight-0 signals — advisory only, the verdict stands.
@@ -950,6 +974,54 @@ async fn proxy_inspected(
     }
 
     resp
+}
+
+/// Inject the native security headers (F16) and strip disclosure headers.
+/// Origin headers win unless `override_origin`; a header the matched
+/// location explicitly sets or removes (`response_headers {}`) is left to
+/// that location. HTTPS-only headers key off a real TLS connection or a
+/// CDN's `X-Forwarded-Proto: https`.
+fn apply_security_headers(
+    sh: &sentry_core::security_headers::SecurityHeaders,
+    resp: &mut Response,
+    parts: &axum::http::request::Parts,
+    is_tls: bool,
+    ops: Option<&sentry_core::edge_routes::HeaderOps>,
+) {
+    if resp.status() == axum::http::StatusCode::SWITCHING_PROTOCOLS {
+        return;
+    }
+    let owned = |name: &str| {
+        ops.is_some_and(|o| {
+            header_set(&o.response_set, name) || header_listed(&o.response_remove, name)
+        })
+    };
+    for name in sh.strip() {
+        if !owned(name) {
+            resp.headers_mut().remove(name.as_str());
+        }
+    }
+    let secure = is_tls
+        || parts
+            .headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("https"));
+    let is_document = sentry_core::security_headers::is_html(
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+    );
+    let plan = sh.plan(|n| resp.headers().contains_key(n), is_document, secure);
+    for w in plan {
+        if owned(w.name) {
+            continue;
+        }
+        if let Ok(value) = axum::http::HeaderValue::from_str(&w.value) {
+            resp.headers_mut().insert(w.name, value);
+        }
+    }
 }
 
 /// Serve a routed request (Allow, challenge-passed, or `inspect: off`):
@@ -1707,6 +1779,7 @@ mod tests {
             router: Arc::new(crate::routing::RouteTable::single(upstream)),
             decided: dec_tx,
             redirect_https: false,
+            security_headers: None,
             forwarded_headers: true,
             response_buffering: true,
             gate: None,
@@ -2502,6 +2575,99 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let pe = dec_rx.try_recv().expect("decided event");
         assert!(posture_signals(&pe).is_empty(), "hardened site is clean");
+    }
+
+    async fn get_with_security_headers(
+        upstream: std::net::SocketAddr,
+        extra: &[(&str, &str)],
+        cfg: sentry_core::config::EdgeSecurityHeadersConfig,
+    ) -> axum::http::HeaderMap {
+        let pipeline = std::sync::Arc::new(sentry_core::pipeline::Pipeline::new(
+            sentry_core::RuleSet::default(),
+            sentry_core::RouteValidator::new(vec![]),
+        ));
+        let runtime = crate::EdgeRuntime::new(pipeline, None, 0);
+        let (dec_tx, _dec_rx) = tokio::sync::mpsc::channel(8);
+        let mut state = proxy_state(runtime, format!("http://{upstream}"), dec_tx);
+        state.security_headers =
+            sentry_core::security_headers::SecurityHeaders::from_config(&cfg).map(Arc::new);
+        let app = Router::new().fallback(any(proxy_handler)).with_state(state);
+        let mut req = axum::http::Request::builder()
+            .uri("/")
+            .header("host", "example.com");
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        let resp = app
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        resp.headers().clone()
+    }
+
+    #[tokio::test]
+    async fn security_headers_are_injected_by_default_and_hsts_follows_https() {
+        let upstream = spawn_html_upstream().await;
+        let cfg = sentry_core::config::EdgeSecurityHeadersConfig::default();
+        let plain = get_with_security_headers(upstream, &[], cfg.clone()).await;
+        for h in [
+            "content-security-policy",
+            "x-frame-options",
+            "x-content-type-options",
+            "referrer-policy",
+            "permissions-policy",
+            "x-xss-protection",
+            "cross-origin-opener-policy",
+            "cross-origin-resource-policy",
+        ] {
+            assert!(plain.contains_key(h), "missing {h}");
+        }
+        assert!(!plain.contains_key("strict-transport-security"));
+        assert!(!plain.contains_key("cross-origin-embedder-policy"));
+        let https =
+            get_with_security_headers(upstream, &[("x-forwarded-proto", "https")], cfg).await;
+        assert!(https.contains_key("strict-transport-security"));
+        assert!(https["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("upgrade-insecure-requests"));
+    }
+
+    #[tokio::test]
+    async fn origin_security_headers_win_and_disclosure_headers_are_stripped() {
+        let upstream = spawn_hardened_upstream().await;
+        let h = get_with_security_headers(
+            upstream,
+            &[],
+            sentry_core::config::EdgeSecurityHeadersConfig::default(),
+        )
+        .await;
+        assert_eq!(h["cross-origin-opener-policy"], "same-origin");
+        assert!(h["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("script-src 'self'"));
+
+        let echo = spawn_uri_echo_upstream().await;
+        let h = get_with_security_headers(
+            echo,
+            &[],
+            sentry_core::config::EdgeSecurityHeadersConfig::default(),
+        )
+        .await;
+        assert!(!h.contains_key("server"));
+        assert!(!h.contains_key("x-powered-by"));
+    }
+
+    #[tokio::test]
+    async fn disabled_security_headers_leave_the_response_untouched() {
+        let upstream = spawn_html_upstream().await;
+        let cfg = sentry_core::config::EdgeSecurityHeadersConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let h = get_with_security_headers(upstream, &[], cfg).await;
+        assert!(!h.contains_key("x-frame-options"));
     }
 
     #[tokio::test]

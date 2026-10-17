@@ -14,6 +14,7 @@ pub mod cmd;
 pub mod config;
 mod daemon;
 pub mod datasets;
+pub mod emailauth;
 pub mod eventlog;
 pub mod logging;
 pub mod metrics;

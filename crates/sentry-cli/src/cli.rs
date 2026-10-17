@@ -149,6 +149,13 @@ pub enum Command {
         /// Look-back window for observed advisories (e.g. `24h`, `7d`).
         #[arg(long, default_value = "24h")]
         from: String,
+        /// Domain(s) for the SPF/DMARC/DKIM DNS audit (default: hosts of the
+        /// configured sites).
+        #[arg(long = "domain")]
+        domains: Vec<String>,
+        /// Skip the email-authentication DNS audit.
+        #[arg(long)]
+        no_email: bool,
     },
     /// Export raw events for SIEM consumption (F4.6).
     Export {

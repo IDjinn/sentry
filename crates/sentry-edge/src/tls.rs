@@ -425,8 +425,14 @@ fn load_server_config(
             }
         }
     }
+    let versions: &[&'static rustls::SupportedProtocolVersion] = match cfg.min_version {
+        sentry_core::config::TlsMinVersion::V13 => &[&rustls::version::TLS13],
+        sentry_core::config::TlsMinVersion::V12 => {
+            &[&rustls::version::TLS13, &rustls::version::TLS12]
+        }
+    };
     let config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .with_protocol_versions(versions)
         .map_err(|e| {
             sentry_core::error::CoreError::Config(format!("edge tls: protocol versions: {e}"))
         })?
@@ -566,8 +572,40 @@ mod tests {
             allowed_hosts: vec![],
             handshake_events: true,
             http2: false,
+            min_version: Default::default(),
             extra_certs: Vec::new(),
         }
+    }
+    fn tls12_only_client_hello_accepted(cfg: &TlsEdgeConfig) -> bool {
+        let mut server = rustls::ServerConnection::new(load_server_config(cfg).unwrap()).unwrap();
+        let client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        let mut client =
+            rustls::ClientConnection::new(Arc::new(client_cfg), "localhost".try_into().unwrap())
+                .unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+        server.read_tls(&mut hello.as_slice()).unwrap();
+        server.process_new_packets().is_ok()
+    }
+
+    #[tokio::test]
+    async fn tls_is_1_3_only_unless_1_2_is_configured() {
+        let cfg = test_tls_cfg("minver");
+        assert!(
+            !tls12_only_client_hello_accepted(&cfg),
+            "default must refuse TLS 1.2"
+        );
+        let relaxed = TlsEdgeConfig {
+            min_version: sentry_core::config::TlsMinVersion::V12,
+            ..test_tls_cfg("minver12")
+        };
+        assert!(tls12_only_client_hello_accepted(&relaxed));
     }
 
     #[tokio::test]

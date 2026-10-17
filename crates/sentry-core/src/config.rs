@@ -1786,6 +1786,10 @@ pub struct EdgeConfig {
     /// are negotiated against `Accept-Encoding` (zstd > brotli > gzip).
     #[serde(default)]
     pub compress: EdgeCompressConfig,
+    /// Native security-header injection (F16) — `http { security_headers }`.
+    /// On by default in inline mode.
+    #[serde(default)]
+    pub security_headers: EdgeSecurityHeadersConfig,
     /// Set `X-Forwarded-For` / `X-Forwarded-Proto` / `X-Forwarded-Host` /
     /// `X-Real-IP` on forwarded requests (default true). Client-supplied
     /// copies of these headers are stripped first — the edge is the
@@ -1799,6 +1803,11 @@ pub struct EdgeConfig {
     /// `edge-tls` feature; default true.
     #[serde(default = "default_edge_http2")]
     pub http2: bool,
+    /// Minimum TLS version the edge accepts: `"1.3"` (default — only the
+    /// highest version) or `"1.2"` (opt-in, for legacy clients). Anything
+    /// older is never offered.
+    #[serde(default = "default_edge_tls_min_version")]
+    pub tls_min_version: String,
     /// Connect timeout for the edge → upstream hop, in seconds (default 5).
     #[serde(default = "default_edge_upstream_connect_timeout")]
     pub upstream_connect_timeout_secs: u64,
@@ -1946,7 +1955,11 @@ impl EdgeConfig {
     /// `sentry config validate` fails on them and the daemon refuses to
     /// start inline.
     pub fn validate(&self) -> Vec<String> {
-        crate::edge_routes::validate(self)
+        let mut errors = crate::edge_routes::validate(self);
+        if let Err(e) = self.tls_min() {
+            errors.push(format!("http › tls: {e}"));
+        }
+        errors
     }
 
     /// Whether any upstream/site is configured (inline mode needs one).
@@ -2090,12 +2103,184 @@ fn default_edge_compress_level_gzip() -> u8 {
 fn default_edge_compress_level_zstd() -> u8 {
     3
 }
+/// Native security-header injection at the inline edge (F16). On by
+/// default: every response the edge serves gets the hardening headers the
+/// origin forgot, so a site is protected without depending on nginx or a
+/// CDN to add them.
+///
+/// Each header value is a string; `"off"` (or empty) disables that header.
+/// Origin headers are respected — a header the upstream already set is left
+/// alone unless `override_origin` is on. Defaults are chosen so they do not
+/// break ordinary sites: the two headers that routinely do
+/// (`Cross-Origin-Embedder-Policy` and a script-restricting CSP) are off /
+/// baseline-only and opt-in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeSecurityHeadersConfig {
+    /// Master switch (default true; inline mode only).
+    #[serde(default = "default_sec_enabled")]
+    pub enabled: bool,
+    /// Replace headers the origin already set (default false).
+    #[serde(default)]
+    pub override_origin: bool,
+    /// `Strict-Transport-Security` — only sent on HTTPS (TLS terminated by
+    /// the edge, or `X-Forwarded-Proto: https` from a CDN in front).
+    #[serde(default = "default_sec_hsts")]
+    pub hsts: String,
+    /// `Content-Security-Policy`. The default baseline (`base-uri`,
+    /// `object-src`, `frame-ancestors`) blocks injection primitives without
+    /// restricting scripts; set a full policy (`script-src …`) to go
+    /// stricter — Sentry cannot guess a site's script origins.
+    #[serde(default = "default_sec_csp")]
+    pub content_security_policy: String,
+    /// Append `upgrade-insecure-requests` to the injected CSP on HTTPS.
+    #[serde(default = "default_sec_enabled")]
+    pub upgrade_insecure_requests: bool,
+    /// `X-Frame-Options`.
+    #[serde(default = "default_sec_xfo")]
+    pub x_frame_options: String,
+    /// `X-Content-Type-Options`.
+    #[serde(default = "default_sec_nosniff")]
+    pub x_content_type_options: String,
+    /// `Referrer-Policy`.
+    #[serde(default = "default_sec_referrer")]
+    pub referrer_policy: String,
+    /// `Permissions-Policy`.
+    #[serde(default = "default_sec_permissions")]
+    pub permissions_policy: String,
+    /// Legacy `X-XSS-Protection` (still graded by common scanners).
+    #[serde(default = "default_sec_xss")]
+    pub x_xss_protection: String,
+    /// `Cross-Origin-Opener-Policy` (`same-origin-allow-popups` keeps
+    /// OAuth/payment popups working).
+    #[serde(default = "default_sec_coop")]
+    pub cross_origin_opener_policy: String,
+    /// `Cross-Origin-Resource-Policy`.
+    #[serde(default = "default_sec_corp")]
+    pub cross_origin_resource_policy: String,
+    /// `Cross-Origin-Embedder-Policy` — off by default: `require-corp`
+    /// breaks every third-party image/script/embed that lacks CORP.
+    #[serde(default = "default_sec_off")]
+    pub cross_origin_embedder_policy: String,
+    /// Response headers removed from every response (information
+    /// disclosure). Case-insensitive.
+    #[serde(default = "default_sec_strip")]
+    pub strip: Vec<String>,
+}
+
+impl Default for EdgeSecurityHeadersConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_sec_enabled(),
+            override_origin: false,
+            hsts: default_sec_hsts(),
+            content_security_policy: default_sec_csp(),
+            upgrade_insecure_requests: default_sec_enabled(),
+            x_frame_options: default_sec_xfo(),
+            x_content_type_options: default_sec_nosniff(),
+            referrer_policy: default_sec_referrer(),
+            permissions_policy: default_sec_permissions(),
+            x_xss_protection: default_sec_xss(),
+            cross_origin_opener_policy: default_sec_coop(),
+            cross_origin_resource_policy: default_sec_corp(),
+            cross_origin_embedder_policy: default_sec_off(),
+            strip: default_sec_strip(),
+        }
+    }
+}
+
+fn default_sec_enabled() -> bool {
+    true
+}
+fn default_sec_hsts() -> String {
+    "max-age=31536000".to_string()
+}
+fn default_sec_csp() -> String {
+    "base-uri 'self'; object-src 'none'; frame-ancestors 'self'".to_string()
+}
+fn default_sec_xfo() -> String {
+    "SAMEORIGIN".to_string()
+}
+fn default_sec_nosniff() -> String {
+    "nosniff".to_string()
+}
+fn default_sec_referrer() -> String {
+    "strict-origin-when-cross-origin".to_string()
+}
+fn default_sec_permissions() -> String {
+    "accelerometer=(), camera=(self), geolocation=(self), gyroscope=(), magnetometer=(), \
+     microphone=(self), payment=(self), usb=()"
+        .to_string()
+}
+fn default_sec_xss() -> String {
+    "1; mode=block".to_string()
+}
+fn default_sec_coop() -> String {
+    "same-origin-allow-popups".to_string()
+}
+fn default_sec_corp() -> String {
+    "same-site".to_string()
+}
+fn default_sec_off() -> String {
+    "off".to_string()
+}
+fn default_sec_strip() -> Vec<String> {
+    [
+        "server",
+        "x-powered-by",
+        "x-aspnet-version",
+        "x-aspnetmvc-version",
+        "x-generator",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
 fn default_edge_forwarded_headers() -> bool {
     true
 }
 fn default_edge_max_concurrent() -> usize {
     1024
 }
+fn default_edge_tls_min_version() -> String {
+    "1.3".to_string()
+}
+
+/// Minimum TLS protocol version accepted by the edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlsMinVersion {
+    /// TLS 1.2 and 1.3 (explicit opt-in).
+    V12,
+    /// TLS 1.3 only (default).
+    #[default]
+    V13,
+}
+
+impl TlsMinVersion {
+    /// Parse `"1.3"` / `"1.2"` (also `tls1.3`, `TLSv1.2`).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .trim_start_matches("tlsv")
+            .trim_start_matches("tls")
+        {
+            "1.3" => Ok(Self::V13),
+            "1.2" => Ok(Self::V12),
+            other => Err(format!(
+                "tls_min_version must be \"1.3\" or \"1.2\" (older versions are never \
+                 offered), got {other:?}"
+            )),
+        }
+    }
+}
+
+impl EdgeConfig {
+    /// Parsed `tls_min_version`.
+    pub fn tls_min(&self) -> Result<TlsMinVersion, String> {
+        TlsMinVersion::parse(&self.tls_min_version)
+    }
+}
+
 fn default_edge_http2() -> bool {
     true
 }
@@ -2207,8 +2392,10 @@ impl Default for EdgeConfig {
             error_pages: EdgeErrorPagesConfig::default(),
             challenge_backend: ChallengeBackend::default(),
             compress: EdgeCompressConfig::default(),
+            security_headers: EdgeSecurityHeadersConfig::default(),
             forwarded_headers: default_edge_forwarded_headers(),
             http2: default_edge_http2(),
+            tls_min_version: default_edge_tls_min_version(),
             upstream_connect_timeout_secs: default_edge_upstream_connect_timeout(),
             upstream_pool_idle: default_edge_upstream_pool_idle(),
             max_concurrent_requests: default_edge_max_concurrent(),

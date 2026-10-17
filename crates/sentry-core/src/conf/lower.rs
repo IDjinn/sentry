@@ -1001,6 +1001,7 @@ fn lower_http(h: HttpBlock, e: &mut EdgeConfig, errors: &mut Vec<String>) {
         e.tls_key = t.key.or(e.tls_key.take());
         set(&mut e.tls_redirect_https, t.redirect_https);
         set(&mut e.http2, t.http2);
+        set(&mut e.tls_min_version, t.min_version);
         set(&mut e.tls_handshake_events, t.handshake_events);
         set(&mut e.tls_allowed_hosts, list(t.allowed_hosts));
     }
@@ -1039,6 +1040,26 @@ fn lower_http(h: HttpBlock, e: &mut EdgeConfig, errors: &mut Vec<String>) {
         set(&mut e.compress.level_br, c.level_br);
         set(&mut e.compress.level_gzip, c.level_gzip);
         set(&mut e.compress.level_zstd, c.level_zstd);
+    }
+    if let Some(c) = h.security_headers {
+        let s = &mut e.security_headers;
+        set(&mut s.enabled, c.enabled);
+        set(&mut s.override_origin, c.override_origin);
+        set(&mut s.hsts, c.hsts);
+        set(&mut s.content_security_policy, c.csp);
+        set(
+            &mut s.upgrade_insecure_requests,
+            c.upgrade_insecure_requests,
+        );
+        set(&mut s.x_frame_options, c.x_frame_options);
+        set(&mut s.x_content_type_options, c.x_content_type_options);
+        set(&mut s.referrer_policy, c.referrer_policy);
+        set(&mut s.permissions_policy, c.permissions_policy);
+        set(&mut s.x_xss_protection, c.x_xss_protection);
+        set(&mut s.cross_origin_opener_policy, c.coop);
+        set(&mut s.cross_origin_resource_policy, c.corp);
+        set(&mut s.cross_origin_embedder_policy, c.coep);
+        set(&mut s.strip, list(c.strip));
     }
     if let Some(c) = h.challenge {
         set(&mut e.challenge_backend, c.backend);
@@ -1324,6 +1345,7 @@ fn raise_http(e: &EdgeConfig) -> HttpBlock {
             key: e.tls_key.clone(),
             redirect_https: Some(e.tls_redirect_https),
             http2: Some(e.http2),
+            min_version: Some(e.tls_min_version.clone()),
             handshake_events: Some(e.tls_handshake_events),
             allowed_hosts: some_list(&e.tls_allowed_hosts),
         }),
@@ -1353,6 +1375,22 @@ fn raise_http(e: &EdgeConfig) -> HttpBlock {
             level_br: Some(e.compress.level_br),
             level_gzip: Some(e.compress.level_gzip),
             level_zstd: Some(e.compress.level_zstd),
+        }),
+        security_headers: Some(SecurityHeadersBlock {
+            enabled: Some(e.security_headers.enabled),
+            override_origin: Some(e.security_headers.override_origin),
+            hsts: Some(e.security_headers.hsts.clone()),
+            csp: Some(e.security_headers.content_security_policy.clone()),
+            upgrade_insecure_requests: Some(e.security_headers.upgrade_insecure_requests),
+            x_frame_options: Some(e.security_headers.x_frame_options.clone()),
+            x_content_type_options: Some(e.security_headers.x_content_type_options.clone()),
+            referrer_policy: Some(e.security_headers.referrer_policy.clone()),
+            permissions_policy: Some(e.security_headers.permissions_policy.clone()),
+            x_xss_protection: Some(e.security_headers.x_xss_protection.clone()),
+            coop: Some(e.security_headers.cross_origin_opener_policy.clone()),
+            corp: Some(e.security_headers.cross_origin_resource_policy.clone()),
+            coep: Some(e.security_headers.cross_origin_embedder_policy.clone()),
+            strip: some_list(&e.security_headers.strip),
         }),
         challenge: Some(ChallengeBlock {
             backend: Some(e.challenge_backend),

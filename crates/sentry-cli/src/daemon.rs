@@ -1049,6 +1049,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
                     allowed_hosts: cfg.edge.tls_allowed_hosts.clone(),
                     handshake_events: cfg.edge.tls_handshake_events,
                     http2: cfg.edge.http2,
+                    min_version: cfg.edge.tls_min().unwrap_or_default(),
                     extra_certs,
                 })
             }
@@ -1098,6 +1099,7 @@ pub async fn run(cfg: SentryConfig) -> color_eyre::Result<()> {
             sites: route_sites.clone(),
             security: cfg.edge.security.clone(),
             compress: cfg.edge.compress.clone(),
+            security_headers: cfg.edge.security_headers.clone(),
             forwarded_headers: cfg.edge.forwarded_headers,
             response_buffering: cfg.edge.response_buffering,
             upstream_connect_timeout_secs: cfg.edge.upstream_connect_timeout_secs,

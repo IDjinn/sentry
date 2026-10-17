@@ -1104,6 +1104,32 @@ telemetria de handshake + provider de appliance
   - ✅ Exemplos/deploy convertidos (`config/sentry.example.conf`,
     `config/sentry.aaPanel.conf`, honeypot, Docker, k8s, CI)
 
+# F16 (concluída): Hardening nativo na edge inline — headers de segurança,
+# TLS 1.3 por padrão, auditoria SPF/DMARC/DKIM
+  - ✅ Injeção nativa de headers (`http { security_headers {} }`,
+    `sentry-core/src/security_headers.rs` puro + `apply_security_headers` no
+    `proxy.rs`): **ligada por default** no modo inline. HSTS (só HTTPS: TLS da
+    edge ou `X-Forwarded-Proto: https` de CDN), CSP baseline (`base-uri`,
+    `object-src 'none'`, `frame-ancestors 'self'` + `upgrade-insecure-requests`
+    em HTTPS), X-Frame-Options, nosniff, Referrer-Policy, Permissions-Policy,
+    X-XSS-Protection, COOP `same-origin-allow-popups`, CORP `same-site`.
+    COEP fica `off` (`require-corp` quebra embeds de terceiros) e CSP com
+    `script-src` é opt-in (a edge não sabe as origens de script do site).
+    Header do origin vence (`override_origin`); `off` desliga um header;
+    `location { response_headers {} }` set/remove prevalece. Headers de
+    documento só em HTML; HSTS/nosniff/CORP em tudo. `strip` remove
+    `Server`/`X-Powered-By`/… (o `Server: cloudflare` é do CF, fora do alcance).
+    Roda antes do grading de posture, então advisories refletem o que o
+    browser recebe
+  - ✅ TLS: `http { tls { min_version } }` — default **só TLS 1.3**; `"1.2"` é
+    opt-in explícito; <1.2 nunca é oferecido; valor inválido falha no
+    `config validate`
+  - ✅ SPF/DMARC/DKIM (`sentry-core/src/email_auth.rs` puro +
+    `sentry-cli/src/emailauth.rs` DNS via hickory): são registros DNS, a edge
+    não os escreve — `sentry posture [--domain d] [--no-email]` audita os
+    hosts dos sites, herda DMARC do domínio pai, e imprime o registro a
+    publicar (domínio web-only sem MX → `v=spf1 -all`, `p=reject`, null MX)
+
 Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4; §27 F12 idem; §28 F13 idem; §29 F14 idem; §3 subprojeto auto — v1 entregue, A.5/A.7/A.12 restantes).
 
 ### Status atual (verificação contínua)

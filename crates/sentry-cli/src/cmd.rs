@@ -857,7 +857,11 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 }
             }
         }
-        Command::Posture { from } => {
+        Command::Posture {
+            from,
+            domains,
+            no_email,
+        } => {
             let cfg = require_config(&cfg)?;
             let since = chrono::Utc::now()
                 - parse_duration(&from)
@@ -900,6 +904,54 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 },
                 cfg.posture.mode.as_str()
             );
+
+            // Email authentication (F16): SPF/DMARC/DKIM live in DNS, so the
+            // edge cannot add them — audit and print the record to publish.
+            if !no_email {
+                println!("\nEmail authentication (SPF/DMARC/DKIM) — DNS:");
+                let targets = crate::emailauth::domains(cfg, &domains);
+                if targets.is_empty() {
+                    println!("  (no concrete domain configured; pass --domain example.com)");
+                }
+                for domain in targets {
+                    match crate::emailauth::audit_domain(&domain).await {
+                        Err(e) => println!("  {domain}: DNS lookup failed ({e})"),
+                        Ok(a) => {
+                            let kind = if a.sends_mail {
+                                "sends mail (MX present)"
+                            } else {
+                                "web-only (no MX)"
+                            };
+                            println!("  {} — {kind}", a.domain);
+                            if let Some(at) = &a.dmarc_at {
+                                if at != &a.domain {
+                                    println!("    DMARC inherited from {at}");
+                                }
+                            }
+                            if a.findings.is_empty() {
+                                println!("    [x] SPF/DMARC/DKIM look healthy");
+                            }
+                            for f in &a.findings {
+                                println!(
+                                    "    [!] {} ({}): {}",
+                                    f.check,
+                                    f.severity.as_str(),
+                                    f.detail
+                                );
+                            }
+                            if a.findings
+                                .iter()
+                                .any(|f| f.severity >= sentry_core::email_auth::Severity::Medium)
+                            {
+                                println!("    publish:");
+                                for rec in &a.recommended {
+                                    println!("      {rec}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // Part 2: advisories observed on origin responses (shadow signals
             // persisted with the events).
