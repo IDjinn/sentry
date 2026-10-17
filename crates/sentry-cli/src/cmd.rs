@@ -1395,6 +1395,7 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
             dry_run,
             category,
             skip_category,
+            ignore,
         } => {
             let (mut sensitive_enable, mut sensitive_skip) = cfg
                 .as_ref()
@@ -1418,6 +1419,7 @@ pub async fn dispatch_with_config(cli: Cli, cfg: Option<SentryConfig>) -> color_
                 config_path,
                 sensitive_enable,
                 sensitive_skip,
+                ignore,
             })
             .await?;
         }

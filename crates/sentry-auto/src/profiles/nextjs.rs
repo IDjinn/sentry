@@ -31,6 +31,9 @@ impl FrameworkDetector for NextjsDetector {
         if routes.is_empty() {
             return None;
         }
+        routes.extend(super::web::next_config_routes(ctx));
+        routes.extend(super::web::api_calls(ctx));
+        routes.extend(super::web::public_assets(ctx));
 
         Some(FrameworkProfile {
             framework: "nextjs".to_string(),

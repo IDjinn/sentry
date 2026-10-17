@@ -37,6 +37,21 @@ pub struct AutoArgs {
     pub sensitive_enable: Vec<String>,
     /// Sensitive-file categories removed from the walk filter.
     pub sensitive_skip: Vec<String>,
+    /// Path prefixes whose routes are dropped from the result.
+    pub ignore: Vec<String>,
+}
+
+/// True when `path` is `prefix` or lives below it (`/api` matches `/api`,
+/// `/api/x`, not `/apiary`).
+fn is_ignored(path: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|p| {
+        let p = p.trim_end_matches('/');
+        let p = p.strip_suffix("/*").unwrap_or(p);
+        !p.is_empty()
+            && path
+                .strip_prefix(p)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
 }
 
 /// Run the auto-discovery pipeline. Returns `Ok(())` with no output when
@@ -75,6 +90,13 @@ pub async fn run(args: AutoArgs) -> color_eyre::Result<()> {
         }
     }
 
+    if !args.ignore.is_empty() {
+        for profile in &mut profiles {
+            profile
+                .routes
+                .retain(|r| !is_ignored(&r.path, &args.ignore));
+        }
+    }
     let artifacts = generate::from_profiles(&profiles);
     if artifacts.routes.is_empty() {
         return Ok(());
@@ -533,6 +555,17 @@ mod tests {
         assert_eq!(path, PathBuf::from("/etc/sentry/sentry.auto.conf"));
         let bare = auto_file_path(Some("sentry.conf"));
         assert_eq!(bare, PathBuf::from("sentry.auto.conf"));
+    }
+
+    #[test]
+    fn ignore_matches_prefix_boundary() {
+        let ig = vec!["/api/".to_string()];
+        assert!(is_ignored("/api", &ig));
+        assert!(is_ignored("/api/*", &ig));
+        assert!(is_ignored("/api/people/{id}", &ig));
+        assert!(!is_ignored("/apiary", &ig));
+        assert!(!is_ignored("/people", &ig));
+        assert!(!is_ignored("/api", &["/*".to_string()]));
     }
 
     #[test]

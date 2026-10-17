@@ -89,7 +89,7 @@ pub struct RuleSuggestion {
 /// config.
 #[derive(Debug, Clone, Default)]
 pub struct FrameworkProfile {
-    /// Profile name (`nginx`, `wordpress`, `laravel`, `nextjs`, `express`,
+    /// Profile name (`nginx`, `wordpress`, `laravel`, `nextjs`, `react`, `express`,
     /// `http-probe`).
     pub framework: String,
     /// Framework version when the manifest declares one.
