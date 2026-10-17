@@ -199,6 +199,7 @@ pub fn profile_paths(name: &str) -> &'static [&'static str] {
         ],
         "nextjs" => &["/_next/static/", "/api/health"],
         "express" => &["/graphql", "/static/"],
+        "react" => &["/assets/", "/static/js/"],
         _ => &[],
     }
 }

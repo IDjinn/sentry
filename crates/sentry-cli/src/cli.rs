@@ -237,6 +237,11 @@ pub enum Command {
         /// (repeatable/comma-separated).
         #[arg(long, value_name = "CATEGORY", value_delimiter = ',')]
         skip_category: Vec<String>,
+        /// Drop discovered routes under this path prefix (repeatable/
+        /// comma-separated; e.g. `/api` when the backend is mapped
+        /// elsewhere). Matches the prefix itself and everything below it.
+        #[arg(long, value_name = "PREFIX", value_delimiter = ',')]
+        ignore: Vec<String>,
     },
 }
 

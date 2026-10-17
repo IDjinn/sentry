@@ -101,6 +101,7 @@ pub fn detectors() -> Vec<Box<dyn FrameworkDetector>> {
         Box::new(profiles::laravel::LaravelDetector),
         Box::new(profiles::nextjs::NextjsDetector),
         Box::new(profiles::express::ExpressDetector),
+        Box::new(profiles::react::ReactDetector),
         Box::new(profiles::openapi::OpenApiDetector),
     ]
 }
@@ -191,6 +192,7 @@ mod tests {
                 "nextjs",
                 "nginx",
                 "openapi",
+                "react",
                 "wordpress"
             ]
         );
