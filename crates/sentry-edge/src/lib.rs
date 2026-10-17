@@ -21,6 +21,7 @@
 
 pub mod challenge;
 pub mod clienthello;
+pub mod collector;
 pub mod compression;
 pub mod middleware;
 pub mod net;
@@ -130,6 +131,7 @@ pub struct EdgeRuntime {
     compressed: Option<prometheus::CounterVec>,
     upstream_failovers: Option<prometheus::CounterVec>,
     visitor_cookie_max_age: Option<u64>,
+    collector: Option<Arc<collector::Collector>>,
 }
 
 impl EdgeRuntime {
@@ -164,6 +166,7 @@ impl EdgeRuntime {
             compressed: None,
             upstream_failovers: None,
             visitor_cookie_max_age: None,
+            collector: None,
         }
     }
 
@@ -219,6 +222,17 @@ impl EdgeRuntime {
     pub fn with_visitor_cookie(mut self, max_age_secs: u64) -> Self {
         self.visitor_cookie_max_age = Some(max_age_secs);
         self
+    }
+
+    /// Serve the first-party browser collector (F18.2) and inject its tag.
+    pub fn with_collector(mut self, collector: Arc<collector::Collector>) -> Self {
+        self.collector = Some(collector);
+        self
+    }
+
+    /// The browser collector, when enabled.
+    pub fn collector(&self) -> Option<&Arc<collector::Collector>> {
+        self.collector.as_ref()
     }
 
     /// Visitor cookie lifetime when issuing is enabled.

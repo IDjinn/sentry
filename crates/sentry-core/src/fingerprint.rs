@@ -66,19 +66,26 @@ pub struct Fingerprint {
     /// `v-…` visitor cookie id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visitor: Option<String>,
+    /// `j-…` browser-side id (canvas/WebGL/audio/fonts/screen…), known once
+    /// the visitor's collector report arrived (F18.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
 }
 
 impl Fingerprint {
     /// All present ids (device, tls, visitor).
     pub fn ids(&self) -> impl Iterator<Item = &str> {
-        [&self.device, &self.tls, &self.visitor]
+        [&self.client, &self.device, &self.tls, &self.visitor]
             .into_iter()
             .filter_map(|o| o.as_deref())
     }
 
     /// No id could be derived.
     pub fn is_empty(&self) -> bool {
-        self.device.is_none() && self.tls.is_none() && self.visitor.is_none()
+        self.device.is_none()
+            && self.tls.is_none()
+            && self.visitor.is_none()
+            && self.client.is_none()
     }
 
     /// Whether any id equals `needle` (case-insensitive).
@@ -200,6 +207,7 @@ pub fn compute(evt: &Event) -> Option<Fingerprint> {
         device,
         tls: tls_id,
         visitor,
+        client: None,
     };
     (!fp.is_empty()).then_some(fp)
 }
@@ -784,6 +792,7 @@ mod tests {
             device: Some("d-aaaa".into()),
             tls: Some("t-bbbb".into()),
             visitor: None,
+            client: None,
         };
         assert!(bans.banned(&fp).is_none());
         bans.ban("T-BBBB", None);

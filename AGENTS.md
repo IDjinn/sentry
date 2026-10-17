@@ -1168,6 +1168,25 @@ telemetria de handshake + provider de appliance
   - ✅ Testes: 14 em `fingerprint.rs` + 4 no pipeline (ids no evento, ban
     pré-detector, auto-ban + taint de IP novo, DSL)
 
+  - ✅ F18.2 Coletor JS próprio (`sentry-edge/assets/collector.js` +
+    `collector.rs`; sem dependência/licença de terceiros): `GET
+    <js_path>/init.js` e `POST <js_path>/collect` (default
+    `/challenge-sentry`, respondidos pela edge, nunca vão ao upstream;
+    config valida o prefixo). Sondas: navigator (UA/platform/languages/
+    hardware/memória/touch/plugins/webdriver/window.chrome), timezone,
+    tela/DPR, canvas, WebGL (vendor/renderer/limites), áudio, fontes. Tag
+    injetada antes de `</head>` em HTML 200 bufferizado e sem
+    `Content-Encoding` (`js_inject: off` p/ CSP estrita). Report preso ao
+    cookie `sentry_vid` (emitido no collect se faltar), limite 8 KiB,
+    1 report/10 s por visitante e 30/min por IP, `ClientStore` por-node com
+    TTL. Id `j-<16hex>` (canvas+WebGL+áudio+fontes+tela+hardware+tz+
+    plataforma+idiomas; precisa de ≥1 sonda de alta entropia) entra em
+    `Fingerprint.client` → reputação/ban/DSL/`fingerprint show`. Sinais:
+    `HeadlessBrowser` (45: webdriver, UA headless, WebGL por software, tela
+    0×0 — ou 2 marcadores fracos) e `ClientInconsistency` (35: UA do JS ≠
+    header, plataforma × OS do UA — ou 2 marcadores fracos), repetidos a
+    cada request do visitante. Dados vêm do cliente: heurística, não prova
+
 Backlog detalhado em `BACKLOG.md` (§24 F9 e §25 F10 continuam no `ARCHITECTURE.md`, pois já foram entregues; §26 F11 idem, roadmap em §5.4; §27 F12 idem; §28 F13 idem; §29 F14 idem; §3 subprojeto auto — v1 entregue, A.5/A.7/A.12 restantes).
 
 ### Status atual (verificação contínua)

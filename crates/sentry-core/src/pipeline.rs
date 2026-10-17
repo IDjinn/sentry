@@ -306,6 +306,7 @@ struct FingerprintStage {
     tracker: Arc<RwLock<crate::fingerprint::FingerprintTracker>>,
     bans: Arc<crate::fingerprint::FingerprintBans>,
     auto_ban_ttl: Duration,
+    clients: Option<Arc<crate::clientsig::ClientStore>>,
 }
 
 /// The analysis pipeline.
@@ -557,7 +558,19 @@ impl Pipeline {
             tracker,
             bans,
             auto_ban_ttl: Duration::from_secs(cfg.auto_ban_ttl_secs.max(1)),
+            clients: None,
         });
+        self
+    }
+
+    /// Attach the browser-side report store (F18.2). Requires
+    /// [`with_fingerprint`](Self::with_fingerprint) first: reports are bound
+    /// to the visitor cookie, add the `j-` id to the request's fingerprint
+    /// and replay headless/inconsistency findings on every request.
+    pub fn with_client_store(mut self, store: Arc<crate::clientsig::ClientStore>) -> Self {
+        if let Some(stage) = &mut self.fingerprint {
+            stage.clients = Some(store);
+        }
         self
     }
 
@@ -573,7 +586,12 @@ impl Pipeline {
         let Some(stage) = &self.fingerprint else {
             return self.process_core(evt, scope, None);
         };
-        let fp = crate::fingerprint::compute(evt);
+        let mut fp = crate::fingerprint::compute(evt);
+        if let (Some(store), Some(fp)) = (&stage.clients, fp.as_mut()) {
+            if let Some(rec) = fp.visitor.as_deref().and_then(|v| store.lookup(v)) {
+                fp.client = rec.id;
+            }
+        }
         let mut pe = self.process_core(evt, scope, fp.as_ref());
         if let Some(fp) = fp {
             if pe.analysis.risk_level >= RiskLevel::High {
@@ -773,6 +791,11 @@ impl Pipeline {
                 evt.client_ip,
                 Instant::now(),
             ));
+            if let (Some(store), Some(visitor)) = (&stage.clients, fp.visitor.as_deref()) {
+                if let Some(rec) = store.lookup(visitor) {
+                    signals.extend(rec.signals);
+                }
+            }
         }
         // Response-phase feedback (inline edge): scan/behavior trackers key
         // on the HTTP status, which only exists after a response was served —
@@ -1041,6 +1064,8 @@ impl Pipeline {
             SignalKind::FingerprintBanned => "fingerprint_banned",
             SignalKind::FingerprintReputation => "fingerprint_reputation",
             SignalKind::VisitorDeviceChurn => "visitor_device_churn",
+            SignalKind::HeadlessBrowser => "headless_browser",
+            SignalKind::ClientInconsistency => "client_inconsistency",
             SignalKind::RuleHit => "rule_hit",
             SignalKind::Custom => "custom",
         };
@@ -1100,6 +1125,8 @@ impl Pipeline {
             SignalKind::FingerprintBanned => "fingerprint_banned",
             SignalKind::FingerprintReputation => "fingerprint_reputation",
             SignalKind::VisitorDeviceChurn => "visitor_device_churn",
+            SignalKind::HeadlessBrowser => "headless_browser",
+            SignalKind::ClientInconsistency => "client_inconsistency",
             SignalKind::RuleHit => "rule_hit",
             SignalKind::Custom => "custom",
         };
@@ -2389,5 +2416,49 @@ mod tests {
             .unwrap();
         let m = crate::rules::dsl::parse(&format!("fingerprint = \"{id}\"")).unwrap();
         assert!(m.matches(&e));
+    }
+
+    #[test]
+    fn collector_report_adds_client_id_and_headless_signal() {
+        let cfg = crate::config::FingerprintConfig::default();
+        let store = Arc::new(crate::clientsig::ClientStore::new(
+            Duration::from_secs(600),
+            100,
+        ));
+        let p = pipeline()
+            .with_fingerprint(
+                &cfg,
+                Arc::new(RwLock::new(
+                    crate::fingerprint::FingerprintTracker::from_config(&cfg),
+                )),
+                Arc::new(crate::fingerprint::FingerprintBans::new()),
+            )
+            .with_client_store(Arc::clone(&store));
+        let visitor = crate::fingerprint::new_visitor_id();
+        let sig = crate::clientsig::ClientSignals {
+            webdriver: Some(true),
+            canvas: Some("abc".into()),
+            ..Default::default()
+        };
+        store.record(
+            &format!("v-{visitor}"),
+            IpAddr::from([203, 0, 113, 1]),
+            &sig,
+            None,
+            None,
+        );
+        let mut e = fp_evt(IpAddr::from([203, 0, 113, 1]), "/");
+        e.http_mut().unwrap().cookies = Some(HashMap::from([(
+            crate::fingerprint::VISITOR_COOKIE.to_string(),
+            visitor,
+        )]));
+        let r = p.process(&e);
+        let fp = r.event.http().unwrap().fingerprint.clone().unwrap();
+        assert!(fp.client.as_deref().unwrap().starts_with("j-"));
+        assert!(r
+            .analysis
+            .signals
+            .iter()
+            .any(|s| s.kind == SignalKind::HeadlessBrowser));
     }
 }

@@ -20,3 +20,6 @@ CREATE INDEX IF NOT EXISTS events_fp_tls_idx
 CREATE INDEX IF NOT EXISTS events_fp_visitor_idx
     ON events ((protocol->'fingerprint'->>'visitor'))
     WHERE protocol->'fingerprint' IS NOT NULL;
+CREATE INDEX IF NOT EXISTS events_fp_client_idx
+    ON events ((protocol->'fingerprint'->>'client'))
+    WHERE protocol->'fingerprint' IS NOT NULL;
