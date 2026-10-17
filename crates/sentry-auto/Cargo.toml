@@ -12,5 +12,6 @@ authors.workspace = true
 sentry-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 regex = { workspace = true }
 thiserror = { workspace = true }

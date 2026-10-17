@@ -101,6 +101,7 @@ pub fn detectors() -> Vec<Box<dyn FrameworkDetector>> {
         Box::new(profiles::laravel::LaravelDetector),
         Box::new(profiles::nextjs::NextjsDetector),
         Box::new(profiles::express::ExpressDetector),
+        Box::new(profiles::openapi::OpenApiDetector),
     ]
 }
 
@@ -184,7 +185,14 @@ mod tests {
         let names = profile_names();
         assert_eq!(
             names,
-            vec!["express", "laravel", "nextjs", "nginx", "wordpress"]
+            vec![
+                "express",
+                "laravel",
+                "nextjs",
+                "nginx",
+                "openapi",
+                "wordpress"
+            ]
         );
     }
 

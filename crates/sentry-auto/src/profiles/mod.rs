@@ -8,4 +8,5 @@ pub mod express;
 pub mod laravel;
 pub mod nextjs;
 pub mod nginx;
+pub mod openapi;
 pub mod wordpress;

@@ -20,6 +20,7 @@ const PROBE_CONCURRENCY: usize = 8;
 const MAX_CANDIDATES_PER_PORT: usize = 80;
 const MAX_SITEMAPS: usize = 2;
 const BODY_PREFIX_CAP: usize = 64 * 1024;
+const SPEC_BODY_CAP: usize = 2 * 1024 * 1024;
 
 /// Arguments for [`run`], straight from the CLI variant plus the
 /// `[auto.sensitive]` config section (CLI flags extend both lists).
@@ -240,11 +241,40 @@ async fn probe_port(
         .collect()
         .await;
 
-    let routes: Vec<FoundRoute> = probe::filter_catch_all(sentinel, hits)
+    let mut routes: Vec<FoundRoute> = probe::filter_catch_all(sentinel, hits)
         .into_iter()
         .map(|path| FoundRoute::new(path, &[], source.as_str()))
         .collect();
+    routes.extend(spec_routes(&client, &base, &source).await);
     Some(routes)
+}
+
+/// Fetch every well-known spec location and keep the routes of the first
+/// document that parses as OpenAPI/Swagger. Unlike the blind candidates
+/// these carry real methods and templates, and a body that parses as a
+/// spec cannot be a catch-all page.
+async fn spec_routes(client: &reqwest::Client, base: &str, source: &str) -> Vec<FoundRoute> {
+    let responses: Vec<(String, ProbeResp)> = stream::iter(probe::SPEC_PATHS.iter().map(|path| {
+        let client = client.clone();
+        let base = base.to_string();
+        async move {
+            let resp = fetch_capped(&client, &base, path, SPEC_BODY_CAP).await?;
+            (resp.status == 200).then(|| (path.to_string(), resp))
+        }
+    }))
+    .buffered(PROBE_CONCURRENCY)
+    .filter_map(|r| async move { r })
+    .collect()
+    .await;
+
+    for (path, resp) in responses {
+        if let Some(routes) =
+            sentry_auto::openapi::parse_spec(&resp.body, &format!("{source}{path}"))
+        {
+            return routes;
+        }
+    }
+    Vec::new()
 }
 
 /// Paths discovered off-probe: robots.txt entries, sitemap `<loc>`s and
@@ -292,17 +322,28 @@ struct ProbeResp {
 /// GET a path on the probe base. Body is read up to [`BODY_PREFIX_CAP`];
 /// the full transfer size (`total`) feeds the catch-all signature.
 async fn fetch(client: &reqwest::Client, base: &str, path: &str) -> Option<ProbeResp> {
+    fetch_capped(client, base, path, BODY_PREFIX_CAP).await
+}
+
+/// [`fetch`] with a custom body-prefix cap (OpenAPI documents outgrow the
+/// default).
+async fn fetch_capped(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    cap: usize,
+) -> Option<ProbeResp> {
     let resp = client.get(format!("{base}{path}")).send().await.ok()?;
     let status = resp.status().as_u16();
     let mut total = 0usize;
     let mut body = Vec::new();
     let mut resp = resp;
-    while total < 4 * BODY_PREFIX_CAP {
+    while total < 4 * cap {
         match resp.chunk().await {
             Ok(Some(chunk)) => {
                 total += chunk.len();
-                if body.len() < BODY_PREFIX_CAP {
-                    let remaining = BODY_PREFIX_CAP - body.len();
+                if body.len() < cap {
+                    let remaining = cap - body.len();
                     body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
                 }
             }

@@ -11,6 +11,7 @@
 
 pub mod detect;
 pub mod generate;
+pub mod openapi;
 pub mod probe;
 pub mod profiles;
 

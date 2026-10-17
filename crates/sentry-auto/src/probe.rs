@@ -159,6 +159,27 @@ pub const COMMON_PATHS: &[&str] = &[
     "/cdn-cgi/trace",
 ];
 
+/// Where live APIs commonly publish their OpenAPI/Swagger document
+/// (FastAPI, Spring, .NET, NestJS, Rails/rswag, plain static files). A hit
+/// only counts when the body parses as a spec, so SPA fallbacks are inert.
+pub const SPEC_PATHS: &[&str] = &[
+    "/openapi.json",
+    "/swagger.json",
+    "/v3/api-docs",
+    "/v2/api-docs",
+    "/api-docs",
+    "/api-docs.json",
+    "/api/openapi.json",
+    "/api/swagger.json",
+    "/api/v1/openapi.json",
+    "/docs/openapi.json",
+    "/swagger/v1/swagger.json",
+    "/openapi.yaml",
+    "/openapi.yml",
+    "/swagger.yaml",
+    "/api-docs/swagger.json",
+];
+
 /// Extra paths a forced profile contributes to the probe list.
 pub fn profile_paths(name: &str) -> &'static [&'static str] {
     match name {
@@ -236,5 +257,6 @@ mod tests {
     fn common_paths_have_leading_slash() {
         assert!(COMMON_PATHS.iter().all(|p| p.starts_with('/')));
         assert!(COMMON_PATHS.len() >= 50);
+        assert!(SPEC_PATHS.iter().all(|p| p.starts_with('/')));
     }
 }
