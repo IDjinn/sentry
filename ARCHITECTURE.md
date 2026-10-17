@@ -2357,3 +2357,70 @@ reported as `config changed but these sections only take effect after a
 restart` and keeps its startup value; the reminder repeats on each reload
 until a restart (the running config is tracked as startup + applied live
 sections). Per-site TLS certificates are restart-only.
+
+## 32. F18 — Client fingerprinting and fingerprint bans
+
+Goal: recognize the same client across IP changes and over time, spot
+single bot tool-chains, let fingerprints influence scoring and rules, and
+ban by fingerprint.
+
+**Ids** (`sentry-core/src/fingerprint.rs`, pure; none include the IP):
+
+| id | built from | identifies |
+| --- | --- | --- |
+| `t-<16 hex>` | JA4 (JA3 fallback) of the TLS connection | the TLS stack (browser build, curl, Go, headless farm) |
+| `d-<16 hex>` | TLS fp + ALPN + `User-Agent`, `Accept-Language`, `Accept-Encoding`, `Sec-CH-UA*` | a device/browser configuration |
+| `v-<32 hex>` | first-party `sentry_vid` cookie | one browser profile, across IP/TLS/header changes |
+
+`Accept`, `Sec-Fetch-*`, `Referer` vary per resource and stay out of the
+device id so one browser maps to one id. Passive ids are *population-level*
+(every Chrome 126 on Windows shares one); only the cookie id follows a single
+profile. The visitor cookie is `HttpOnly; SameSite=Lax; Max-Age=1y` (`Secure`
+on HTTPS), issued by the inline edge on successful HTML `GET` responses only —
+`Set-Cookie` makes CDNs treat responses as uncacheable, so assets/APIs are
+untouched. `cookie: off` keeps the passive ids.
+
+**Plumbing**: `tls.rs` injects the connection's `TlsData` as a request
+extension; the proxy/middleware copy it to `HttpData.tls`; `Pipeline::
+process_scoped` computes the ids, runs the stage, and stores them in
+`HttpData.fingerprint` (so they land in `events.protocol` and are queryable;
+expression indexes in migration `20261017000000_fingerprint.sql`).
+Handshake events (`SourceKind::EdgeTls`) get a `t-` id, so a banned TLS id
+drops the connection right after the handshake.
+
+**Signals** (`FingerprintTracker`, sliding window `window`, bounded by
+`max_entries` and 128 IPs/id):
+
+- `FingerprintReputation` (35): ≥ `reputation_ips` *other* IPs under an id were
+  flagged High/Critical and they are ≥ 50% of the IPs seen under it. The ratio
+  is what keeps a popular, mostly-clean id from being tainted by a few bad
+  actors behind it; a bot farm rotating IPs with one tool-chain trips it from
+  the first request of each new IP.
+- `VisitorDeviceChurn` (30): one cookie presented ≥ `visitor_devices` device
+  ids in the window (cookie replay, antidetect browsers).
+- `FingerprintBanned` (100): see below.
+
+**Bans**: `FingerprintBans` has a persistent tier (`fingerprint_bans` table,
+`NOTIFY sentry_fingerprints_changed`, loaded at startup and hot-reloaded on
+every node) and an in-memory automatic tier (`auto_ban_ips` > 0, TTL
+`auto_ban_ttl`) that survives table reloads. The pipeline checks it after the
+trusted-IP and blacklist guards (never-ban still wins) and before any
+detector. CLI: `sentry fingerprint list | top | show <id> | ban <id> [--ttl]
+[--note] [--force] | unban <id>`. `ban` prints the id's 7-day population and
+refuses ids shared by ≥ 20 IPs with < 50% flagged unless `--force`.
+
+**Rules**: `fingerprint = "d-…"` (any string operator) matches any of the
+request's ids, e.g. `fingerprint = "t-3f9c…" AND path starts_with "/login"`.
+
+**Config**: `detect { fingerprint { enabled cookie cookie_max_age window
+reputation_ips visitor_devices auto_ban_ips auto_ban_ttl max_entries } }`;
+on by default. Weights: `[scorer.weights] fingerprint_reputation`,
+`visitor_device_churn`.
+
+**Limits**: trackers are per-node (like the other behavioral trackers);
+bans are cluster-wide through Postgres. Passive ids on non-inline sources
+(nginx logs) only exist when the `log_format` exports the relevant
+`http_*` headers; without TLS data the device id is UA/header-based and weak.
+Privacy: ids are derived hashes and a random cookie, no raw JA4/IP in the
+cookie; the cookie is a tracking identifier — disclose it in your privacy
+policy or set `cookie: off`.

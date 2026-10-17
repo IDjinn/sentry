@@ -174,12 +174,19 @@ async fn handle_conn(
         }
     }
 
+    // Handshake metadata rides every request of the connection so the
+    // fingerprint stage (F18) can bind JA3/JA4 to the HTTP identity.
+    let conn_tls = hello.as_ref().map(|h| tls_data(h, &version, &cipher));
+
     // Serve the decrypted requests through the same router as plain HTTP.
     let service =
         hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
             req.extensions_mut()
                 .insert(axum::extract::ConnectInfo(peer));
             req.extensions_mut().insert(TlsTerminated);
+            if let Some(t) = &conn_tls {
+                req.extensions_mut().insert(t.clone());
+            }
             req.headers_mut().insert(
                 axum::http::HeaderName::from_static("x-forwarded-proto"),
                 axum::http::HeaderValue::from_static("https"),
@@ -219,6 +226,17 @@ async fn read_hello_prefix(tcp: &mut TcpStream) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+fn tls_data(hello: &ClientHello, version: &str, cipher: &str) -> sentry_core::event::TlsData {
+    sentry_core::event::TlsData {
+        sni: hello.sni.clone(),
+        ja3: hello.ja3.clone(),
+        ja4: hello.ja4.clone(),
+        cipher: Some(cipher.to_string()),
+        version: Some(version.to_string()),
+        alpn: hello.alpn.clone(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn emit_handshake_event(
     runtime: &EdgeRuntime,
@@ -233,14 +251,7 @@ async fn emit_handshake_event(
     if !cfg.handshake_events && mismatch.is_none() {
         return false;
     }
-    let data = sentry_core::event::TlsData {
-        sni: hello.sni.clone(),
-        ja3: hello.ja3.clone(),
-        ja4: hello.ja4.clone(),
-        cipher: Some(cipher.to_string()),
-        version: Some(version.to_string()),
-        alpn: hello.alpn.clone(),
-    };
+    let data = tls_data(hello, version, cipher);
     let mut evt = sentry_core::event::Event::new(
         sentry_core::event::SourceKind::EdgeTls,
         peer.ip(),

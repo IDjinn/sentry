@@ -129,6 +129,7 @@ pub struct EdgeRuntime {
     error_pages: Option<Arc<pages::ErrorPages>>,
     compressed: Option<prometheus::CounterVec>,
     upstream_failovers: Option<prometheus::CounterVec>,
+    visitor_cookie_max_age: Option<u64>,
 }
 
 impl EdgeRuntime {
@@ -162,6 +163,7 @@ impl EdgeRuntime {
             error_pages: None,
             compressed: None,
             upstream_failovers: None,
+            visitor_cookie_max_age: None,
         }
     }
 
@@ -210,6 +212,18 @@ impl EdgeRuntime {
     /// Upstream failover counter, when attached.
     pub fn upstream_failovers(&self) -> Option<&prometheus::CounterVec> {
         self.upstream_failovers.as_ref()
+    }
+
+    /// Issue the first-party `sentry_vid` visitor cookie (F18) on HTML
+    /// responses to clients that don't present a valid one.
+    pub fn with_visitor_cookie(mut self, max_age_secs: u64) -> Self {
+        self.visitor_cookie_max_age = Some(max_age_secs);
+        self
+    }
+
+    /// Visitor cookie lifetime when issuing is enabled.
+    pub fn visitor_cookie_max_age(&self) -> Option<u64> {
+        self.visitor_cookie_max_age
     }
 
     /// Arm request-body inspection (F10): bodies are buffered up to the

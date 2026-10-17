@@ -449,6 +449,18 @@ fn lower_detect(d: DetectBlock, cfg: &mut SentryConfig) {
         set(&mut cfg.correlation.enabled, c.enabled);
         set(&mut cfg.correlation.window_secs, secs(c.window));
     }
+    if let Some(f) = d.fingerprint {
+        let k = &mut cfg.fingerprint;
+        set(&mut k.enabled, f.enabled);
+        set(&mut k.cookie, f.cookie);
+        set(&mut k.cookie_max_age_secs, secs(f.cookie_max_age));
+        set(&mut k.window_secs, secs(f.window));
+        set(&mut k.reputation_ips, f.reputation_ips);
+        set(&mut k.visitor_devices, f.visitor_devices);
+        set(&mut k.auto_ban_ips, f.auto_ban_ips);
+        set(&mut k.auto_ban_ttl_secs, secs(f.auto_ban_ttl));
+        set(&mut k.max_entries, f.max_entries);
+    }
     if let Some(b) = d.bot_verification {
         let k = &mut cfg.bot_verification;
         set(&mut k.enabled, b.enabled);
@@ -1752,6 +1764,17 @@ fn raise_detect(c: &SentryConfig) -> DetectBlock {
         correlation: Some(CorrelationBlock {
             enabled: Some(c.correlation.enabled),
             window: Some(Secs(c.correlation.window_secs)),
+        }),
+        fingerprint: Some(FingerprintBlock {
+            enabled: Some(c.fingerprint.enabled),
+            cookie: Some(c.fingerprint.cookie),
+            cookie_max_age: Some(Secs(c.fingerprint.cookie_max_age_secs)),
+            window: Some(Secs(c.fingerprint.window_secs)),
+            reputation_ips: Some(c.fingerprint.reputation_ips),
+            visitor_devices: Some(c.fingerprint.visitor_devices),
+            auto_ban_ips: Some(c.fingerprint.auto_ban_ips),
+            auto_ban_ttl: Some(Secs(c.fingerprint.auto_ban_ttl_secs)),
+            max_entries: Some(c.fingerprint.max_entries),
         }),
         bot_verification: Some(BotVerificationBlock {
             enabled: Some(c.bot_verification.enabled),

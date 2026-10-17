@@ -190,6 +190,15 @@ pub enum SignalKind {
     /// policy. Describes the protected site, not the visitor — advisory
     /// only, weight is always 0.
     PostureAdvisory,
+    /// The request's fingerprint (device, TLS or visitor id) is on the ban
+    /// list (F18) — always a block.
+    FingerprintBanned,
+    /// A large share of the other IPs seen under this fingerprint were
+    /// flagged High/Critical (F18): same tooling, rotating IPs.
+    FingerprintReputation,
+    /// One visitor cookie presented many distinct device fingerprints in the
+    /// window (F18): cookie replay or antidetect-browser rotation.
+    VisitorDeviceChurn,
     /// A custom rule matched (the rule id is carried in `detail`).
     RuleHit,
     /// Any other signal not yet cataloged.

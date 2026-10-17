@@ -56,6 +56,11 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<IpCmd>,
     },
+    /// Inspect and ban client fingerprints (device / TLS / visitor ids).
+    Fingerprint {
+        #[command(subcommand)]
+        action: FingerprintCmd,
+    },
     /// Manage known routes.
     Routes {
         #[command(subcommand)]
@@ -272,6 +277,48 @@ pub enum IpCmd {
     Info,
     /// Reset the strike counters (offender memory) for an IP.
     Forgive,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FingerprintCmd {
+    /// List active fingerprint bans.
+    List,
+    /// Rank the most active fingerprints (by flagged IPs, then volume).
+    Top {
+        /// Id kind to rank: `device`, `tls` or `visitor`.
+        #[arg(long, default_value = "device")]
+        kind: String,
+        /// Look-back window (e.g. `24h`).
+        #[arg(long, default_value = "24h")]
+        from: String,
+        /// Rows to show.
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+    },
+    /// Show how many events/IPs share a fingerprint and whether it is banned.
+    Show {
+        /// `d-…`, `t-…` or `v-…` id.
+        id: String,
+        /// Look-back window.
+        #[arg(long, default_value = "7d")]
+        from: String,
+    },
+    /// Ban a fingerprint (every node reloads via NOTIFY).
+    Ban {
+        /// `d-…`, `t-…` or `v-…` id.
+        id: String,
+        /// Ban lifetime (e.g. `24h`); permanent when omitted.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Free-text reason.
+        #[arg(long)]
+        note: Option<String>,
+        /// Ban even when the id is shared by many mostly-clean IPs.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Lift a fingerprint ban.
+    Unban { id: String },
 }
 
 #[derive(Debug, Subcommand)]
