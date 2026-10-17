@@ -791,6 +791,11 @@ impl Pipeline {
                 evt.client_ip,
                 Instant::now(),
             ));
+            if let (Some(store), Some(visitor)) = (&stage.clients, fp.visitor.as_deref()) {
+                if let Some(rec) = store.lookup(visitor) {
+                    signals.extend(rec.signals);
+                }
+            }
         }
         // Response-phase feedback (inline edge): scan/behavior trackers key
         // on the HTTP status, which only exists after a response was served —
